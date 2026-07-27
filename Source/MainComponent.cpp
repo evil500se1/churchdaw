@@ -396,13 +396,10 @@ MainComponent::MainComponent()
                 c->openEditorForSlot (0);
         });
 
-    // primeiro uso: abre o escaneador de plugins automaticamente
-    if (knownPlugins.getNumTypes() == 0)
-        juce::MessageManager::callAsync ([safe = juce::Component::SafePointer<MainComponent> (this)]
-        {
-            if (auto* c = safe.getComponent())
-                c->showPluginScanner();
-        });
+    // O escaneador de plugins nunca abre sozinho. Em uma instalacao limpa ele
+    // cobria a mesa inteira logo na primeira abertura e fazia o ChurchDAW parecer
+    // quebrado, especialmente no macOS. O usuario continua podendo abri-lo pelo
+    // botao "Plugins" / "Escanear VST3" quando realmente quiser instalar VST/AU.
 }
 
 MainComponent::~MainComponent()

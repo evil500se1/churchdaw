@@ -102,8 +102,10 @@ public:
 
     static juce::File holyKeysSamplesFolder()
     {
-        const auto exeDir = juce::File::getSpecialLocation (juce::File::currentExecutableFile)
-                                .getParentDirectory();
+        // No macOS o executavel fica em ChurchDAW.app/Contents/MacOS. appFolder()
+        // sobe ate a pasta que o usuario enxerga; no Windows continua sendo a
+        // pasta do .exe.
+        const auto exeDir = AppPaths::appFolder();
 
         for (const char* name : { "Library6", "HolyKeys" })
         {
@@ -124,8 +126,7 @@ public:
 
     static juce::File studioPianosSamplesFolder()
     {
-        const auto exeDir = juce::File::getSpecialLocation (juce::File::currentExecutableFile)
-                                .getParentDirectory();
+        const auto exeDir = AppPaths::appFolder();
 
         for (const char* name : { "Library5", "StudioPianos" })
         {
@@ -147,8 +148,7 @@ public:
     static juce::File defaultSamplesFolder()
     {
         // modo portatil: biblioteca ao lado do executavel tem prioridade
-        const auto exeDir = juce::File::getSpecialLocation (juce::File::currentExecutableFile)
-                                .getParentDirectory();
+        const auto exeDir = AppPaths::appFolder();
 
         for (const char* name : { "Library", "ChurchLive Library", "SAMPLES" })
         {
@@ -744,8 +744,7 @@ public:
 
     static juce::File redkeysSamplesFolder()
     {
-        const auto exeDir = juce::File::getSpecialLocation (juce::File::currentExecutableFile)
-                                .getParentDirectory();
+        const auto exeDir = AppPaths::appFolder();
 
         for (const char* name : { "Library2", "REDKEYS" })
         {
@@ -797,8 +796,7 @@ public:
 
     static juce::File worshipSamplesFolder()
     {
-        const auto exeDir = juce::File::getSpecialLocation (juce::File::currentExecutableFile)
-                                .getParentDirectory();
+        const auto exeDir = AppPaths::appFolder();
 
         for (const char* name : { "Library3", "Worship" })
         {
@@ -824,8 +822,7 @@ public:
 
     static juce::File baselabSamplesFolder()
     {
-        const auto exeDir = juce::File::getSpecialLocation (juce::File::currentExecutableFile)
-                                .getParentDirectory();
+        const auto exeDir = AppPaths::appFolder();
 
         for (const char* name : { "Library4", "BaseLab" })
         {

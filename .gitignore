@@ -1,5 +1,6 @@
-build/
-asiosdk/
+/build/
+/build-mac/
+/asiosdk/
 insert_params.txt
 *.user
 .vs/

@@ -13,12 +13,41 @@
 // entao getParentDirectory() devolve "Contents/MacOS", nao a pasta onde o
 // usuario ve o aplicativo. Procurar a biblioteca ali nunca acharia nada, e o
 // app abriria vazio no Mac sem dar erro nenhum -- o pior tipo de bug.
+//
+// A ARMADILHA DO ANDROID: e a mesma armadilha, so que pior, e vale a pena
+// registrar porque o codigo abaixo parece errado ate voce saber disto.
+// Conferido em juce_Files_android.cpp:809-870 (JUCE 9.0.0):
+//
+//   currentExecutableFile          -> publicSourceDir, que e o CAMINHO DO .APK
+//                                     (/data/app/<pkg>/base.apk). Nao e o
+//                                     executavel numa pasta: getParentDirectory()
+//                                     cai em /data/app/<pkg>, pasta do SISTEMA,
+//                                     somente leitura, onde biblioteca nenhuma
+//                                     jamais vai estar. "appFolder" nao existe
+//                                     como conceito no Android.
+//
+//   commonApplicationDataDirectory -> dataDir (/data/user/0/<pkg>), e o mesmo
+//   userApplicationDataDirectory      valor para os DOIS. Alem de coincidirem,
+//                                     e armazenamento PRIVADO: nao aparece
+//                                     quando o usuario liga o cabo USB. Mandar
+//                                     ele copiar 29 GB para la e impossivel,
+//                                     nao dificil.
+//
+// Resultado: as tres buscas do findLibrary() falhariam no celular, e a ultima
+// falharia em silencio apontando para um lugar inalcancavel. Por isso no
+// Android a biblioteca mora em Music/ChurchDAW -- pasta que o usuario ENXERGA
+// no gerenciador de arquivos e no cabo USB, e para onde ele consegue arrastar
+// os samples do PC.
 //==============================================================================
 struct AppPaths
 {
     // Pasta "onde o aplicativo esta", do ponto de vista do usuario.
     static juce::File appFolder()
     {
+       #if JUCE_ANDROID
+        // ver nota acima: derivar do "executavel" apontaria para /data/app.
+        return sharedDataFolder();
+       #else
         auto exe = juce::File::getSpecialLocation (juce::File::currentExecutableFile);
 
        #if JUCE_MAC
@@ -31,7 +60,8 @@ struct AppPaths
         return exe.getParentDirectory();
        #else
         return exe.getParentDirectory();
-       #endif
+       #endif // JUCE_MAC
+       #endif // JUCE_ANDROID
     }
 
     // Recursos embarcados. No Mac vivem dentro do bundle; no Windows, ao lado.
@@ -51,8 +81,21 @@ struct AppPaths
     // Onde o instalador coloca as bibliotecas compartilhadas.
     //   Windows: C:\ProgramData\ChurchDAW
     //   macOS:   /Library/Application Support/ChurchDAW
+    //   Android: /storage/emulated/0/Music/ChurchDAW
+    //
+    // No celular NAO ha instalador: quem "instala" a biblioteca e o proprio
+    // comprador, arrastando a pasta pelo cabo USB. Entao o destino tem que ser
+    // um lugar que ele ENXERGUE do PC -- e o armazenamento privado do app nao
+    // aparece no cabo (ver a nota no topo do arquivo). Music/ChurchDAW aparece,
+    // e sobrevive a atualizacao do app.
     static juce::File sharedDataFolder()
     {
+       #if JUCE_ANDROID
+        if (auto music = juce::File::getSpecialLocation (juce::File::userMusicDirectory);
+            music != juce::File())
+            return music.getChildFile ("ChurchDAW");
+       #endif
+
         return juce::File::getSpecialLocation (juce::File::commonApplicationDataDirectory)
                    .getChildFile ("ChurchDAW");
     }

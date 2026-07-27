@@ -1588,13 +1588,25 @@ public:
         // teste. Um comprador nunca recebe notas automaticas por acidente.
         const auto selfTestMode = juce::SystemStats::getEnvironmentVariable ("CHURCHDAW_SELFTEST", {});
         selfTestStress = selfTestMode.equalsIgnoreCase ("stress");
-        selfTestOn = selfTestStress || selfTestMode.equalsIgnoreCase ("worship");
+        selfTestRestore = selfTestMode.equalsIgnoreCase ("restore");
+        selfTestExternalMidi = selfTestMode.equalsIgnoreCase ("external");
+        selfTestOn = selfTestStress
+                  || selfTestMode.equalsIgnoreCase ("worship")
+                  || selfTestRestore
+                  || selfTestExternalMidi;
+        selfTestQuitSamples = (juce::int64) (hostSampleRate
+            * juce::SystemStats::getEnvironmentVariable ("CHURCHDAW_SELFTEST_QUIT_SECONDS", "0")
+                  .getDoubleValue());
        #endif
 
         if (selfTestOn)
-            juce::Logger::writeToLog (selfTestStress
-                ? "AUDIO: TESTE DE ESTRESSE LIGADO"
-                : "AUDIO: TESTE WORSHIP SUAVE LIGADO");
+        {
+            auto testName = selfTestStress ? juce::String ("ESTRESSE")
+                           : selfTestExternalMidi ? juce::String ("MIDI EXTERNO")
+                           : selfTestRestore ? juce::String ("RESTAURACAO")
+                           : juce::String ("WORSHIP SUAVE");
+            juce::Logger::writeToLog ("AUDIO: TESTE " + testName + " LIGADO");
+        }
        #endif
 
        #if CHURCHDAW_STREAM_SAMPLES
@@ -2037,6 +2049,27 @@ public:
         if (! selfTestOn)
             return;
 
+        selfTestElapsedSamples += numSamples;
+
+       #if JUCE_MAC
+        if (! selfTestQuitRequested
+             && selfTestQuitSamples > 0
+             && selfTestElapsedSamples >= selfTestQuitSamples)
+        {
+            selfTestQuitRequested = true;
+            juce::MessageManager::callAsync ([]
+            {
+                juce::JUCEApplicationBase::quit();
+            });
+        }
+       #endif
+
+        // Neste modo as notas precisam vir da porta CoreMIDI criada pelo teste.
+        // Gerar notas aqui mascararia exatamente a falha de hot-plug que queremos
+        // detectar.
+        if (selfTestExternalMidi)
+            return;
+
         selfTestCounter += numSamples;
 
         if (selfTestStress)
@@ -2145,10 +2178,15 @@ public:
 
     bool selfTestOn = false;
     bool selfTestStress = false;
+    bool selfTestRestore = false;
+    bool selfTestExternalMidi = false;
+    bool selfTestQuitRequested = false;
     int selfTestCounter = 0;
     int selfTestNotes[8] { 0, 0, 0, 0, 0, 0, 0, 0 };
     int selfTestPhase = 0, selfTestChord = 0;
     unsigned int selfTestSeed = 12345u;
+    juce::int64 selfTestElapsedSamples = 0;
+    juce::int64 selfTestQuitSamples = 0;
 
    #if JUCE_MAC
     int macSelfTestBlocks = 0;
@@ -3490,7 +3528,7 @@ private:
         //
         // So roda com um marcador de diagnostico presente. Num aparelho de
         // comprador o arquivo nao existe.
-        if (selfTestOn)
+        if (selfTestOn && ! selfTestRestore)
         {
             static const char* wanted[numLayers] = { "Black Upright", "Pad2", "REV", "BELLP4", "Pad3" };
 

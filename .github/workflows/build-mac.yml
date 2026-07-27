@@ -27,7 +27,7 @@ jobs:
           plutil -lint "$PLIST"
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$PLIST")" = "com.churchdaw.app"
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLIST")" = "1.1.0"
-          ! /usr/libexec/PlistBuddy -c 'Print :NSMicrophoneUsageDescription' "$PLIST" >/dev/null 2>&1
+          /usr/libexec/PlistBuddy -c 'Print :NSMicrophoneUsageDescription' "$PLIST" | grep -q "guitarra/microfone"
           ARCHS="$(lipo -archs "$EXE")"
           echo "Arquiteturas: $ARCHS"
           grep -qw arm64 <<<"$ARCHS"
@@ -82,12 +82,15 @@ jobs:
           APP=build-mac/MinhaDAW_artefacts/Release/ChurchDAW.app
           EXE="$APP/Contents/MacOS/ChurchDAW"
           mkdir -p prints
-          CHURCHDAW_SELFTEST=worship "$EXE" >mac-selftest.log 2>&1 &
+          CHURCHDAW_SELFTEST=worship CHURCHDAW_SELFTEST_QUIT_SECONDS=22 \
+            "$EXE" >mac-selftest.log 2>&1 &
           PID=$!
 
           cleanup() {
-            kill "$PID" >/dev/null 2>&1 || true
-            wait "$PID" >/dev/null 2>&1 || true
+            if [[ -n "${PID:-}" ]]; then
+              kill "$PID" >/dev/null 2>&1 || true
+              wait "$PID" >/dev/null 2>&1 || true
+            fi
           }
           trap cleanup EXIT
 
@@ -99,6 +102,15 @@ jobs:
             screencapture -x "prints/tela_${current}s.png" || true
           done
 
+          for unused in {1..10}; do
+            kill -0 "$PID" >/dev/null 2>&1 || break
+            sleep 1
+          done
+          kill -0 "$PID" >/dev/null 2>&1 && { echo "APP NAO ENCERROU LIMPO"; exit 1; }
+          wait "$PID"
+          PID=
+          trap - EXIT
+
           cat mac-selftest.log
           grep -q "AUDIO: TESTE WORSHIP SUAVE LIGADO" mac-selftest.log
           grep -q "AUDIO: teste carregando canal 1 = Black Upright" mac-selftest.log
@@ -107,18 +119,84 @@ jobs:
           ! grep -Eq "MAC_SELFTEST:.*invalid [1-9][0-9]*" mac-selftest.log
           echo "APP RODANDO, MIDI GERADO E AUDIO NA SAIDA"
 
+      - name: Testar salvamento e restauracao
+        run: |
+          APP=build-mac/MinhaDAW_artefacts/Release/ChurchDAW.app
+          EXE="$APP/Contents/MacOS/ChurchDAW"
+          SETTINGS_DIR="$HOME/Library/Application Support/ChurchDAW"
+          find "$SETTINGS_DIR" -maxdepth 1 -type f -print
+          test -n "$(find "$SETTINGS_DIR" -maxdepth 1 -type f -size +0c -print -quit)"
+
+          CHURCHDAW_SELFTEST=restore CHURCHDAW_SELFTEST_QUIT_SECONDS=7 \
+            "$EXE" >mac-restore.log 2>&1 &
+          PID=$!
+
+          for unused in {1..12}; do
+            kill -0 "$PID" >/dev/null 2>&1 || break
+            sleep 1
+          done
+          kill -0 "$PID" >/dev/null 2>&1 && { kill "$PID"; echo "REABERTURA NAO ENCERROU"; exit 1; }
+          wait "$PID"
+
+          cat mac-restore.log
+          grep -q "AUDIO: TESTE RESTAURACAO LIGADO" mac-restore.log
+          grep -q "BIBLIOTECA: timbre Black Upright pronto" mac-restore.log
+          grep -Eq "MAC_SELFTEST: blocks [0-9]+ audible [1-9][0-9]*" mac-restore.log
+          ! grep -Eq "MAC_SELFTEST:.*invalid [1-9][0-9]*" mac-restore.log
+          echo "ESTADO SALVO E RESTAURADO COM AUDIO"
+
+      - name: Testar hot-plug e notas CoreMIDI
+        run: |
+          APP=build-mac/MinhaDAW_artefacts/Release/ChurchDAW.app
+          EXE="$APP/Contents/MacOS/ChurchDAW"
+          clang++ -std=c++17 Tests/mac_midi_source.cpp \
+            -framework CoreMIDI -framework CoreFoundation -o mac-midi-source
+
+          CHURCHDAW_SELFTEST=external CHURCHDAW_SELFTEST_QUIT_SECONDS=16 \
+            "$EXE" >mac-external-midi.log 2>&1 &
+          APP_PID=$!
+          sleep 3
+          ./mac-midi-source >mac-midi-helper.log 2>&1 &
+          MIDI_PID=$!
+          sleep 6
+          kill -0 "$APP_PID"
+          kill -0 "$MIDI_PID"
+          screencapture -x prints/tela_midi_externo.png || true
+          wait "$MIDI_PID"
+
+          for unused in {1..10}; do
+            kill -0 "$APP_PID" >/dev/null 2>&1 || break
+            sleep 1
+          done
+          kill -0 "$APP_PID" >/dev/null 2>&1 && { kill "$APP_PID"; echo "APP NAO ENCERROU"; exit 1; }
+          wait "$APP_PID"
+
+          cat mac-midi-helper.log
+          cat mac-external-midi.log
+          grep -q "MIDI_HELPER_READY" mac-midi-helper.log
+          grep -q "AUDIO: TESTE MIDI EXTERNO LIGADO" mac-external-midi.log
+          grep -Eq "MIDI: [1-9][0-9]* entrada\\(s\\)" mac-external-midi.log
+          grep -Eq "MAC_SELFTEST: blocks [0-9]+ audible [1-9][0-9]*" mac-external-midi.log
+          ! grep -Eq "MAC_SELFTEST:.*invalid [1-9][0-9]*" mac-external-midi.log
+          echo "HOT-PLUG COREMIDI E NOTAS EXTERNAS OK"
+
       - name: Publicar diagnostico de audio
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: diagnostico-audio-macos
-          path: mac-selftest.log
+          path: |
+            mac-selftest.log
+            mac-restore.log
+            mac-external-midi.log
+            mac-midi-helper.log
 
       - name: Teste visual do app
         run: |
           test -s prints/tela_5s.png
           test -s prints/tela_12s.png
           test -s prints/tela_20s.png
+          test -s prints/tela_midi_externo.png
           echo "PRINTS DO APP OK"
 
       - name: Publicar prints do app rodando no Mac

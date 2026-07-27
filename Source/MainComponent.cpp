@@ -142,10 +142,7 @@ MainComponent::MainComponent()
 
     auto savedAudio = appProperties.getUserSettings()->getXmlValue ("audioSetup");
 
-    // ZERO canais de ENTRADA em todas as plataformas, e nao e economia: o
-    // ChurchDAW e um sampler e o no de entrada nao participa de nenhuma conexao
-    // do graph. Pedir dois canais no desktop apenas acionava a permissao de
-    // microfone do macOS/Windows sem haver caminho para esse audio no motor.
+    // ZERO canais de ENTRADA no celular, e nao e economia: e o que faz haver som.
     //
     // Pedir entrada obriga o Android a exigir RECORD_AUDIO, e sem essa permissao
     // ele nao recusa so a entrada -- recusa o STREAM INTEIRO. O proprio Oboe
@@ -155,7 +152,13 @@ MainComponent::MainComponent()
     // O ChurchDAW e um sampler: ele nao grava nada. Pedir microfone seria pedir
     // ao comprador uma permissao que o app nao usa -- alem de assustar, e o tipo
     // de coisa que faz a Play Store barrar.
+   #if JUCE_ANDROID || JUCE_IOS
     const int numInputs = 0;
+   #else
+    // No desktop a entrada e opcional e so entra no graph quando o usuario liga
+    // "Entrada de audio (guitarra/mic)" no painel Audio/MIDI.
+    const int numInputs = 2;
+   #endif
 
     deviceManager.initialise (numInputs, 2, savedAudio.get(), true);
 

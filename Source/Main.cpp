@@ -233,7 +233,8 @@ public:
                               DocumentWindow::allButtons)
         {
             setUsingNativeTitleBar (true);
-            setContentOwned (new MainComponent(), true);
+            holder = new ScaledHolder();
+            setContentOwned (holder, true);
             setResizable (true, true);
             setResizeLimits (960, 600, 32000, 32000);
             centreWithSize (getWidth(), getHeight());
@@ -244,22 +245,6 @@ public:
             // baixo e a barra de tarefas comia o resto — o fim da regua master
             // (Auto EQ Master / Punch) ficava fora da tela. userArea ja desconta a
             // barra de tarefas, entao tudo cabe em qualquer escala de DPI.
-            // O layout foi desenhado para ~1280x672 px LOGICOS (tela 1920 no
-            // Windows a 150% de DPI). Num monitor a 100% -- caso tipico do
-            // macOS -- a mesma tela tem 1920 px logicos e a interface inteira
-            // encolhe para 2/3 do tamanho. Igualamos o tamanho VISUAL em
-            // qualquer maquina escalando o excesso de area util. No Windows a
-            // 150% a conta da 1.0 e nada muda.
-            if (auto* display = juce::Desktop::getInstance().getDisplays().getPrimaryDisplay())
-            {
-                auto area = display->userArea;
-                const float scale = juce::jmin (area.getWidth()  / 1280.0f,
-                                                area.getHeight() / 672.0f);
-                if (scale > 1.05f)
-                    juce::Desktop::getInstance().setGlobalScaleFactor (scale);
-            }
-
-            // re-consulta: com a escala global nova, userArea muda de valor
             if (auto* display = juce::Desktop::getInstance().getDisplays().getPrimaryDisplay())
                 setBounds (display->userArea);
             else
@@ -273,8 +258,36 @@ public:
 
         MainComponent* content() const
         {
-            return dynamic_cast<MainComponent*> (getContentComponent());
+            return holder != nullptr ? &holder->inner : nullptr;
         }
+
+    private:
+        // O layout foi desenhado para ~1280x672 px LOGICOS (tela 1920 no
+        // Windows a 150% de DPI, onde o sistema ja entrega essa medida). Num
+        // monitor a 100% -- caso tipico do macOS -- a janela tem 1920 px
+        // logicos e a interface inteira encolhia para 2/3 do tamanho. Este
+        // involucro da zoom no MainComponent ate a janela "valer" 1280x672,
+        // reproduzindo em qualquer tela o mesmo tamanho visual do Windows.
+        // No Windows a 150% a conta da 1.0 e nada muda.
+        struct ScaledHolder : public juce::Component
+        {
+            ScaledHolder() { addAndMakeVisible (inner); }
+
+            void resized() override
+            {
+                const float s = juce::jmax (1.0f,
+                                            juce::jmin (getWidth()  / 1280.0f,
+                                                        getHeight() / 672.0f));
+                inner.setTransform (juce::AffineTransform::scale (s));
+                inner.setBounds (0, 0,
+                                 (int) std::ceil (getWidth()  / s),
+                                 (int) std::ceil (getHeight() / s));
+            }
+
+            MainComponent inner;
+        };
+
+        ScaledHolder* holder = nullptr;
 
         JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MainWindow)
     };

@@ -33,8 +33,20 @@ jobs:
           grep -qw arm64 <<<"$ARCHS"
           grep -qw x86_64 <<<"$ARCHS"
           otool -L "$EXE"
-          codesign -dvvv "$APP" 2>&1 || true
-          codesign --verify --deep --strict --verbose=2 "$APP" 2>&1 || true
+          plutil -lint Packaging/ChurchDAW.entitlements
+
+          # A assinatura ad-hoc nao substitui o Developer ID, mas faz o runner
+          # executar o app sob o Hardened Runtime e valida a estrutura/entitlements.
+          codesign --force --deep --sign - --options runtime \
+            --entitlements Packaging/ChurchDAW.entitlements "$APP"
+          codesign -dvvv "$APP" 2>&1
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          codesign -d --entitlements :- "$APP" >signed-entitlements.plist
+          plutil -lint signed-entitlements.plist
+          /usr/libexec/PlistBuddy -c 'Print :com.apple.security.device.audio-input' \
+            signed-entitlements.plist | grep -q true
+          /usr/libexec/PlistBuddy -c 'Print :com.apple.security.cs.disable-library-validation' \
+            signed-entitlements.plist | grep -q true
 
       - name: Criar piano sintetico para o teste
         run: |

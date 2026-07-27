@@ -23,7 +23,9 @@ juce_add_gui_app(MinhaDAW
     MICROPHONE_PERMISSION_ENABLED TRUE
     MICROPHONE_PERMISSION_TEXT "O ChurchDAW usa a entrada de audio somente quando voce ativa guitarra/microfone em Audio/MIDI."
     HARDENED_RUNTIME_ENABLED TRUE
-    HARDENED_RUNTIME_OPTIONS "com.apple.security.cs.disable-library-validation"
+    HARDENED_RUNTIME_OPTIONS
+        "com.apple.security.device.audio-input"
+        "com.apple.security.cs.disable-library-validation"
     ICON_BIG "${CMAKE_CURRENT_SOURCE_DIR}/Assets/icon.png"
     ICON_SMALL "${CMAKE_CURRENT_SOURCE_DIR}/Assets/icon.png")
 

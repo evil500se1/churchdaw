@@ -179,14 +179,36 @@ public:
         // deixa a splash aparecer antes do carregamento pesado dos plugins
         juce::Timer::callAfterDelay (180, [this]
         {
-            mainWindow = std::make_unique<MainWindow> (getApplicationName());
-
-            if (splash != nullptr && mainWindow->content() != nullptr)
-                gate = std::make_unique<LoadGate> (*splash, *mainWindow->content(),
-                                                   [this] { splash = nullptr; });
-            else
-                juce::Timer::callAfterDelay (900, [this] { splash = nullptr; });
+           #if JUCE_ANDROID || JUCE_IOS
+            // A PERMISSAO TEM QUE VIR ANTES DA JANELA, e a ordem aqui nao e
+            // detalhe: quem varre a biblioteca e o TimbresProcessor, que nasce
+            // junto com a MainWindow. Criar a janela primeiro faria a varredura
+            // rodar sem permissao, e o Android nao devolve erro -- devolve pasta
+            // VAZIA. O app abriria bonito, sem mensagem nenhuma, e simplesmente
+            // sem timbre. Foi exatamente o que aconteceu no aparelho de teste:
+            //   MediaProvider: Permission to access file ... is denied
+            // e a lista aparecendo vazia, sem nada na tela explicando.
+            //
+            // A janela e criada mesmo se o usuario NEGAR: app que nao abre e pior
+            // que app sem biblioteca. Negando, ele entra vazio e pode apontar a
+            // pasta pelo painel -- ou liberar a permissao e reabrir.
+            juce::RuntimePermissions::request (juce::RuntimePermissions::readMediaAudio,
+                                               [this] (bool) { createMainWindow(); });
+           #else
+            createMainWindow();
+           #endif
         });
+    }
+
+    void createMainWindow()
+    {
+        mainWindow = std::make_unique<MainWindow> (getApplicationName());
+
+        if (splash != nullptr && mainWindow->content() != nullptr)
+            gate = std::make_unique<LoadGate> (*splash, *mainWindow->content(),
+                                               [this] { splash = nullptr; });
+        else
+            juce::Timer::callAfterDelay (900, [this] { splash = nullptr; });
     }
 
     void shutdown() override
@@ -222,6 +244,22 @@ public:
             // baixo e a barra de tarefas comia o resto — o fim da regua master
             // (Auto EQ Master / Punch) ficava fora da tela. userArea ja desconta a
             // barra de tarefas, entao tudo cabe em qualquer escala de DPI.
+            // O layout foi desenhado para ~1280x672 px LOGICOS (tela 1920 no
+            // Windows a 150% de DPI). Num monitor a 100% -- caso tipico do
+            // macOS -- a mesma tela tem 1920 px logicos e a interface inteira
+            // encolhe para 2/3 do tamanho. Igualamos o tamanho VISUAL em
+            // qualquer maquina escalando o excesso de area util. No Windows a
+            // 150% a conta da 1.0 e nada muda.
+            if (auto* display = juce::Desktop::getInstance().getDisplays().getPrimaryDisplay())
+            {
+                auto area = display->userArea;
+                const float scale = juce::jmin (area.getWidth()  / 1280.0f,
+                                                area.getHeight() / 672.0f);
+                if (scale > 1.05f)
+                    juce::Desktop::getInstance().setGlobalScaleFactor (scale);
+            }
+
+            // re-consulta: com a escala global nova, userArea muda de valor
             if (auto* display = juce::Desktop::getInstance().getDisplays().getPrimaryDisplay())
                 setBounds (display->userArea);
             else

@@ -124,8 +124,20 @@ MainComponent::MainComponent()
     // instrumento. Pior: o Windows abre porta MIDI em modo exclusivo, entao com o
     // deviceManager segurando a porta o LaunchkeyControl nao conseguia abri-la e
     // os faders/knobs/pads nem chegavam ao mapeamento.
-    for (auto& d : juce::MidiInput::getAvailableDevices())
-        deviceManager.setMidiInputDeviceEnabled (d.identifier, ! LaunchkeyControl::isDawPort (d.name));
+    refreshMidiInputs();
+
+    // A descoberta de MIDI pode acontecer depois que o app ja abriu (Android,
+    // macOS e teclados conectados a quente). Reaplica a habilitacao sempre que
+    // o sistema avisar que a lista de dispositivos mudou.
+    const auto safeThis = juce::Component::SafePointer<MainComponent> (this);
+    midiListConnection = juce::MidiDeviceListConnection::make ([safeThis]
+    {
+        juce::MessageManager::callAsync ([safeThis]
+        {
+            if (auto* c = safeThis.getComponent())
+                c->refreshMidiInputs();
+        });
+    });
 
     deviceManager.addMidiInputDeviceCallback ({}, &player);
 
@@ -641,6 +653,21 @@ void MainComponent::paint (juce::Graphics& g)
                         rest.getX(), iconBox.getBottom() + 44, rest.getWidth(), 20,
                         juce::Justification::centred);
         }
+    }
+}
+
+void MainComponent::refreshMidiInputs()
+{
+    const auto midiIns = juce::MidiInput::getAvailableDevices();
+    juce::Logger::writeToLog ("MIDI: " + juce::String (midiIns.size()) + " entrada(s)");
+
+    for (auto& d : midiIns)
+    {
+        const bool daw = LaunchkeyControl::isDawPort (d.name);
+        deviceManager.setMidiInputDeviceEnabled (d.identifier, ! daw);
+
+        juce::Logger::writeToLog ("MIDI IN: \"" + d.name + "\"  id=" + d.identifier
+                                   + (daw ? "  -> DAW (desligada)" : "  -> LIGADA"));
     }
 }
 

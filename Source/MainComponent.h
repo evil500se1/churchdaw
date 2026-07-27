@@ -80,6 +80,12 @@ private:
 
     // ---- motor de audio ----
     juce::AudioDeviceManager deviceManager;
+
+    // Reaplica as entradas habilitadas quando o sistema descobre, conecta ou
+    // remove um dispositivo MIDI depois da abertura do app.
+    void refreshMidiInputs();
+    juce::MidiDeviceListConnection midiListConnection;
+
     juce::AudioPluginFormatManager formatManager;
     juce::KnownPluginList knownPlugins;
     juce::AudioProcessorGraph graph;

@@ -7,6 +7,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # runtime do C++ embutido no exe: roda em qualquer PC sem instalar redistribuivel
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
+# Apple Silicon + Intel no mesmo binario — precisa valer para TODOS os alvos
+# (app, assets, juceaide), senao o linker mistura arquiteturas e falha.
+if(APPLE)
+    set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "" FORCE)
+endif()
+
 add_subdirectory(JUCE)
 
 juce_add_gui_app(MinhaDAW
@@ -31,14 +37,28 @@ target_sources(MinhaDAW PRIVATE
     Source/Main.cpp
     Source/MainComponent.cpp)
 
+# Hospedar plugins (Kontakt e afins) e recurso de COMPUTADOR. No Android e no
+# iOS nao existe plugin nativo carregavel -- nao e limitacao do JUCE, e da
+# plataforma. Ali o ChurchDAW roda so com os timbres proprios.
+#
+# O codigo do host NAO e apagado: fica atras de CHURCHDAW_HOSTS_PLUGINS, para
+# haver UM codigo-fonte so. Apagar criaria duas versoes do motor de samples que
+# divergiriam na primeira correcao.
+if(ANDROID OR IOS)
+    set(CHURCHDAW_PLUGINS 0)
+else()
+    set(CHURCHDAW_PLUGINS 1)
+endif()
+
 target_compile_definitions(MinhaDAW PRIVATE
-    JUCE_PLUGINHOST_VST3=1
+    CHURCHDAW_HOSTS_PLUGINS=${CHURCHDAW_PLUGINS}
+    JUCE_PLUGINHOST_VST3=${CHURCHDAW_PLUGINS}
     JUCE_WEB_BROWSER=0
     JUCE_USE_CURL=0)
 
 # macOS: o Kontakt e a maioria dos plugins existem tambem como Audio Unit, que e
 # o formato nativo do sistema. Sem isto o usuario de Mac so enxergaria os VST3.
-if(APPLE)
+if(APPLE AND NOT IOS)
     target_compile_definitions(MinhaDAW PRIVATE
         JUCE_PLUGINHOST_AU=1)
 

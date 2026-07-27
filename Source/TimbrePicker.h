@@ -96,7 +96,21 @@ public:
 
     // grabKeyboardFocus dentro de visibilityChanged() nao pega: o componente
     // ainda nao esta na tela. O foco e pedido depois, ja montado.
-    void focusSearch() { search.grabKeyboardFocus(); }
+    void focusSearch()
+    {
+        // No CELULAR nao. Focar a busca faz o Android abrir o teclado virtual,
+        // que come metade da tela e tapa justamente a lista de timbres -- foi o
+        // que aconteceu no aparelho: a lista abriu e o teclado cobriu o rodape.
+        //
+        // No PC focar e conveniencia (o usuario ja esta com a mao no teclado);
+        // no celular a mao esta na tela, e ele quer ROLAR a lista, nao digitar.
+        // Quem quiser buscar toca no campo, e ai o teclado sobe por escolha dele.
+       #if JUCE_ANDROID || JUCE_IOS
+        return;
+       #else
+        search.grabKeyboardFocus();
+       #endif
+    }
 
     void paint (juce::Graphics& g) override
     {

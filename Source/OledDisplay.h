@@ -1,5 +1,10 @@
 ﻿#pragma once
 
+// EXPERIMENTO TEMPORARIO: 1 congela o desenho para medir quanto ele custa.
+#ifndef CHURCHDAW_UI_BISECT
+ #define CHURCHDAW_UI_BISECT 0
+#endif
+
 #include <juce_gui_basics/juce_gui_basics.h>
 #include "NordLookAndFeel.h"
 
@@ -45,7 +50,17 @@ public:
     OledDisplay()
     {
         setInterceptsMouseClicks (false, false);
-        startTimerHz (20);   // so o acorde precisa desta cadencia
+        // so o acorde precisa desta cadencia. No celular ela cai: este visor
+        // ocupa a largura toda da tela e cada quadro dele custa caro no
+        // desenho por software -- ver a nota em LevelMeter sobre a thread da
+        // interface saturando um nucleo enquanto se toca.
+       #if CHURCHDAW_UI_BISECT
+        // experimento: visor congelado, para medir quanto ele custa
+       #elif JUCE_ANDROID || JUCE_IOS
+        startTimerHz (10);
+       #else
+        startTimerHz (20);
+       #endif
     }
 
     // devolve o nome do acorde tocado agora ("" = nada). O visor consulta sozinho:
@@ -81,15 +96,54 @@ public:
         g.setColour (juce::Colours::white.withAlpha (0.06f));
         g.drawRoundedRectangle (b.reduced (2.0f), r - 1.0f, 1.0f);
 
-        auto inner = b.reduced (18.0f, 12.0f);
+        // CELULAR DEITADO: a faixa toda tem ~60 px de altura, e o empilhamento de
+        // PC pede 22 (chapa) + 10 (respiro) + 40 (nome) = 72. O nome simplesmente
+        // caia para fora e o visor mostrava a chapa vermelha sozinha num retangulo
+        // preto -- justamente o "vazio sem intencao" que o comentario abaixo diz
+        // querer evitar. Aqui chapa e nome dividem a MESMA linha.
+        const bool tight = getHeight() < 90;
+
+        auto inner = b.reduced (tight ? 12.0f : 18.0f, tight ? 6.0f : 12.0f);
 
         // DUAS COLUNAS. Empilhado, o painel precisava ser estreito e sobrava meia
         // tela de preto de cada lado -- vazio sem intencao, que e o que mais
         // denuncia software amador. Lado a lado ele ocupa a faixa inteira:
         // esquerda = o programa em foco, direita = o setup completo.
-        auto right = inner.removeFromRight (inner.getWidth() * 0.52f);
-        inner.removeFromRight (22.0f);
+        //
+        // Apertado a direita encolhe: a lista de canais e referencia, o NOME do
+        // programa e o que se le de longe tocando.
+        auto right = inner.removeFromRight (inner.getWidth() * (tight ? 0.34f : 0.52f));
+        inner.removeFromRight (tight ? 12.0f : 22.0f);
 
+        if (tight)
+        {
+            if (slotText.isNotEmpty())
+            {
+                g.setFont (juce::Font (juce::FontOptions (12.0f, juce::Font::bold)));
+                const float chipW = juce::jmin (inner.getWidth() * 0.5f,
+                                                juce::GlyphArrangement::getStringWidth (g.getCurrentFont(), slotText) + 20.0f);
+                auto chip = inner.removeFromLeft (chipW).withSizeKeepingCentre (chipW, 20.0f);
+
+                g.setGradientFill (juce::ColourGradient (NordLookAndFeel::nordRedBright(), chip.getX(), chip.getY(),
+                                                         NordLookAndFeel::nordRed(), chip.getX(), chip.getBottom(), false));
+                g.fillRoundedRectangle (chip, 3.5f);
+                g.setColour (juce::Colours::white);
+                g.drawText (slotText, chip.reduced (9.0f, 0.0f).toNearestInt(),
+                            juce::Justification::centred, true);
+
+                inner.removeFromLeft (10.0f);
+            }
+
+            if (titleText.isNotEmpty())
+            {
+                g.setColour (juce::Colours::white);
+                g.setFont (juce::Font (juce::FontOptions (25.0f, juce::Font::bold)));
+                g.drawText (titleText, inner.toNearestInt(), juce::Justification::centredLeft, true);
+            }
+
+        }
+        else
+        {
         // ---- coluna esquerda: chapa vermelha + nome grande ----
         if (slotText.isNotEmpty())
         {
@@ -152,6 +206,7 @@ public:
             g.setColour (NordLookAndFeel::oledAmber());
             g.drawText (chordText, chip.toNearestInt(), juce::Justification::centred, true);
         }
+        }   // fim do layout empilhado (PC / tablet)
 
         // ---- coluna direita: a lista dos canais, com titulo proprio ----
         {

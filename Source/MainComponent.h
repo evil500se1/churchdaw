@@ -2,6 +2,11 @@
 
 #include <juce_audio_utils/juce_audio_utils.h>
 #include <juce_audio_processors/juce_audio_processors.h>
+#include "AppPaths.h"   // define CHURCHDAW_HOSTS_PLUGINS
+
+#if JUCE_ANDROID || JUCE_IOS
+ #include <juce_opengl/juce_opengl.h>
+#endif
 
 #include "MasterProcessor.h"
 #include "LevelMeter.h"
@@ -79,13 +84,31 @@ private:
     };
 
     // ---- motor de audio ----
+   #if JUCE_ANDROID || JUCE_IOS
+    // DESENHO PELA GPU.
+    //
+    // Sem isto o JUCE rasteriza a janela inteira por SOFTWARE e envia o
+    // resultado como textura a cada quadro. Numa tela de 2460x1080 sao 10,6 MB
+    // por quadro. Medido no aparelho com dumpsys gfxinfo:
+    //
+    //     Janky frames: 261 de 261 (100%)
+    //     50o percentil: 250 ms por quadro     -> 4 FPS
+    //     Slow UI thread: 261      (todos)
+    //     Slow bitmap uploads: 261 (todos)
+    //     GPU: 3-4 ms              <- a GPU estava OCIOSA
+    //
+    // Era esta a lentidao ao navegar entre menus, e nao falta de maquina: o
+    // trabalho estava indo todo para a CPU enquanto a GPU nao fazia nada.
+    juce::OpenGLContext glContext;
+   #endif
+
     juce::AudioDeviceManager deviceManager;
 
-    // Reaplica as entradas habilitadas quando o sistema descobre, conecta ou
-    // remove um dispositivo MIDI depois da abertura do app.
+    // Reexecuta a habilitacao das entradas MIDI quando o sistema avisa que a
+    // lista mudou -- no Android a descoberta e assincrona e a lista esta VAZIA
+    // no momento em que o construtor pergunta.
     void refreshMidiInputs();
     juce::MidiDeviceListConnection midiListConnection;
-
     juce::AudioPluginFormatManager formatManager;
     juce::KnownPluginList knownPlugins;
     juce::AudioProcessorGraph graph;

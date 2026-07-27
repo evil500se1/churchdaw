@@ -3,6 +3,25 @@
 #include <juce_core/juce_core.h>
 
 //==============================================================================
+// Hospedar plugins (Kontakt e afins) e recurso de COMPUTADOR.
+//
+// Android e iOS nao tem plugin nativo carregavel -- e limitacao da PLATAFORMA,
+// nao do JUCE nem nossa. No celular o ChurchDAW roda so com os timbres proprios.
+//
+// O CMake ja define este simbolo; a rede de seguranca abaixo existe porque o
+// build de Android nao passa por CMake (o proprio JUCE avisa em docs/CMake
+// API.md linha 6: "Android targets are not currently supported"), entao ele vem
+// do Projucer -- e um projeto do Projucer mal configurado silenciosamente
+// ligaria o host de plugins num alvo onde ele nao compila.
+#ifndef CHURCHDAW_HOSTS_PLUGINS
+ #if JUCE_ANDROID || JUCE_IOS
+  #define CHURCHDAW_HOSTS_PLUGINS 0
+ #else
+  #define CHURCHDAW_HOSTS_PLUGINS 1
+ #endif
+#endif
+
+//==============================================================================
 // Caminhos da aplicacao, resolvidos por plataforma.
 //
 // A ARMADILHA DO MAC: no Windows o executavel fica solto numa pasta, entao

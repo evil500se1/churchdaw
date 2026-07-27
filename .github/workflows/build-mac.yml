@@ -19,6 +19,28 @@ jobs:
       - name: Compilar
         run: cmake --build build-mac --config Release --parallel 3
 
+      - name: Teste de fumaca - abre o app e tira prints
+        run: |
+          APP=build-mac/MinhaDAW_artefacts/Release/ChurchDAW.app
+          open "$APP"
+          mkdir -p prints
+          for i in 5 15 30; do
+            sleep_time=$(( i - prev )); prev=$i
+            sleep ${sleep_time:-5}
+            screencapture -x prints/tela_${i}s.png || true
+          done
+          # o processo ainda esta vivo depois de 30s? (nao crashou)
+          pgrep -x ChurchDAW && echo "APP RODANDO OK" || { echo "APP CRASHOU"; exit 1; }
+        env:
+          prev: 0
+
+      - name: Publicar prints do app rodando no Mac
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: prints-macos
+          path: prints/
+
       - name: Gerar instalador .dmg
         run: |
           mkdir dmg-root

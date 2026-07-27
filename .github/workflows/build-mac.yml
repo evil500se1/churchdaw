@@ -19,13 +19,15 @@ jobs:
       - name: Compilar
         run: cmake --build build-mac --config Release --parallel 3
 
-      - name: Empacotar app
+      - name: Gerar instalador .dmg
         run: |
-          cd build-mac/MinhaDAW_artefacts/Release
-          zip -r ChurchDAW-mac.zip ChurchDAW.app
+          mkdir dmg-root
+          cp -R build-mac/MinhaDAW_artefacts/Release/ChurchDAW.app dmg-root/
+          ln -s /Applications dmg-root/Applications
+          hdiutil create -volname "ChurchDAW" -srcfolder dmg-root -ov -format UDZO ChurchDAW.dmg
 
-      - name: Publicar app compilado
+      - name: Publicar instalador
         uses: actions/upload-artifact@v4
         with:
           name: ChurchDAW-macOS
-          path: build-mac/MinhaDAW_artefacts/Release/ChurchDAW-mac.zip
+          path: ChurchDAW.dmg

@@ -19,6 +19,9 @@ juce_add_gui_app(MinhaDAW
     PRODUCT_NAME "ChurchDAW"
     COMPANY_NAME "ChurchDAW"
     VERSION "1.1.0"
+    BUNDLE_ID "com.churchdaw.app"
+    HARDENED_RUNTIME_ENABLED TRUE
+    HARDENED_RUNTIME_OPTIONS "com.apple.security.cs.disable-library-validation"
     ICON_BIG "${CMAKE_CURRENT_SOURCE_DIR}/Assets/icon.png"
     ICON_SMALL "${CMAKE_CURRENT_SOURCE_DIR}/Assets/icon.png")
 

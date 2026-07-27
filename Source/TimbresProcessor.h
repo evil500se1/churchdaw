@@ -1569,9 +1569,10 @@ public:
         // (mesmo padrao do midiCopy: membro reusado, nada de local por bloco)
         midiScratch.ensureSize (2048);
 
-       #if JUCE_ANDROID
+       #if JUCE_ANDROID || JUCE_MAC
         // O marcador e consultado aqui, e nao a cada bloco: tocar o disco na
         // thread de audio seria criar o defeito que estamos medindo.
+       #if JUCE_ANDROID
         //
         // No Android 11+ um .txt dentro de Music pode ficar invisivel para um
         // app que possui apenas READ_MEDIA_AUDIO. Por isso os marcadores novos
@@ -1582,6 +1583,13 @@ public:
         selfTestOn = selfTestStress
                   || testRoot.getChildFile ("selftest-worship.wav").existsAsFile()
                   || testRoot.getChildFile ("selftest.txt").existsAsFile();
+       #else
+        // No macOS o diagnostico de CI e ativado somente para o processo de
+        // teste. Um comprador nunca recebe notas automaticas por acidente.
+        const auto selfTestMode = juce::SystemStats::getEnvironmentVariable ("CHURCHDAW_SELFTEST", {});
+        selfTestStress = selfTestMode.equalsIgnoreCase ("stress");
+        selfTestOn = selfTestStress || selfTestMode.equalsIgnoreCase ("worship");
+       #endif
 
         if (selfTestOn)
             juce::Logger::writeToLog (selfTestStress
@@ -1649,6 +1657,10 @@ public:
         // denormals nas caudas de reverb/delay explodem o uso de CPU (pipocos)
         juce::ScopedNoDenormals noDenormals;
 
+       #if JUCE_ANDROID || JUCE_MAC
+        const auto blockStart = juce::Time::getHighResolutionTicks();
+       #endif
+
        #if JUCE_ANDROID
         // Feito daqui porque e ESTA a thread que precisa ser presa, e ela e
         // criada pelo sistema -- nao ha outro ponto em que possamos falar "eu".
@@ -1668,8 +1680,9 @@ public:
         //   carga alta          -> otimizar o motor / aumentar o buffer
         //   carga baixa e estala-> a thread nao esta sendo ACORDADA a tempo,
         //                          e mexer no motor nao resolve nada
-        const auto blockStart = juce::Time::getHighResolutionTicks();
+       #endif
 
+       #if JUCE_ANDROID || JUCE_MAC
         selfTestTick (midi, buffer.getNumSamples());
        #endif
 
@@ -1925,9 +1938,64 @@ public:
             }
         }
        #endif
+
+       #if JUCE_MAC
+        if (selfTestOn)
+        {
+            const double used = juce::Time::highResolutionTicksToSeconds
+                                    (juce::Time::getHighResolutionTicks() - blockStart);
+            const double budget = (double) buffer.getNumSamples() / juce::jmax (1.0, hostSampleRate);
+            float blockPeak = 0.0f;
+            bool finite = true;
+
+            for (int ch = 0; ch < juce::jmin (2, buffer.getNumChannels()); ++ch)
+            {
+                blockPeak = juce::jmax (blockPeak,
+                                        buffer.getMagnitude (ch, 0, buffer.getNumSamples()));
+                const auto* samples = buffer.getReadPointer (ch);
+
+                for (int s = 0; s < buffer.getNumSamples(); ++s)
+                    if (! std::isfinite (samples[s]))
+                    {
+                        finite = false;
+                        break;
+                    }
+            }
+
+            ++macSelfTestBlocks;
+            macSelfTestSeconds += budget;
+            macSelfTestPeak = juce::jmax (macSelfTestPeak, blockPeak);
+            macSelfTestMaxLoad = juce::jmax (macSelfTestMaxLoad,
+                                             budget > 0.0 ? used / budget : 0.0);
+
+            if (activeVoiceCount() > 0 && blockPeak > 0.00001f)
+                ++macSelfTestAudibleBlocks;
+
+            if (! finite)
+                ++macSelfTestInvalidBlocks;
+
+            if (macSelfTestSeconds >= 1.0)
+            {
+                juce::Logger::writeToLog ("MAC_SELFTEST: blocks "
+                    + juce::String (macSelfTestBlocks)
+                    + " audible " + juce::String (macSelfTestAudibleBlocks)
+                    + " voices " + juce::String (activeVoiceCount())
+                    + " peak " + juce::String (macSelfTestPeak, 6)
+                    + " maxLoad " + juce::String (macSelfTestMaxLoad, 3)
+                    + " invalid " + juce::String (macSelfTestInvalidBlocks));
+
+                macSelfTestBlocks = 0;
+                macSelfTestAudibleBlocks = 0;
+                macSelfTestInvalidBlocks = 0;
+                macSelfTestSeconds = 0.0;
+                macSelfTestPeak = 0.0f;
+                macSelfTestMaxLoad = 0.0;
+            }
+        }
+       #endif
     }
 
-   #if JUCE_ANDROID
+   #if JUCE_ANDROID || JUCE_MAC
     int activeVoiceCount() const noexcept
     {
         int n = 0;
@@ -1939,6 +2007,7 @@ public:
         return n;
     }
 
+   #if JUCE_ANDROID
     int blocksSeen = 0, blocksLate = 0, lateWakes = 0;
     double peakLoad = 0.0, sumLoad = 0.0, peakGap = 0.0;
     float peakOut = 0.0f;
@@ -1947,6 +2016,7 @@ public:
     juce::int64 voicesTicks = 0, fxTicks = 0;
     double sumBudget = 0.0;
     juce::int64 lastBlockStart = 0;
+   #endif
 
     //== TOCADOR AUTOMATICO (so para diagnostico) ==============================
     //
@@ -2079,6 +2149,15 @@ public:
     int selfTestNotes[8] { 0, 0, 0, 0, 0, 0, 0, 0 };
     int selfTestPhase = 0, selfTestChord = 0;
     unsigned int selfTestSeed = 12345u;
+
+   #if JUCE_MAC
+    int macSelfTestBlocks = 0;
+    int macSelfTestAudibleBlocks = 0;
+    int macSelfTestInvalidBlocks = 0;
+    double macSelfTestSeconds = 0.0;
+    double macSelfTestMaxLoad = 0.0;
+    float macSelfTestPeak = 0.0f;
+   #endif
    #endif
 
 
@@ -3399,7 +3478,7 @@ private:
                 pendingLayerLibs[l].clear();
             }
 
-       #if JUCE_ANDROID
+       #if JUCE_ANDROID || JUCE_MAC
         // MODO DE TESTE: carrega timbres sozinho assim que a biblioteca termina
         // de ser lida.
         //

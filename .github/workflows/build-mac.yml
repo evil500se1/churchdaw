@@ -19,20 +19,107 @@ jobs:
       - name: Compilar
         run: cmake --build build-mac --config Release --parallel 3
 
-      - name: Teste de fumaca - abre o app e tira prints
+      - name: Auditar pacote universal do macOS
         run: |
           APP=build-mac/MinhaDAW_artefacts/Release/ChurchDAW.app
-          open "$APP"
+          EXE="$APP/Contents/MacOS/ChurchDAW"
+          PLIST="$APP/Contents/Info.plist"
+          plutil -lint "$PLIST"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$PLIST")" = "com.churchdaw.app"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLIST")" = "1.1.0"
+          ! /usr/libexec/PlistBuddy -c 'Print :NSMicrophoneUsageDescription' "$PLIST" >/dev/null 2>&1
+          ARCHS="$(lipo -archs "$EXE")"
+          echo "Arquiteturas: $ARCHS"
+          grep -qw arm64 <<<"$ARCHS"
+          grep -qw x86_64 <<<"$ARCHS"
+          otool -L "$EXE"
+          codesign -dvvv "$APP" 2>&1 || true
+          codesign --verify --deep --strict --verbose=2 "$APP" 2>&1 || true
+
+      - name: Criar piano sintetico para o teste
+        run: |
+          SAMPLE_DIR=build-mac/MinhaDAW_artefacts/Release/Library/01.\ Pianos/Black\ Upright
+          mkdir -p "$SAMPLE_DIR"
+          SAMPLE_DIR="$SAMPLE_DIR" python3 - <<'PY'
+          import math
+          import os
+          import struct
+          import wave
+
+          rate = 48000
+          duration = 12
+          frames = rate * duration
+          path = os.path.join(os.environ["SAMPLE_DIR"], "C3.wav")
+
+          with wave.open(path, "wb") as wav:
+              wav.setnchannels(2)
+              wav.setsampwidth(2)
+              wav.setframerate(rate)
+              chunk = bytearray()
+
+              for i in range(frames):
+                  t = i / rate
+                  fade_in = min(1.0, i / (rate * 0.04))
+                  fade_out = min(1.0, (frames - i) / (rate * 0.08))
+                  envelope = fade_in * fade_out * math.exp(-t * 0.055)
+                  sample = int(32767 * 0.045 * envelope * (
+                      math.sin(2 * math.pi * 130.8128 * t)
+                      + 0.30 * math.sin(2 * math.pi * 261.6256 * t)
+                      + 0.12 * math.sin(2 * math.pi * 392.4384 * t)))
+                  packed = struct.pack("<hh", sample, sample)
+                  chunk.extend(packed)
+
+                  if len(chunk) >= 65536:
+                      wav.writeframesraw(chunk)
+                      chunk.clear()
+
+              if chunk:
+                  wav.writeframesraw(chunk)
+          PY
+
+      - name: Testar audio e MIDI dentro do app
+        run: |
+          APP=build-mac/MinhaDAW_artefacts/Release/ChurchDAW.app
+          EXE="$APP/Contents/MacOS/ChurchDAW"
           mkdir -p prints
-          for i in 5 15 30; do
-            sleep_time=$(( i - prev )); prev=$i
-            sleep ${sleep_time:-5}
-            screencapture -x prints/tela_${i}s.png || true
+          CHURCHDAW_SELFTEST=worship "$EXE" >mac-selftest.log 2>&1 &
+          PID=$!
+
+          cleanup() {
+            kill "$PID" >/dev/null 2>&1 || true
+            wait "$PID" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          previous=0
+          for current in 5 12 20; do
+            sleep $(( current - previous ))
+            previous=$current
+            kill -0 "$PID" || { echo "APP CRASHOU"; cat mac-selftest.log; exit 1; }
+            screencapture -x "prints/tela_${current}s.png" || true
           done
-          # o processo ainda esta vivo depois de 30s? (nao crashou)
-          pgrep -x ChurchDAW && echo "APP RODANDO OK" || { echo "APP CRASHOU"; exit 1; }
-        env:
-          prev: 0
+
+          cat mac-selftest.log
+          grep -q "AUDIO: TESTE WORSHIP SUAVE LIGADO" mac-selftest.log
+          grep -q "AUDIO: teste carregando canal 1 = Black Upright" mac-selftest.log
+          grep -q "BIBLIOTECA: timbre Black Upright pronto" mac-selftest.log
+          grep -Eq "MAC_SELFTEST: blocks [0-9]+ audible [1-9][0-9]*" mac-selftest.log
+          ! grep -Eq "MAC_SELFTEST:.*invalid [1-9][0-9]*" mac-selftest.log
+          echo "APP RODANDO, MIDI GERADO E AUDIO NA SAIDA"
+
+      - name: Publicar diagnostico de audio
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostico-audio-macos
+          path: mac-selftest.log
+
+      - name: Teste visual do app
+        run: |
+          test -s prints/tela_5s.png
+          test -s prints/tela_12s.png
+          test -s prints/tela_20s.png
+          echo "PRINTS DO APP OK"
 
       - name: Publicar prints do app rodando no Mac
         if: always()
@@ -43,10 +130,20 @@ jobs:
 
       - name: Gerar instalador .dmg
         run: |
+          APP=build-mac/MinhaDAW_artefacts/Release/ChurchDAW.app
           mkdir dmg-root
-          cp -R build-mac/MinhaDAW_artefacts/Release/ChurchDAW.app dmg-root/
+          cp -R "$APP" dmg-root/
           ln -s /Applications dmg-root/Applications
           hdiutil create -volname "ChurchDAW" -srcfolder dmg-root -ov -format UDZO ChurchDAW.dmg
+
+      - name: Validar instalador .dmg
+        run: |
+          MOUNT="$(mktemp -d)"
+          hdiutil attach ChurchDAW.dmg -readonly -nobrowse -mountpoint "$MOUNT"
+          test -d "$MOUNT/ChurchDAW.app"
+          test -L "$MOUNT/Applications"
+          /usr/bin/codesign -dvv "$MOUNT/ChurchDAW.app" 2>&1 || true
+          hdiutil detach "$MOUNT"
 
       - name: Publicar instalador
         uses: actions/upload-artifact@v4

@@ -88,6 +88,13 @@ jobs:
         run: |
           SAMPLE_DIR=build-mac-selftest/MinhaDAW_artefacts/Release/Library/01.\ Pianos/Black\ Upright
           mkdir -p "$SAMPLE_DIR"
+
+          # O runner e uma instalacao limpa. Marque a escolha "abrir sem
+          # baixar" para a automacao entrar na DAW; o piano sintetico abaixo
+          # substitui o pack apenas durante o autoteste.
+          mkdir -p "$HOME/Library/ChurchDAW/Services"
+          printf '1\n' >"$HOME/Library/ChurchDAW/Services/starter-choice-completed"
+
           SAMPLE_DIR="$SAMPLE_DIR" python3 - <<'PY'
           import math
           import os

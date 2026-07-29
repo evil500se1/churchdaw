@@ -665,7 +665,7 @@ public:
         // Android e desktop possuem ciclos de versao independentes. No
         // desktop, use a mesma versao do bundle/EXE gerada pelo CMake para que
         // a tela Sobre e os logs nunca herdem por engano o versionName do APK.
-        return juce::ProjectInfo::versionString;
+        return CHURCHDAW_APP_VERSION;
        #endif
     }
     bool moreThanOneInstanceAllowed() override          { return false; }

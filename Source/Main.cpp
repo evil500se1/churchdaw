@@ -656,8 +656,18 @@ class ChurchDAWApplication : public juce::JUCEApplication
 public:
     ChurchDAWApplication() = default;
 
-    const juce::String getApplicationName() override    { return "ChurchDAW"; }
-    const juce::String getApplicationVersion() override { return ChurchDAWServices::currentVersionName; }
+    const juce::String getApplicationName() override { return "ChurchDAW"; }
+    const juce::String getApplicationVersion() override
+    {
+       #if JUCE_ANDROID
+        return ChurchDAWServices::currentVersionName;
+       #else
+        // Android e desktop possuem ciclos de versao independentes. No
+        // desktop, use a mesma versao do bundle/EXE gerada pelo CMake para que
+        // a tela Sobre e os logs nunca herdem por engano o versionName do APK.
+        return juce::ProjectInfo::versionString;
+       #endif
+    }
     bool moreThanOneInstanceAllowed() override          { return false; }
 
     void initialise (const juce::String&) override
@@ -679,7 +689,7 @@ public:
         fileLogger.reset (juce::FileLogger::createDefaultAppLogger (
             "ChurchDAW", "ChurchDAW.log",
             juce::String ("ChurchDAW ")
-                + ChurchDAWServices::currentVersionName + " iniciado",
+                + getApplicationVersion() + " iniciado",
             512 * 1024));
         juce::Logger::setCurrentLogger (fileLogger.get());
 

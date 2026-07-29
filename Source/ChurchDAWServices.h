@@ -32,8 +32,8 @@
 //==============================================================================
 namespace ChurchDAWServices
 {
-    inline constexpr int currentVersionCode = 7;
-    inline constexpr const char* currentVersionName = "1.5.2";
+    inline constexpr int currentVersionCode = 8;
+    inline constexpr const char* currentVersionName = "1.5.3";
     inline constexpr const char* packageId = "com.churchdaw.app";
     inline constexpr const char* updatePolicyUrl =
         "https://churchdaw.com/app/android/update-policy-v2.json";
@@ -43,7 +43,7 @@ namespace ChurchDAWServices
     inline constexpr const char* fallbackManifestUrl =
         "https://www.churchdaw.com/app/android/manifest.json";
     inline constexpr const char* defaultPlayStoreUrl =
-        "https://churchdaw.com/app/android/ChurchDAW-1.5.2-signed.apk";
+        "https://churchdaw.com/app/android/ChurchDAW-1.5.3-signed.apk";
     inline constexpr int maximumUpdatePolicyBytes = 32 * 1024;
     inline constexpr int maximumSignedPolicyPayloadBytes = 24 * 1024;
     inline constexpr int maximumVersionNameCharacters = 48;
@@ -725,22 +725,55 @@ namespace ChurchDAWServices
 
     inline bool isOfficialLibraryDownloadUrl (const juce::String& value)
     {
-        static constexpr const char* prefix =
+        static constexpr const char* protectedPrefix =
             "https://churchdaw.com/api/v1/library/files/";
+        static constexpr const char* publicBasePrefix =
+            "https://churchdaw.com/app/android/packs/";
         const auto trimmed = value.trim();
+        bool isPublicBasePart = false;
+        int prefixLength = 0;
 
-        if (! trimmed.startsWith (prefix))
+        if (trimmed.startsWith (protectedPrefix))
+            prefixLength = (int) std::char_traits<char>::length (
+                protectedPrefix);
+        else if (trimmed.startsWith (publicBasePrefix))
+        {
+            prefixLength = (int) std::char_traits<char>::length (
+                publicBasePrefix);
+            isPublicBasePart = true;
+        }
+        else
             return false;
 
         const auto fileName = trimmed.substring (
-            (int) std::char_traits<char>::length (prefix));
+            prefixLength);
 
-        return fileName.isNotEmpty()
+        const bool safeFileName = fileName.isNotEmpty()
             && fileName.length() <= 180
             && fileName.endsWithIgnoreCase (".zip")
             && fileName.containsOnly (
                 "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
                 "0123456789._-");
+
+        if (! safeFileName || ! isPublicBasePart)
+            return safeFileName;
+
+        static constexpr const char* basePartPrefix =
+            "church-live-v1-segment-";
+        const auto partPrefixLength = (int) std::char_traits<char>::length (
+            basePartPrefix);
+        const auto partNumberText = fileName.substring (
+            partPrefixLength, partPrefixLength + 2);
+        const auto partNumber = partNumberText.getIntValue();
+
+        return fileName.startsWith (basePartPrefix)
+            && partNumberText.length() == 2
+            && partNumberText.containsOnly ("0123456789")
+            && partNumber >= 1
+            && partNumber <= 30
+            && fileName == juce::String (basePartPrefix)
+                + juce::String (partNumber).paddedLeft ('0', 2)
+                + ".zip";
     }
 
     struct LibraryPart

@@ -94,9 +94,32 @@ public:
         rebuildRows();
     }
 
+    void useTouchLayout (bool shouldUseTouch)
+    {
+        touchLayout = shouldUseTouch;
+        list.setRowHeight (touchLayout ? 38 : 26);
+        search.setFont (juce::Font (juce::FontOptions (touchLayout ? 17.0f : 15.0f)));
+        resized();
+        repaint();
+    }
+
     // grabKeyboardFocus dentro de visibilityChanged() nao pega: o componente
     // ainda nao esta na tela. O foco e pedido depois, ja montado.
-    void focusSearch() { search.grabKeyboardFocus(); }
+    void focusSearch()
+    {
+        // No CELULAR nao. Focar a busca faz o Android abrir o teclado virtual,
+        // que come metade da tela e tapa justamente a lista de timbres -- foi o
+        // que aconteceu no aparelho: a lista abriu e o teclado cobriu o rodape.
+        //
+        // No PC focar e conveniencia (o usuario ja esta com a mao no teclado);
+        // no celular a mao esta na tela, e ele quer ROLAR a lista, nao digitar.
+        // Quem quiser buscar toca no campo, e ai o teclado sobe por escolha dele.
+       #if JUCE_ANDROID || JUCE_IOS
+        return;
+       #else
+        search.grabKeyboardFocus();
+       #endif
+    }
 
     void paint (juce::Graphics& g) override
     {
@@ -125,13 +148,16 @@ public:
         g.setFont (juce::Font (juce::FontOptions (14.0f)).boldened().withExtraKerningFactor (0.10f));
         g.drawText ("ESCOLHER INSTRUMENTO", head, juce::Justification::centredLeft);
 
-        // rodape com as teclas de atalho
+        // rodape com as teclas de atalho. No toque, atalhos de teclado so
+        // gastavam altura; mostramos apenas a contagem.
         auto foot = card.toNearestInt().reduced (20, 0).withBottom (card.toNearestInt().getBottom() - 12).withHeight (16);
         foot.setY (card.toNearestInt().getBottom() - 26);
         g.setColour (NordLookAndFeel::dimText().withAlpha (0.55f));
         g.setFont (juce::Font (juce::FontOptions (11.0f)));
-        g.drawText (juce::String::fromUTF8 ("Enter escolhe  \xc2\xb7  setas navegam  \xc2\xb7  Esc fecha"),
-                    foot, juce::Justification::centredLeft);
+
+        if (! touchLayout)
+            g.drawText (juce::String::fromUTF8 ("Enter escolhe  \xc2\xb7  setas navegam  \xc2\xb7  Esc fecha"),
+                        foot, juce::Justification::centredLeft);
 
         g.setColour (NordLookAndFeel::dimText().withAlpha (0.55f));
         g.drawText (juce::String (countPickable()) + " itens", foot, juce::Justification::centredRight);
@@ -140,13 +166,16 @@ public:
     void resized() override
     {
         auto card = getLocalBounds().reduced (margin);
-        closeBtn.setBounds (card.getRight() - 42, card.getY() + 14, 26, 22);
+        closeBtn.setBounds (card.getRight() - (touchLayout ? 48 : 42),
+                            card.getY() + 12,
+                            touchLayout ? 34 : 26,
+                            touchLayout ? 30 : 22);
 
-        auto area = card.reduced (20, 16);
-        area.removeFromTop (24);            // titulo
-        search.setBounds (area.removeFromTop (34));
-        area.removeFromTop (10);
-        area.removeFromBottom (24);         // rodape
+        auto area = card.reduced (touchLayout ? 16 : 20, touchLayout ? 12 : 16);
+        area.removeFromTop (touchLayout ? 30 : 24);            // titulo
+        search.setBounds (area.removeFromTop (touchLayout ? 42 : 34));
+        area.removeFromTop (touchLayout ? 7 : 10);
+        area.removeFromBottom (touchLayout ? 18 : 24);         // rodape
         list.setBounds (area);
     }
 
@@ -293,7 +322,8 @@ private:
         if (r.header)
         {
             g.setColour (NordLookAndFeel::nordRedBright().withAlpha (0.85f));
-            g.setFont (juce::Font (juce::FontOptions (10.0f)).boldened().withExtraKerningFactor (0.16f));
+            g.setFont (juce::Font (juce::FontOptions (touchLayout ? 12.0f : 10.0f))
+                                   .boldened().withExtraKerningFactor (0.16f));
             g.drawText (r.text, 8, 0, width - 16, height, juce::Justification::centredLeft);
             g.setColour (juce::Colours::white.withAlpha (0.08f));
             g.fillRect (8, height - 1, width - 16, 1);
@@ -345,8 +375,9 @@ private:
         g.setColour (rowIsSelected ? juce::Colours::white
                      : isCurrent   ? NordLookAndFeel::nordRedBright()
                                    : NordLookAndFeel::textColour());
-        g.setFont (juce::Font (juce::FontOptions (14.0f, rowIsSelected ? juce::Font::bold
-                                                                       : juce::Font::plain)));
+        g.setFont (juce::Font (juce::FontOptions (touchLayout ? 16.0f : 14.0f,
+                                                   rowIsSelected ? juce::Font::bold
+                                                                 : juce::Font::plain)));
         g.drawText (r.text, textX, 0, width - textX - 26, height, juce::Justification::centredLeft, true);
 
         if (isCurrent)
@@ -363,6 +394,7 @@ private:
     juce::Array<Item> items;
     juce::Array<Row> rows;
     int currentSelectedId = 0;
+    bool touchLayout = false;
 
     SearchBox search;
     juce::ListBox list;

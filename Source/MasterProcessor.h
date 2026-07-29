@@ -5,6 +5,8 @@
 
 #include <atomic>
 
+#include "StereoLookaheadLimiter.h"
+
 //==============================================================================
 // No de master do grafo: aplica o volume geral (com suavizacao) e mede os
 // niveis de pico de cada canal para os medidores da interface.
@@ -62,6 +64,16 @@ public:
     }
 
     bool readAndResetClip() noexcept            { return clipped.exchange (false); }
+
+    float getLimiterGainReductionDb() const noexcept
+    {
+        return masterLimiter.getCurrentGainReductionDb();
+    }
+
+    uint64_t getLimiterEmergencyCorrectionCount() const noexcept
+    {
+        return masterLimiter.getEmergencyCorrectionCount();
+    }
 
     //==============================================================================
     const juce::String getName() const override { return "Master"; }
@@ -122,9 +134,15 @@ public:
         punchComp.setRatio (4.0f);
         punchComp.setAttack (12.0f);
         punchComp.setRelease (140.0f);
+
+        masterLimiter.prepare (sampleRate, block);
+        setLatencySamples (masterLimiter.getLatencySamples());
     }
 
-    void releaseResources() override {}
+    void releaseResources() override
+    {
+        masterLimiter.reset();
+    }
 
     bool isBusesLayoutSupported (const BusesLayout& layouts) const override
     {
@@ -206,14 +224,21 @@ public:
         buffer.applyGainRamp (0, numSamples, start, end);
 
         for (int ch = 0; ch < juce::jmin (2, buffer.getNumChannels()); ++ch)
+            if (buffer.getMagnitude (ch, 0, numSamples) > 1.0f)
+                clipped.store (true);
+
+        // Ultimo estagio antes da saida fisica. O lookahead stereo-linked
+        // preserva o ataque do piano e impede que Return/Master no maximo
+        // virem clipping digital/chiado no DAC do Android.
+        masterLimiter.process (buffer);
+
+        for (int ch = 0; ch < juce::jmin (2, buffer.getNumChannels()); ++ch)
         {
             const float peak = buffer.getMagnitude (ch, 0, numSamples);
 
             float current = levels[ch].load();
             while (peak > current && ! levels[ch].compare_exchange_weak (current, peak)) {}
 
-            if (peak > 1.0f)
-                clipped.store (true);
         }
     }
 
@@ -244,6 +269,7 @@ private:
     juce::dsp::Compressor<float> punchComp;
     juce::AudioBuffer<float> punchBuf;
     juce::SmoothedValue<float> gain { 1.0f };
+    StereoLookaheadLimiter masterLimiter;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MasterProcessor)
 };

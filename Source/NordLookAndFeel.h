@@ -43,6 +43,112 @@ public:
     static juce::Colour catLead()        { return juce::Colour (0xff4e86c5); }
     static juce::Colour catPlugin()      { return juce::Colour (0xffc9823a); }
 
+    // Marca vetorial para superficies aceleradas. Alguns drivers OpenGL Android
+    // renderizam PNGs do BinaryData como textura preta, embora a mesma arte
+    // apareca corretamente na splash. Cruz + igreja + teclas preservam a
+    // identidade sem depender de upload de bitmap no contexto do mixer.
+    static void drawChurchDAWMark (juce::Graphics& g, juce::Rectangle<float> bounds)
+    {
+        if (bounds.isEmpty())
+            return;
+
+        juce::Graphics::ScopedSaveState state (g);
+        const float side = juce::jmin (bounds.getWidth(), bounds.getHeight());
+        auto box = bounds.withSizeKeepingCentre (side, side).reduced (side * 0.035f);
+        const float x = box.getX();
+        const float y = box.getY();
+        const float w = box.getWidth();
+        const float h = box.getHeight();
+        const float cx = box.getCentreX();
+        const float radius = side * 0.21f;
+
+        juce::Path plate;
+        plate.addRoundedRectangle (box, radius);
+        juce::DropShadow (juce::Colours::black.withAlpha (0.58f),
+                          juce::jmax (2, juce::roundToInt (side * 0.09f)),
+                          { 0, juce::roundToInt (side * 0.025f) }).drawForPath (g, plate);
+
+        // Cor solida aqui e deliberada: o mesmo driver que recusou a textura
+        // raster tambem escurecia o gradiente do plate. O brilho e criado por
+        // contornos vetoriais, que permanecem identicos em qualquer GPU.
+        g.setColour (juce::Colour (0xff790018));
+        g.fillPath (plate);
+
+        g.setColour (juce::Colours::white.withAlpha (0.45f));
+        g.drawRoundedRectangle (box.reduced (side * 0.025f), radius * 0.88f,
+                                juce::jmax (1.0f, side * 0.018f));
+        g.setColour (juce::Colour (0xffff6a7e).withAlpha (0.9f));
+        g.drawRoundedRectangle (box, radius, juce::jmax (1.0f, side * 0.025f));
+
+        // Ondas de audio discretas dos dois lados da igreja.
+        for (int i = 0; i < 4; ++i)
+        {
+            const float barH = h * (0.10f + 0.035f * (float) i);
+            const float leftX = x + w * (0.10f + 0.045f * (float) i);
+            const float rightX = x + w - (leftX - x);
+            const float barW = juce::jmax (1.0f, side * 0.024f);
+            g.setColour (juce::Colours::white.withAlpha (0.28f + 0.08f * (float) i));
+            g.fillRoundedRectangle (leftX, y + h * 0.51f - barH * 0.5f,
+                                    barW, barH, side * 0.012f);
+            g.fillRoundedRectangle (rightX - barW, y + h * 0.51f - barH * 0.5f,
+                                    barW, barH, side * 0.012f);
+        }
+
+        // Silhueta clara da igreja.
+        juce::Path church;
+        church.startNewSubPath (cx, y + h * 0.27f);
+        church.lineTo (x + w * 0.28f, y + h * 0.47f);
+        church.lineTo (x + w * 0.33f, y + h * 0.47f);
+        church.lineTo (x + w * 0.33f, y + h * 0.83f);
+        church.lineTo (x + w * 0.67f, y + h * 0.83f);
+        church.lineTo (x + w * 0.67f, y + h * 0.47f);
+        church.lineTo (x + w * 0.72f, y + h * 0.47f);
+        church.closeSubPath();
+        g.setColour (juce::Colour (0xfff8f5f1));
+        g.fillPath (church);
+        g.setColour (juce::Colour (0xff4a050f));
+        g.strokePath (church, juce::PathStrokeType (juce::jmax (1.0f, side * 0.025f),
+                                                    juce::PathStrokeType::curved,
+                                                    juce::PathStrokeType::rounded));
+
+        // Vitral central.
+        auto window = juce::Rectangle<float> (cx - w * 0.055f, y + h * 0.39f,
+                                              w * 0.11f, h * 0.18f);
+        g.setColour (juce::Colour (0xff6c0717));
+        g.fillRoundedRectangle (window, w * 0.045f);
+        g.setColour (juce::Colour (0xffff3655));
+        g.drawRoundedRectangle (window, w * 0.045f, juce::jmax (1.0f, side * 0.014f));
+
+        // Teclado integrado a fachada.
+        auto keys = juce::Rectangle<float> (x + w * 0.31f, y + h * 0.57f,
+                                            w * 0.38f, h * 0.27f);
+        g.setColour (juce::Colour (0xfff7f5f2));
+        g.fillRoundedRectangle (keys, side * 0.025f);
+        g.setColour (juce::Colour (0xff4a4545));
+        g.drawRoundedRectangle (keys, side * 0.025f, juce::jmax (1.0f, side * 0.014f));
+
+        const float whiteW = keys.getWidth() / 5.0f;
+        for (int i = 1; i < 5; ++i)
+            g.drawVerticalLine (juce::roundToInt (keys.getX() + whiteW * (float) i),
+                                keys.getY(), keys.getBottom());
+
+        g.setColour (juce::Colour (0xff171315));
+        for (int i : { 1, 2, 4 })
+        {
+            const float keyX = keys.getX() + whiteW * (float) i - whiteW * 0.20f;
+            g.fillRoundedRectangle (keyX, keys.getY(), whiteW * 0.40f,
+                                    keys.getHeight() * 0.61f, side * 0.012f);
+        }
+
+        // Cruz acima do telhado.
+        g.setColour (juce::Colours::white);
+        const float crossW = juce::jmax (1.5f, side * 0.045f);
+        g.fillRoundedRectangle (cx - crossW * 0.5f, y + h * 0.075f,
+                                crossW, h * 0.19f, crossW * 0.45f);
+        g.fillRoundedRectangle (cx - w * 0.075f, y + h * 0.12f,
+                                w * 0.15f, crossW, crossW * 0.45f);
+    }
+
     // ---- medidores: faixas de nivel em dBFS ----
     static juce::Colour meterOff()       { return juce::Colour (0xff252a31); }   // segmento apagado
     static juce::Colour meterVeryLow()   { return juce::Colour (0xff234a2d); }   // -60 a -30
@@ -166,7 +272,17 @@ public:
                                bool shouldDrawButtonAsHighlighted, bool shouldDrawButtonAsDown) override
     {
         auto bounds = button.getLocalBounds().toFloat().reduced (0.5f);
+
+       #if JUCE_ANDROID || JUCE_IOS
+        // CHIP de toque, nao botao de desktop. O alvo de 48 dp e sagrado no
+        // palco, mas com raio de 4 px ele le como um TIJOLO -- era a sensacao
+        // de "desktop espremido" da tela toda. Raio proporcional a altura
+        // devolve a leveza sem encolher um unico pixel de area de toque.
+        const float r = juce::jmin (11.0f, bounds.getHeight() * 0.30f);
+       #else
         const float r = radiusControl;
+       #endif
+
         auto base = backgroundColour;
 
         // botao "fantasma" (fundo transparente): so um contorno sutil, sem chapa
@@ -201,6 +317,19 @@ public:
 
         g.setColour (accent ? base.brighter (0.45f).withAlpha (0.7f) : panelOutline());
         g.drawRoundedRectangle (bounds, r, 1.0f);
+
+       #if JUCE_ANDROID || JUCE_IOS
+        // HALO nos botoes de acento (PANIC, pagina ativa, toggles ligados):
+        // no OLED do palco a luz difusa em volta e o que diz "isto esta ACESO"
+        // de relance -- e a assinatura dos instrumentos de verdade.
+        if (accent)
+        {
+            g.setColour (base.withAlpha (0.30f));
+            g.drawRoundedRectangle (bounds.expanded (1.8f), r + 1.8f, 2.4f);
+            g.setColour (base.withAlpha (0.12f));
+            g.drawRoundedRectangle (bounds.expanded (3.6f), r + 3.6f, 2.4f);
+        }
+       #endif
     }
 
     //==============================================================================
@@ -319,6 +448,94 @@ public:
                            float sliderPos, float minSliderPos, float maxSliderPos,
                            juce::Slider::SliderStyle style, juce::Slider& slider) override
     {
+       #if JUCE_ANDROID || JUCE_IOS
+        if (style == juce::Slider::LinearHorizontal)
+        {
+            juce::ignoreUnused (minSliderPos, maxSliderPos, slider);
+
+            // No layout mobile canal e master usam fader horizontal. O desenho
+            // padrao do toolkit era uma linha fina com uma bolinha vermelha,
+            // destoando do fader de console vertical e ficando dificil de tocar.
+            const float inset = juce::jlimit (7.0f, 12.0f, (float) width * 0.045f);
+
+            // trilha com mais PRESENCA: o fader e o controle principal do canal
+            // e com 8 px lia como um risco; 10-14 px da corpo sem virar barra
+            const float trackH = juce::jlimit (10.0f, 14.0f, (float) height * 0.38f);
+            auto track = juce::Rectangle<float> ((float) x + inset,
+                                                 (float) y + (float) height * 0.5f - trackH * 0.5f,
+                                                 juce::jmax (1.0f, (float) width - inset * 2.0f),
+                                                 trackH);
+            const float trackR = trackH * 0.5f;
+            const float pos = juce::jlimit (track.getX(), track.getRight(), sliderPos);
+
+            g.setColour (juce::Colours::black.withAlpha (0.60f));
+            g.fillRoundedRectangle (track.translated (0.0f, 1.0f), trackR);
+            g.setGradientFill (juce::ColourGradient (juce::Colour (0xff090a0d),
+                                                     track.getX(), track.getY(),
+                                                     juce::Colour (0xff1c1f25),
+                                                     track.getX(), track.getBottom(), false));
+            g.fillRoundedRectangle (track, trackR);
+            g.setColour (juce::Colours::white.withAlpha (0.07f));
+            g.drawRoundedRectangle (track.reduced (0.5f), trackR, 1.0f);
+
+            auto value = track.withRight (pos).reduced (2.0f);
+
+            if (value.getWidth() > 1.0f)
+            {
+                g.setGradientFill (juce::ColourGradient (nordRedDark(), value.getX(), value.getCentreY(),
+                                                         nordRedBright(), value.getRight(), value.getCentreY(),
+                                                         false));
+                g.fillRoundedRectangle (value, value.getHeight() * 0.5f);
+                g.setColour (nordRedBright().withAlpha (0.32f));
+                g.fillRoundedRectangle (value.withTrimmedLeft (value.getWidth() * 0.72f),
+                                        value.getHeight() * 0.5f);
+            }
+
+            // MARCA DE 0 dB: a referencia que todo tecladista procura ao zerar o
+            // ganho. Um risco discreto acima e abaixo da trilha, exatamente onde
+            // o valor 0 cai -- calculado pelo proprio slider, entao respeita a
+            // curva (skew) do fader em vez de chutar proporcao linear.
+            {
+                const auto range = slider.getRange();
+
+                if (range.getStart() < 0.0 && range.getEnd() > 0.0)
+                {
+                    const float zx = slider.getPositionOfValue (0.0);
+
+                    if (zx > track.getX() + 6.0f && zx < track.getRight() - 6.0f)
+                    {
+                        g.setColour (juce::Colours::white.withAlpha (0.34f));
+                        g.fillRoundedRectangle (zx - 0.9f, track.getY() - 5.0f, 1.8f, 4.0f, 0.9f);
+                        g.fillRoundedRectangle (zx - 0.9f, track.getBottom() + 1.0f, 1.8f, 4.0f, 0.9f);
+                    }
+                }
+            }
+
+            const float capW = juce::jlimit (24.0f, 34.0f, (float) height * 0.92f);
+            const float capH = juce::jlimit (16.0f, 22.0f, (float) height - 4.0f);
+            auto cap = juce::Rectangle<float> (pos - capW * 0.5f,
+                                               track.getCentreY() - capH * 0.5f,
+                                               capW, capH);
+
+            juce::Path shadow;
+            shadow.addRoundedRectangle (cap, 4.0f);
+            juce::DropShadow (juce::Colours::black.withAlpha (0.55f), 5, { 0, 2 })
+                .drawForPath (g, shadow);
+
+            g.setGradientFill (juce::ColourGradient (juce::Colour (0xff555a64),
+                                                     cap.getX(), cap.getY(),
+                                                     juce::Colour (0xff282b32),
+                                                     cap.getX(), cap.getBottom(), false));
+            g.fillRoundedRectangle (cap, 4.0f);
+            g.setColour (juce::Colours::white.withAlpha (0.18f));
+            g.drawRoundedRectangle (cap.reduced (0.5f), 4.0f, 1.0f);
+            g.setColour (juce::Colour (0xffe2e4e8));
+            g.fillRect (cap.getCentreX() - 1.1f, cap.getY() + 3.0f,
+                        2.2f, juce::jmax (1.0f, cap.getHeight() - 6.0f));
+            return;
+        }
+       #endif
+
         if (style != juce::Slider::LinearVertical)
         {
             juce::LookAndFeel_V4::drawLinearSlider (g, x, y, width, height, sliderPos,
@@ -411,7 +628,15 @@ public:
         auto bounds = button.getLocalBounds().toFloat();
         const bool on = button.getToggleState();
 
+       #if JUCE_ANDROID || JUCE_IOS
+        // Pill de TOQUE: os 20 px de teto vinham do desktop, onde o interruptor
+        // divide a linha com texto pequeno. Numa fileira de 48 dp o pill mirrado
+        // parecia enfeite -- e interruptor que parece enfeite ninguem confia que
+        // liga o sustain no meio do culto.
+        const float h = juce::jlimit (20.0f, 26.0f, bounds.getHeight() - 6.0f);
+       #else
         const float h = juce::jlimit (14.0f, 20.0f, bounds.getHeight() - 2.0f);
+       #endif
         const float w = h * 1.9f;
         auto sw = juce::Rectangle<float> (bounds.getX() + 1.0f, bounds.getCentreY() - h * 0.5f, w, h);
 
@@ -530,7 +755,15 @@ public:
         // preset aparece atras de vidro escuro embutido, com o mesmo vocabulario do
         // visor grande de programa -- nao numa chapa clara com bordinha de app.
         auto bounds = juce::Rectangle<float> (0.0f, 0.0f, (float) width, (float) height).reduced (0.5f);
+
+       #if JUCE_ANDROID || JUCE_IOS
+        // mesmo criterio dos chips: raio proporcional. O combo e o componente
+        // mais tocado do celular (troca de preset) e era o que mais parecia
+        // "caixa de formulario".
+        const float r = juce::jmin (10.0f, bounds.getHeight() * 0.24f);
+       #else
         const float r = radiusControl;
+       #endif
 
         // rebaixo: sombra INTERNA no topo faz o vidro parecer afundado na chapa
         g.setColour (juce::Colour (0xff0b0c0e));

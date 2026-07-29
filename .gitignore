@@ -4,3 +4,15 @@
 insert_params.txt
 *.user
 .vs/
+*.jks
+*.keystore
+*.p12
+.secrets/
+Packaging/DesktopLicensing/backend/config/local.php
+Packaging/DesktopLicensing/backend/config/*.local.php
+Packaging/DesktopLicensing/backend/.env
+Packaging/DesktopLicensing/backend/.env.*
+!Packaging/DesktopLicensing/backend/.env.example
+Packaging/DesktopLicensing/backend/var/
+Packaging/DesktopLicensing/backend/**/*.key
+Packaging/DesktopLicensing/backend/**/*private*.pem

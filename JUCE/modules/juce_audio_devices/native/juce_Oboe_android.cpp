@@ -555,6 +555,38 @@ private:
             builder.setSampleRate (newSampleRate);
             builder.setPerformanceMode (oboe::PerformanceMode::LowLatency);
 
+            // [ChurchDAW] TAMANHO DO BLOCO ENTREGUE AO APLICATIVO.
+            //
+            // Sem esta linha o JUCE define apenas setBufferSizeInFrames, que e a
+            // CAPACIDADE do stream (latencia) -- e nao o tamanho do bloco que
+            // chega no callback. O AAudio entao entrega sempre a rajada nativa,
+            // 256 quadros neste aparelho, mesmo com o app pedindo 1024.
+            //
+            // O efeito e caro: o custo FIXO por chamada (percorrer o grafo, cinco
+            // camadas, efeitos, master) passa a ser pago 188 vezes por segundo em
+            // vez de 47. Medido no aparelho, com 23 vozes: media de 75% do prazo,
+            // picos de 116% e 54 blocos perdidos por segundo. Com o bloco maior o
+            // mesmo trabalho cabe folgado.
+            //
+            // MODIFICACAO NA COPIA LOCAL DO JUCE. Se um dia atualizarem o JUCE,
+            // esta linha precisa ser reaplicada.
+            // DESLIGADO -- esta linha causou uma regressao grave.
+            //
+            // Ela de fato faz o AAudio entregar blocos maiores, e isso reduzia o
+            // custo fixo do grafo (188 chamadas por segundo -> 47). MAS a rajada
+            // nativa do aparelho e 256 e a capacidade do stream, 2048: pedir
+            // blocos de 1024 deixa margem de apenas DOIS blocos. O audio tocava
+            // 2 a 4 segundos, a margem esvaziava e o stream morria em silencio --
+            // com o app continuando a produzir normalmente, medidores mexendo e
+            // ZERO blocos perdidos do nosso lado. No AudioFlinger:
+            // "1 Tracks of which 0 are active", underruns de 34 para 1611.
+            //
+            // E a medicao que motivou a linha era da build DEBUG (-O0). Na
+            // release o custo fixo e 3x menor, entao o ganho nao compensa o
+            // risco. Se um dia valer a pena revisitar, tera que vir junto com
+            // setBufferCapacityInFrames bem maior -- nao sozinha.
+            juce::ignoreUnused (newBufferSize);
+
            #if JUCE_USE_ANDROID_OBOE_STABILIZED_CALLBACK
             if (newCallback != nullptr)
             {

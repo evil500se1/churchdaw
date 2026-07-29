@@ -18,7 +18,10 @@ public:
 
     AboutPanel()
     {
-        logo = juce::ImageCache::getFromMemory (BinaryData::logo_round_png, BinaryData::logo_round_pngSize);
+       #if ! JUCE_ANDROID
+        logo = juce::ImageCache::getFromMemory (BinaryData::logo_round_png,
+                                                BinaryData::logo_round_pngSize);
+       #endif
 
         whatsBtn.setButtonText (juce::String::fromUTF8 ("Falar no WhatsApp"));
         whatsBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff1f8f4d));
@@ -28,6 +31,18 @@ public:
             juce::URL ("https://wa.me/5562981278461").launchInDefaultBrowser();
         };
         addAndMakeVisible (whatsBtn);
+
+        privacyBtn.setButtonText (juce::String::fromUTF8 ("Privacidade"));
+        privacyBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff2a2d35));
+        privacyBtn.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
+        privacyBtn.onClick = []
+        {
+            // Dominio oficial, com DNS e certificado validos. A URL tecnica
+            // antiga agora redireciona para 404 e nao pode aparecer na Play.
+            juce::URL ("https://churchdaw.com/politica-de-privacidade.html")
+                .launchInDefaultBrowser();
+        };
+        addAndMakeVisible (privacyBtn);
 
         closeBtn.setButtonText ("Fechar");
         closeBtn.onClick = [this] { if (onClose != nullptr) onClose(); };
@@ -65,6 +80,9 @@ public:
         // logo redondo (a arte tem fundo preto chapado -> recorta no circulo)
         auto logoBox = body.removeFromTop (168).withSizeKeepingCentre (168, 168);
 
+       #if JUCE_ANDROID
+        NordLookAndFeel::drawChurchDAWMark (g, logoBox.toFloat());
+       #else
         if (logo.isValid())
         {
             juce::Path circle;
@@ -77,12 +95,17 @@ public:
                                logoBox.getWidth(), logoBox.getHeight(),
                                juce::RectanglePlacement::centred);
         }
+       #endif
 
         body.removeFromTop (12);
 
         g.setColour (NordLookAndFeel::dimText().withAlpha (0.75f));
         g.setFont (juce::Font (juce::FontOptions (12.0f)));
-        g.drawText (juce::String::fromUTF8 ("Vers\xc3\xa3o 1.1.0"),
+        auto version = juce::String ("--");
+        if (auto* app = juce::JUCEApplicationBase::getInstance())
+            version = app->getApplicationVersion();
+
+        g.drawText (juce::String::fromUTF8 ("Vers\xc3\xa3o ") + version,
                     body.removeFromTop (16), juce::Justification::centred);
 
         body.removeFromTop (14);
@@ -112,8 +135,13 @@ public:
         auto card = getLocalBounds().reduced (margin);
         auto row = card.removeFromBottom (62).removeFromTop (38).reduced (24, 0);
 
-        whatsBtn.setBounds (row.removeFromLeft (row.getWidth() / 2 - 5));
-        row.removeFromLeft (10);
+        constexpr int gap = 8;
+        const int buttonWidth = (row.getWidth() - gap * 2) / 3;
+
+        privacyBtn.setBounds (row.removeFromLeft (buttonWidth));
+        row.removeFromLeft (gap);
+        whatsBtn.setBounds (row.removeFromLeft (buttonWidth));
+        row.removeFromLeft (gap);
         closeBtn.setBounds (row);
     }
 
@@ -121,7 +149,7 @@ private:
     static constexpr int margin = 18;   // respiro pra sombra caber
 
     juce::Image logo;
-    juce::TextButton whatsBtn, closeBtn;
+    juce::TextButton privacyBtn, whatsBtn, closeBtn;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (AboutPanel)
 };

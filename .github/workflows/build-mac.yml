@@ -1,9 +1,17 @@
-name: Build macOS
+name: CI macOS (nao distribuivel)
 
 on:
+  pull_request:
   push:
     branches: [main]
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build-mac:
@@ -14,25 +22,229 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Configurar CMake
-        run: cmake -B build-mac -DCMAKE_BUILD_TYPE=Release
+        run: >-
+          cmake -B build-mac
+          -DCMAKE_BUILD_TYPE=Release
+          -DCHURCHDAW_ENABLE_DESKTOP_LICENSING=ON
+          -DCHURCHDAW_BUILD_LICENSE_TESTS=ON
 
       - name: Compilar
         run: cmake --build build-mac --config Release --parallel 3
 
-      - name: Teste de fumaca - abre o app e tira prints
+      - name: Testar CSPRNG e assinatura de licença no macOS
+        run: |
+          TEST_EXE="$(find build-mac -type f -name ChurchDAWLicenseVerifierTests -perm -111 -print -quit)"
+          test -n "$TEST_EXE"
+          "$TEST_EXE" \
+            Tests/DesktopLicensing/lease-fixture-ci.token \
+            fixture-installation-id \
+            1800000000
+
+      - name: Auditar pacote universal do macOS
         run: |
           APP=build-mac/MinhaDAW_artefacts/Release/ChurchDAW.app
-          open "$APP"
+          EXE="$APP/Contents/MacOS/ChurchDAW"
+          PLIST="$APP/Contents/Info.plist"
+          EXPECTED_VERSION="$(
+            sed -nE \
+              's/^[[:space:]]*project\(MinhaDAW[[:space:]]+VERSION[[:space:]]+([0-9]+\.[0-9]+\.[0-9]+)[[:space:]]*\)$/\1/p' \
+              CMakeLists.txt
+          )"
+          test -n "$EXPECTED_VERSION"
+          plutil -lint "$PLIST"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$PLIST")" = "com.churchdaw.app"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLIST")" = "$EXPECTED_VERSION"
+          /usr/libexec/PlistBuddy -c 'Print :NSMicrophoneUsageDescription' "$PLIST" | grep -q "guitarra/microfone"
+          ARCHS="$(lipo -archs "$EXE")"
+          echo "Arquiteturas: $ARCHS"
+          grep -qw arm64 <<<"$ARCHS"
+          grep -qw x86_64 <<<"$ARCHS"
+          otool -L "$EXE"
+          plutil -lint Packaging/ChurchDAW.entitlements
+
+          # A assinatura ad-hoc nao substitui o Developer ID, mas faz o runner
+          # executar o app sob o Hardened Runtime e valida a estrutura/entitlements.
+          codesign --force --deep --sign - --options runtime \
+            --entitlements Packaging/ChurchDAW.entitlements "$APP"
+          codesign -dvvv "$APP" 2>&1
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          codesign -d --entitlements :- "$APP" >signed-entitlements.plist
+          plutil -lint signed-entitlements.plist
+          /usr/libexec/PlistBuddy -c 'Print :com.apple.security.device.audio-input' \
+            signed-entitlements.plist | grep -q true
+          /usr/libexec/PlistBuddy -c 'Print :com.apple.security.cs.disable-library-validation' \
+            signed-entitlements.plist | grep -q true
+
+      - name: Compilar binário isolado para autotestes de áudio
+        run: |
+          cmake -B build-mac-selftest \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCHURCHDAW_ENABLE_DESKTOP_LICENSING=OFF \
+            -DCHURCHDAW_BUILD_LICENSE_TESTS=OFF
+          cmake --build build-mac-selftest --config Release --target MinhaDAW --parallel 3
+
+      - name: Criar piano sintetico para o teste
+        run: |
+          SAMPLE_DIR=build-mac-selftest/MinhaDAW_artefacts/Release/Library/01.\ Pianos/Black\ Upright
+          mkdir -p "$SAMPLE_DIR"
+          SAMPLE_DIR="$SAMPLE_DIR" python3 - <<'PY'
+          import math
+          import os
+          import struct
+          import wave
+
+          rate = 48000
+          duration = 12
+          frames = rate * duration
+          path = os.path.join(os.environ["SAMPLE_DIR"], "C3.wav")
+
+          with wave.open(path, "wb") as wav:
+              wav.setnchannels(2)
+              wav.setsampwidth(2)
+              wav.setframerate(rate)
+              chunk = bytearray()
+
+              for i in range(frames):
+                  t = i / rate
+                  fade_in = min(1.0, i / (rate * 0.04))
+                  fade_out = min(1.0, (frames - i) / (rate * 0.08))
+                  envelope = fade_in * fade_out * math.exp(-t * 0.055)
+                  sample = int(32767 * 0.045 * envelope * (
+                      math.sin(2 * math.pi * 130.8128 * t)
+                      + 0.30 * math.sin(2 * math.pi * 261.6256 * t)
+                      + 0.12 * math.sin(2 * math.pi * 392.4384 * t)))
+                  packed = struct.pack("<hh", sample, sample)
+                  chunk.extend(packed)
+
+                  if len(chunk) >= 65536:
+                      wav.writeframesraw(chunk)
+                      chunk.clear()
+
+              if chunk:
+                  wav.writeframesraw(chunk)
+          PY
+
+      - name: Testar audio e MIDI dentro do app
+        run: |
+          APP=build-mac-selftest/MinhaDAW_artefacts/Release/ChurchDAW.app
+          EXE="$APP/Contents/MacOS/ChurchDAW"
           mkdir -p prints
-          for i in 5 15 30; do
-            sleep_time=$(( i - prev )); prev=$i
-            sleep ${sleep_time:-5}
-            screencapture -x prints/tela_${i}s.png || true
+          CHURCHDAW_SELFTEST=worship CHURCHDAW_SELFTEST_QUIT_SECONDS=22 \
+            "$EXE" >mac-selftest.log 2>&1 &
+          PID=$!
+
+          cleanup() {
+            if [[ -n "${PID:-}" ]]; then
+              kill "$PID" >/dev/null 2>&1 || true
+              wait "$PID" >/dev/null 2>&1 || true
+            fi
+          }
+          trap cleanup EXIT
+
+          previous=0
+          for current in 5 12 20; do
+            sleep $(( current - previous ))
+            previous=$current
+            kill -0 "$PID" || { echo "APP CRASHOU"; cat mac-selftest.log; exit 1; }
+            screencapture -x "prints/tela_${current}s.png" || true
           done
-          # o processo ainda esta vivo depois de 30s? (nao crashou)
-          pgrep -x ChurchDAW && echo "APP RODANDO OK" || { echo "APP CRASHOU"; exit 1; }
-        env:
-          prev: 0
+
+          for unused in {1..10}; do
+            kill -0 "$PID" >/dev/null 2>&1 || break
+            sleep 1
+          done
+          kill -0 "$PID" >/dev/null 2>&1 && { echo "APP NAO ENCERROU LIMPO"; exit 1; }
+          wait "$PID"
+          PID=
+          trap - EXIT
+
+          cat mac-selftest.log
+          grep -q "AUDIO: TESTE WORSHIP SUAVE LIGADO" mac-selftest.log
+          grep -q "AUDIO: teste carregando canal 1 = Black Upright" mac-selftest.log
+          grep -q "BIBLIOTECA: timbre Black Upright pronto" mac-selftest.log
+          grep -Eq "MAC_SELFTEST: blocks [0-9]+ audible [1-9][0-9]*" mac-selftest.log
+          ! grep -Eq "MAC_SELFTEST:.*invalid [1-9][0-9]*" mac-selftest.log
+          echo "APP RODANDO, MIDI GERADO E AUDIO NA SAIDA"
+
+      - name: Testar salvamento e restauracao
+        run: |
+          APP=build-mac-selftest/MinhaDAW_artefacts/Release/ChurchDAW.app
+          EXE="$APP/Contents/MacOS/ChurchDAW"
+          SETTINGS_DIR="$HOME/Library/Application Support/ChurchDAW"
+          find "$SETTINGS_DIR" -maxdepth 1 -type f -print
+          test -n "$(find "$SETTINGS_DIR" -maxdepth 1 -type f -size +0c -print -quit)"
+
+          CHURCHDAW_SELFTEST=restore CHURCHDAW_SELFTEST_QUIT_SECONDS=7 \
+            "$EXE" >mac-restore.log 2>&1 &
+          PID=$!
+
+          for unused in {1..12}; do
+            kill -0 "$PID" >/dev/null 2>&1 || break
+            sleep 1
+          done
+          kill -0 "$PID" >/dev/null 2>&1 && { kill "$PID"; echo "REABERTURA NAO ENCERROU"; exit 1; }
+          wait "$PID"
+
+          cat mac-restore.log
+          grep -q "AUDIO: TESTE RESTAURACAO LIGADO" mac-restore.log
+          grep -q "BIBLIOTECA: timbre Black Upright pronto" mac-restore.log
+          grep -Eq "MAC_SELFTEST: blocks [0-9]+ audible [1-9][0-9]*" mac-restore.log
+          ! grep -Eq "MAC_SELFTEST:.*invalid [1-9][0-9]*" mac-restore.log
+          echo "ESTADO SALVO E RESTAURADO COM AUDIO"
+
+      - name: Testar hot-plug e notas CoreMIDI
+        run: |
+          APP=build-mac-selftest/MinhaDAW_artefacts/Release/ChurchDAW.app
+          EXE="$APP/Contents/MacOS/ChurchDAW"
+          clang++ -std=c++17 Tests/mac_midi_source.cpp \
+            -framework CoreMIDI -framework CoreFoundation -o mac-midi-source
+
+          CHURCHDAW_SELFTEST=external CHURCHDAW_SELFTEST_QUIT_SECONDS=16 \
+            "$EXE" >mac-external-midi.log 2>&1 &
+          APP_PID=$!
+          sleep 3
+          ./mac-midi-source >mac-midi-helper.log 2>&1 &
+          MIDI_PID=$!
+          sleep 6
+          kill -0 "$APP_PID"
+          kill -0 "$MIDI_PID"
+          screencapture -x prints/tela_midi_externo.png || true
+          wait "$MIDI_PID"
+
+          for unused in {1..10}; do
+            kill -0 "$APP_PID" >/dev/null 2>&1 || break
+            sleep 1
+          done
+          kill -0 "$APP_PID" >/dev/null 2>&1 && { kill "$APP_PID"; echo "APP NAO ENCERROU"; exit 1; }
+          wait "$APP_PID"
+
+          cat mac-midi-helper.log
+          cat mac-external-midi.log
+          grep -q "MIDI_HELPER_READY" mac-midi-helper.log
+          grep -q "AUDIO: TESTE MIDI EXTERNO LIGADO" mac-external-midi.log
+          grep -Eq "MIDI: [1-9][0-9]* entrada\\(s\\)" mac-external-midi.log
+          grep -Eq "MAC_SELFTEST: blocks [0-9]+ audible [1-9][0-9]*" mac-external-midi.log
+          ! grep -Eq "MAC_SELFTEST:.*invalid [1-9][0-9]*" mac-external-midi.log
+          echo "HOT-PLUG COREMIDI E NOTAS EXTERNAS OK"
+
+      - name: Publicar diagnostico de audio
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostico-audio-macos
+          path: |
+            mac-selftest.log
+            mac-restore.log
+            mac-external-midi.log
+            mac-midi-helper.log
+
+      - name: Teste visual do app
+        run: |
+          test -s prints/tela_5s.png
+          test -s prints/tela_12s.png
+          test -s prints/tela_20s.png
+          test -s prints/tela_midi_externo.png
+          echo "PRINTS DO APP OK"
 
       - name: Publicar prints do app rodando no Mac
         if: always()
@@ -41,15 +253,54 @@ jobs:
           name: prints-macos
           path: prints/
 
-      - name: Gerar instalador .dmg
+      - name: Gerar imagem para distribuicao direta
         run: |
+          APP=build-mac/MinhaDAW_artefacts/Release/ChurchDAW.app
+          VERSION="$(
+            sed -nE \
+              's/^[[:space:]]*project\(MinhaDAW[[:space:]]+VERSION[[:space:]]+([0-9]+\.[0-9]+\.[0-9]+)[[:space:]]*\)$/\1/p' \
+              CMakeLists.txt
+          )"
+          test -n "$VERSION"
+          DMG="ChurchDAW-${VERSION}-macOS-Direct.dmg"
+          echo "DMG=$DMG" >>"$GITHUB_ENV"
           mkdir dmg-root
-          cp -R build-mac/MinhaDAW_artefacts/Release/ChurchDAW.app dmg-root/
+          cp -R "$APP" dmg-root/
           ln -s /Applications dmg-root/Applications
-          hdiutil create -volname "ChurchDAW" -srcfolder dmg-root -ov -format UDZO ChurchDAW.dmg
+          cat >dmg-root/INSTALACAO.txt <<'EOF'
+          ChurchDAW para instalacao direta, fora da App Store.
 
-      - name: Publicar instalador
+          Arraste ChurchDAW.app para Applications. Na primeira abertura:
+          1. Clique com o botao direito no ChurchDAW e escolha Abrir.
+          2. Se o macOS bloquear, abra Ajustes do Sistema > Privacidade e
+             Seguranca e escolha Abrir Mesmo Assim.
+
+          Esta imagem usa assinatura ad-hoc e nao foi notarizada pela Apple.
+          EOF
+          hdiutil create -volname "ChurchDAW $VERSION" -srcfolder dmg-root \
+            -ov -format UDZO "$DMG"
+
+      - name: Validar imagem de distribuicao direta
+        run: |
+          MOUNT="$(mktemp -d)"
+          cleanup() {
+            hdiutil detach "$MOUNT" >/dev/null 2>&1 || true
+            rmdir "$MOUNT" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          hdiutil attach "$DMG" -readonly -nobrowse -mountpoint "$MOUNT"
+          test -d "$MOUNT/ChurchDAW.app"
+          test -L "$MOUNT/Applications"
+          test -s "$MOUNT/INSTALACAO.txt"
+          /usr/bin/codesign --verify --deep --strict --verbose=2 "$MOUNT/ChurchDAW.app"
+          hdiutil detach "$MOUNT"
+          trap - EXIT
+          rmdir "$MOUNT"
+
+      - name: Publicar imagem de distribuicao direta
         uses: actions/upload-artifact@v4
         with:
-          name: ChurchDAW-macOS
-          path: ChurchDAW.dmg
+          name: ChurchDAW-macOS-Direct
+          path: ${{ env.DMG }}
+          if-no-files-found: error
+          retention-days: 30

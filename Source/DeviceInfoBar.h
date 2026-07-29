@@ -37,9 +37,56 @@ public:
         }
     }
 
+    void setCompact (bool shouldBeCompact)
+    {
+        if (compact != shouldBeCompact)
+        {
+            compact = shouldBeCompact;
+            repaint();
+        }
+    }
+
+    void setMappingCount (int count)
+    {
+        count = juce::jmax (0, count);
+
+        if (mappingCount != count)
+        {
+            mappingCount = count;
+            repaint();
+        }
+    }
+
+    void setMidiActivity (bool active)
+    {
+        if (midiActivity != active)
+        {
+            midiActivity = active;
+            repaint();
+        }
+    }
+
     void paint (juce::Graphics& g) override
     {
         auto area = getLocalBounds();
+
+        if (area.isEmpty())
+            return;
+
+        juce::String keyboardTag (compact ? "MIDI" : "TECLADO");
+
+        if (mappingCount > 0)
+            keyboardTag << "  " << juce::String::charToString ((juce::juce_wchar) 0x2022)
+                        << "  " << mappingCount << (mappingCount == 1 ? " MAPA" : " MAPAS");
+
+        if (compact)
+        {
+            drawChip (g, area.toFloat(), keyboardTag,
+                      controller.isNotEmpty() ? controller : juce::String ("Nenhum"),
+                      ctrlOn, Glyph::keys, midiActivity);
+            return;
+        }
+
         const int gap = 8;
         // nome do controlador costuma ser mais longo → ganha mais largura
         const int chipW = juce::roundToInt ((area.getWidth() - gap) * 0.57f);
@@ -48,16 +95,16 @@ public:
         // ("CONTROLADO", "INTERFA"), e ainda roubavam largura do nome do aparelho,
         // que e a informacao que importa.
         drawChip (g, area.removeFromLeft (chipW).toFloat(),
-                  juce::String::fromUTF8 ("TECLADO"),
+                  keyboardTag,
                   controller.isNotEmpty() ? controller : juce::String ("Nenhum"),
-                  ctrlOn, Glyph::keys);
+                  ctrlOn, Glyph::keys, midiActivity);
 
         area.removeFromLeft (gap);
 
         drawChip (g, area.toFloat(),
                   juce::String::fromUTF8 ("\xc3\x81UDIO"),   // ÁUDIO
                   interfaceName.isNotEmpty() ? interfaceName : juce::String ("Nenhum"),
-                  ifaceOn, Glyph::speaker);
+                  ifaceOn, Glyph::speaker, false);
     }
 
 private:
@@ -65,7 +112,7 @@ private:
 
     static void drawChip (juce::Graphics& g, juce::Rectangle<float> chip,
                           const juce::String& tag, const juce::String& name,
-                          bool connected, Glyph glyph)
+                          bool connected, Glyph glyph, bool activity)
     {
         // HIERARQUIA: estes chips sao informacao de contexto, nao acao. Tinham
         // chapa, borda e brilho iguais aos dos botoes e competiam com eles no
@@ -75,11 +122,19 @@ private:
         g.setColour (juce::Colours::white.withAlpha (0.045f));
         g.drawRoundedRectangle (chip.reduced (0.5f), NordLookAndFeel::radiusControl, 1.0f);
 
+        if (activity)
+        {
+            g.setColour (NordLookAndFeel::greenOk().withAlpha (0.62f));
+            g.drawRoundedRectangle (chip.reduced (0.8f), NordLookAndFeel::radiusControl, 1.6f);
+        }
+
         auto inner = chip.reduced (8.0f, 5.0f);
 
         // ponto de status + mini-icone
         auto iconCol = inner.removeFromLeft (20.0f);
-        const auto accent = connected ? juce::Colour (0xff5fd08a) : juce::Colour (0xff6a6d75);
+        const auto accent = activity  ? NordLookAndFeel::greenOk().brighter (0.25f)
+                          : connected ? juce::Colour (0xff5fd08a)
+                                      : juce::Colour (0xff6a6d75);
 
         // halo + ponto
         auto dot = juce::Rectangle<float> (iconCol.getX(), iconCol.getCentreY() - 9.0f, 7.0f, 7.0f);
@@ -108,7 +163,8 @@ private:
         g.setColour (connected ? juce::Colours::white.withAlpha (0.72f)
                                : juce::Colours::white.withAlpha (0.34f));
         g.setFont (juce::Font (juce::FontOptions (12.0f)));
-        g.drawText (name, inner.toNearestInt(), juce::Justification::centredLeft, true);
+        g.drawFittedText (name, inner.toNearestInt(), juce::Justification::centredLeft,
+                          1, 0.82f);
     }
 
     static void drawKeysIcon (juce::Graphics& g, juce::Rectangle<float> r)
@@ -141,6 +197,8 @@ private:
 
     juce::String controller, interfaceName;
     bool ctrlOn = false, ifaceOn = false;
+    bool compact = false, midiActivity = false;
+    int mappingCount = 0;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (DeviceInfoBar)
 };

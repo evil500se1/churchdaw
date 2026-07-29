@@ -152,7 +152,10 @@ jobs:
             screencapture -x "prints/tela_${current}s.png" || true
           done
 
-          for unused in {1..10}; do
+          # O gate de update roda antes da janela principal e pode consumir
+          # cerca de 15 s mesmo contra o endpoint local fechado. Os 22 s do
+          # autoteste contam somente depois que o motor de audio abre.
+          for unused in {1..45}; do
             kill -0 "$PID" >/dev/null 2>&1 || break
             sleep 1
           done
@@ -185,7 +188,8 @@ jobs:
             "$EXE" >mac-restore.log 2>&1 &
           PID=$!
 
-          for unused in {1..12}; do
+          # Inclui a latencia do gate de update anterior ao motor de audio.
+          for unused in {1..45}; do
             kill -0 "$PID" >/dev/null 2>&1 || break
             sleep 1
           done
@@ -210,10 +214,24 @@ jobs:
             -framework CoreMIDI -framework CoreFoundation -o mac-midi-source
 
           rm -rf "$LOG_DIR"
-          CHURCHDAW_SELFTEST=external CHURCHDAW_SELFTEST_QUIT_SECONDS=16 \
+          CHURCHDAW_SELFTEST=external CHURCHDAW_SELFTEST_QUIT_SECONDS=25 \
             "$EXE" >mac-external-midi.log 2>&1 &
           APP_PID=$!
-          sleep 3
+
+          # Espere o motor abrir. Iniciar o CoreMIDI por tempo absoluto fazia
+          # o helper terminar enquanto o gate de update ainda estava na tela.
+          AUDIO_READY=0
+          for unused in {1..60}; do
+            kill -0 "$APP_PID"
+            if find "$LOG_DIR" -type f -name 'ChurchDAW.log' \
+                 -exec grep -q "AUDIO: TESTE MIDI EXTERNO LIGADO" {} +; then
+              AUDIO_READY=1
+              break
+            fi
+            sleep 1
+          done
+          test "$AUDIO_READY" = 1
+
           ./mac-midi-source >mac-midi-helper.log 2>&1 &
           MIDI_PID=$!
           sleep 6
@@ -222,7 +240,7 @@ jobs:
           screencapture -x prints/tela_midi_externo.png || true
           wait "$MIDI_PID"
 
-          for unused in {1..10}; do
+          for unused in {1..35}; do
             kill -0 "$APP_PID" >/dev/null 2>&1 || break
             sleep 1
           done

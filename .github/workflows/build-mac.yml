@@ -322,23 +322,28 @@ jobs:
           codesign --verify --deep --strict --verbose=2 dmg-site/ChurchDAW.app
 
           # PROVA DE VIDA: este binario (o que o cliente recebe) nunca era
-          # executado no CI — so o build-mac-selftest, sem assinatura. Roda
-          # de verdade antes de empacotar.
+          # executado no CI — so o build-mac-selftest, sem assinatura nem
+          # licenciamento. Aqui a build e a COMERCIAL: ela para na tela de
+          # login de proposito, entao exigir audio seria teste errado. O que
+          # importa provar e que o app SOBE, cria janela e continua vivo —
+          # o cliente relatou icone pulando sem janela nenhuma (30/07).
           DIST_EXE="dmg-site/ChurchDAW.app/Contents/MacOS/ChurchDAW"
-          CHURCHDAW_SELFTEST=worship CHURCHDAW_SELFTEST_QUIT_SECONDS=12 \
-            "$DIST_EXE" >dist-launch.log 2>&1 &
+          "$DIST_EXE" >dist-launch.log 2>&1 &
           DIST_PID=$!
-          sleep 6
-          kill -0 "$DIST_PID" || { echo "APP DO DMG MORREU AO ABRIR"; cat dist-launch.log; exit 1; }
-          for unused in {1..15}; do
-            kill -0 "$DIST_PID" >/dev/null 2>&1 || break
-            sleep 1
-          done
+          sleep 20
+          if ! kill -0 "$DIST_PID" 2>/dev/null; then
+            echo "APP DO DMG MORREU AO ABRIR"; cat dist-launch.log; exit 1
+          fi
+
+          # janela de verdade na tela (nao so processo vivo)
+          screencapture -x dist-launch.png || true
+          WINDOWS="$(osascript -e 'tell application "System Events" to count windows of (first process whose name is "ChurchDAW")' 2>/dev/null || echo 0)"
+          echo "janelas abertas: $WINDOWS"
           kill "$DIST_PID" >/dev/null 2>&1 || true
           wait "$DIST_PID" >/dev/null 2>&1 || true
           cat dist-launch.log
-          grep -q "AUDIO: TESTE WORSHIP SUAVE LIGADO" dist-launch.log
-          echo "APP ASSINADO DO DMG ABRE E TOCA"
+          test "$WINDOWS" -ge 1 || { echo "APP SUBIU MAS NAO ABRIU JANELA"; exit 1; }
+          echo "APP ASSINADO DO DMG ABRE COM JANELA"
           ln -s /Applications dmg-site/Applications
           cat >dmg-site/LEIA-ME.txt <<'EOF'
           ChurchDAW para macOS — distribuicao direta pelo churchdaw.com.
@@ -348,6 +353,17 @@ jobs:
           hdiutil create -volname "ChurchDAW" -srcfolder dmg-site \
             -ov -format UDZO "ChurchDAW-${VERSION}-macOS-Direct.dmg"
           shasum -a 256 "ChurchDAW-${VERSION}-macOS-Direct.dmg"
+
+      - name: Publicar prova de vida do app do site
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: prova-de-vida-dmg
+          path: |
+            dist-launch.log
+            dist-launch.png
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Publicar imagem de distribuicao direta
         uses: actions/upload-artifact@v4

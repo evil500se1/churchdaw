@@ -311,6 +311,34 @@ jobs:
           test -n "$VERSION"
           mkdir dmg-site
           cp -R "$APP" dmg-site/
+
+          # O passo de auditoria assina com --options runtime (Hardened
+          # Runtime). Com Developer ID isso e o certo; com assinatura
+          # AD-HOC o macOS mata o processo ao lancar — o cliente ve so o
+          # icone pulando no Dock (relatado em 30/07). Para a copia que vai
+          # ao site, reassina simples: ad-hoc SEM hardened runtime.
+          codesign --remove-signature dmg-site/ChurchDAW.app || true
+          codesign --force --deep --sign - dmg-site/ChurchDAW.app
+          codesign --verify --deep --strict --verbose=2 dmg-site/ChurchDAW.app
+
+          # PROVA DE VIDA: este binario (o que o cliente recebe) nunca era
+          # executado no CI — so o build-mac-selftest, sem assinatura. Roda
+          # de verdade antes de empacotar.
+          DIST_EXE="dmg-site/ChurchDAW.app/Contents/MacOS/ChurchDAW"
+          CHURCHDAW_SELFTEST=worship CHURCHDAW_SELFTEST_QUIT_SECONDS=12 \
+            "$DIST_EXE" >dist-launch.log 2>&1 &
+          DIST_PID=$!
+          sleep 6
+          kill -0 "$DIST_PID" || { echo "APP DO DMG MORREU AO ABRIR"; cat dist-launch.log; exit 1; }
+          for unused in {1..15}; do
+            kill -0 "$DIST_PID" >/dev/null 2>&1 || break
+            sleep 1
+          done
+          kill "$DIST_PID" >/dev/null 2>&1 || true
+          wait "$DIST_PID" >/dev/null 2>&1 || true
+          cat dist-launch.log
+          grep -q "AUDIO: TESTE WORSHIP SUAVE LIGADO" dist-launch.log
+          echo "APP ASSINADO DO DMG ABRE E TOCA"
           ln -s /Applications dmg-site/Applications
           cat >dmg-site/LEIA-ME.txt <<'EOF'
           ChurchDAW para macOS — distribuicao direta pelo churchdaw.com.

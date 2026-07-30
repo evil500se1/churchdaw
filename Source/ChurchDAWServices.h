@@ -761,6 +761,8 @@ namespace ChurchDAWServices
         if (! safeFileName || ! isPublicBasePart)
             return safeFileName;
 
+        // A pasta publica nao exige token, entao o nome do arquivo e a
+        // unica barreira: so aceitamos os conjuntos que NOS publicamos.
         static constexpr const char* basePartPrefix =
             "church-live-v1-segment-";
         const auto partPrefixLength = (int) std::char_traits<char>::length (
@@ -769,14 +771,33 @@ namespace ChurchDAWServices
             partPrefixLength, partPrefixLength + 2);
         const auto partNumber = partNumberText.getIntValue();
 
-        return fileName.startsWith (basePartPrefix)
-            && partNumberText.length() == 2
-            && partNumberText.containsOnly ("0123456789")
-            && partNumber >= 1
-            && partNumber <= 30
-            && fileName == juce::String (basePartPrefix)
-                + juce::String (partNumber).paddedLeft ('0', 2)
-                + ".zip";
+        if (fileName.startsWith (basePartPrefix)
+             && partNumberText.length() == 2
+             && partNumberText.containsOnly ("0123456789")
+             && partNumber >= 1
+             && partNumber <= 30
+             && fileName == juce::String (basePartPrefix)
+                 + juce::String (partNumber).paddedLeft ('0', 2)
+                 + ".zip")
+            return true;
+
+        // Pad Continuo (30/07): uma parte por tom natural, publica como o
+        // Church Live. "pad-continuo-v1-<tom>.zip", tom em c..b minusculo.
+        static constexpr const char* padPartPrefix = "pad-continuo-v1-";
+        const auto padPrefixLength = (int) std::char_traits<char>::length (
+            padPartPrefix);
+
+        if (fileName.startsWith (padPartPrefix))
+        {
+            const auto tone = fileName.substring (
+                padPrefixLength, padPrefixLength + 1);
+
+            return tone.length() == 1
+                && juce::String ("cdefgab").containsChar (tone[0])
+                && fileName == juce::String (padPartPrefix) + tone + ".zip";
+        }
+
+        return false;
     }
 
     struct LibraryPart
@@ -2307,7 +2328,15 @@ namespace ChurchDAWServices
             juce::URL::InputStreamOptions (
                 juce::URL::ParameterHandling::inAddress)
                 .withConnectionTimeoutMs (timeoutMs)
-                .withNumRedirectsToFollow (0)
+                // O host de fallback (www.churchdaw.com) responde 301 para o
+                // apex — com zero redirects o fallback NUNCA funcionou, e o
+                // app mostrava "nao foi possivel validar o catalogo" sempre
+                // que o endpoint principal falhava. Medido no CI do macOS em
+                // 30/07: "HTTP 301: Manifesto nao corresponde ao SHA-256".
+                // Seguir ate 2 saltos e seguro aqui porque o conteudo so e
+                // aceito se casar com o SHA-256 da policy assinada em RSA:
+                // um redirecionamento hostil nao consegue forjar o catalogo.
+                .withNumRedirectsToFollow (2)
                 .withResponseHeaders (&responseHeaders)
                 .withStatusCode (&response.statusCode)
                 .withExtraHeaders (

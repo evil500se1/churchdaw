@@ -911,6 +911,23 @@ public:
         if (startupWindow != nullptr || mainWindow != nullptr)
             return;
 
+       #if JUCE_MAC
+        // Self-test de CI nao tem quem clique: quando o catalogo nao valida
+        // (runner sem acesso, host de fallback em 301...), a tela de
+        // primeira configuracao fica esperando "Abrir sem baixar" para
+        // sempre — o audio nunca inicia, o quit por amostras nunca dispara
+        // e o workflow acusava "APP NAO ENCERROU LIMPO" sem dizer por que.
+        // Provado pelo print tela_20s.png do run de 30/07.
+        if (juce::SystemStats::getEnvironmentVariable (
+                "CHURCHDAW_SELFTEST", {}).isNotEmpty())
+        {
+            juce::Logger::writeToLog (
+                "SELFTEST: pulando a primeira configuracao");
+            requestMainWindowAfterLicense();
+            return;
+        }
+       #endif
+
         auto logo = loadChurchDAWBrandImage();
         startupWindow = std::make_unique<StartupWindow> (std::move (logo));
         startupWindow->panel.showChecking();

@@ -296,3 +296,35 @@ jobs:
           path: ChurchDAW-CI-UNSIGNED.dmg
           if-no-files-found: error
           retention-days: 3
+
+      # Distribuicao DIRETA pelo site (decisao do dono, 30/07): sem
+      # Developer ID, o app vai ad-hoc + Hardened Runtime e o site ensina a
+      # primeira abertura em https://churchdaw.com/instalar-mac.html
+      - name: Gerar imagem para distribuicao direta
+        run: |
+          APP=build-mac/MinhaDAW_artefacts/Release/ChurchDAW.app
+          VERSION="$(
+            sed -nE \
+              's/^[[:space:]]*project\(MinhaDAW[[:space:]]+VERSION[[:space:]]+([0-9]+\.[0-9]+\.[0-9]+)[[:space:]]*\)$/\1/p' \
+              CMakeLists.txt
+          )"
+          test -n "$VERSION"
+          mkdir dmg-site
+          cp -R "$APP" dmg-site/
+          ln -s /Applications dmg-site/Applications
+          cat >dmg-site/LEIA-ME.txt <<'EOF'
+          ChurchDAW para macOS — distribuicao direta pelo churchdaw.com.
+          Primeira abertura: clique com o botao direito no app e escolha Abrir.
+          Guia completo: https://churchdaw.com/instalar-mac.html
+          EOF
+          hdiutil create -volname "ChurchDAW" -srcfolder dmg-site \
+            -ov -format UDZO "ChurchDAW-${VERSION}-macOS-Direct.dmg"
+          shasum -a 256 "ChurchDAW-${VERSION}-macOS-Direct.dmg"
+
+      - name: Publicar imagem de distribuicao direta
+        uses: actions/upload-artifact@v4
+        with:
+          name: ChurchDAW-macOS-Direct
+          path: ChurchDAW-*-macOS-Direct.dmg
+          if-no-files-found: error
+          retention-days: 7

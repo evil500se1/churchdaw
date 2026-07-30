@@ -51,6 +51,13 @@ public:
             return f.isDirectory() && f.getChildFile ("pad_C.wav").existsAsFile();
         };
 
+        // Modulo baixado pela loja (30/07): o instalador de bibliotecas
+        // grava em managedLibrariesFolder()/Pads — que o findLibrary NAO
+        // varre. E o caminho do pack "Pad Continuo" no Android.
+        if (auto f = AppPaths::managedLibrariesFolder().getChildFile ("Pads");
+            valid (f))
+            return f;
+
         if (auto f = AppPaths::findLibrary ({ "Pads", "ChurchDAW Pads" }); valid (f))
             return f;
 

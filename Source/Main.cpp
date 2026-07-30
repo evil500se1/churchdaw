@@ -1,4 +1,7 @@
 #include <juce_gui_extra/juce_gui_extra.h>
+
+#include <iostream>   // logger de stdout do self-test de CI
+
 #include "NordLookAndFeel.h"
 #include "MainComponent.h"
 #include "StartupPanel.h"
@@ -708,14 +711,28 @@ public:
         // Vai para %APPDATA%\ChurchDAW no Windows e ~/Library/Logs/ChurchDAW
         // no Mac, com rodizio em 512 KB para nao crescer sem fim no PC da
         // igreja.
-        // No self-test de CI o log TEM de ficar no stdout: o FileLogger
-        // silenciou o runner do macOS em 30/07 (mac-selftest.log com uma
-        // linha) e derrubou os greps do workflow — e escondeu qualquer
-        // evidencia do shutdown. Cliente real continua com o arquivo.
+        // No self-test de CI o log TEM de sair no stdout: com o FileLogger
+        // (ou com logger nenhum, que cai em outputDebugString) o
+        // mac-selftest.log do runner ficou com UMA linha em 30/07, os greps
+        // do workflow perderam a evidencia e o diagnostico do shutdown
+        // ficou cego. Cliente real continua com o arquivo rotativo.
         const bool ciSelfTest = juce::SystemStats::getEnvironmentVariable (
             "CHURCHDAW_SELFTEST", {}).isNotEmpty();
 
-        if (! ciSelfTest)
+        if (ciSelfTest)
+        {
+            struct StdoutLogger final : public juce::Logger
+            {
+                void logMessage (const juce::String& message) override
+                {
+                    std::cout << message << std::endl;
+                }
+            };
+
+            stdoutLogger = std::make_unique<StdoutLogger>();
+            juce::Logger::setCurrentLogger (stdoutLogger.get());
+        }
+        else
         {
             fileLogger.reset (juce::FileLogger::createDefaultAppLogger (
                 "ChurchDAW", "ChurchDAW.log",
@@ -1932,6 +1949,7 @@ private:
     // Declarado ANTES do resto: e o primeiro a nascer e o ultimo a morrer, para
     // registrar tambem o que acontece durante a destruicao dos outros membros.
     std::unique_ptr<juce::FileLogger> fileLogger;
+    std::unique_ptr<juce::Logger> stdoutLogger;   // so no self-test de CI
     NordLookAndFeel nordLookAndFeel;
    #if JUCE_ANDROID
     std::unique_ptr<AndroidLoginWindow> androidLoginWindow;

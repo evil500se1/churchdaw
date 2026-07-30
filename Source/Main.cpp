@@ -708,12 +708,22 @@ public:
         // Vai para %APPDATA%\ChurchDAW no Windows e ~/Library/Logs/ChurchDAW
         // no Mac, com rodizio em 512 KB para nao crescer sem fim no PC da
         // igreja.
-        fileLogger.reset (juce::FileLogger::createDefaultAppLogger (
-            "ChurchDAW", "ChurchDAW.log",
-            juce::String ("ChurchDAW ")
-                + getApplicationVersion() + " iniciado",
-            512 * 1024));
-        juce::Logger::setCurrentLogger (fileLogger.get());
+        // No self-test de CI o log TEM de ficar no stdout: o FileLogger
+        // silenciou o runner do macOS em 30/07 (mac-selftest.log com uma
+        // linha) e derrubou os greps do workflow — e escondeu qualquer
+        // evidencia do shutdown. Cliente real continua com o arquivo.
+        const bool ciSelfTest = juce::SystemStats::getEnvironmentVariable (
+            "CHURCHDAW_SELFTEST", {}).isNotEmpty();
+
+        if (! ciSelfTest)
+        {
+            fileLogger.reset (juce::FileLogger::createDefaultAppLogger (
+                "ChurchDAW", "ChurchDAW.log",
+                juce::String ("ChurchDAW ")
+                    + getApplicationVersion() + " iniciado",
+                512 * 1024));
+            juce::Logger::setCurrentLogger (fileLogger.get());
+        }
 
         juce::LookAndFeel::setDefaultLookAndFeel (&nordLookAndFeel);
 

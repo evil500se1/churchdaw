@@ -1,0 +1,303 @@
+<?php
+
+declare(strict_types=1);
+
+use ChurchDAW\Licensing\Config;
+use ChurchDAW\Licensing\Database;
+
+ini_set('display_errors', '0');
+header_remove('X-Powered-By');
+header('Content-Type: application/json; charset=utf-8');
+header('Cache-Control: no-store, max-age=0');
+header('X-Content-Type-Options: nosniff');
+header('X-Frame-Options: DENY');
+header('Referrer-Policy: no-referrer');
+header("Content-Security-Policy: default-src 'none'; frame-ancestors 'none'");
+
+$reply = static function (int $status, array $body): never {
+    http_response_code($status);
+    echo json_encode($body, JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+    exit;
+};
+
+if (($_SERVER['REQUEST_METHOD'] ?? '') !== 'POST') {
+    $reply(404, ['ok' => false]);
+}
+if (($_SERVER['HTTPS'] ?? '') !== 'on') {
+    $reply(400, ['ok' => false, 'error' => 'HTTPS_REQUIRED']);
+}
+
+$providedToken = (string) ($_SERVER['HTTP_X_CHURCHDAW_DEPLOY'] ?? '');
+if ($providedToken === ''
+    || !hash_equals('__TOKEN_HASH__', hash('sha256', $providedToken))) {
+    usleep(random_int(120000, 280000));
+    $reply(404, ['ok' => false]);
+}
+
+$input = json_decode((string) file_get_contents('php://input'), true);
+$action = is_array($input) ? (string) ($input['action'] ?? '') : '';
+if ($action === 'cleanup') {
+    $path = __FILE__;
+    if (!@unlink($path)) {
+        $reply(500, ['ok' => false, 'error' => 'CLEANUP_FAILED']);
+    }
+    $reply(200, ['ok' => true, 'removed' => true]);
+}
+if ($action !== 'activate') {
+    $reply(400, ['ok' => false, 'error' => 'INVALID_ACTION']);
+}
+
+$release = '__RELEASE__';
+$home = dirname(__DIR__);
+$accountHome = $home . '/churchdaw';
+$releaseRoot = $accountHome . '/releases/' . $release;
+$sharedConfig = $accountHome . '/shared/config/local.php';
+$releaseConfig = $releaseRoot . '/config/local.php';
+$publicRoot = __DIR__;
+$stagedPublic = $accountHome . '/deploy-public';
+
+$hardenPrivateTree = static function (string $root): void {
+    if (!is_dir($root)) {
+        return;
+    }
+    chmod($root, 0750);
+    $iterator = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator(
+            $root,
+            FilesystemIterator::SKIP_DOTS
+        ),
+        RecursiveIteratorIterator::SELF_FIRST
+    );
+    foreach ($iterator as $entry) {
+        if ($entry->isLink()) {
+            continue;
+        }
+        chmod($entry->getPathname(), $entry->isDir() ? 0750 : 0640);
+    }
+};
+
+$atomicCopy = static function (string $source, string $destination): void {
+    if (!is_file($source) || is_link($source)) {
+        throw new RuntimeException('Arquivo de origem ausente ou inseguro.');
+    }
+    $directory = dirname($destination);
+    if (!is_dir($directory) && !mkdir($directory, 0750, true) && !is_dir($directory)) {
+        throw new RuntimeException('Nao foi possivel criar diretorio publico.');
+    }
+    $temporary = $destination . '.next-' . bin2hex(random_bytes(8));
+    if (!copy($source, $temporary)) {
+        throw new RuntimeException('Nao foi possivel preparar arquivo publico.');
+    }
+    chmod($temporary, 0644);
+    if (!rename($temporary, $destination)) {
+        @unlink($temporary);
+        throw new RuntimeException('Nao foi possivel promover arquivo publico.');
+    }
+};
+
+try {
+    // ZIPs montados no Windows nao preservam os bits de execucao dos
+    // diretorios. Normalize somente a arvore privada desta release antes do
+    // preflight; config e chave recebem permissoes ainda mais restritas abaixo.
+    foreach ([
+        $accountHome,
+        $accountHome . '/releases',
+        $releaseRoot,
+        $sharedConfig !== '' ? dirname(dirname($sharedConfig)) : '',
+        $stagedPublic,
+    ] as $privateTree) {
+        if ($privateTree !== '') {
+            $hardenPrivateTree($privateTree);
+        }
+    }
+    if (is_file($sharedConfig)) {
+        chmod($sharedConfig, 0600);
+    }
+    $sharedKey = $accountHome . '/shared/keys/churchdaw-license-private.pem';
+    if (is_file($sharedKey)) {
+        chmod($sharedKey, 0600);
+    }
+
+    if (!preg_match('/^[A-Za-z0-9._-]{1,64}$/', $release)
+        || !is_dir($releaseRoot)
+        || !is_file($releaseRoot . '/src/autoload.php')
+        || !is_file($sharedConfig)) {
+        throw new RuntimeException('Release privada incompleta.');
+    }
+
+    $configDirectory = dirname($releaseConfig);
+    if (!is_dir($configDirectory)
+        && !mkdir($configDirectory, 0750, true)
+        && !is_dir($configDirectory)) {
+        throw new RuntimeException('Nao foi possivel criar config da release.');
+    }
+    if (file_exists($releaseConfig) || is_link($releaseConfig)) {
+        if (!is_link($releaseConfig) || realpath($releaseConfig) !== realpath($sharedConfig)) {
+            throw new RuntimeException('Config da release ja existe com destino inesperado.');
+        }
+    } elseif (!symlink($sharedConfig, $releaseConfig)) {
+        throw new RuntimeException('Hospedagem recusou o link simbolico do config.');
+    }
+
+    require $releaseRoot . '/src/autoload.php';
+    $config = Config::load($releaseRoot);
+    $config->assertRuntimeReady();
+    if (!hash_equals($release, $config->string('app.release'))
+        || $config->bool('checkout.enabled')) {
+        throw new RuntimeException('Preflight da release recusado.');
+    }
+
+    $database = new Database($config);
+    $pdo = $database->pdo();
+    $serverVersion = trim((string) $pdo->query('SELECT VERSION()')->fetchColumn());
+    $isMariaDb = stripos($serverVersion, 'mariadb') !== false;
+    preg_match_all(
+        '/(?<![0-9])([0-9]+\.[0-9]+\.[0-9]+)(?![0-9])/',
+        $serverVersion,
+        $versionMatches
+    );
+    $detectedVersions = $versionMatches[1] ?? [];
+    $parsedVersion = $isMariaDb
+        ? end($detectedVersions)
+        : ($detectedVersions[0] ?? false);
+    $minimumVersion = $isMariaDb ? '10.6.0' : '5.7.44';
+    if (!is_string($parsedVersion)
+        || version_compare($parsedVersion, $minimumVersion, '<')) {
+        throw new RuntimeException('Versao do banco nao suportada.');
+    }
+
+    $pdo->exec(
+        'CREATE TABLE IF NOT EXISTS schema_migrations (
+            version VARCHAR(64) PRIMARY KEY,
+            applied_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+         ) ENGINE=InnoDB
+           DEFAULT CHARSET=utf8mb4
+           COLLATE=utf8mb4_unicode_ci
+           ROW_FORMAT=DYNAMIC'
+    );
+    $lockName = 'churchdaw_desktop_licensing_migrations';
+    $lock = $pdo->prepare('SELECT GET_LOCK(:name, 15)');
+    $lock->execute(['name' => $lockName]);
+    if ((int) $lock->fetchColumn() !== 1) {
+        throw new RuntimeException('Outra migracao esta em andamento.');
+    }
+    try {
+        $migrationFiles = glob($releaseRoot . '/migrations/*.sql') ?: [];
+        sort($migrationFiles, SORT_STRING);
+        foreach ($migrationFiles as $migrationFile) {
+            $version = basename($migrationFile);
+            $check = $pdo->prepare(
+                'SELECT COUNT(*) FROM schema_migrations WHERE version = :version'
+            );
+            $check->execute(['version' => $version]);
+            if ((int) $check->fetchColumn() > 0) {
+                continue;
+            }
+            $sql = file_get_contents($migrationFile);
+            if (!is_string($sql) || trim($sql) === '') {
+                throw new RuntimeException('Migration vazia.');
+            }
+            $pdo->exec($sql);
+            $insert = $pdo->prepare(
+                'INSERT INTO schema_migrations (version) VALUES (:version)'
+            );
+            $insert->execute(['version' => $version]);
+        }
+        $product = $pdo->prepare(
+            "INSERT INTO products (code, name, currency, price_cents, status)
+             VALUES (:code, :name, :currency, :price_cents, 'active')
+             ON DUPLICATE KEY UPDATE
+                name = VALUES(name),
+                currency = VALUES(currency),
+                price_cents = VALUES(price_cents),
+                status = 'active'"
+        );
+        $product->execute([
+            'code' => $config->string('product.code'),
+            'name' => $config->string('product.name'),
+            'currency' => $config->string('product.currency'),
+            'price_cents' => $config->int('product.price_cents'),
+        ]);
+    } finally {
+        $unlock = $pdo->prepare('SELECT RELEASE_LOCK(:name)');
+        $unlock->execute(['name' => $lockName]);
+    }
+
+    $assetSource = $releaseRoot . '/public/account-assets';
+    foreach (['app.css', 'app.js'] as $asset) {
+        if (!is_file($assetSource . '/' . $asset)) {
+            throw new RuntimeException('Asset da conta ausente.');
+        }
+    }
+    $assetDestination = $publicRoot . '/account-assets/' . $release;
+    if (!is_dir($assetDestination)) {
+        $assetTemporary = $publicRoot . '/account-assets/.'
+            . $release . '.next-' . bin2hex(random_bytes(8));
+        if (!mkdir($assetTemporary, 0755, true) && !is_dir($assetTemporary)) {
+            throw new RuntimeException('Nao foi possivel preparar assets.');
+        }
+        foreach (['app.css', 'app.js'] as $asset) {
+            if (!copy($assetSource . '/' . $asset, $assetTemporary . '/' . $asset)) {
+                throw new RuntimeException('Falha ao copiar asset.');
+            }
+            chmod($assetTemporary . '/' . $asset, 0644);
+        }
+        if (!rename($assetTemporary, $assetDestination)) {
+            throw new RuntimeException('Falha ao promover assets.');
+        }
+    } else {
+        foreach (['app.css', 'app.js'] as $asset) {
+            $sourceHash = hash_file('sha256', $assetSource . '/' . $asset);
+            $destinationHash = hash_file('sha256', $assetDestination . '/' . $asset);
+            if (!is_string($sourceHash)
+                || !is_string($destinationHash)
+                || !hash_equals($sourceHash, $destinationHash)) {
+                throw new RuntimeException('Release publica ja existe com bytes divergentes.');
+            }
+        }
+    }
+
+    $atomicCopy(
+        $stagedPublic . '/account-assets.htaccess',
+        $publicRoot . '/account-assets/.htaccess'
+    );
+    $atomicCopy(
+        $stagedPublic . '/churchdaw-account.php',
+        $publicRoot . '/churchdaw-account.php'
+    );
+
+    $current = $accountHome . '/current';
+    if (file_exists($current) && !is_link($current)) {
+        throw new RuntimeException('current nao e um link simbolico.');
+    }
+    $next = $accountHome . '/.current-next-' . bin2hex(random_bytes(8));
+    if (!symlink($releaseRoot, $next)) {
+        throw new RuntimeException('Nao foi possivel preparar current.');
+    }
+    if (!rename($next, $current)) {
+        @unlink($next);
+        throw new RuntimeException('Nao foi possivel ativar current.');
+    }
+
+    $applied = $pdo->query(
+        'SELECT version FROM schema_migrations ORDER BY version'
+    )->fetchAll(PDO::FETCH_COLUMN);
+    $reply(200, [
+        'ok' => true,
+        'release' => $release,
+        'checkout_enabled' => false,
+        'database' => $isMariaDb ? 'MariaDB ' . $parsedVersion : 'MySQL ' . $parsedVersion,
+        'migrations' => $applied,
+        'assets_sha256' => [
+            'app.css' => hash_file('sha256', $assetSource . '/app.css'),
+            'app.js' => hash_file('sha256', $assetSource . '/app.js'),
+        ],
+    ]);
+} catch (Throwable $error) {
+    error_log('ChurchDAW deploy failed: ' . $error->getMessage());
+    $reply(500, [
+        'ok' => false,
+        'error' => 'DEPLOY_FAILED',
+        'message' => $error->getMessage(),
+    ]);
+}

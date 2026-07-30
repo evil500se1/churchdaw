@@ -1,0 +1,11 @@
+
+> Task :app:externalNativeBuildCleanDebug_Debug
+Clean juce_jni-arm64-v8a, oboe-arm64-v8a, cpufeatures-arm64-v8a
+Clean juce_jni-armeabi-v7a, oboe-armeabi-v7a, cpufeatures-armeabi-v7a
+Clean juce_jni-x86, oboe-x86, cpufeatures-x86
+Clean juce_jni-x86_64, oboe-x86_64, cpufeatures-x86_64
+
+> Task :app:externalNativeBuildCleanRelease_Release FAILED
+Clean juce_jni-arm64-v8a, oboe-arm64-v8a, cpufeatures-arm64-v8a
+C/C++: ninja: error: opening build log: Permission denied
+2 actionable tasks: 2 executed

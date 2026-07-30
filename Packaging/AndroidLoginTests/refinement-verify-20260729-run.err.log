@@ -1,0 +1,7 @@
+A tela de login nao ficou pronta em 35 segundos.
+No C:\Users\Administrator\MinhaDAW\Packaging\TestAndroidAdaptiveLogin.ps1:125 caractere:5
++     throw 'A tela de login nao ficou pronta em 35 segundos.'
++     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (A tela de login...em 35 segundos.:String) [], RuntimeException
+    + FullyQualifiedErrorId : A tela de login nao ficou pronta em 35 segundos.
+ 

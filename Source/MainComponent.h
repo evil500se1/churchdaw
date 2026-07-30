@@ -2,6 +2,11 @@
 
 #include <juce_audio_utils/juce_audio_utils.h>
 #include <juce_audio_processors/juce_audio_processors.h>
+#include "AppPaths.h"   // define CHURCHDAW_HOSTS_PLUGINS
+
+#if JUCE_ANDROID || JUCE_IOS
+ #include <juce_opengl/juce_opengl.h>
+#endif
 
 #include "MasterProcessor.h"
 #include "LevelMeter.h"
@@ -9,6 +14,8 @@
 #include "PadProcessor.h"
 #include "PadPanel.h"
 #include "LaunchkeyControl.h"
+#include "MidiLearnPanel.h"
+#include "MidiMappingSafety.h"
 #include "OledDisplay.h"
 
 #include <atomic>
@@ -49,14 +56,29 @@ public:
     juce::String getLoadingDetail() const;
     float getLoadingProgress() const;
 
+    // Botao BACK fisico do Android. Fecha a camada de cima (organ ->
+    // mixer; Audio/MIDI -> mixer; Bibliotecas -> mixer) e devolve true.
+    // False = nada aberto, o chamador decide se o app sai.
+    bool handleBackButton();
+
+    // O demo encerra com um fade do master antes de destruir o grafo. Nunca
+    // corte uma cauda de reverb ou nota sustentada na troca para o gate.
+    void beginLicenseFadeOut();
+
+    // Hot-plug, sleep/resume e troca de rota podem perder o pitch-wheel center
+    // ou um note-off. Recentraliza todos os 16 canais no proximo bloco.
+    void resetMidiTransportState();
+
 private:
     static constexpr int numFxSlots = 3;
     static constexpr int numSlots   = numFxSlots + 1;   // slot 0 = instrumento
 
     static constexpr int headerHeight    = 52;
+    static constexpr int mobileHeaderHeight = 38;
     // faixa propria do painel de programa, abaixo do cabecalho. Ele NAO e peca de
     // cabecalho: e um bloco centralizado, como o display no painel do Electro 7.
     static constexpr int programBandHeight = 152;   // +16 para o respiro interno do visor
+    static constexpr int mobileProgramBandHeight = 44;
     juce::Rectangle<int> programBand;   // chapa de chassi onde o visor se apoia
     juce::String programLibrary;        // biblioteca do canal em foco (serigrafia direita)
     static constexpr int slotsRowHeight  = 168;
@@ -79,13 +101,31 @@ private:
     };
 
     // ---- motor de audio ----
+   #if JUCE_ANDROID || JUCE_IOS
+    // DESENHO PELA GPU.
+    //
+    // Sem isto o JUCE rasteriza a janela inteira por SOFTWARE e envia o
+    // resultado como textura a cada quadro. Numa tela de 2460x1080 sao 10,6 MB
+    // por quadro. Medido no aparelho com dumpsys gfxinfo:
+    //
+    //     Janky frames: 261 de 261 (100%)
+    //     50o percentil: 250 ms por quadro     -> 4 FPS
+    //     Slow UI thread: 261      (todos)
+    //     Slow bitmap uploads: 261 (todos)
+    //     GPU: 3-4 ms              <- a GPU estava OCIOSA
+    //
+    // Era esta a lentidao ao navegar entre menus, e nao falta de maquina: o
+    // trabalho estava indo todo para a CPU enquanto a GPU nao fazia nada.
+    juce::OpenGLContext glContext;
+   #endif
+
     juce::AudioDeviceManager deviceManager;
 
-    // Reaplica as entradas habilitadas quando o sistema descobre, conecta ou
-    // remove um dispositivo MIDI depois da abertura do app.
+    // Reexecuta a habilitacao das entradas MIDI quando o sistema avisa que a
+    // lista mudou -- no Android a descoberta e assincrona e a lista esta VAZIA
+    // no momento em que o construtor pergunta.
     void refreshMidiInputs();
     juce::MidiDeviceListConnection midiListConnection;
-
     juce::AudioPluginFormatManager formatManager;
     juce::KnownPluginList knownPlugins;
     juce::AudioProcessorGraph graph;
@@ -108,12 +148,14 @@ private:
     juce::TextButton scanButton { "Plugins" };
     juce::TextButton saveButton { "Salvar" };
     juce::TextButton padButton { "Pad" };   // mostra/oculta o card do Pad Continuo
+    juce::TextButton librariesButton { "Bibliotecas" };
     std::unique_ptr<PadPanel> padPanel;     // card embutido (nao e janela separada)
     // ultima posicao do card do Pad setada por codigo: se a atual difere, o
     // usuario arrastou e o resized() nao pode re-centralizar
     juce::Rectangle<int> padPanelHome;
     std::unique_ptr<juce::Component> audioPanel;   // card Audio/MIDI embutido
     std::unique_ptr<juce::Component> aboutPanel;   // card "Sobre" (clique na marca)
+    std::unique_ptr<juce::Component> librariesPanel; // catalogo/download de packs
     bool brandHover = false;                       // marca do header sob o mouse
     juce::TextButton instrumentsButton { "Instrumentos" };   // volta da tela cheia do Church Live
     juce::ToggleButton inputToggle { "Entrada de audio (guitarra/mic)" };   // agora vive no dialogo Audio/MIDI
@@ -141,19 +183,31 @@ private:
     // (MASTER FX) — sem isso o BigSky ficava fora do alcance do MIDI Learn.
     // paramName e a ancora de verdade: o indice sozinho aponta pra "o parametro
     // numero N do que estiver ali", e isso muda quando o plugin do slot e trocado.
-    struct CCTarget { int slot = -2; int param = -1; int insert = -1; juce::String paramName; };
+    struct CCTarget
+    {
+        int slot = -2;
+        int param = -1;       // somente diagnostico/migracao; nunca resolve sozinho
+        int insert = -1;
+        juce::String paramName;
+        juce::String paramId; // ancora estavel entre versoes/reordenacoes
+    };
 
-    std::map<int, CCTarget> ccMappings;                   // numero do CC -> alvo
-    juce::CriticalSection mapLock;
+    using MidiControlKey = ChurchDAWMidiMapping::ControllerKey;
+    std::map<MidiControlKey, CCTarget> ccMappings;        // dispositivo + canal + CC -> alvo
+    mutable juce::CriticalSection mapLock;
     std::atomic<bool> midiLearnActive { false };
     std::atomic<int> lastTouchedSlot { -2 };
     std::atomic<int> lastTouchedParam { -1 };
     std::atomic<int> lastTouchedInsert { -1 };   // insert do Church Live tocado
     std::atomic<int> lastMappedCC { -1 };
+    MidiControlKey lastMappedKey;                         // protegido por mapLock
+    std::atomic<juce::uint32> lastMidiActivityMs { 0 };
+    std::atomic<juce::uint32> lastLearnedAtMs { 0 };
     std::atomic<juce::uint32> suppressTouchUntilMs { 0 }; // ignora "ecos" de parametro apos mapear/aplicar
     // era um bool cru: escrito na thread de mensagens e lido na thread de audio
     std::atomic<bool> applyingMappedCC { false };
     juce::String lastTouchedParamName;                    // protegido por mapLock
+    juce::String lastTouchedParamId;                      // protegido por mapLock
 
     // Launchkey em modo DAW: faders/knobs mapeados sozinhos + nome no visor
     std::unique_ptr<LaunchkeyControl> launchkey;
@@ -169,13 +223,89 @@ private:
 
     juce::TextButton mapButton { "Mapear MIDI" };
     juce::TextButton clearMapButton { "Limpar map." };
-    juce::Label learnStatus;
+    MidiLearnPanel midiLearnPanel;
+    bool clearMapConfirmationArmed = false;
+    int lastMidiDiagnosticCC = -1;
+    int lastMidiDiagnosticChannel = -1;
+    juce::String lastMidiDiagnosticSource;
+    int lastMidiDiagnosticState = -1;
+    juce::uint32 lastMidiDiagnosticMs = 0;
+    juce::uint32 lastLaunchkeyRetryMs = 0;
+
+    // Sombra do visor, desenhada uma vez.
+    //
+    // MEDIDO no TANK 3 (30/07/2026): MainComponent::paint custava 40,8 ms, e
+    // TimbresEditor::paint mais 24,1 -- os ~65 ms por quadro que davam os
+    // 15,3 fps medidos durante rolagem. DropShadow::drawForPath faz desfoque
+    // gaussiano NA CPU a cada pintura, e este e de raio 16.
+    //
+    // A forma e um retangulo arredondado que so muda quando o layout muda.
+    // Entao o desfoque passa a ser feito uma vez e o resultado e apenas
+    // copiado. Invalidacao: o proprio retangulo de origem.
+    juce::Image oledShadowCache;
+    juce::Rectangle<int> oledShadowSource;
+    static constexpr int oledShadowPad = 24;   // raio 16 + deslocamento 3 + folga
+
+    // Mesma historia para a sombra da chapa do icone: raio menor, area menor,
+    // mas ainda um desfoque de CPU por quadro. Chave inclui o raio porque ele
+    // muda entre header compacto e normal.
+    juce::Image iconShadowCache;
+    juce::Rectangle<int> iconShadowSource;
+    int iconShadowRadius = 0;
+    static constexpr int iconShadowPad = 16;
+
+    // Lista de entradas MIDI em cache.
+    //
+    // MEDIDO no TANK 3 (30/07/2026): timerCallback custava 158-189 ms POR
+    // SEGUNDO, e o timer e de 1 Hz -- ou seja, a interface congelava quase um
+    // quinto de cada segundo. A causa era chamar getAvailableDevices() DUAS
+    // vezes por tique: no Android isso atravessa JNI e faz o servico de MIDI do
+    // sistema enumerar o USB inteiro.
+    //
+    // Hot-plug continua funcionando: 4 s e mais rapido do que qualquer musico
+    // consegue plugar e tocar, e o laco de reabertura do Launchkey ja opera em
+    // 5 s. Quem some/aparece e detectado no proximo refresh.
+    juce::Array<juce::MidiDeviceInfo> cachedMidiInputs;
+    juce::uint32 cachedMidiInputsAtMs = 0;
+    static constexpr juce::uint32 midiInputCacheMs = 4000;
+
+    const juce::Array<juce::MidiDeviceInfo>& midiInputsCached (juce::uint32 nowMs)
+    {
+        if (cachedMidiInputsAtMs == 0
+             || nowMs - cachedMidiInputsAtMs >= midiInputCacheMs)
+        {
+            cachedMidiInputs = juce::MidiInput::getAvailableDevices();
+            cachedMidiInputsAtMs = nowMs;
+        }
+
+        return cachedMidiInputs;
+    }
+
+   #if JUCE_ANDROID
+    // O Android parte de 2 bursts (512 no TANK3) e so aumenta se o contador
+    // real de xruns confirmar falta de prazo. Mantido na message thread.
+    int androidLastXRunCount = 0;
+    juce::uint32 androidLastBufferTuneMs = 0;
+   #endif
 
     juce::Image brandIcon;
     juce::Label statusInfo;   // taxa / buffer / CPU / MIDI (agora dentro do visor)
     OledDisplay oled;             // visor de programa, como o OLED do Stage 4
 
     // geometria calculada no resized() e reaproveitada no paint()
+    int layoutHeaderHeight = headerHeight;
+    int layoutProgramBandHeight = programBandHeight;
+    int layoutBrandWidth = 228;
+    int layoutSafeLeft = 0;
+    int layoutSafeRight = 0;
+    int layoutSafeTop = 0;
+    int layoutSafeBottom = 0;
+    bool mobilePortraitLayout = false;
+    bool mobileShortLandscapeLayout = false;
+    bool compactHeaderLayout = false;
+    bool narrowHeaderLayout = false;
+    juce::Rectangle<int> layoutContentBounds;
+    juce::Rectangle<int> layoutDockHeaderBounds;
     juce::Rectangle<int> slotCardBounds[numSlots];
     juce::Rectangle<int> masterCardBounds;
     int slotsRowActual = slotsRowHeight;   // a fileira cresce quando sobra um card so
@@ -201,26 +331,33 @@ private:
     void componentMovedOrResized (juce::Component&, bool wasMoved, bool wasResized) override;
 
     void handleIncomingMidiMessage (juce::MidiInput*, const juce::MidiMessage&) override;
+    bool processControllerCC (int cc, int value,
+                              const juce::String& sourceId, int channel);
     void audioProcessorParameterChanged (juce::AudioProcessor*, int parameterIndex, float newValue) override;
     void audioProcessorChanged (juce::AudioProcessor*, const ChangeDetails&) override {}
     void handleAsyncUpdate() override;
     void timerCallback() override;
-    void applyCCTarget (CCTarget target, float value01, int ccNumber = -1);
+    void applyCCTarget (CCTarget target, float value01,
+                        MidiControlKey control = {});
+    juce::String describeCCTarget (const CCTarget&) const;
+    int getMidiMappingCount() const;
 
     // estado de pickup por CC: enquanto o fader fisico nao alcanca o valor atual
     // do parametro, o movimento e ignorado (evita salto no meio do louvor)
     struct CCPickup { float last = 0.0f; bool hasLast = false; bool engaged = false; };
-    std::map<int, CCPickup> ccPickup;             // exclusivo da message thread
+    std::map<MidiControlKey, CCPickup> ccPickup;  // exclusivo da message thread
     // a thread de MIDI nao mexe no map: pede o reset por aqui e o clear
     // (mapa inteiro — o slot unico coalesce pedidos) e no handleAsyncUpdate
     std::atomic<int> ccPickupToClear { -1 };
-    bool ccHasPickedUp (int cc, float incoming, float current);
+    bool ccHasPickedUp (const MidiControlKey&, float incoming, float current);
     void saveMidiMap();
     void restoreMidiMap();
 
     void rebuildGraphConnections();
     void showAudioSettings();
     void showAbout();
+    void showLibraries();
+    void rescanInstalledLibraries();
     juce::Rectangle<int> brandArea() const;   // area clicavel da marca no header
     void showPluginScanner();
     void showPadWindow();

@@ -1,0 +1,72 @@
+name: Release comercial macOS
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Tag imutavel no formato vMAJOR.MINOR.PATCH
+        required: true
+        type: string
+      confirmation:
+        description: Confirme que esta e uma release comercial
+        required: true
+        type: choice
+        default: CANCEL
+        options:
+          - CANCEL
+          - RELEASE
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-commercial-${{ inputs.release_tag }}
+  cancel-in-progress: false
+
+jobs:
+  release-macos:
+    if: inputs.confirmation == 'RELEASE'
+    name: Assinar, notarizar e verificar
+    runs-on: macos-14
+    timeout-minutes: 120
+    environment: macos-production
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      BUILD_NUMBER: ${{ github.run_number }}
+      EXPECTED_BUNDLE_ID: com.churchdaw.app
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
+      RELEASE_OUTPUT_ROOT: release-macos
+      MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+      MACOS_CERTIFICATE_P12_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_P12_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+      APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+      APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+
+    steps:
+      - name: Baixar exatamente a tag solicitada
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.release_tag }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Construir, assinar e notarizar sem atalhos
+        run: bash Packaging/MacRelease/release-macos.sh
+
+      - name: Publicar logs de auditoria
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ChurchDAW-macOS-release-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: release-macos/logs/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Publicar candidato comercial notarizado
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ChurchDAW-macOS-${{ inputs.release_tag }}-notarized
+          path: release-macos/artifacts/
+          if-no-files-found: error
+          retention-days: 30

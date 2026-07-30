@@ -1,0 +1,6 @@
+Options -Indexes
+AddType application/json .json
+<IfModule mod_headers.c>
+  Header set X-Content-Type-Options "nosniff"
+  Header set Cache-Control "no-store, max-age=0"
+</IfModule>

@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "package_id": "com.churchdaw.app",
+  "latest_version_code": 2,
+  "minimum_version_code": 1,
+  "latest_version_name": "1.2.0",
+  "update_message": "Manifesto de diagnostico local.",
+  "play_store_url": "https://play.google.com/store/apps/details?id=com.churchdaw.app",
+  "libraries": [
+    {
+      "id": "multipart-fixture",
+      "name": "Validador multipartes",
+      "description": "Fixture temporaria de duas partes usada pelo teste do instalador.",
+      "version": 1,
+      "version_name": "1.0",
+      "install_folder": "multipart-fixture",
+      "download_bytes": 1960,
+      "installed_bytes": 2820,
+      "parts": [
+        {
+          "download_url": "https://igoralbertoteixeiram1785096285554.0630537.meusitehostgator.com.br/app/android/packs/multipart-fixture-a-v2.zip",
+          "sha256": "02af829356b316a96b17e428f74906c1f164bdce8d21373fad6b75a7a8318c94",
+          "download_bytes": 796
+        },
+        {
+          "download_url": "https://igoralbertoteixeiram1785096285554.0630537.meusitehostgator.com.br/app/android/packs/multipart-fixture-b-v2.zip",
+          "sha256": "0671a84e68830e05f9b982704589a62d167cf232ec48e15d0bceffbc7666dc96",
+          "download_bytes": 1164
+        }
+      ],
+      "included": true,
+      "featured": true,
+      "price_label": "Diagnostico",
+      "purchase_url": ""
+    }
+  ]
+}

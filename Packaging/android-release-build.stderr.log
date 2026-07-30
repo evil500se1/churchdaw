@@ -1,0 +1,30 @@
+
+FAILURE: Build failed with an exception.
+
+* What went wrong:
+Execution failed for task ':app:externalNativeBuildCleanRelease_Release'.
+> com.android.ide.common.process.ProcessException: ninja: Entering directory `C:\Users\Administrator\MinhaDAW\Builds\Android\app\.cxx\RelWithDebInfo\397382d4\arm64-v8a'
+  
+  C++ build system [clean] failed while executing:
+      @echo off
+      "C:\\Users\\Administrator\\AppData\\Local\\Android\\Sdk\\cmake\\3.22.1\\bin\\ninja.exe" ^
+        -C ^
+        "C:\\Users\\Administrator\\MinhaDAW\\Builds\\Android\\app\\.cxx\\RelWithDebInfo\\397382d4\\arm64-v8a" ^
+        clean
+    from C:\Users\Administrator\MinhaDAW\Builds\Android\app
+  ninja: error: opening build log: Permission denied
+
+* Try:
+> Run with --stacktrace option to get the stack trace.
+> Run with --info or --debug option to get more log output.
+> Run with --scan to get full insights.
+> Get more help at https://help.gradle.org.
+
+BUILD FAILED in 2s
+A build Android terminou com codigo 1
+No C:\Users\Administrator\MinhaDAW\Packaging\BuildSignedAndroidRelease.ps1:38 caractere:13
++             throw "A build Android terminou com codigo $LASTEXITCODE"
++             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (A build Android terminou com codigo 1:String) [], RuntimeException
+    + FullyQualifiedErrorId : A build Android terminou com codigo 1
+ 

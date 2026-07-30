@@ -1,0 +1,2 @@
+CONFIGURACAO_ANDROID_OK package=com.churchdaw.app versionName=1.4.0 versionCode=4
+Starting a Gradle Daemon, 2 busy Daemons could not be reused, use --status for details

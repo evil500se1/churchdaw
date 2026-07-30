@@ -1,4 +1,9 @@
-#pragma once
+﻿#pragma once
+
+// EXPERIMENTO TEMPORARIO: 1 congela o desenho para medir quanto ele custa.
+#ifndef CHURCHDAW_UI_BISECT
+ #define CHURCHDAW_UI_BISECT 0
+#endif
 
 #include <juce_gui_basics/juce_gui_basics.h>
 
@@ -23,7 +28,19 @@ public:
           levelFn (std::move (levelSource)),
           clipFn (std::move (clipSource))
     {
+        // No celular o JUCE desenha por SOFTWARE, e a tela e grande (2460x1080).
+        // Medido com o app tocando: a thread da interface saturava um nucleo
+        // inteiro (100%) e o audio, que precisa de prazo, ficava sem CPU -- era
+        // essa a origem do pipoco, nao falta de memoria nem o streaming.
+        // 15 Hz ainda le como movimento continuo num medidor de nivel; 30 Hz e
+        // luxo de PC.
+       #if CHURCHDAW_UI_BISECT
+        // experimento: medidores congelados, para medir quanto eles custam
+       #elif JUCE_ANDROID || JUCE_IOS
+        startTimerHz (15);
+       #else
         startTimerHz (30);
+       #endif
     }
 
     void mouseDown (const juce::MouseEvent&) override
@@ -116,7 +133,7 @@ public:
             }
         }
 
-        // Escala: as marcas estavam a 14% de alpha — invisiveis, o medidor lia como
+        // Escala: as marcas estavam a 14% de alpha â€” invisiveis, o medidor lia como
         // um tubo cinza sem referencia. Agora dao pra ver, e o 0 dB (a linha que
         // realmente importa) tem peso e cor proprios.
         for (float mark : { 0.0f, -6.0f, -12.0f, -24.0f, -48.0f })

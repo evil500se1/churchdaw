@@ -1,0 +1,202 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<!-- Projeto do Projucer para os alvos MOVEIS (Android e, depois, iOS).
+
+     Por que existe este arquivo, se o projeto ja tem CMakeLists.txt:
+     o proprio JUCE avisa em docs/CMake API.md linha 6 que "Android targets are
+     not currently supported" pelo sistema CMake. Entao Windows/macOS continuam
+     saindo do CMake e o celular sai daqui. Os DOIS leem o mesmo Source/;
+     nao ha copia de codigo.
+
+     ATENCAO ao mexer no ANDROIDSTUDIO abaixo: o exemplo AudioPerformanceTest
+     que vem no JUCE traz extraCompilerFlags com "-mfpu=neon -mfloat-abi=hard
+     -mhard-float". Sao flags de ARM 32 BITS e o clang do NDK recusa em
+     arm64-v8a, que e o que todo celular atual usa. Nao copie de la. -->
+
+<JUCERPROJECT id="ChDW01" name="ChurchDAW" projectType="guiapp"
+              version="1.5.4" bundleIdentifier="com.churchdaw.app"
+              companyName="ChurchDAW" companyCopyright="ChurchDAW"
+              useAppConfig="0" addUsingNamespaceToJuceHeader="0"
+              jucerFormatVersion="1"
+              defines="CHURCHDAW_HOSTS_PLUGINS=0&#10;JUCE_PLUGINHOST_VST3=0&#10;JUCE_PLUGINHOST_AU=0&#10;JUCE_WEB_BROWSER=0&#10;JUCE_USE_CURL=0&#10;JUCE_PUSH_NOTIFICATIONS=0&#10;JUCE_USE_ANDROID_OBOE=1&#10;JUCE_USE_ANDROID_OBOE_STABILIZED_CALLBACK=0">
+  <MAINGROUP id="ChDWmg" name="ChurchDAW">
+    <GROUP id="ChDWsrc" name="Source">
+      <FILE id="srcMai" name="Main.cpp"             compile="1" resource="0" file="Source/Main.cpp"/>
+      <FILE id="srcMcp" name="MainComponent.cpp"    compile="1" resource="0" file="Source/MainComponent.cpp"/>
+      <FILE id="srcMch" name="MainComponent.h"      compile="0" resource="0" file="Source/MainComponent.h"/>
+      <FILE id="srcApp" name="AppPaths.h"           compile="0" resource="0" file="Source/AppPaths.h"/>
+      <FILE id="srcSvc" name="ChurchDAWServices.h"  compile="0" resource="0" file="Source/ChurchDAWServices.h"/>
+      <FILE id="srcSup" name="StartupPanel.h"       compile="0" resource="0" file="Source/StartupPanel.h"/>
+      <FILE id="srcLib" name="LibraryPanel.h"       compile="0" resource="0" file="Source/LibraryPanel.h"/>
+      <FILE id="srcTim" name="TimbresProcessor.h"   compile="0" resource="0" file="Source/TimbresProcessor.h"/>
+      <FILE id="srcCtn" name="ChannelToneShaper.h"  compile="0" resource="0" file="Source/ChannelToneShaper.h"/>
+      <FILE id="srcCrs" name="ChannelRotarySpeaker.h" compile="0" resource="0" file="Source/ChannelRotarySpeaker.h"/>
+      <FILE id="srcMms" name="MidiMappingSafety.h"  compile="0" resource="0" file="Source/MidiMappingSafety.h"/>
+      <FILE id="srcPms" name="PerformanceMidiSafety.h" compile="0" resource="0" file="Source/PerformanceMidiSafety.h"/>
+      <FILE id="srcStr" name="SampleStream.h"       compile="0" resource="0" file="Source/SampleStream.h"/>
+      <FILE id="srcRvb" name="WorshipReverb.h"      compile="0" resource="0" file="Source/WorshipReverb.h"/>
+      <FILE id="srcLim" name="StereoLookaheadLimiter.h" compile="0" resource="0" file="Source/StereoLookaheadLimiter.h"/>
+      <FILE id="srcMas" name="MasterProcessor.h"    compile="0" resource="0" file="Source/MasterProcessor.h"/>
+      <FILE id="srcPad" name="PadProcessor.h"       compile="0" resource="0" file="Source/PadProcessor.h"/>
+      <FILE id="srcPdp" name="PadPanel.h"           compile="0" resource="0" file="Source/PadPanel.h"/>
+      <FILE id="srcNrd" name="NordLookAndFeel.h"    compile="0" resource="0" file="Source/NordLookAndFeel.h"/>
+      <FILE id="srcTpk" name="TimbrePicker.h"       compile="0" resource="0" file="Source/TimbrePicker.h"/>
+      <FILE id="srcLvl" name="LevelMeter.h"         compile="0" resource="0" file="Source/LevelMeter.h"/>
+      <FILE id="srcDev" name="DeviceInfoBar.h"      compile="0" resource="0" file="Source/DeviceInfoBar.h"/>
+      <FILE id="srcLkc" name="LaunchkeyControl.h"   compile="0" resource="0" file="Source/LaunchkeyControl.h"/>
+      <FILE id="srcMlp" name="MidiLearnPanel.h"     compile="0" resource="0" file="Source/MidiLearnPanel.h"/>
+      <FILE id="srcOld" name="OledDisplay.h"        compile="0" resource="0" file="Source/OledDisplay.h"/>
+      <FILE id="srcAbt" name="AboutPanel.h"         compile="0" resource="0" file="Source/AboutPanel.h"/>
+      <FILE id="srcChd" name="ChordDetect.h"        compile="0" resource="0" file="Source/ChordDetect.h"/>
+      <GROUP id="ChDWorg" name="ChurchOrgan">
+        <FILE id="org001" name="AutoMixContext.cpp"          compile="1" resource="0" file="Source/ChurchOrgan/AutoMixContext.cpp"/>
+        <FILE id="org002" name="AutoMixContext.h"            compile="0" resource="0" file="Source/ChurchOrgan/AutoMixContext.h"/>
+        <FILE id="org003" name="ChurchOrganCore.cpp"         compile="1" resource="0" file="Source/ChurchOrgan/ChurchOrganCore.cpp"/>
+        <FILE id="org004" name="ChurchOrganCore.h"           compile="0" resource="0" file="Source/ChurchOrgan/ChurchOrganCore.h"/>
+        <FILE id="org005" name="ChurchOrganDesignTokens.h"   compile="0" resource="0" file="Source/ChurchOrgan/ChurchOrganDesignTokens.h"/>
+        <FILE id="org006" name="ChurchOrganEditor.cpp"       compile="1" resource="0" file="Source/ChurchOrgan/ChurchOrganEditor.cpp"/>
+        <FILE id="org007" name="ChurchOrganEditor.h"         compile="0" resource="0" file="Source/ChurchOrgan/ChurchOrganEditor.h"/>
+        <FILE id="org008" name="ChurchOrganLayout.cpp"       compile="1" resource="0" file="Source/ChurchOrgan/ChurchOrganLayout.cpp"/>
+        <FILE id="org009" name="ChurchOrganLayout.h"         compile="0" resource="0" file="Source/ChurchOrgan/ChurchOrganLayout.h"/>
+        <FILE id="org051" name="ChurchOrganLayerProcessor.cpp" compile="1" resource="0" file="Source/ChurchOrgan/ChurchOrganLayerProcessor.cpp"/>
+        <FILE id="org052" name="ChurchOrganLayerProcessor.h" compile="0" resource="0" file="Source/ChurchOrgan/ChurchOrganLayerProcessor.h"/>
+        <FILE id="org010" name="ChurchOrganTypes.h"          compile="0" resource="0" file="Source/ChurchOrgan/ChurchOrganTypes.h"/>
+        <FILE id="org011" name="HarmonicFoldback.cpp"        compile="1" resource="0" file="Source/ChurchOrgan/HarmonicFoldback.cpp"/>
+        <FILE id="org012" name="HarmonicFoldback.h"          compile="0" resource="0" file="Source/ChurchOrgan/HarmonicFoldback.h"/>
+        <FILE id="org013" name="HarmonicPercussion.cpp"      compile="1" resource="0" file="Source/ChurchOrgan/HarmonicPercussion.cpp"/>
+        <FILE id="org014" name="HarmonicPercussion.h"        compile="0" resource="0" file="Source/ChurchOrgan/HarmonicPercussion.h"/>
+        <FILE id="org015" name="KeyClickGenerator.cpp"       compile="1" resource="0" file="Source/ChurchOrgan/KeyClickGenerator.cpp"/>
+        <FILE id="org016" name="KeyClickGenerator.h"         compile="0" resource="0" file="Source/ChurchOrgan/KeyClickGenerator.h"/>
+        <FILE id="org017" name="MultiContactKeying.cpp"      compile="1" resource="0" file="Source/ChurchOrgan/MultiContactKeying.cpp"/>
+        <FILE id="org018" name="MultiContactKeying.h"        compile="0" resource="0" file="Source/ChurchOrgan/MultiContactKeying.h"/>
+        <FILE id="org019" name="OrganAmpCab.cpp"             compile="1" resource="0" file="Source/ChurchOrgan/OrganAmpCab.cpp"/>
+        <FILE id="org020" name="OrganAmpCab.h"               compile="0" resource="0" file="Source/ChurchOrgan/OrganAmpCab.h"/>
+        <FILE id="org021" name="OrganArticulationTypes.h"    compile="0" resource="0" file="Source/ChurchOrgan/OrganArticulationTypes.h"/>
+        <FILE id="org022" name="OrganDspUtilities.h"         compile="0" resource="0" file="Source/ChurchOrgan/OrganDspUtilities.h"/>
+        <FILE id="org023" name="OrganParameters.cpp"         compile="1" resource="0" file="Source/ChurchOrgan/OrganParameters.cpp"/>
+        <FILE id="org024" name="OrganParameters.h"           compile="0" resource="0" file="Source/ChurchOrgan/OrganParameters.h"/>
+        <FILE id="org025" name="OrganPresetState.cpp"        compile="1" resource="0" file="Source/ChurchOrgan/OrganPresetState.cpp"/>
+        <FILE id="org026" name="OrganPresetState.h"          compile="0" resource="0" file="Source/ChurchOrgan/OrganPresetState.h"/>
+        <FILE id="org027" name="PipeOrganEngine.cpp"         compile="1" resource="0" file="Source/ChurchOrgan/PipeOrganEngine.cpp"/>
+        <FILE id="org028" name="PipeOrganEngine.h"           compile="0" resource="0" file="Source/ChurchOrgan/PipeOrganEngine.h"/>
+        <FILE id="org029" name="PipeOrganTypes.h"            compile="0" resource="0" file="Source/ChurchOrgan/PipeOrganTypes.h"/>
+        <FILE id="org030" name="RotaryCabinet.cpp"           compile="1" resource="0" file="Source/ChurchOrgan/RotaryCabinet.cpp"/>
+        <FILE id="org031" name="RotaryCabinet.h"             compile="0" resource="0" file="Source/ChurchOrgan/RotaryCabinet.h"/>
+        <FILE id="org032" name="ScannerVibrato.cpp"          compile="1" resource="0" file="Source/ChurchOrgan/ScannerVibrato.cpp"/>
+        <FILE id="org033" name="ScannerVibrato.h"            compile="0" resource="0" file="Source/ChurchOrgan/ScannerVibrato.h"/>
+        <FILE id="org034" name="TonewheelBank.cpp"           compile="1" resource="0" file="Source/ChurchOrgan/TonewheelBank.cpp"/>
+        <FILE id="org035" name="TonewheelBank.h"             compile="0" resource="0" file="Source/ChurchOrgan/TonewheelBank.h"/>
+        <FILE id="org036" name="TonewheelCharacter.cpp"      compile="1" resource="0" file="Source/ChurchOrgan/TonewheelCharacter.cpp"/>
+        <FILE id="org037" name="TonewheelCharacter.h"        compile="0" resource="0" file="Source/ChurchOrgan/TonewheelCharacter.h"/>
+        <FILE id="org038" name="TonewheelOrganEngine.cpp"    compile="1" resource="0" file="Source/ChurchOrgan/TonewheelOrganEngine.cpp"/>
+        <FILE id="org039" name="TonewheelOrganEngine.h"      compile="0" resource="0" file="Source/ChurchOrgan/TonewheelOrganEngine.h"/>
+        <FILE id="org040" name="TransistorDividerBank.cpp"   compile="1" resource="0" file="Source/ChurchOrgan/TransistorDividerBank.cpp"/>
+        <FILE id="org041" name="TransistorDividerBank.h"     compile="0" resource="0" file="Source/ChurchOrgan/TransistorDividerBank.h"/>
+        <FILE id="org042" name="TransistorOrganEngine.cpp"   compile="1" resource="0" file="Source/ChurchOrgan/TransistorOrganEngine.cpp"/>
+        <FILE id="org043" name="TransistorOrganEngine.h"     compile="0" resource="0" file="Source/ChurchOrgan/TransistorOrganEngine.h"/>
+        <FILE id="org044" name="TransistorOrganTypes.h"      compile="0" resource="0" file="Source/ChurchOrgan/TransistorOrganTypes.h"/>
+        <GROUP id="ChDWoui" name="UI">
+          <FILE id="orgU01" name="ChurchOrganControls.cpp"   compile="1" resource="0" file="Source/ChurchOrgan/UI/ChurchOrganControls.cpp"/>
+          <FILE id="orgU02" name="ChurchOrganControls.h"     compile="0" resource="0" file="Source/ChurchOrgan/UI/ChurchOrganControls.h"/>
+          <FILE id="orgU03" name="ChurchOrganViewModel.h"    compile="0" resource="0" file="Source/ChurchOrgan/UI/ChurchOrganViewModel.h"/>
+        </GROUP>
+        <FILE id="org045" name="WorshipDspUtilities.h"       compile="0" resource="0" file="Source/ChurchOrgan/WorshipDspUtilities.h"/>
+        <FILE id="org046" name="WorshipHybridEngine.cpp"     compile="1" resource="0" file="Source/ChurchOrgan/WorshipHybridEngine.cpp"/>
+        <FILE id="org047" name="WorshipHybridEngine.h"       compile="0" resource="0" file="Source/ChurchOrgan/WorshipHybridEngine.h"/>
+        <FILE id="org048" name="WorshipLayerEngine.cpp"      compile="1" resource="0" file="Source/ChurchOrgan/WorshipLayerEngine.cpp"/>
+        <FILE id="org049" name="WorshipLayerEngine.h"        compile="0" resource="0" file="Source/ChurchOrgan/WorshipLayerEngine.h"/>
+        <FILE id="org050" name="WorshipLayerTypes.h"         compile="0" resource="0" file="Source/ChurchOrgan/WorshipLayerTypes.h"/>
+      </GROUP>
+    </GROUP>
+    <GROUP id="ChDWast" name="Assets">
+      <FILE id="astIco" name="icon.png"           compile="0" resource="1" file="Assets/icon.png"/>
+      <FILE id="astAnd" name="icon-android.png"   compile="0" resource="1" file="Assets/icon-android.png"/>
+      <FILE id="astAui" name="app-icon-512.png"   compile="0" resource="1" file="Packaging/PlayStore/app-icon-512.png"/>
+      <FILE id="astLgo" name="logo_round.png"     compile="0" resource="1" file="Assets/logo_round.png"/>
+      <FILE id="astGpi" name="glyph_piano.png"    compile="0" resource="1" file="Assets/glyph_piano.png"/>
+      <FILE id="astGpa" name="glyph_pad.png"      compile="0" resource="1" file="Assets/glyph_pad.png"/>
+      <FILE id="astGor" name="glyph_organ.png"    compile="0" resource="1" file="Assets/glyph_organ.png"/>
+      <FILE id="astGst" name="glyph_strings.png"  compile="0" resource="1" file="Assets/glyph_strings.png"/>
+      <FILE id="astGam" name="glyph_ambience.png" compile="0" resource="1" file="Assets/glyph_ambience.png"/>
+      <FILE id="astGbe" name="glyph_bells.png"    compile="0" resource="1" file="Assets/glyph_bells.png"/>
+      <FILE id="astGle" name="glyph_lead.png"     compile="0" resource="1" file="Assets/glyph_lead.png"/>
+    </GROUP>
+  </MAINGROUP>
+  <EXPORTFORMATS>
+    <!-- javaopt/app fornece com.rmsl.juce.Receiver, que o Projucer registra
+         incondicionalmente no Manifest. ChurchDAWActivity NAO herda da
+         JuceActivity desse diretorio: sem push, a base correta e Activity. -->
+    <ANDROIDSTUDIO targetFolder="Builds/Android"
+                   androidActivitySubClassName="com.churchdaw.app.ChurchDAWActivity"
+                   androidAdditionalJavaFolders="Source/AndroidJava&#10;JUCE/modules/juce_gui_basics/native/javaopt/app"
+                   androidCpp11="1"
+                   androidMinimumSDK="24"
+                   androidTargetSDK="36"
+                   androidVersionCode="10"
+                   androidInternetNeeded="1"
+                   androidReadMediaAudioPermission="1"
+                   androidReadMediaImagesPermission="0"
+                   androidReadMediaVideoPermission="0"
+                   androidExternalWriteNeeded="0"
+                   androidPushNotifications="0"
+                   androidScreenOrientation="unspecified"
+                   androidTheme="@android:style/Theme.Black.NoTitleBar.Fullscreen"
+                   bigIcon="astAnd"
+                   smallIcon="astAnd"
+                   androidDependencies=""
+                   androidCustomAppBuildGradleContent="&#10;    // A distribuicao e feita pelo churchdaw.com. A chave de release fica fora&#10;    // do projeto; sem as credenciais o Gradle nunca assina um APK de producao.&#10;    def churchStore = System.getenv(&quot;CHURCHDAW_UPLOAD_STORE_FILE&quot;)&#10;    def churchStorePass = System.getenv(&quot;CHURCHDAW_UPLOAD_STORE_PASSWORD&quot;)&#10;    def churchKeyAlias = System.getenv(&quot;CHURCHDAW_UPLOAD_KEY_ALIAS&quot;)&#10;    def churchKeyPass = System.getenv(&quot;CHURCHDAW_UPLOAD_KEY_PASSWORD&quot;)&#10;    if (churchStore &amp;&amp; churchStorePass &amp;&amp; churchKeyAlias &amp;&amp; churchKeyPass) {&#10;        signingConfigs.create(&quot;churchDawWebRelease&quot;) {&#10;            storeFile(file(churchStore))&#10;            storePassword(churchStorePass)&#10;            keyAlias(churchKeyAlias)&#10;            keyPassword(churchKeyPass)&#10;            storeType(&quot;jks&quot;)&#10;        }&#10;        buildTypes.release.signingConfig = signingConfigs.churchDawWebRelease&#10;    } else {&#10;        buildTypes.release.signingConfig = null&#10;    }&#10;"
+                   extraCompilerFlags="-funroll-loops"
+                   androidManifestCustomXmlElements="&#10;&lt;manifest&gt;&#10;  &lt;!-- SEM ESTA LINHA O TECLADO NAO TOCA. O Android so entrega dispositivos&#10;       MIDI a um app que declara a feature; sem ela o MidiManager devolve&#10;       lista VAZIA, sem erro nenhum -- o app abre, o timbre carrega, e apertar&#10;       a tecla nao faz nada. Foi exatamente o sintoma no aparelho. --&gt;&#10;  &lt;uses-feature android:name=&quot;android.software.midi&quot; android:required=&quot;true&quot; /&gt;&#10;  &lt;uses-feature android:name=&quot;android.hardware.usb.host&quot; android:required=&quot;false&quot; /&gt;&#10;  &lt;!-- INTERNET faz o JUCE declarar multicast; torne Wi-Fi opcional para nao&#10;       excluir tablets Android com outra conectividade na Play Store. --&gt;&#10;  &lt;uses-feature android:name=&quot;android.hardware.wifi&quot; android:required=&quot;false&quot; /&gt;&#10;  &lt;!-- Libraries pode ocupar dezenas de GB e nunca deve entrar em Auto Backup.&#10;       O icone adaptativo e a fonte oficial do launcher; o roundIcon usa a mesma&#10;       arte para respeitar a mascara escolhida pelo fabricante. --&gt;&#10;  &lt;application android:allowBackup=&quot;false&quot; android:fullBackupContent=&quot;false&quot;&#10;               android:icon=&quot;@mipmap/ic_launcher&quot;&#10;               android:roundIcon=&quot;@mipmap/ic_launcher&quot; /&gt;&#10;&lt;/manifest&gt;&#10;">
+      <CONFIGURATIONS>
+        <CONFIGURATION name="Debug"   isDebug="1" targetName="ChurchDAW"
+                       androidArchitectures="arm64-v8a"
+                       androidAdditionalDrawableResources="Packaging/AndroidResources/drawable-xxhdpi"/>
+        <CONFIGURATION name="Release" isDebug="0" optimisation="5" targetName="ChurchDAW"
+                       androidArchitectures="arm64-v8a"
+                       androidAdditionalDrawableResources="Packaging/AndroidResources/drawable-xxhdpi"/>
+      </CONFIGURATIONS>
+      <MODULEPATHS>
+        <MODULEPATH id="juce_core"                      path="JUCE/modules"/>
+        <MODULEPATH id="juce_cryptography"              path="JUCE/modules"/>
+        <MODULEPATH id="juce_events"                    path="JUCE/modules"/>
+        <MODULEPATH id="juce_graphics"                  path="JUCE/modules"/>
+        <MODULEPATH id="juce_data_structures"           path="JUCE/modules"/>
+        <MODULEPATH id="juce_gui_basics"                path="JUCE/modules"/>
+        <MODULEPATH id="juce_gui_extra"                 path="JUCE/modules"/>
+        <MODULEPATH id="juce_audio_basics"              path="JUCE/modules"/>
+        <MODULEPATH id="juce_audio_devices"             path="JUCE/modules"/>
+        <MODULEPATH id="juce_audio_formats"             path="JUCE/modules"/>
+        <MODULEPATH id="juce_audio_processors"          path="JUCE/modules"/>
+        <MODULEPATH id="juce_audio_processors_headless" path="JUCE/modules"/>
+        <MODULEPATH id="juce_audio_utils"               path="JUCE/modules"/>
+        <MODULEPATH id="juce_dsp"                       path="JUCE/modules"/>
+        <MODULEPATH id="juce_opengl"                    path="JUCE/modules"/>
+      </MODULEPATHS>
+    </ANDROIDSTUDIO>
+  </EXPORTFORMATS>
+  <MODULES>
+    <MODULE id="juce_audio_basics"              showAllCode="1" useLocalCopy="0"/>
+    <MODULE id="juce_audio_devices"             showAllCode="1" useLocalCopy="0"/>
+    <MODULE id="juce_audio_formats"             showAllCode="1" useLocalCopy="0"/>
+    <MODULE id="juce_audio_processors"          showAllCode="1" useLocalCopy="0"/>
+    <MODULE id="juce_audio_processors_headless" showAllCode="1" useLocalCopy="0"/>
+    <MODULE id="juce_audio_utils"               showAllCode="1" useLocalCopy="0"/>
+    <MODULE id="juce_core"                      showAllCode="1" useLocalCopy="0"/>
+    <MODULE id="juce_cryptography"              showAllCode="1" useLocalCopy="0"/>
+    <MODULE id="juce_data_structures"           showAllCode="1" useLocalCopy="0"/>
+    <MODULE id="juce_dsp"                       showAllCode="1" useLocalCopy="0"/>
+    <MODULE id="juce_events"                    showAllCode="1" useLocalCopy="0"/>
+    <MODULE id="juce_graphics"                  showAllCode="1" useLocalCopy="0"/>
+    <MODULE id="juce_gui_basics"                showAllCode="1" useLocalCopy="0"/>
+    <MODULE id="juce_gui_extra"                 showAllCode="1" useLocalCopy="0"/>
+    <MODULE id="juce_opengl"                    showAllCode="1" useLocalCopy="0"/>
+  </MODULES>
+  <JUCEOPTIONS JUCE_WEB_BROWSER="0"
+               JUCE_USE_CURL="0"
+               JUCE_PUSH_NOTIFICATIONS="0"
+               JUCE_PLUGINHOST_VST3="0"
+               JUCE_PLUGINHOST_AU="0"
+               JUCE_USE_ANDROID_OBOE="1"
+               JUCE_USE_ANDROID_OBOE_STABILIZED_CALLBACK="0"/>
+  <LIVE_SETTINGS/>
+</JUCERPROJECT>

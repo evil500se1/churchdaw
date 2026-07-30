@@ -1,0 +1,18 @@
+<?php
+
+declare(strict_types=1);
+
+spl_autoload_register(static function (string $class): void {
+    $prefix = 'ChurchDAW\\Licensing\\';
+    if (!str_starts_with($class, $prefix)) {
+        return;
+    }
+    $relative = substr($class, strlen($prefix));
+    $path = __DIR__ . '/' . str_replace('\\', '/', $relative) . '.php';
+    if (is_file($path)) {
+        require $path;
+    }
+});
+
+// Arquivos que agrupam tipos pequenos e intencionalmente relacionados.
+require_once __DIR__ . '/Http.php';

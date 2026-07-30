@@ -1,0 +1,30 @@
+﻿07-29 11:38:57.605  4630  4630 I GoogleInputMethodService: GoogleInputMethodService.onStartInput():1460 onStartInput(EditorInfo{EditorInfo{packageName=com.churchdaw.app, inputType=0, inputTypeString=NULL, enableLearning=false, autoCorrection=false, autoComplete=false, imeOptions=50000000, privateImeOptions=null, actionName=UNSPECIFIED, actionLabel=, initialSelStart=-1, initialSelEnd=-1, initialCapsMode=0, label=, fieldId=-1, fieldName=null, extras=null, hintText=empty, hintLocales=[]}}, true)
+07-29 11:38:57.610  1770  1784 W PackageConfigPersister: App-specific configuration not found for packageName: com.churchdaw.app and userId: 0
+07-29 11:38:57.704  4630  4630 I GoogleInputMethodService: GoogleInputMethodService.onStartInput():1460 onStartInput(EditorInfo{EditorInfo{packageName=com.churchdaw.app, inputType=0, inputTypeString=NULL, enableLearning=false, autoCorrection=false, autoComplete=false, imeOptions=50000000, privateImeOptions=null, actionName=UNSPECIFIED, actionLabel=, initialSelStart=-1, initialSelEnd=-1, initialCapsMode=0, label=, fieldId=-1, fieldName=null, extras=null, hintText=empty, hintLocales=[]}}, true)
+07-29 11:38:57.705  1770  1784 W PackageConfigPersister: App-specific configuration not found for packageName: com.churchdaw.app and userId: 0
+07-29 11:38:57.706  1193  1193 I BufferQueueProducer: [com.churchdaw.app/com.churchdaw.app.ChurchDAWActivity#17148](this:0xb400007ec8564828,id:-1,api:0,p:-1,c:1193) queueBuffer: fps=0.01 dur=577608.99 max=577130.74 min=49.49
+07-29 11:38:58.149  1186  1312 I libPowerHal: [perfNotifyAppState] pack:com.churchdaw.app, act:com.churchdaw.app.ChurchDAWActivity, state:5, pid:9644, uid:10275, fps:60
+07-29 11:38:58.149  1186  1312 E UxUtility: notifyAppState error = NULL
+07-29 11:38:58.149  1186  1312 I TouchUtility: notifyAppState error = NULL
+07-29 11:38:59.149  1186  1312 I libPowerHal: [perfNotifyAppState] pack:com.churchdaw.app, act:com.churchdaw.app.ChurchDAWActivity, state:5, pid:9644, uid:10275, fps:-1
+07-29 11:38:59.149  1186  1312 E UxUtility: notifyAppState error = NULL
+07-29 11:38:59.149  1186  1312 I TouchUtility: notifyAppState error = NULL
+07-29 11:39:09.802 11042 11042 I adbd    : adbd service requested 'shell,v2,raw:uiautomator dump /sdcard/library-after-tap.xml'
+07-29 11:39:09.895  9854  9854 I AndroidRuntime: Using default boot image
+07-29 11:39:09.895  9854  9854 I AndroidRuntime: Leaving lock profiling enabled
+07-29 11:39:09.991  9854  9854 W libc    : Access denied finding property "ro.product.name_for_attestation"
+07-29 11:39:09.991  9854  9854 W libc    : Access denied finding property "ro.product.brand_for_attestation"
+07-29 11:39:09.991  9854  9854 W libc    : Access denied finding property "ro.product.model_for_attestation"
+07-29 11:39:09.992  9854  9854 W libc    : Access denied finding property "ro.vendor.mtk.hbt_binfmt_misc_support"
+07-29 11:39:09.992  9854  9854 W libc    : Access denied finding property "ro.vendor.mtk.hbt_dyn_type"
+07-29 11:39:09.986  9854  9854 W main    : type=1400 audit(0.0:601816): avc:  denied  { read } for  name="u:object_r:build_attestation_prop:s0" dev="tmpfs" ino=115 scontext=u:r:shell:s0 tcontext=u:object_r:build_attestation_prop:s0 tclass=file permissive=0
+07-29 11:39:09.992  9854  9854 W libc    : Access denied finding property "persist.vendor.mtk.hbt_dyn_type"
+07-29 11:39:09.986  9854  9854 W main    : type=1400 audit(0.0:601817): avc:  denied  { read } for  name="u:object_r:build_attestation_prop:s0" dev="tmpfs" ino=115 scontext=u:r:shell:s0 tcontext=u:object_r:build_attestation_prop:s0 tclass=file permissive=0
+07-29 11:39:09.986  9854  9854 W main    : type=1400 audit(0.0:601818): avc:  denied  { read } for  name="u:object_r:build_attestation_prop:s0" dev="tmpfs" ino=115 scontext=u:r:shell:s0 tcontext=u:object_r:build_attestation_prop:s0 tclass=file permissive=0
+07-29 11:39:09.986  9854  9854 W main    : type=1400 audit(0.0:601819): avc:  denied  { read } for  name="u:object_r:system_mtk_app32_boost_prop:s0" dev="tmpfs" ino=335 scontext=u:r:shell:s0 tcontext=u:object_r:system_mtk_app32_boost_prop:s0 tclass=file permissive=0
+07-29 11:39:09.986  9854  9854 W main    : type=1400 audit(0.0:601820): avc:  denied  { read } for  name="u:object_r:system_mtk_app32_boost_prop:s0" dev="tmpfs" ino=335 scontext=u:r:shell:s0 tcontext=u:object_r:system_mtk_app32_boost_prop:s0 tclass=file permissive=0
+07-29 11:39:11.036  9854  9854 W libc    : Access denied finding property "qemu.sf.lcd_density"
+07-29 11:39:11.036  9854  9854 W libc    : Access denied finding property "qemu.sf.lcd_density"
+07-29 11:39:11.034  9854  9854 W uiautomator: type=1400 audit(0.0:601822): avc:  denied  { read } for  name="u:object_r:qemu_sf_lcd_density_prop:s0" dev="tmpfs" ino=293 scontext=u:r:shell:s0 tcontext=u:object_r:qemu_sf_lcd_density_prop:s0 tclass=file permissive=0
+07-29 11:39:11.034  9854  9854 W uiautomator: type=1400 audit(0.0:601823): avc:  denied  { read } for  name="u:object_r:qemu_sf_lcd_density_prop:s0" dev="tmpfs" ino=293 scontext=u:r:shell:s0 tcontext=u:object_r:qemu_sf_lcd_density_prop:s0 tclass=file permissive=0
+07-29 11:39:12.019 11042 11042 I adbd    : adbd service requested 'shell,v2,raw:screencap -p /sdcard/library-after-tap.png'

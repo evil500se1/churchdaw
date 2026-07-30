@@ -5,6 +5,8 @@
 
 #include <atomic>
 
+#include "StereoLookaheadLimiter.h"
+
 //==============================================================================
 // No de master do grafo: aplica o volume geral (com suavizacao) e mede os
 // niveis de pico de cada canal para os medidores da interface.
@@ -63,6 +65,16 @@ public:
 
     bool readAndResetClip() noexcept            { return clipped.exchange (false); }
 
+    float getLimiterGainReductionDb() const noexcept
+    {
+        return masterLimiter.getCurrentGainReductionDb();
+    }
+
+    uint64_t getLimiterEmergencyCorrectionCount() const noexcept
+    {
+        return masterLimiter.getEmergencyCorrectionCount();
+    }
+
     //==============================================================================
     const juce::String getName() const override { return "Master"; }
 
@@ -99,8 +111,8 @@ public:
 
         // peso no grave + limpeza da lama (para nao embolar)
         juce::dsp::IIR::Coefficients<float>::Ptr wc[2] = {
-            C::makeLowShelf  (sampleRate, 90.0f,  0.7f, dB (2.5f)),   // peso/corpo
-            C::makePeakFilter (sampleRate, 320.0f, 1.2f, dB (-1.8f))  // tira a lama
+            C::makeLowShelf  (sampleRate, 90.0f,  0.7f, dB (3.0f)),   // peso/corpo
+            C::makePeakFilter (sampleRate, 320.0f, 1.2f, dB (-2.0f))  // tira a lama
         };
 
         for (int ch = 0; ch < 2; ++ch)
@@ -118,13 +130,19 @@ public:
 
         const juce::dsp::ProcessSpec stereoSpec { sampleRate, (juce::uint32) block, 2 };
         punchComp.prepare (stereoSpec);
-        punchComp.setThreshold (-24.0f);
-        punchComp.setRatio (4.0f);
+        punchComp.setThreshold (-21.0f);
+        punchComp.setRatio (3.5f);
         punchComp.setAttack (12.0f);
         punchComp.setRelease (140.0f);
+
+        masterLimiter.prepare (sampleRate, block);
+        setLatencySamples (masterLimiter.getLatencySamples());
     }
 
-    void releaseResources() override {}
+    void releaseResources() override
+    {
+        masterLimiter.reset();
+    }
 
     bool isBusesLayoutSupported (const BusesLayout& layouts) const override
     {
@@ -155,36 +173,50 @@ public:
         if (punchOn.load())
         {
             const int chs = juce::jmin (2, buffer.getNumChannels());
+            const int scratchCapacity = punchBuf.getNumSamples();
 
-            if (punchBuf.getNumSamples() < numSamples)
-                punchBuf.setSize (2, numSamples, false, false, true);
-
-            // caminho paralelo: copia + HPF (tira sub do compressor)
-            for (int ch = 0; ch < chs; ++ch)
+            // O driver pode entregar ocasionalmente um bloco maior que o
+            // informado no prepareToPlay. Processamos em fatias do scratch ja
+            // reservado; nunca redimensionamos/alocamos na thread de audio.
+            for (int offset = 0;
+                 chs > 0 && scratchCapacity > 0 && offset < numSamples;
+                 offset += scratchCapacity)
             {
-                punchBuf.copyFrom (ch, 0, buffer, ch, 0, numSamples);
-                float* p = punchBuf.getWritePointer (ch);
+                const int count =
+                    juce::jmin (scratchCapacity, numSamples - offset);
 
-                for (int s = 0; s < numSamples; ++s)
-                    p[s] = punchHp[ch].processSample (p[s]);
-            }
+                // caminho paralelo: copia + HPF (tira sub do compressor)
+                for (int ch = 0; ch < chs; ++ch)
+                {
+                    punchBuf.copyFrom (
+                        ch, 0, buffer, ch, offset, count);
+                    float* p = punchBuf.getWritePointer (ch);
 
-            // compressao forte no paralelo (soco)
-            {
-                juce::dsp::AudioBlock<float> blk (punchBuf.getArrayOfWritePointers(), (size_t) chs, (size_t) numSamples);
-                juce::dsp::ProcessContextReplacing<float> ctx (blk);
-                punchComp.process (ctx);
-            }
+                    for (int s = 0; s < count; ++s)
+                        p[s] = punchHp[ch].processSample (p[s]);
+                }
 
-            // saturacao suave (harmonicos = peso que traduz em qualquer caixa)
-            // + mistura paralela de volta ao seco (mantem a dinamica original)
-            for (int ch = 0; ch < chs; ++ch)
-            {
-                const float* p = punchBuf.getReadPointer (ch);
-                float* d = buffer.getWritePointer (ch);
+                // compressao forte no paralelo (soco)
+                {
+                    juce::dsp::AudioBlock<float> blk (
+                        punchBuf.getArrayOfWritePointers(),
+                        (size_t) chs, (size_t) count);
+                    juce::dsp::ProcessContextReplacing<float> ctx (blk);
+                    punchComp.process (ctx);
+                }
 
-                for (int s = 0; s < numSamples; ++s)
-                    d[s] += std::tanh (p[s] * 1.6f) * 0.30f;
+                // saturacao suave (harmonicos = peso que traduz em qualquer
+                // caixa) + mistura paralela de volta ao seco.
+                for (int ch = 0; ch < chs; ++ch)
+                {
+                    const float* p = punchBuf.getReadPointer (ch);
+                    float* d = buffer.getWritePointer (ch, offset);
+
+                    for (int s = 0; s < count; ++s)
+                    // Saturação paralela mais agressiva para recuperar peso,
+                    // mantendo a percussividade sem estourar.
+                    d[s] += std::tanh (p[s] * 1.95f) * 0.45f;
+                }
             }
 
             // peso no grave + limpeza da lama para nao embolar
@@ -205,6 +237,21 @@ public:
         const float end = gain.getCurrentValue();
         buffer.applyGainRamp (0, numSamples, start, end);
 
+        // Quando o controle principal está no máximo, o caminho de retorno do
+        // punch tende a ficar menos presente em salas pequenas. Esta etapa de
+        // "pré-master" adiciona densidade sem destruir headroom do limiter.
+        if (punchOn.load())
+            buffer.applyGain (juce::Decibels::decibelsToGain (1.0f));
+
+        for (int ch = 0; ch < juce::jmin (2, buffer.getNumChannels()); ++ch)
+            if (buffer.getMagnitude (ch, 0, numSamples) > 1.0f)
+                clipped.store (true);
+
+        // Ultimo estagio antes da saida fisica. O lookahead stereo-linked
+        // preserva o ataque do piano e impede que Return/Master no maximo
+        // virem clipping digital/chiado no DAC do Android.
+        masterLimiter.process (buffer);
+
         for (int ch = 0; ch < juce::jmin (2, buffer.getNumChannels()); ++ch)
         {
             const float peak = buffer.getMagnitude (ch, 0, numSamples);
@@ -212,8 +259,6 @@ public:
             float current = levels[ch].load();
             while (peak > current && ! levels[ch].compare_exchange_weak (current, peak)) {}
 
-            if (peak > 1.0f)
-                clipped.store (true);
         }
     }
 
@@ -238,12 +283,15 @@ private:
     std::atomic<float> levels[2] { 0.0f, 0.0f };
     std::atomic<bool> clipped { false };
     std::atomic<bool> autoEqOn { false };
-    std::atomic<bool> punchOn { false };
+    // Novos setups ja abrem com o corpo worship calibrado. Projetos salvos
+    // continuam restaurando explicitamente a escolha do usuario.
+    std::atomic<bool> punchOn { true };
     juce::dsp::IIR::Filter<float> eq[2][numBands];
     juce::dsp::IIR::Filter<float> weightEq[2][2], punchHp[2];
     juce::dsp::Compressor<float> punchComp;
     juce::AudioBuffer<float> punchBuf;
     juce::SmoothedValue<float> gain { 1.0f };
+    StereoLookaheadLimiter masterLimiter;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MasterProcessor)
 };

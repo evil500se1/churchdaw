@@ -1,0 +1,8 @@
+Primeira versão do ChurchDAW para Android na Google Play.
+
+• Performance com até cinco canais de pianos, pads e camadas.
+• Reverb worship nativo com 12 ambientes, envio por canal e retorno master.
+• Mapeamento MIDI e controles de master.
+• Church Live disponível como download opcional.
+• Instalador com retomada e verificação de integridade.
+• Atualizações de compatibilidade pelo fluxo oficial da Google Play.

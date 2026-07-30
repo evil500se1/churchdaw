@@ -1,0 +1,246 @@
+﻿--------- beginning of main
+I/JUCE    (28523): AUDIO: media 22.6%  pico 56.8%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.23x  | PICO -20.9 dBFS  | VOZES 6.16566%  FX 16.0704%  | FALHA-STREAM 0  | vozes 5
+I/JUCE    (28523): AUDIO: media 20.7%  pico 43.8%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.28x  | PICO -29.4 dBFS  | VOZES 2.65193%  FX 17.7578%  | FALHA-STREAM 0  | vozes 7
+I/JUCE    (28523): LAUNCHKEY: porta DAW ainda nao disponivel
+I/JUCE    (28523): AUDIO: media 22.1%  pico 45.2%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.22x  | PICO -27.2 dBFS  | VOZES 4.75761%  FX 16.9668%  | FALHA-STREAM 0  | vozes 10
+I/JUCE    (28523): AUDIO: media 22.9%  pico 67.2%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.23x  | PICO -23.7 dBFS  | VOZES 5.52008%  FX 16.9854%  | FALHA-STREAM 0  | vozes 15
+I/JUCE    (28523): AUDIO: media 24.0%  pico 47.9%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.33x  | PICO -21.8 dBFS  | VOZES 6.28285%  FX 17.3741%  | FALHA-STREAM 0  | vozes 18
+I/JUCE    (28523): AUDIO: media 26.9%  pico 52.3%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.24x  | PICO -20.4 dBFS  | VOZES 8.55409%  FX 17.9583%  | FALHA-STREAM 0  | vozes 20
+I/JUCE    (28523): AUDIO: media 24.6%  pico 55.6%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.22x  | PICO -19.9 dBFS  | VOZES 8.36779%  FX 15.9353%  | FALHA-STREAM 0  | vozes 25
+I/JUCE    (28523): LAUNCHKEY: porta DAW ainda nao disponivel
+I/JUCE    (28523): AUDIO: media 24.8%  pico 55.0%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.26x  | PICO -19.8 dBFS  | VOZES 8.8515%  FX 15.6522%  | FALHA-STREAM 0  | vozes 27
+I/JUCE    (28523): AUDIO: media 30.8%  pico 57.8%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.25x  | PICO -20.2 dBFS  | VOZES 12.3707%  FX 18.0778%  | FALHA-STREAM 0  | vozes 30
+I/JUCE    (28523): AUDIO: media 21.7%  pico 67.1%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.28x  | PICO -18.9 dBFS  | VOZES 8.54781%  FX 12.811%  | FALHA-STREAM 0  | vozes 5
+I/JUCE    (28523): AUDIO: media 21.8%  pico 42.3%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.27x  | PICO -30.6 dBFS  | VOZES 2.87603%  FX 18.5748%  | FALHA-STREAM 0  | vozes 5
+I/JUCE    (28523): AUDIO: media 19.6%  pico 64.1%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.31x  | PICO -28.7 dBFS  | VOZES 3.65545%  FX 15.6103%  | FALHA-STREAM 0  | vozes 10
+I/JUCE    (28523): AUDIO: media 21.1%  pico 44.5%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.19x  | PICO -26.6 dBFS  | VOZES 4.32287%  FX 16.4715%  | FALHA-STREAM 0  | vozes 12
+I/JUCE    (28523): LAUNCHKEY: porta DAW ainda nao disponivel
+I/JUCE    (28523): AUDIO: media 23.4%  pico 48.4%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.18x  | PICO -23.9 dBFS  | VOZES 6.39435%  FX 16.6221%  | FALHA-STREAM 0  | vozes 15
+I/JUCE    (28523): AUDIO: media 17.8%  pico 51.2%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.19x  | PICO -23.1 dBFS  | VOZES 5.30236%  FX 12.2217%  | FALHA-STREAM 0  | vozes 20
+I/JUCE    (28523): AUDIO: media 23.3%  pico 52.7%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.26x  | PICO -19.6 dBFS  | VOZES 7.21755%  FX 15.8074%  | FALHA-STREAM 0  | vozes 23
+I/JUCE    (28523): AUDIO: media 32.4%  pico 54.3%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.24x  | PICO -20.0 dBFS  | VOZES 11.8575%  FX 20.1037%  | FALHA-STREAM 0  | vozes 25
+I/JUCE    (28523): AUDIO: media 24.0%  pico 58.5%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.25x  | PICO -20.0 dBFS  | VOZES 9.31556%  FX 14.3707%  | FALHA-STREAM 0  | vozes 30
+I/JUCE    (28523): LAUNCHKEY: porta DAW ainda nao disponivel
+I/JUCE    (28523): AUDIO: media 27.2%  pico 61.8%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.29x  | PICO -18.0 dBFS  | VOZES 10.7684%  FX 16.101%  | FALHA-STREAM 0  | vozes 30
+I/JUCE    (28523): AUDIO: media 25.1%  pico 76.9%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.32x  | PICO -25.3 dBFS  | VOZES 6.86998%  FX 17.8344%  | FALHA-STREAM 0  | vozes 5
+I/JUCE    (28523): AUDIO: media 20.8%  pico 48.1%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.23x  | PICO -29.3 dBFS  | VOZES 2.60186%  FX 17.8225%  | FALHA-STREAM 0  | vozes 8
+I/JUCE    (28523): AUDIO: media 25.9%  pico 44.7%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.32x  | PICO -26.0 dBFS  | VOZES 5.57513%  FX 19.9591%  | FALHA-STREAM 0  | vozes 10
+I/JUCE    (28523): AUDIO: media 19.8%  pico 47.8%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.22x  | PICO -24.5 dBFS  | VOZES 4.89983%  FX 14.5931%  | FALHA-STREAM 0  | vozes 15
+I/JUCE    (28523): LAUNCHKEY: porta DAW ainda nao disponivel
+I/JUCE    (28523): AUDIO: media 22.4%  pico 47.1%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.21x  | PICO -24.1 dBFS  | VOZES 5.87144%  FX 16.2258%  | FALHA-STREAM 0  | vozes 18
+I/JUCE    (28523): AUDIO: media 30.0%  pico 51.7%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.23x  | PICO -20.7 dBFS  | VOZES 9.48182%  FX 20.2011%  | FALHA-STREAM 0  | vozes 20
+I/JUCE    (28523): AUDIO: media 23.5%  pico 55.7%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.25x  | PICO -21.2 dBFS  | VOZES 8.11805%  FX 15.049%  | FALHA-STREAM 0  | vozes 25
+I/JUCE    (28523): AUDIO: media 24.8%  pico 54.4%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.24x  | PICO -18.5 dBFS  | VOZES 9.01536%  FX 15.4435%  | FALHA-STREAM 0  | vozes 29
+I/JUCE    (28523): AUDIO: media 33.8%  pico 67.8%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.32x  | PICO -18.9 dBFS  | VOZES 13.5675%  FX 19.8954%  | FALHA-STREAM 0  | vozes 30
+I/JUCE    (28523): AUDIO: media 22.0%  pico 61.0%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.27x  | PICO -19.1 dBFS  | VOZES 8.44927%  FX 13.2952%  | FALHA-STREAM 0  | vozes 4
+I/JUCE    (28523): LAUNCHKEY: porta DAW ainda nao disponivel
+I/JUCE    (28523): AUDIO: media 21.6%  pico 41.5%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.25x  | PICO -28.8 dBFS  | VOZES 3.07689%  FX 18.1947%  | FALHA-STREAM 0  | vozes 5
+I/JUCE    (28523): AUDIO: media 19.6%  pico 44.2%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.35x  | PICO -28.6 dBFS  | VOZES 3.68178%  FX 15.5852%  | FALHA-STREAM 0  | vozes 10
+I/JUCE    (28523): AUDIO: media 19.6%  pico 45.9%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.28x  | PICO -26.8 dBFS  | VOZES 4.05249%  FX 15.2237%  | FALHA-STREAM 0  | vozes 12
+I/JUCE    (28523): AUDIO: media 22.6%  pico 47.9%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.34x  | PICO -24.8 dBFS  | VOZES 6.21772%  FX 16.0668%  | FALHA-STREAM 0  | vozes 15
+I/JUCE    (28523): AUDIO: media 20.2%  pico 49.9%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.25x  | PICO -22.5 dBFS  | VOZES 5.85878%  FX 14.0014%  | FALHA-STREAM 0  | vozes 20
+I/JUCE    (28523): LAUNCHKEY: porta DAW ainda nao disponivel
+I/JUCE    (28523): AUDIO: media 22.6%  pico 51.8%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.19x  | PICO -21.4 dBFS  | VOZES 7.19751%  FX 15.0941%  | FALHA-STREAM 0  | vozes 21
+I/JUCE    (28523): AUDIO: media 29.5%  pico 55.0%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.21x  | PICO -19.8 dBFS  | VOZES 10.8691%  FX 18.2526%  | FALHA-STREAM 0  | vozes 25
+I/JUCE    (28523): AUDIO: media 25.2%  pico 58.2%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.27x  | PICO -20.3 dBFS  | VOZES 9.52271%  FX 15.3654%  | FALHA-STREAM 0  | vozes 30
+I/JUCE    (28523): AUDIO: media 26.3%  pico 59.2%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.37x  | PICO -19.2 dBFS  | VOZES 10.6261%  FX 15.3791%  | FALHA-STREAM 0  | vozes 30
+I/JUCE    (28523): AUDIO: media 22.8%  pico 60.2%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.26x  | PICO -23.2 dBFS  | VOZES 6.15758%  FX 16.2558%  | FALHA-STREAM 0  | vozes 5
+I/JUCE    (28523): LAUNCHKEY: porta DAW ainda nao disponivel
+I/JUCE    (28523): AUDIO: media 21.9%  pico 68.3%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.35x  | PICO -29.2 dBFS  | VOZES 2.70199%  FX 18.8148%  | FALHA-STREAM 0  | vozes 7
+I/JUCE    (28523): AUDIO: media 27.1%  pico 45.3%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.29x  | PICO -26.6 dBFS  | VOZES 5.66729%  FX 20.9592%  | FALHA-STREAM 0  | vozes 10
+I/JUCE    (28523): AUDIO: media 20.0%  pico 49.6%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.22x  | PICO -26.0 dBFS  | VOZES 4.63753%  FX 15.028%  | FALHA-STREAM 0  | vozes 15
+I/JUCE    (28523): AUDIO: media 25.9%  pico 69.1%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.48x  | PICO -22.9 dBFS  | VOZES 6.73833%  FX 18.8283%  | FALHA-STREAM 0  | vozes 15
+I/JUCE    (28523): AUDIO: media 24.5%  pico 60.3%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.27x  | PICO -20.5 dBFS  | VOZES 7.89904%  FX 16.244%  | FALHA-STREAM 0  | vozes 20
+I/JUCE    (28523): LAUNCHKEY: porta DAW ainda nao disponivel
+I/JUCE    (28523): AUDIO: media 24.6%  pico 55.1%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.20x  | PICO -21.7 dBFS  | VOZES 8.15376%  FX 16.1152%  | FALHA-STREAM 0  | vozes 25
+I/JUCE    (28523): AUDIO: media 23.3%  pico 56.1%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.24x  | PICO -19.4 dBFS  | VOZES 8.50163%  FX 14.5163%  | FALHA-STREAM 0  | vozes 26
+I/JUCE    (28523): AUDIO: media 27.6%  pico 62.8%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.22x  | PICO -19.7 dBFS  | VOZES 11.2124%  FX 16.0373%  | FALHA-STREAM 0  | vozes 30
+I/JUCE    (28523): AUDIO: media 26.4%  pico 78.5%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.27x  | PICO -18.6 dBFS  | VOZES 10.3917%  FX 15.6536%  | FALHA-STREAM 0  | vozes 13
+I/JUCE    (28523): AUDIO: media 21.1%  pico 46.4%  lentos 0/188  | CHAMADA atrasada 1x  pior intervalo 1.84x  | PICO -29.9 dBFS  | VOZES 2.87174%  FX 17.8785%  | FALHA-STREAM 0  | vozes 5
+I/JUCE    (28523): LAUNCHKEY: porta DAW ainda nao disponivel
+I/JUCE    (28523): AUDIO: media 17.0%  pico 54.4%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.29x  | PICO -27.9 dBFS  | VOZES 2.59807%  FX 14.0837%  | FALHA-STREAM 0  | vozes 10
+I/JUCE    (28523): AUDIO: media 22.4%  pico 46.5%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.30x  | PICO -25.1 dBFS  | VOZES 4.61918%  FX 17.4307%  | FALHA-STREAM 0  | vozes 11
+I/JUCE    (28523): AUDIO: media 23.4%  pico 50.6%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.27x  | PICO -24.2 dBFS  | VOZES 6.39026%  FX 16.6405%  | FALHA-STREAM 0  | vozes 15
+I/JUCE    (28523): AUDIO: media 23.1%  pico 51.2%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.24x  | PICO -22.8 dBFS  | VOZES 6.39166%  FX 16.3879%  | FALHA-STREAM 0  | vozes 20
+I/JUCE    (28523): AUDIO: media 25.1%  pico 51.6%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.25x  | PICO -21.3 dBFS  | VOZES 8.05542%  FX 16.6692%  | FALHA-STREAM 0  | vozes 21
+I/JUCE    (28523): LAUNCHKEY: porta DAW ainda nao disponivel
+I/JUCE    (28523): AUDIO: media 25.4%  pico 63.6%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.31x  | PICO -21.0 dBFS  | VOZES 9.45389%  FX 15.6122%  | FALHA-STREAM 0  | vozes 25
+I/JUCE    (28523): AUDIO: media 25.4%  pico 56.8%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.28x  | PICO -19.8 dBFS  | VOZES 9.81951%  FX 15.2556%  | FALHA-STREAM 0  | vozes 30
+I/JUCE    (28523): AUDIO: media 27.7%  pico 58.5%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.20x  | PICO -18.6 dBFS  | VOZES 11.0212%  FX 16.3225%  | FALHA-STREAM 0  | vozes 30
+I/JUCE    (28523): AUDIO: media 24.2%  pico 56.9%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.26x  | PICO -22.6 dBFS  | VOZES 7.19501%  FX 16.6426%  | FALHA-STREAM 0  | vozes 5
+I/JUCE    (28523): AUDIO: media 21.0%  pico 43.2%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.39x  | PICO -29.5 dBFS  | VOZES 2.69511%  FX 17.9054%  | FALHA-STREAM 0  | vozes 7
+I/JUCE    (28523): LAUNCHKEY: porta DAW ainda nao disponivel
+I/JUCE    (28523): AUDIO: media 26.5%  pico 47.3%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.36x  | PICO -27.6 dBFS  | VOZES 5.77999%  FX 20.3163%  | FALHA-STREAM 0  | vozes 10
+I/JUCE    (28523): AUDIO: media 21.7%  pico 50.5%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.22x  | PICO -25.9 dBFS  | VOZES 5.12842%  FX 16.2108%  | FALHA-STREAM 0  | vozes 15
+I/JUCE    (28523): AUDIO: media 22.3%  pico 47.3%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.21x  | PICO -21.9 dBFS  | VOZES 5.8865%  FX 16.0995%  | FALHA-STREAM 0  | vozes 16
+I/JUCE    (28523): AUDIO: media 25.4%  pico 51.8%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.41x  | PICO -21.7 dBFS  | VOZES 8.25%  FX 16.8233%  | FALHA-STREAM 0  | vozes 20
+I/JUCE    (28523): AUDIO: media 22.3%  pico 54.5%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.40x  | PICO -21.6 dBFS  | VOZES 7.48564%  FX 14.5123%  | FALHA-STREAM 0  | vozes 25
+I/JUCE    (28523): LAUNCHKEY: porta DAW ainda nao disponivel
+I/JUCE    (28523): AUDIO: media 24.3%  pico 64.0%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.32x  | PICO -19.5 dBFS  | VOZES 8.8887%  FX 15.0701%  | FALHA-STREAM 0  | vozes 26
+I/JUCE    (28523): AUDIO: media 25.3%  pico 58.7%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.28x  | PICO -18.2 dBFS  | VOZES 10.3801%  FX 14.6512%  | FALHA-STREAM 0  | vozes 30
+I/JUCE    (28523): AUDIO: media 26.7%  pico 57.8%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.29x  | PICO -18.8 dBFS  | VOZES 10.7021%  FX 15.6274%  | FALHA-STREAM 0  | vozes 15
+I/JUCE    (28523): AUDIO: media 21.6%  pico 43.7%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.33x  | PICO -30.4 dBFS  | VOZES 2.89129%  FX 18.3584%  | FALHA-STREAM 0  | vozes 5
+I/JUCE    (28523): AUDIO: media 18.5%  pico 59.1%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.29x  | PICO -29.3 dBFS  | VOZES 2.97377%  FX 15.1841%  | FALHA-STREAM 0  | vozes 10
+I/JUCE    (28523): AUDIO: media 23.0%  pico 45.3%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.27x  | PICO -25.4 dBFS  | VOZES 4.78743%  FX 17.8514%  | FALHA-STREAM 0  | vozes 10
+I/JUCE    (28523): LAUNCHKEY: porta DAW ainda nao disponivel
+I/JUCE    (28523): AUDIO: media 23.4%  pico 48.7%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.20x  | PICO -24.0 dBFS  | VOZES 6.39265%  FX 16.6807%  | FALHA-STREAM 0  | vozes 15
+I/JUCE    (28523): AUDIO: media 22.8%  pico 50.6%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.28x  | PICO -23.0 dBFS  | VOZES 6.45708%  FX 15.9917%  | FALHA-STREAM 0  | vozes 20
+I/JUCE    (28523): AUDIO: media 26.5%  pico 53.8%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.21x  | PICO -21.1 dBFS  | VOZES 8.15924%  FX 17.9389%  | FALHA-STREAM 0  | vozes 20
+I/JUCE    (28523): AUDIO: media 28.4%  pico 58.9%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.22x  | PICO -20.3 dBFS  | VOZES 10.2288%  FX 17.7934%  | FALHA-STREAM 0  | vozes 25
+I/JUCE    (28523): AUDIO: media 23.9%  pico 58.4%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.31x  | PICO -19.4 dBFS  | VOZES 8.94265%  FX 14.6066%  | FALHA-STREAM 0  | vozes 30
+I/JUCE    (28523): LAUNCHKEY: porta DAW ainda nao disponivel
+I/JUCE    (28523): AUDIO: media 31.5%  pico 58.6%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.26x  | PICO -19.0 dBFS  | VOZES 12.5119%  FX 18.6617%  | FALHA-STREAM 0  | vozes 30
+I/JUCE    (28523): AUDIO: media 20.5%  pico 57.2%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.19x  | PICO -21.0 dBFS  | VOZES 6.95645%  FX 13.2298%  | FALHA-STREAM 0  | vozes 5
+I/JUCE    (28523): AUDIO: media 23.5%  pico 44.0%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.24x  | PICO -29.7 dBFS  | VOZES 3.02314%  FX 20.0697%  | FALHA-STREAM 0  | vozes 5
+I/JUCE    (28523): AUDIO: media 20.9%  pico 47.3%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.40x  | PICO -28.0 dBFS  | VOZES 4.35678%  FX 16.2151%  | FALHA-STREAM 0  | vozes 10
+I/JUCE    (28523): AUDIO: media 21.8%  pico 59.5%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.25x  | PICO -24.6 dBFS  | VOZES 4.77816%  FX 16.7241%  | FALHA-STREAM 0  | vozes 15
+I/JUCE    (28523): LAUNCHKEY: porta DAW ainda nao disponivel
+I/JUCE    (28523): AUDIO: media 24.5%  pico 56.4%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.25x  | PICO -22.5 dBFS  | VOZES 6.43095%  FX 17.6869%  | FALHA-STREAM 0  | vozes 15
+I/JUCE    (28523): AUDIO: media 24.1%  pico 53.5%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.33x  | PICO -22.8 dBFS  | VOZES 7.47038%  FX 16.279%  | FALHA-STREAM 0  | vozes 20
+I/JUCE    (28523): AUDIO: media 23.3%  pico 53.2%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.26x  | PICO -20.6 dBFS  | VOZES 7.53082%  FX 15.433%  | FALHA-STREAM 0  | vozes 25
+I/JUCE    (28523): AUDIO: media 26.7%  pico 54.6%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.20x  | PICO -19.6 dBFS  | VOZES 10.031%  FX 16.3186%  | FALHA-STREAM 0  | vozes 25
+I/JUCE    (28523): AUDIO: media 28.2%  pico 58.5%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.30x  | PICO -19.0 dBFS  | VOZES 11.2296%  FX 16.6074%  | FALHA-STREAM 0  | vozes 30
+I/JUCE    (28523): LAUNCHKEY: porta DAW ainda nao disponivel
+I/JUCE    (28523): AUDIO: media 27.9%  pico 69.1%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.29x  | PICO -20.1 dBFS  | VOZES 10.9383%  FX 16.6544%  | FALHA-STREAM 0  | vozes 30
+I/JUCE    (28523): AUDIO: media 18.8%  pico 71.9%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.32x  | PICO -32.7 dBFS  | VOZES 3.80037%  FX 14.7052%  | FALHA-STREAM 0  | vozes 5
+I/JUCE    (28523): AUDIO: media 18.3%  pico 44.9%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.24x  | PICO -29.4 dBFS  | VOZES 2.29837%  FX 15.731%  | FALHA-STREAM 0  | vozes 10
+I/JUCE    (28523): AUDIO: media 24.3%  pico 44.7%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.24x  | PICO -26.8 dBFS  | VOZES 5.19166%  FX 18.7394%  | FALHA-STREAM 0  | vozes 10
+I/JUCE    (28523): AUDIO: media 19.4%  pico 49.3%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.23x  | PICO -24.6 dBFS  | VOZES 4.74515%  FX 14.3336%  | FALHA-STREAM 0  | vozes 15
+I/JUCE    (28523): LAUNCHKEY: porta DAW ainda nao disponivel
+I/JUCE    (28523): AUDIO: media 25.5%  pico 48.9%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.24x  | PICO -23.4 dBFS  | VOZES 6.65246%  FX 18.5198%  | FALHA-STREAM 0  | vozes 16
+I/JUCE    (28523): AUDIO: media 26.1%  pico 53.2%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.23x  | PICO -22.5 dBFS  | VOZES 8.44538%  FX 17.3082%  | FALHA-STREAM 0  | vozes 20
+I/JUCE    (28523): AUDIO: media 24.7%  pico 54.7%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.26x  | PICO -21.5 dBFS  | VOZES 7.89904%  FX 16.4495%  | FALHA-STREAM 0  | vozes 25
+I/JUCE    (28523): AUDIO: media 25.7%  pico 53.5%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.29x  | PICO -20.5 dBFS  | VOZES 9.00818%  FX 16.3877%  | FALHA-STREAM 0  | vozes 25
+I/JUCE    (28523): AUDIO: media 23.9%  pico 58.1%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.35x  | PICO -17.8 dBFS  | VOZES 9.18092%  FX 14.37%  | FALHA-STREAM 0  | vozes 30
+I/JUCE    (28523): AUDIO: media 29.6%  pico 58.8%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.38x  | PICO -18.6 dBFS  | VOZES 11.6504%  FX 17.5323%  | FALHA-STREAM 0  | vozes 30
+I/JUCE    (28523): LAUNCHKEY: porta DAW ainda nao disponivel
+I/JUCE    (28523): AUDIO: media 22.1%  pico 57.1%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.32x  | PICO -24.9 dBFS  | VOZES 5.55698%  FX 16.2125%  | FALHA-STREAM 0  | vozes 5
+I/JUCE    (28523): AUDIO: media 20.9%  pico 55.0%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.39x  | PICO -30.5 dBFS  | VOZES 2.51061%  FX 17.9766%  | FALHA-STREAM 0  | vozes 5
+I/JUCE    (28523): AUDIO: media 23.5%  pico 45.2%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.22x  | PICO -27.8 dBFS  | VOZES 4.9857%  FX 18.1388%  | FALHA-STREAM 0  | vozes 10
+I/JUCE    (28523): AUDIO: media 22.6%  pico 47.4%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.22x  | PICO -26.5 dBFS  | VOZES 4.37922%  FX 17.8953%  | FALHA-STREAM 0  | vozes 15
+I/JUCE    (28523): AUDIO: media 32.0%  pico 48.9%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.33x  | PICO -24.3 dBFS  | VOZES 8.58201%  FX 22.9921%  | FALHA-STREAM 0  | vozes 15
+I/JUCE    (28523): LAUNCHKEY: porta DAW ainda nao disponivel
+I/JUCE    (28523): AUDIO: media 23.1%  pico 53.8%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.29x  | PICO -22.5 dBFS  | VOZES 7.11742%  FX 15.6287%  | FALHA-STREAM 0  | vozes 20
+I/JUCE    (28523): AUDIO: media 24.9%  pico 51.2%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.25x  | PICO -21.5 dBFS  | VOZES 7.76061%  FX 16.7688%  | FALHA-STREAM 0  | vozes 21
+I/JUCE    (28523): AUDIO: media 26.2%  pico 54.2%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.29x  | PICO -20.9 dBFS  | VOZES 9.75479%  FX 16.0688%  | FALHA-STREAM 0  | vozes 25
+I/JUCE    (28523): AUDIO: media 24.0%  pico 58.0%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.30x  | PICO -19.5 dBFS  | VOZES 9.19857%  FX 14.4863%  | FALHA-STREAM 0  | vozes 30
+I/JUCE    (28523): AUDIO: media 28.8%  pico 58.6%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.31x  | PICO -19.6 dBFS  | VOZES 11.5618%  FX 16.8629%  | FALHA-STREAM 0  | vozes 30
+I/JUCE    (28523): LAUNCHKEY: porta DAW ainda nao disponivel
+I/JUCE    (28523): AUDIO: media 26.2%  pico 56.2%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.25x  | PICO -22.9 dBFS  | VOZES 6.64199%  FX 19.1755%  | FALHA-STREAM 0  | vozes 5
+I/JUCE    (28523): AUDIO: media 22.8%  pico 41.2%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.23x  | PICO -31.9 dBFS  | VOZES 2.9992%  FX 19.4566%  | FALHA-STREAM 0  | vozes 5
+I/JUCE    (28523): AUDIO: media 22.1%  pico 44.9%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.31x  | PICO -28.7 dBFS  | VOZES 4.44275%  FX 17.2988%  | FALHA-STREAM 0  | vozes 10
+I/JUCE    (28523): AUDIO: media 21.1%  pico 48.0%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.38x  | PICO -26.6 dBFS  | VOZES 4.66007%  FX 16.1145%  | FALHA-STREAM 0  | vozes 15
+I/JUCE    (28523): AUDIO: media 23.3%  pico 59.7%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.25x  | PICO -24.0 dBFS  | VOZES 6.26041%  FX 16.7126%  | FALHA-STREAM 0  | vozes 15
+I/JUCE    (28523): AUDIO: media 28.1%  pico 52.7%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.27x  | PICO -23.3 dBFS  | VOZES 8.97816%  FX 18.7203%  | FALHA-STREAM 0  | vozes 20
+I/JUCE    (28523): LAUNCHKEY: porta DAW ainda nao disponivel
+I/JUCE    (28523): AUDIO: media 23.5%  pico 60.4%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.26x  | PICO -20.5 dBFS  | VOZES 7.6511%  FX 15.496%  | FALHA-STREAM 0  | vozes 25
+I/JUCE    (28523): AUDIO: media 33.1%  pico 56.9%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.32x  | PICO -18.9 dBFS  | VOZES 11.9791%  FX 20.6818%  | FALHA-STREAM 0  | vozes 25
+I/JUCE    (28523): AUDIO: media 27.2%  pico 57.9%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.42x  | PICO -20.1 dBFS  | VOZES 10.8532%  FX 16.005%  | FALHA-STREAM 0  | vozes 30
+I/JUCE    (28523): AUDIO: media 27.7%  pico 59.0%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.30x  | PICO -19.0 dBFS  | VOZES 10.9434%  FX 16.3958%  | FALHA-STREAM 0  | vozes 30
+I/JUCE    (28523): AUDIO: media 19.8%  pico 57.6%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.19x  | PICO -32.2 dBFS  | VOZES 3.73205%  FX 15.7321%  | FALHA-STREAM 0  | vozes 5
+I/JUCE    (28523): LAUNCHKEY: porta DAW ainda nao disponivel
+I/JUCE    (28523): AUDIO: media 21.7%  pico 46.9%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.27x  | PICO -29.3 dBFS  | VOZES 2.9258%  FX 18.4089%  | FALHA-STREAM 0  | vozes 10
+I/JUCE    (28523): AUDIO: media 25.5%  pico 44.5%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.29x  | PICO -26.5 dBFS  | VOZES 5.31523%  FX 19.7631%  | FALHA-STREAM 0  | vozes 10
+I/JUCE    (28523): AUDIO: media 24.0%  pico 48.3%  lentos 0/188  | CHAMADA atrasada 1x  pior intervalo 2.89x  | PICO -23.4 dBFS  | VOZES 6.46626%  FX 17.1779%  | FALHA-STREAM 0  | vozes 15
+I/JUCE    (28523): AUDIO: media 21.8%  pico 49.8%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.23x  | PICO -23.0 dBFS  | VOZES 5.8891%  FX 15.5896%  | FALHA-STREAM 0  | vozes 20
+I/JUCE    (28523): AUDIO: media 28.3%  pico 51.5%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.24x  | PICO -22.2 dBFS  | VOZES 8.97836%  FX 18.9521%  | FALHA-STREAM 0  | vozes 20
+I/JUCE    (28523): LAUNCHKEY: porta DAW ainda nao disponivel
+I/JUCE    (28523): AUDIO: media 22.9%  pico 55.8%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.22x  | PICO -20.6 dBFS  | VOZES 7.92477%  FX 14.6583%  | FALHA-STREAM 0  | vozes 25
+I/JUCE    (28523): AUDIO: media 29.1%  pico 55.1%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.22x  | PICO -19.8 dBFS  | VOZES 10.1954%  FX 18.4943%  | FALHA-STREAM 0  | vozes 25
+I/JUCE    (28523): AUDIO: media 30.2%  pico 58.4%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.23x  | PICO -18.9 dBFS  | VOZES 11.9482%  FX 17.856%  | FALHA-STREAM 0  | vozes 30
+I/JUCE    (28523): AUDIO: media 28.2%  pico 57.3%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.31x  | PICO -19.2 dBFS  | VOZES 11.0738%  FX 16.7406%  | FALHA-STREAM 0  | vozes 11
+I/JUCE    (28523): AUDIO: media 20.1%  pico 55.1%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.25x  | PICO -33.1 dBFS  | VOZES 2.35632%  FX 17.3212%  | FALHA-STREAM 0  | vozes 5
+I/JUCE    (28523): AUDIO: media 24.2%  pico 42.6%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.21x  | PICO -29.6 dBFS  | VOZES 2.74219%  FX 21.1076%  | FALHA-STREAM 0  | vozes 5
+I/JUCE    (28523): LAUNCHKEY: porta DAW ainda nao disponivel
+I/JUCE    (28523): AUDIO: media 29.2%  pico 43.6%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.23x  | PICO -30.4 dBFS  | VOZES 3.04129%  FX 25.6864%  | FALHA-STREAM 0  | vozes 5
+I/JUCE    (28523): AUDIO: media 21.6%  pico 54.9%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.40x  | PICO -26.9 dBFS  | VOZES 4.30771%  FX 16.9132%  | FALHA-STREAM 0  | vozes 10
+I/JUCE    (28523): AUDIO: media 22.9%  pico 44.4%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.22x  | PICO -26.1 dBFS  | VOZES 4.24328%  FX 18.3072%  | FALHA-STREAM 0  | vozes 10
+I/JUCE    (28523): AUDIO: media 31.0%  pico 44.5%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.26x  | PICO -28.3 dBFS  | VOZES 5.49744%  FX 25.0592%  | FALHA-STREAM 0  | vozes 11
+I/JUCE    (28523): AUDIO: media 23.6%  pico 48.5%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.20x  | PICO -25.3 dBFS  | VOZES 6.39624%  FX 16.823%  | FALHA-STREAM 0  | vozes 15
+I/JUCE    (28523): LAUNCHKEY: porta DAW ainda nao disponivel
+I/JUCE    (28523): AUDIO: media 34.1%  pico 50.9%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.26x  | PICO -23.9 dBFS  | VOZES 8.29309%  FX 25.3611%  | FALHA-STREAM 0  | vozes 15
+I/JUCE    (28523): AUDIO: media 33.9%  pico 48.2%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.36x  | PICO -23.7 dBFS  | VOZES 8.1367%  FX 25.3578%  | FALHA-STREAM 0  | vozes 15
+I/JUCE    (28523): AUDIO: media 25.4%  pico 51.0%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.39x  | PICO -22.6 dBFS  | VOZES 7.34422%  FX 17.7454%  | FALHA-STREAM 0  | vozes 20
+I/JUCE    (28523): AUDIO: media 25.4%  pico 52.4%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.23x  | PICO -20.7 dBFS  | VOZES 7.85765%  FX 17.2517%  | FALHA-STREAM 0  | vozes 20
+I/JUCE    (28523): AUDIO: media 32.6%  pico 50.5%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.21x  | PICO -21.7 dBFS  | VOZES 9.72188%  FX 22.4936%  | FALHA-STREAM 0  | vozes 20
+I/JUCE    (28523): AUDIO: media 26.4%  pico 56.9%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.32x  | PICO -23.2 dBFS  | VOZES 8.56147%  FX 17.5005%  | FALHA-STREAM 0  | vozes 25
+I/JUCE    (28523): LAUNCHKEY: porta DAW ainda nao disponivel
+I/JUCE    (28523): AUDIO: media 25.5%  pico 55.3%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.24x  | PICO -21.0 dBFS  | VOZES 9.39146%  FX 15.8279%  | FALHA-STREAM 0  | vozes 25
+I/JUCE    (28523): AUDIO: media 38.0%  pico 54.1%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.23x  | PICO -20.3 dBFS  | VOZES 12.9713%  FX 24.5778%  | FALHA-STREAM 0  | vozes 25
+I/JUCE    (28523): AUDIO: media 36.8%  pico 53.4%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.35x  | PICO -21.6 dBFS  | VOZES 12.6231%  FX 23.7483%  | FALHA-STREAM 0  | vozes 25
+I/JUCE    (28523): AUDIO: media 29.3%  pico 58.6%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.33x  | PICO -21.3 dBFS  | VOZES 11.1676%  FX 17.8095%  | FALHA-STREAM 0  | vozes 30
+I/JUCE    (28523): AUDIO: media 26.7%  pico 57.9%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.24x  | PICO -19.2 dBFS  | VOZES 10.4823%  FX 15.9106%  | FALHA-STREAM 0  | vozes 30
+I/JUCE    (28523): LAUNCHKEY: porta DAW ainda nao disponivel
+I/JUCE    (28523): AUDIO: media 28.2%  pico 55.4%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.22x  | PICO -26.9 dBFS  | VOZES 4.32846%  FX 23.4091%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): AUDIO: media 22.9%  pico 39.7%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.28x  | PICO -49.3 dBFS  | VOZES 0.087367%  FX 22.2364%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): AUDIO: media 24.8%  pico 32.1%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.37x  | PICO -56.2 dBFS  | VOZES 0.0953457%  FX 24.0261%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): AUDIO: media 24.8%  pico 32.9%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.21x  | PICO -64.7 dBFS  | VOZES 0.0928524%  FX 24.0095%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): AUDIO: media 25.0%  pico 32.4%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.22x  | PICO -74.4 dBFS  | VOZES 0.0923537%  FX 24.2782%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): LAUNCHKEY: porta DAW ainda nao disponivel
+I/JUCE    (28523): AUDIO: media 25.4%  pico 37.9%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.22x  | PICO -81.3 dBFS  | VOZES 0.0939495%  FX 24.5998%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): AUDIO: media 27.2%  pico 34.9%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.37x  | PICO -89.0 dBFS  | VOZES 0.099734%  FX 26.3962%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): AUDIO: media 28.5%  pico 32.1%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.23x  | PICO -96.2 dBFS  | VOZES 0.103025%  FX 27.6385%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): AUDIO: media 29.4%  pico 32.0%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.35x  | PICO -100.0 dBFS  | VOZES 0.107414%  FX 28.4949%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): AUDIO: media 28.3%  pico 31.7%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.40x  | PICO -100.0 dBFS  | VOZES 0.105918%  FX 27.4553%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): LAUNCHKEY: porta DAW ainda nao disponivel
+I/JUCE    (28523): AUDIO: media 28.3%  pico 31.8%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.26x  | PICO -100.0 dBFS  | VOZES 0.107613%  FX 27.4816%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): AUDIO: media 4.6%  pico 31.6%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.21x  | PICO -100.0 dBFS  | VOZES 0.102128%  FX 3.77354%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): AUDIO: media 1.0%  pico 1.1%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.21x  | PICO -100.0 dBFS  | VOZES 0.106516%  FX 0.210239%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): AUDIO: media 1.0%  pico 1.2%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.27x  | PICO -100.0 dBFS  | VOZES 0.109209%  FX 0.213032%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): AUDIO: media 1.0%  pico 3.0%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.33x  | PICO -100.0 dBFS  | VOZES 0.107912%  FX 0.214628%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): AUDIO: media 1.0%  pico 1.2%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.21x  | PICO -100.0 dBFS  | VOZES 0.109408%  FX 0.211935%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): LAUNCHKEY: porta DAW ainda nao disponivel
+I/JUCE    (28523): AUDIO: media 1.0%  pico 1.2%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.20x  | PICO -100.0 dBFS  | VOZES 0.108211%  FX 0.21383%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): AUDIO: media 1.0%  pico 2.8%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.33x  | PICO -100.0 dBFS  | VOZES 0.107713%  FX 0.211935%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): AUDIO: media 1.1%  pico 3.1%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.26x  | PICO -100.0 dBFS  | VOZES 0.106416%  FX 0.220313%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): AUDIO: media 1.0%  pico 1.1%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.28x  | PICO -100.0 dBFS  | VOZES 0.108012%  FX 0.212832%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): AUDIO: media 1.0%  pico 1.1%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.28x  | PICO -100.0 dBFS  | VOZES 0.108511%  FX 0.212533%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): LAUNCHKEY: porta DAW ainda nao disponivel
+I/JUCE    (28523): AUDIO: media 1.0%  pico 1.2%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.25x  | PICO -100.0 dBFS  | VOZES 0.109109%  FX 0.211536%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): AUDIO: media 1.0%  pico 1.1%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.30x  | PICO -100.0 dBFS  | VOZES 0.104023%  FX 0.206948%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): AUDIO: media 1.0%  pico 1.2%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.24x  | PICO -100.0 dBFS  | VOZES 0.109408%  FX 0.213531%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): AUDIO: media 1.0%  pico 1.1%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.39x  | PICO -100.0 dBFS  | VOZES 0.107214%  FX 0.213032%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): AUDIO: media 1.0%  pico 1.2%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.35x  | PICO -100.0 dBFS  | VOZES 0.107414%  FX 0.20994%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): LAUNCHKEY: porta DAW ainda nao disponivel
+I/JUCE    (28523): AUDIO: media 1.0%  pico 1.1%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.15x  | PICO -100.0 dBFS  | VOZES 0.108311%  FX 0.213331%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): AUDIO: media 1.0%  pico 1.1%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.19x  | PICO -100.0 dBFS  | VOZES 0.107314%  FX 0.213431%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): AUDIO: media 1.0%  pico 1.1%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.32x  | PICO -100.0 dBFS  | VOZES 0.10871%  FX 0.21373%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): AUDIO: media 1.0%  pico 1.1%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.34x  | PICO -100.0 dBFS  | VOZES 0.107613%  FX 0.214428%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): AUDIO: media 1.0%  pico 1.1%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.21x  | PICO -100.0 dBFS  | VOZES 0.109608%  FX 0.211237%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): LAUNCHKEY: porta DAW ainda nao disponivel
+I/JUCE    (28523): AUDIO: media 1.0%  pico 1.2%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.33x  | PICO -100.0 dBFS  | VOZES 0.107214%  FX 0.211935%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): AUDIO: media 1.0%  pico 1.1%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.22x  | PICO -100.0 dBFS  | VOZES 0.108411%  FX 0.21383%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): AUDIO: media 1.0%  pico 1.1%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.31x  | PICO -100.0 dBFS  | VOZES 0.107713%  FX 0.212434%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): AUDIO: media 1.0%  pico 3.0%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.31x  | PICO -100.0 dBFS  | VOZES 0.106316%  FX 0.209641%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): AUDIO: media 1.0%  pico 1.2%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.18x  | PICO -100.0 dBFS  | VOZES 0.109109%  FX 0.212234%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): LAUNCHKEY: porta DAW ainda nao disponivel
+I/JUCE    (28523): AUDIO: media 1.0%  pico 1.2%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.18x  | PICO -100.0 dBFS  | VOZES 0.10881%  FX 0.215226%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): AUDIO: media 1.0%  pico 1.1%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.33x  | PICO -100.0 dBFS  | VOZES 0.105918%  FX 0.207646%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): AUDIO: media 1.0%  pico 1.1%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.23x  | PICO -100.0 dBFS  | VOZES 0.108211%  FX 0.211536%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): AUDIO: media 1.0%  pico 2.6%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.29x  | PICO -100.0 dBFS  | VOZES 0.116689%  FX 0.20994%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): AUDIO: media 1.0%  pico 1.2%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.37x  | PICO -100.0 dBFS  | VOZES 0.10881%  FX 0.210838%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): LAUNCHKEY: porta DAW ainda nao disponivel
+I/JUCE    (28523): AUDIO: media 1.0%  pico 1.2%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.25x  | PICO -100.0 dBFS  | VOZES 0.109209%  FX 0.213531%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): AUDIO: media 1.0%  pico 1.1%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.34x  | PICO -100.0 dBFS  | VOZES 0.104222%  FX 0.20635%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): AUDIO: media 1.0%  pico 1.1%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.21x  | PICO -100.0 dBFS  | VOZES 0.107912%  FX 0.216024%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): AUDIO: media 1.0%  pico 1.2%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.21x  | PICO -100.0 dBFS  | VOZES 0.108411%  FX 0.210738%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): AUDIO: media 1.0%  pico 1.2%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.30x  | PICO -100.0 dBFS  | VOZES 0.109309%  FX 0.210938%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): LAUNCHKEY: porta DAW ainda nao disponivel
+I/JUCE    (28523): AUDIO: media 1.0%  pico 1.6%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.28x  | PICO -100.0 dBFS  | VOZES 0.10891%  FX 0.214727%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): AUDIO: media 1.1%  pico 3.2%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.20x  | PICO -100.0 dBFS  | VOZES 0.10891%  FX 0.211935%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): AUDIO: media 1.0%  pico 1.1%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.36x  | PICO -100.0 dBFS  | VOZES 0.109309%  FX 0.212234%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): AUDIO: media 1.0%  pico 3.0%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.33x  | PICO -100.0 dBFS  | VOZES 0.119481%  FX 0.213032%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): AUDIO: media 1.0%  pico 1.1%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.38x  | PICO -100.0 dBFS  | VOZES 0.109209%  FX 0.211636%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): LAUNCHKEY: porta DAW ainda nao disponivel
+I/JUCE    (28523): AUDIO: media 1.0%  pico 1.1%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.28x  | PICO -100.0 dBFS  | VOZES 0.107414%  FX 0.212633%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): AUDIO: media 1.0%  pico 1.2%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.32x  | PICO -100.0 dBFS  | VOZES 0.109209%  FX 0.213531%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): AUDIO: media 1.0%  pico 1.1%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.27x  | PICO -100.0 dBFS  | VOZES 0.108411%  FX 0.213231%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): AUDIO: media 1.0%  pico 1.1%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.28x  | PICO -100.0 dBFS  | VOZES 0.109009%  FX 0.215226%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): AUDIO: media 1.0%  pico 3.0%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.31x  | PICO -100.0 dBFS  | VOZES 0.118185%  FX 0.211137%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): LAUNCHKEY: porta DAW ainda nao disponivel
+I/JUCE    (28523): AUDIO: media 1.0%  pico 1.1%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.23x  | PICO -100.0 dBFS  | VOZES 0.109009%  FX 0.211137%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): AUDIO: media 1.0%  pico 1.2%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.34x  | PICO -100.0 dBFS  | VOZES 0.109907%  FX 0.212134%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): AUDIO: media 1.0%  pico 1.2%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.23x  | PICO -100.0 dBFS  | VOZES 0.109608%  FX 0.213531%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): AUDIO: media 1.0%  pico 1.1%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.38x  | PICO -100.0 dBFS  | VOZES 0.107813%  FX 0.213331%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): AUDIO: media 1.0%  pico 1.1%  lentos 0/188  | CHAMADA atrasada 0x  pior intervalo 1.28x  | PICO -100.0 dBFS  | VOZES 0.108511%  FX 0.214827%  | FALHA-STREAM 0  | vozes 0
+I/JUCE    (28523): LAUNCHKEY: porta DAW ainda nao disponivel

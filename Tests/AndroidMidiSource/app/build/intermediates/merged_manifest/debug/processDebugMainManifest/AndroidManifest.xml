@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.churchdaw.miditest"
+    android:versionCode="1"
+    android:versionName="1.0" >
+
+    <uses-sdk
+        android:minSdkVersion="23"
+        android:targetSdkVersion="35" />
+
+    <uses-feature
+        android:name="android.software.midi"
+        android:required="true" />
+
+    <application
+        android:allowBackup="false"
+        android:debuggable="true"
+        android:extractNativeLibs="false"
+        android:label="ChurchDAW MIDI Test Source"
+        android:supportsRtl="true" >
+        <service
+            android:name="com.churchdaw.miditest.MidiSourceService"
+            android:exported="true"
+            android:permission="android.permission.BIND_MIDI_DEVICE_SERVICE" >
+            <intent-filter>
+                <action android:name="android.media.midi.MidiDeviceService" />
+            </intent-filter>
+
+            <meta-data
+                android:name="android.media.midi.MidiDeviceService"
+                android:resource="@xml/midi_device_info" />
+        </service>
+
+        <receiver
+            android:name="com.churchdaw.miditest.SendCcReceiver"
+            android:exported="true" >
+            <intent-filter>
+                <action android:name="com.churchdaw.miditest.SEND_CC" />
+            </intent-filter>
+        </receiver>
+    </application>
+
+</manifest>

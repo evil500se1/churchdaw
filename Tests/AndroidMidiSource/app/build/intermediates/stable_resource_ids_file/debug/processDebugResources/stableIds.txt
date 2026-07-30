@@ -1,0 +1,1 @@
+com.churchdaw.miditest:xml/midi_device_info = 0x7f010000

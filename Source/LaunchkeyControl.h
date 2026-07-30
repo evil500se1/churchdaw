@@ -52,11 +52,31 @@ public:
     // A porta DAW e a SEGUNDA do aparelho. Publico porque o resto do app precisa
     // manter essa porta FORA da entrada MIDI normal (senao pad vira nota tocada,
     // e a porta fica ocupada — o Windows abre MIDI em modo exclusivo).
+    // A SEGUNDA porta do Launchkey nao e teclado: em modo DAW ela carrega pads e
+    // controles de superficie. Se entrar como MIDI comum, apertar um pad toca uma
+    // NOTA no instrumento.
+    //
+    // O problema e que cada sistema batiza a mesma porta de um jeito:
+    //   Windows : "MIDIIN2 (Launchkey MK4 61)"
+    //   Android : "Focusrite - Novation Launchkey MK4 61 Output Port 2"
+    //   macOS   : "Launchkey MK4 61 DAW"
+    // So os nomes do Windows estavam previstos aqui. No celular NENHUM casava,
+    // as duas portas entravam como teclado, e a porta de controle ficava sem
+    // dono -- conferido no log do aparelho, que mostrou os nomes reais.
     static bool isDawPort (const juce::String& name)
     {
+        // Os nomes acima sao os do Windows. No Android a porta vem do nome da
+        // INTERFACE USB, e o aparelho publica "Launchkey MK4 61 MIDI Int" --
+        // nenhum dos padroes do Windows casa, entao a porta DAW passava batido,
+        // entrava como teclado comum e ainda deixava o LaunchkeyControl sem
+        // dono da porta (dai o "porta DAW ainda nao disponivel" no log).
+        // Conferido em 30/07/2026 no TANK 3 via dumpsys midi.
         return name.containsIgnoreCase ("Launchkey")
                 && (name.containsIgnoreCase ("MIDIIN2") || name.containsIgnoreCase ("MIDIOUT2")
-                     || name.containsIgnoreCase ("DAW"));
+                     || name.containsIgnoreCase ("DAW")
+                     || name.containsIgnoreCase ("Port 2")
+                     || name.containsIgnoreCase ("MIDI Int")
+                     || name.containsIgnoreCase ("MIDI2"));
     }
 
     //== Visor =================================================================

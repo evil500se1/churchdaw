@@ -1,0 +1,36 @@
+> Task :app:preBuild UP-TO-DATE
+> Task :app:preRelease_ReleaseBuild UP-TO-DATE
+> Task :app:javaPreCompileRelease_Release UP-TO-DATE
+> Task :app:checkRelease_ReleaseAarMetadata UP-TO-DATE
+> Task :app:processRelease_ReleaseNavigationResources UP-TO-DATE
+> Task :app:compileRelease_ReleaseNavigationResources UP-TO-DATE
+> Task :app:generateRelease_ReleaseResValues UP-TO-DATE
+> Task :app:mapRelease_ReleaseSourceSetPaths UP-TO-DATE
+> Task :app:generateRelease_ReleaseResources UP-TO-DATE
+> Task :app:mergeRelease_ReleaseResources UP-TO-DATE
+> Task :app:packageRelease_ReleaseResources UP-TO-DATE
+> Task :app:parseRelease_ReleaseLocalResources UP-TO-DATE
+> Task :app:createRelease_ReleaseCompatibleScreenManifests UP-TO-DATE
+> Task :app:extractDeepLinksRelease_Release UP-TO-DATE
+> Task :app:processRelease_ReleaseMainManifest UP-TO-DATE
+> Task :app:processRelease_ReleaseManifest UP-TO-DATE
+> Task :app:processRelease_ReleaseManifestForPackage UP-TO-DATE
+> Task :app:processRelease_ReleaseResources UP-TO-DATE
+> Task :app:compileRelease_ReleaseJavaWithJavac UP-TO-DATE
+> Task :app:extractProguardFiles UP-TO-DATE
+> Task :app:generateRelease_ReleaseLintReportModel UP-TO-DATE
+> Task :app:bundleRelease_ReleaseClassesToCompileJar UP-TO-DATE
+> Task :app:preRelease_ReleaseUnitTestBuild UP-TO-DATE
+> Task :app:generateRelease_ReleaseUnitTestLintModel UP-TO-DATE
+> Task :app:lintAnalyzeRelease_Release UP-TO-DATE
+> Task :app:lintAnalyzeRelease_ReleaseUnitTest UP-TO-DATE
+> Task :app:lintReportRelease_Release UP-TO-DATE
+
+> Task :app:lintRelease_Release FAILED
+Lint found 1 error, 5 warnings. First failure:
+
+C:\Users\Administrator\MinhaDAW\Builds\Android\local.properties:1: Error: Windows file separators (\) and drive letter separators (':') must be escaped (\\) in property files; use C\:\\Users\\Administrator\\AppData\\Local\\Android\\Sdk [PropertyEscape]
+
+The full lint text report is located at:
+  C:\Users\Administrator\MinhaDAW\Builds\Android\app\build\intermediates\lint_intermediate_text_report\release_Release\lintReportRelease_Release\lint-results-release_Release.txt
+25 actionable tasks: 1 executed, 24 up-to-date

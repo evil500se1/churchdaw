@@ -39,6 +39,42 @@ juce::String deviceLabel()
     return name + " / " + juce::SystemStats::getOperatingSystemName();
 }
 
+/*  IDENTIDADE PRESA AO HARDWARE.
+
+    Antes o installation_id era um numero sorteado na primeira execucao e
+    guardado no computador. Quem formatava ou reinstalava perdia o arquivo,
+    o app sorteava outro numero, e o servidor via "outro computador" — o
+    cliente batia na mensagem "esta licenca ja esta ativa em outra maquina"
+    tendo formatado a PROPRIA maquina, e precisava pedir socorro.
+
+    Agora o identificador e DERIVADO do hardware, sempre o mesmo na mesma
+    placa: SMBIOS UUID no Windows, IOPlatformUUID no macOS. Formatar,
+    reinstalar o sistema ou trocar de HD nao muda nada — o cliente entra
+    com e-mail e senha e volta a funcionar sozinho.
+
+    O texto do hardware nunca sai do computador: o que vai para o servidor
+    e um hash com um sal fixo do produto, entao o identificador nao serve
+    para rastrear a maquina fora daqui.
+
+    Vazio quando o sistema nao deixa ler (raro; algumas VMs e politicas
+    corporativas) — nesse caso o chamador volta ao sorteio aleatorio, que e
+    o comportamento antigo.  */
+juce::String hardwareInstallationId()
+{
+    const auto raw = juce::SystemStats::getUniqueDeviceID().trim();
+
+    // O JUCE devolve "0" ou vazio quando nao conseguiu ler nada util.
+    if (raw.isEmpty() || raw == "0")
+        return {};
+
+    const auto material = "churchdaw-device-v3|" + raw;
+    const juce::SHA256 hash (material.toRawUTF8(),
+                             material.getNumBytesAsUTF8());
+
+    // 32 hex = mesmo tamanho do randomToken(16) que ele substitui.
+    return hash.toHexString().substring (0, 32);
+}
+
 juce::var makeObject()
 {
     return juce::var (new juce::DynamicObject());
@@ -420,19 +456,32 @@ Client::DeviceIdentity Client::ensureDeviceIdentity (juce::String& error)
                 propertyString (parsed, "device_label")
             };
 
-            if (propertyInt64 (parsed, "schema") == 2 && existing.valid())
+            // Schema 2 = identidade sorteada; schema 3 = presa ao hardware.
+            // As DUAS continuam valendo: quem ja esta ativado mantem o
+            // identificador que o servidor conhece. Trocar o de um cliente
+            // em uso o faria aparecer como "outro computador" e derrubaria
+            // a licenca de todo mundo de uma vez.
+            const auto schema = propertyInt64 (parsed, "schema");
+
+            if ((schema == 2 || schema == 3) && existing.valid())
                 return existing;
         }
     }
 
+    // Sem identidade salva: maquina nova, sistema reinstalado ou formatado.
+    // O identificador vem do hardware para que a MESMA maquina volte com o
+    // MESMO id e o servidor a reconheca. So cai no sorteio se o sistema nao
+    // deixar ler o hardware.
+    const auto fromHardware = hardwareInstallationId();
+
     DeviceIdentity created {
-        randomToken (16),
-        randomToken (32),
+        fromHardware.isNotEmpty() ? fromHardware : randomToken (16),
+        randomToken (32),   // o segredo continua sorteado: nunca derivado
         deviceLabel()
     };
 
     auto value = makeObject();
-    setProperty (value, "schema", 2);
+    setProperty (value, "schema", fromHardware.isNotEmpty() ? 3 : 2);
     setProperty (value, "installation_id", created.installationId);
     setProperty (value, "device_secret", created.secretBase64);
     setProperty (value, "device_label", created.label);
@@ -440,6 +489,15 @@ Client::DeviceIdentity Client::ensureDeviceIdentity (juce::String& error)
     if (! CredentialStore::saveSecret (
             deviceCredentialAccount, juce::JSON::toString (value, false), error))
         return {};
+
+    // Fica no log de propósito: quando um cliente diz que a licença
+    // acusa "outro computador", este e o numero a conferir com o painel.
+    // E, apos formatar, ele tem de voltar IGUAL ao de antes.
+    juce::Logger::writeToLog (
+        juce::String ("LICENCA: identidade deste computador = ")
+        + created.installationId
+        + (fromHardware.isNotEmpty() ? "  (presa ao hardware)"
+                                     : "  (sorteada — hardware ilegivel)"));
 
     return created;
 }

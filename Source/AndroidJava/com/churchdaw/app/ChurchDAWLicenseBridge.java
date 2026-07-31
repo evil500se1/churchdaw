@@ -22,6 +22,7 @@ import java.security.KeyFactory;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
 import java.security.KeyStore;
+import java.security.MessageDigest;
 import java.security.PrivateKey;
 import java.security.PublicKey;
 import java.security.SecureRandom;
@@ -500,17 +501,67 @@ public final class ChurchDAWLicenseBridge {
         }
     }
 
+    /**
+     * Identificador estavel do aparelho, derivado do ANDROID_ID.
+     *
+     * O ANDROID_ID sobrevive a desinstalar e reinstalar o app; so muda em
+     * reset de fabrica (e, desde o Android 8, ele ja e diferente por app,
+     * entao nem serve para rastrear entre aplicativos). O hash com sal
+     * garante que o valor bruto do sistema nunca saia do aparelho.
+     *
+     * String vazia se o SHA-256 nao estiver disponivel — o chamador volta
+     * ao sorteio aleatorio, que era o comportamento antigo.
+     */
+    private static String deriveInstallationId(String androidId) {
+        try {
+            final MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            final byte[] hash = digest.digest(
+                ("churchdaw-device-v3|" + androidId).getBytes(StandardCharsets.UTF_8));
+            final StringBuilder hex = new StringBuilder(32);
+            for (int i = 0; i < 16; ++i)
+                hex.append(String.format("%02x", hash[i]));
+            return hex.toString();
+        } catch (Exception ignored) {
+            return "";
+        }
+    }
+
     public static String identityJson() {
         try {
             final Context context = requireContext();
             final SharedPreferences preferences =
                 context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+            String androidId = Settings.Secure.getString(
+                context.getContentResolver(), Settings.Secure.ANDROID_ID);
+            if (androidId == null || androidId.length() < 8)
+                return "";
+
+            // IDENTIDADE PRESA AO APARELHO.
+            //
+            // O id era sorteado e guardado nas preferencias. Desinstalar o
+            // app apagava as preferencias, o proximo arranque sorteava
+            // outro, e o servidor via "outro aparelho" — o cliente
+            // reinstalava no MESMO celular e batia em "licenca ja ativa em
+            // outra maquina".
+            //
+            // Agora ele e derivado do ANDROID_ID, que sobrevive a
+            // desinstalacao (so muda em reset de fabrica). Um id ja
+            // gravado e MANTIDO: trocar o de quem esta ativado o faria
+            // aparecer como aparelho novo e derrubaria a licenca.
+            //
+            // O ANDROID_ID nao vai cru para o servidor: segue um hash com
+            // sal do produto, como no desktop.
             String installationId = preferences.getString(INSTALLATION_KEY, "");
             if (installationId == null || !installationId.matches("[A-Za-z0-9_-]{16,128}")) {
-                final byte[] random = new byte[24];
-                RANDOM.nextBytes(random);
-                installationId = Base64.encodeToString(
-                    random, Base64.URL_SAFE | Base64.NO_WRAP | Base64.NO_PADDING);
+                installationId = deriveInstallationId(androidId);
+
+                if (installationId.isEmpty()) {
+                    final byte[] random = new byte[24];
+                    RANDOM.nextBytes(random);
+                    installationId = Base64.encodeToString(
+                        random, Base64.URL_SAFE | Base64.NO_WRAP | Base64.NO_PADDING);
+                }
+
                 if (!preferences.edit().putString(INSTALLATION_KEY, installationId).commit())
                     return "";
             }
@@ -519,10 +570,6 @@ public final class ChurchDAWLicenseBridge {
             final String publicKey = Base64.encodeToString(
                 pair.getPublic().getEncoded(),
                 Base64.URL_SAFE | Base64.NO_WRAP | Base64.NO_PADDING);
-            String androidId = Settings.Secure.getString(
-                context.getContentResolver(), Settings.Secure.ANDROID_ID);
-            if (androidId == null || androidId.length() < 8)
-                return "";
 
             final String model = (Build.MANUFACTURER + " " + Build.MODEL).trim();
             return new JSONObject()

@@ -154,8 +154,25 @@ juce::String CredentialStore::loadSecret (const juce::String& account,
 
         if (status != errSecSuccess || result == nullptr)
         {
-            error = "Nao foi possivel abrir a sessao protegida: "
-                  + statusError (status);
+            if (result != nullptr)
+                CFRelease (result);
+
+            // A assinatura ad-hoc muda a cada build: um item gravado por
+            // uma versao anterior fica com ACL de "outro app" e a leitura
+            // dispara o dialogo de senha das chaves "login" — que o
+            // cliente nao tem como responder (30/07: dois Macs de
+            // clientes presos nesse ciclo a cada reinicio/atualizacao).
+            // Sessao ilegivel e tratada como sessao inexistente: descarta
+            // o item velho em silencio e deixa o app pedir o login
+            // normal; o proximo save grava um item novo, proprio deste
+            // binario. Nunca propagar erro aqui — erro vira dialogo, e
+            // dialogo de chaves e exatamente o que estamos eliminando.
+            deleteSecret (account, true);
+            deleteSecret (account, false);
+            juce::Logger::writeToLog (
+                "LICENCA: sessao no cofre ilegivel ("
+                + statusError (status)
+                + ") — item descartado, login sera pedido");
             return {};
         }
 

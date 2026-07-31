@@ -551,13 +551,38 @@ Decision fetchPolicy (Policy& policy, juce::String& error)
     juce::StringPairArray responseHeaders;
     int statusCode = 0;
 
+    // A PRIMEIRA conexao HTTPS do processo costuma falhar no Windows.
+    //
+    // Medido em 31/07/2026: no mesmo arranque, a busca da politica de
+    // update falhava, a da politica de distribuicao falhava, e a do
+    // catalogo — a terceira — funcionava. Servidor respondendo em ~110 ms
+    // o tempo todo (seis medicoes seguidas com HTTP 200). O que falha e o
+    // WinINet: a sessao e aberta com INTERNET_OPEN_TYPE_PRECONFIG e a
+    // deteccao de proxy do sistema so fica pronta depois da primeira
+    // tentativa. Resultado pratico: o aviso de atualizacao NUNCA aparecia,
+    // e o cliente ficava numa versao velha sem saber que havia outra.
+    //
+    // Tres tentativas com uma pausa curta cobrem o aquecimento sem atrasar
+    // o arranque de quem esta offline (o timeout de conexao continua o
+    // mesmo; offline falha rapido nas tres).
     const juce::URL url (policyUrl);
-    auto stream = url.createInputStream (
-        juce::URL::InputStreamOptions (juce::URL::ParameterHandling::inAddress)
-            .withConnectionTimeoutMs (policyTimeoutMs)
-            .withResponseHeaders (&responseHeaders)
-            .withStatusCode (&statusCode)
-            .withNumRedirectsToFollow (2));
+    std::unique_ptr<juce::InputStream> stream;
+
+    for (int tentativa = 0; tentativa < 3 && stream == nullptr; ++tentativa)
+    {
+        if (tentativa > 0)
+            juce::Thread::sleep (350);
+
+        responseHeaders.clear();
+        statusCode = 0;
+
+        stream = url.createInputStream (
+            juce::URL::InputStreamOptions (juce::URL::ParameterHandling::inAddress)
+                .withConnectionTimeoutMs (policyTimeoutMs)
+                .withResponseHeaders (&responseHeaders)
+                .withStatusCode (&statusCode)
+                .withNumRedirectsToFollow (2));
+    }
 
     if (stream == nullptr)
     {

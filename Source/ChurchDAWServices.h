@@ -2346,8 +2346,23 @@ namespace ChurchDAWServices
                         ? "Authorization: Bearer " + bearer + "\n"
                         : juce::String()));
 
-        if (auto stream =
-                juce::URL (endpoint).createInputStream (options))
+        // Ver a nota em DesktopUpdater.cpp: a primeira conexao HTTPS do
+        // processo falha no Windows enquanto o WinINet resolve o proxy do
+        // sistema. Sem a repeticao, a politica de distribuicao (a primeira
+        // coisa que o app busca) voltava "HTTPS indisponivel" mesmo com o
+        // servidor respondendo em 110 ms — e o catalogo, buscado depois,
+        // funcionava no mesmo arranque.
+        std::unique_ptr<juce::InputStream> stream;
+
+        for (int tentativa = 0; tentativa < 3 && stream == nullptr; ++tentativa)
+        {
+            if (tentativa > 0)
+                juce::Thread::sleep (350);
+
+            stream = juce::URL (endpoint).createInputStream (options);
+        }
+
+        if (stream != nullptr)
         {
             response.serverTime =
                 parseHttpDateEpochSeconds (responseHeaders["Date"]);

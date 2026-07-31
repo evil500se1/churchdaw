@@ -4056,7 +4056,8 @@ float MainComponent::getLoadingProgress() const
 #if CHURCHDAW_HOSTS_PLUGINS
 // A lista de plugins do JUCE esconde o escaneamento dentro de "Opcoes...".
 // Este envelope poe um botao "Escanear VST3" visivel no mesmo rodape.
-struct PluginListHolder final : public juce::Component
+struct PluginListHolder final : public juce::Component,
+                                private juce::Timer
 {
     PluginListHolder (juce::AudioPluginFormatManager& fm, juce::KnownPluginList& kl,
                       const juce::File& deadMansPedal, juce::PropertiesFile* props)
@@ -4076,14 +4077,45 @@ struct PluginListHolder final : public juce::Component
 
     void scanNow()
     {
-        // Varre TODOS os formatos que o sistema hospeda, nao so VST3. No
-        // Mac isso inclui Audio Unit: o Kontakt e boa parte das
-        // bibliotecas so instalam a versao AU, e o cliente reclamou em
-        // 31/07 que o Kontakt instalado "nao vinha" — ele nunca era
-        // procurado. No Windows a lista continua sendo so VST3, porque e
-        // o unico formato que existe la.
+        // UM FORMATO DE CADA VEZ.
+        //
+        // PluginListComponent::scanFor faz "currentScanner = Scanner::make
+        // (...)": chamar duas vezes em sequencia DESTROI o scanner anterior
+        // e so o ultimo formato roda. Foi o que aconteceu no Mac do cliente
+        // em 31/07 — o BigSky esta instalado apenas como Audio Unit
+        // (/Library/Audio/Plug-Ins/Components/BigSky.component) e a lista
+        // voltou inteira com "VST3" na coluna de formato, sem nenhum AU.
+        //
+        // A fila abaixo dispara o proximo formato so quando o anterior
+        // termina (isScanning() == false).
+        filaDeFormatos.clearQuick();
+
         for (auto* format : formats.getFormats())
+            filaDeFormatos.add (format);
+
+        dispararProximoFormato();
+    }
+
+    void dispararProximoFormato()
+    {
+        if (filaDeFormatos.isEmpty())
+        {
+            stopTimer();
+            return;
+        }
+
+        auto* format = filaDeFormatos.removeAndReturn (0);
+
+        if (format != nullptr)
             list.scanFor (*format);
+
+        startTimer (400);
+    }
+
+    void timerCallback() override
+    {
+        if (! list.isScanning())
+            dispararProximoFormato();
     }
 
     static juce::String formatosDaPlataforma()
@@ -4107,6 +4139,7 @@ struct PluginListHolder final : public juce::Component
     juce::AudioPluginFormatManager& formats;
     juce::PluginListComponent list;
     juce::TextButton scanButton;
+    juce::Array<juce::AudioPluginFormat*> filaDeFormatos;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (PluginListHolder)
 };

@@ -703,6 +703,15 @@ public:
         // o app -- e o sacrificavel que abre um plugin de cada vez. Sem
         // janela, sem audio, sem licenca. Se o plugin travar, morre so ele
         // e o app segue a lista (ver PluginScanSubprocess.h).
+        //
+        // O TESTE DA LINHA DE COMANDO VEM PRIMEIRO, e nao e detalhe: o
+        // construtor de PluginScannerSubprocess chama
+        // addDefaultFormatsToManager, que no macOS abre o registro de
+        // Audio Units do sistema. Num Mac com muitos plugins isso demora
+        // (ou trava) -- e como este bloco roda antes do logger, o app
+        // ficava sem janela e sem UMA linha de log, so o icone pulando no
+        // Dock. Foi o que travou o Mac de um cliente em 31/07/2026.
+        if (commandLine.contains (ChurchDAWPluginScan::processUID))
         {
             auto scanner = std::make_unique<
                 ChurchDAWPluginScan::PluginScannerSubprocess>();

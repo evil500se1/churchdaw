@@ -72,13 +72,46 @@ final class LicenseService
             );
 
             if ($device !== null) {
-                if (!hash_equals((string) $device['secret_fingerprint'], $fingerprint)
-                    || !hash_equals(
-                        (string) ($device['identity_type'] ?? 'shared-secret-v1'),
-                        (string) $identity['identity_type']
-                    )) {
-                    throw new ApiException(401, 'DEVICE_IDENTITY_MISMATCH', 'Acesso negado.');
+                // ROTACAO DO SEGREDO EM REINSTALACAO.
+                //
+                // O installation_id passou a ser derivado do hardware
+                // (31/07/2026), entao a MESMA maquina volta com o MESMO id
+                // depois de formatar. Mas o segredo do aparelho continua
+                // sorteado - e tem de continuar, senao bastaria conhecer o
+                // UUID da placa para se passar por ela.
+                //
+                // Recusar aqui era o que fazia o cliente formatar e bater
+                // em "acesso negado" (DEVICE_IDENTITY_MISMATCH): mesmo id,
+                // segredo novo. Como este caminho e o activateForLogin -
+                // so se chega nele APOS validar e-mail e senha -, quem
+                // chegou aqui ja provou ser o dono da conta, e registrar o
+                // segredo novo e o comportamento certo.
+                //
+                // A protecao que importa continua de pe: sem a senha nao
+                // se chega aqui, e o /auth/refresh (que usa so o token)
+                // segue exigindo o segredo exato.
+                $mesmoSegredo = hash_equals(
+                    (string) $device['secret_fingerprint'],
+                    $fingerprint
+                ) && hash_equals(
+                    (string) ($device['identity_type'] ?? 'shared-secret-v1'),
+                    (string) $identity['identity_type']
+                );
+
+                if (!$mesmoSegredo) {
+                    $rotate = $pdo->prepare(
+                        "UPDATE devices
+                            SET secret_fingerprint = :secret_fingerprint,
+                                identity_type = :identity_type
+                          WHERE id = :id"
+                    );
+                    $rotate->execute([
+                        'secret_fingerprint' => $fingerprint,
+                        'identity_type' => (string) $identity['identity_type'],
+                        'id' => $device['id'],
+                    ]);
                 }
+
                 $update = $pdo->prepare(
                     "UPDATE devices
                      SET label = :label, platform = :platform, status = 'active',

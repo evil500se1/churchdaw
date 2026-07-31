@@ -168,6 +168,12 @@ MainComponent::MainComponent()
    #if CHURCHDAW_HOSTS_PLUGINS
     juce::addDefaultFormatsToManager (formatManager);
 
+    // Cada plugin e aberto num processo filho. Um VST que trava (o "Piano
+    // V3" no Mac do cliente, 31/07) derruba so o filho: a varredura marca
+    // aquele arquivo e continua, em vez de fechar o ChurchDAW no meio.
+    knownPlugins.setCustomScanner (
+        std::make_unique<ChurchDAWPluginScan::ChurchDAWPluginScanner>());
+
     if (auto xml = appProperties.getUserSettings()->getXmlValue ("pluginList"))
         knownPlugins.recreateFromXml (*xml);
 
@@ -4059,7 +4065,7 @@ struct PluginListHolder final : public juce::Component
         list.setOptionsButtonText (juce::String::fromUTF8 ("Op\xc3\xa7\xc3\xb5" "es..."));
         addAndMakeVisible (list);
 
-        scanButton.setButtonText ("Escanear VST3");
+        scanButton.setButtonText ("Escanear " + formatosDaPlataforma());
         scanButton.setColour (juce::TextButton::buttonColourId, NordLookAndFeel::nordRed());
         scanButton.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
         scanButton.onClick = [this] { scanNow(); };
@@ -4070,9 +4076,23 @@ struct PluginListHolder final : public juce::Component
 
     void scanNow()
     {
+        // Varre TODOS os formatos que o sistema hospeda, nao so VST3. No
+        // Mac isso inclui Audio Unit: o Kontakt e boa parte das
+        // bibliotecas so instalam a versao AU, e o cliente reclamou em
+        // 31/07 que o Kontakt instalado "nao vinha" — ele nunca era
+        // procurado. No Windows a lista continua sendo so VST3, porque e
+        // o unico formato que existe la.
         for (auto* format : formats.getFormats())
-            if (format->getName() == "VST3")
-                list.scanFor (*format);
+            list.scanFor (*format);
+    }
+
+    static juce::String formatosDaPlataforma()
+    {
+       #if JUCE_MAC
+        return "VST3 e Audio Unit";
+       #else
+        return "VST3";
+       #endif
     }
 
     void resized() override
@@ -4101,7 +4121,7 @@ void MainComponent::showPluginScanner()
 
     juce::DialogWindow::LaunchOptions o;
     o.content.setOwned (holder);
-    o.dialogTitle = "Plugins VST3";
+    o.dialogTitle = "Plugins — " + PluginListHolder::formatosDaPlataforma();
     o.componentToCentreAround = this;
     // LaunchOptions vem com dialogBackgroundColour = lightgrey: era dai o rodape
     // e as bordas claras que destoavam do app inteiro

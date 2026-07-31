@@ -12738,6 +12738,12 @@ private:
             volume.removeFromRight (6);
         }
 
+        // O estilo herdado do construtor e LinearVertical, mas esta faixa tem
+        // 56 px de ALTURA e a largura toda da coluna (ate 760): um fader
+        // vertical ali fica com 56 px de curso — "curso minusculo", como o
+        // dono relatou em 30/07. Horizontal usa a largura inteira e vira um
+        // fader de mesa de verdade.
+        masterDbSlider.setSliderStyle (juce::Slider::LinearHorizontal);
         masterDbSlider.setBounds (volume);
         masterLevelGroupBounds = { m.getX(), levelTop, m.getWidth(),
                                    juce::jmax (1, m.getY() - levelTop) };
@@ -12959,6 +12965,11 @@ private:
         juce::TextButton tonePageBtn { "EQ" };
         juce::TextButton pluginOpenBtn { "Abrir" };   // canal-plugin (abre a interface do VSTi)
         juce::TextButton addButton { "+ Adicionar instrumento" };   // card vazio
+        // Remover o timbre exigia abrir o seletor e escolher "canal vazio" —
+        // o dono chamou de esquisito (30/07) e tem razao: e uma acao de
+        // limpar escondida dentro de uma acao de escolher. Este X fica na
+        // cara do card, so aparece com timbre carregado.
+        juce::TextButton clearBtn { juce::String::fromUTF8 ("\xc3\x97") };
         juce::ComboBox rotaryModeBox;
         juce::Slider compKnob, dlyKnob, echoKnob, rotaryKnob,
                      attackKnob, releaseKnob,

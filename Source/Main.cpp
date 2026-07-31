@@ -695,8 +695,27 @@ public:
     }
     bool moreThanOneInstanceAllowed() override          { return false; }
 
-    void initialise (const juce::String&) override
+    void initialise (const juce::String& commandLine) override
     {
+       #if CHURCHDAW_HOSTS_PLUGINS
+        // O ChurchDAW relanca A SI MESMO como processo de varredura: quando
+        // a linha de comando traz o canal do scanner, esta instancia NAO e
+        // o app -- e o sacrificavel que abre um plugin de cada vez. Sem
+        // janela, sem audio, sem licenca. Se o plugin travar, morre so ele
+        // e o app segue a lista (ver PluginScanSubprocess.h).
+        {
+            auto scanner = std::make_unique<
+                ChurchDAWPluginScan::PluginScannerSubprocess>();
+
+            if (scanner->initialiseFromCommandLine (
+                    commandLine, ChurchDAWPluginScan::processUID))
+            {
+                pluginScannerWorker = std::move (scanner);
+                return;
+            }
+        }
+       #endif
+
         // REGISTRO EM ARQUIVO.
         //
         // No Android o Logger cai no logcat e da para ler com o cabo. No
@@ -1748,9 +1767,19 @@ public:
            #endif
            #else
             if (auto* display = juce::Desktop::getInstance().getDisplays().getPrimaryDisplay())
-                setBounds (display->userBounds.toNearestInt());
+            {
+                // userBounds e a area para o CONTEUDO. Com barra de titulo
+                // NATIVA o JUCE posiciona a moldura acima dela — a janela
+                // nascia em (-7,-30) e a barra com o X ficava FORA da tela:
+                // o dono relatou em 30/07 que nao havia como fechar o
+                // programa. setBoundsConstrained respeita a moldura e o
+                // gerenciador de janelas, entao a barra fica sempre visivel.
+                setBoundsConstrained (display->userBounds.toNearestInt());
+            }
             else
+            {
                 setFullScreen (true);
+            }
            #endif
         }
 
@@ -1967,6 +1996,12 @@ private:
     // registrar tambem o que acontece durante a destruicao dos outros membros.
     std::unique_ptr<juce::FileLogger> fileLogger;
     std::unique_ptr<juce::Logger> stdoutLogger;   // so no self-test de CI
+
+   #if CHURCHDAW_HOSTS_PLUGINS
+    // Preenchido SOMENTE quando este processo e o filho que varre plugins.
+    std::unique_ptr<ChurchDAWPluginScan::PluginScannerSubprocess>
+        pluginScannerWorker;
+   #endif
     NordLookAndFeel nordLookAndFeel;
    #if JUCE_ANDROID
     std::unique_ptr<AndroidLoginWindow> androidLoginWindow;

@@ -18,6 +18,10 @@
 #include "MidiMappingSafety.h"
 #include "OledDisplay.h"
 
+#if CHURCHDAW_HOSTS_PLUGINS
+ #include "PluginScanSubprocess.h"
+#endif
+
 #include <atomic>
 #include <map>
 #include <memory>

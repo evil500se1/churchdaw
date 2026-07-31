@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include "AppPaths.h"
 #include "SampleStream.h"
@@ -84,7 +84,14 @@ class TimbresProcessor : public juce::AudioProcessor,
                          public juce::ChangeBroadcaster
 {
 public:
-    static constexpr int numLayers = 5;
+    // 14 canais (31/07/2026). Eram 5 e virou pedido recorrente de cliente:
+    // uma equipe com dois teclados, orgao, pads e naipe de sopros estoura
+    // cinco em qualquer domingo. O teto e fixo de proposito -- o JUCE so
+    // aceita criar parametros de automacao na CONSTRUCAO do processador,
+    // entao "ilimitado" nao existe; o que existe e um teto generoso com a
+    // mesa mostrando os canais em uso. Cada canal a mais custa 19
+    // parametros, um buffer e uma cadeia de EQ/comp, nada por voz.
+    static constexpr int numLayers = 14;
     static constexpr int churchOrganFamilyCount = 4;
     static_assert (
         static_cast<int> (
@@ -96,8 +103,17 @@ public:
     // um pad segurado no pedal nunca roube a polifonia do piano. Antes eram 64
     // vozes num pool unico -- e como cada tecla dispara uma voz POR camada, dois
     // acordes com pedal ja estouravam o pool e cortavam o piano no meio.
-    static constexpr int layerVoices[numLayers] = { 96, 40, 40, 40, 40 };
-    static constexpr int maxVoices = 96 + 40 + 40 + 40 + 40;
+    // Canal 1 e o do piano principal (96 vozes: acorde com pedal segura
+    // cauda longa); os demais carregam pad/orgao/naipe e 40 bastam. Como
+    // funcao, o orcamento acompanha numLayers sem lista escrita a mao --
+    // uma lista de 5 valores num array de 14 daria ZERO voz aos canais
+    // novos, e eles simplesmente nao soariam.
+    static constexpr int voicesForLayer (int layerIndex) noexcept
+    {
+        return layerIndex == 0 ? 96 : 40;
+    }
+
+    static constexpr int maxVoices = 96 + 40 * (numLayers - 1);
     static constexpr int realtimeBlockReserve = 8192;
 
     // Quanto de cada zona fica residente na RAM quando o resto vem do disco.
@@ -858,6 +874,20 @@ public:
     TimbresProcessor()
         : AudioProcessor (BusesProperties().withOutput ("Saida", juce::AudioChannelSet::stereo(), true))
     {
+        // Valores neutros de cada canal. Ficam AQUI, num laco, e nao em
+        // listas escritas a mao junto do membro: com 14 canais uma lista
+        // de cinco valores deixaria os nove ultimos com zero -- cor fixa
+        // errada, pedal "solto" em vez de desconhecido e trim mudo. Erro
+        // silencioso, do tipo que so aparece no meio do culto.
+        for (int l = 0; l < numLayers; ++l)
+        {
+            layerColourIdx[l] = -1;                     // segue a categoria
+            lastChurchOrganChannelRotaryMode[l].store (-1);
+            churchOrganSustainMirror[l].store (sustainStateUnknown);
+            pluginSustainMirror[l].store (sustainStateUnknown);
+            layerNativeFamilyTrim[l].store (1.0f);      // ganho unitario
+        }
+
         for (int l = 0; l < numLayers; ++l)
         {
             // O adapter reúne os quatro motores e vive pelo tempo do canal.
@@ -6772,7 +6802,15 @@ private:
         // comprador o arquivo nao existe.
         if (selfTestOn && ! selfTestRestore)
         {
-            static const char* wanted[numLayers] = { "Black Upright", "Pad2", "REV", "BELLP4", "Pad3" };
+            // Lista PROPRIA, com contagem propria: dimensiona-la por
+            // numLayers deixava ponteiros nulos nos canais alem do quinto
+            // (o stress test percorre todos e faria containsIgnoreCase
+            // num nullptr). O ciclo repete os mesmos timbres, que e o
+            // suficiente para medir carga com todos os canais soando.
+            static const char* const wanted[] = {
+                "Black Upright", "Pad2", "REV", "BELLP4", "Pad3"
+            };
+            constexpr int numWanted = (int) (sizeof (wanted) / sizeof (wanted[0]));
 
             const int layersToLoad = selfTestStress ? numLayers : 1;
 
@@ -6782,7 +6820,7 @@ private:
                     continue;
 
                 for (const auto& e : entriesCache)
-                    if (e.label.containsIgnoreCase (wanted[l]))
+                    if (e.label.containsIgnoreCase (wanted[l % numWanted]))
                     {
                         juce::Logger::writeToLog ("AUDIO: teste carregando canal "
                                                    + juce::String (l + 1) + " = " + e.label);
@@ -6916,7 +6954,7 @@ private:
         }
 
         // orcamento da camada estourado: a vitima sai de DENTRO da propria camada
-        if (usedInLayer >= layerVoices[layerIndex] && victimInLayer != nullptr)
+        if (usedInLayer >= voicesForLayer (layerIndex) && victimInLayer != nullptr)
             return victimInLayer;
 
         if (freeVoice != nullptr)
@@ -8674,11 +8712,15 @@ private:
     double hostSampleRate = 44100.0;
 
     std::atomic<int> uiSelectedLayer { -1 };   // abre sem canal selecionado
-    int layerColourIdx[numLayers] { -1, -1, -1, -1, -1 };   // -1 = segue a categoria
+    // ATENCAO ao mexer em numLayers: listas escritas a mao ("{-1,-1,...}")
+    // deixariam os canais novos com 0 em vez do valor neutro. Tudo que
+    // precisa de valor inicial diferente de zero e preenchido em
+    // inicializarCanais(), chamado no construtor.
+    int layerColourIdx[numLayers] {};   // -1 = segue a categoria
     std::atomic<juce::uint32> heldBits[4] {};   // teclas pressionadas (para o acorde)
-    std::atomic<float> layerLevelsL[numLayers] { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
-    std::atomic<float> layerLevelsR[numLayers] { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
-    std::atomic<float> layerLevelShown[numLayers] { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };   // espelho p/ o visor CANAIS
+    std::atomic<float> layerLevelsL[numLayers] {};
+    std::atomic<float> layerLevelsR[numLayers] {};
+    std::atomic<float> layerLevelShown[numLayers] {};   // espelho p/ o visor CANAIS
 
     // ---- notas presas nos VSTi hospedados (Kontakt) ----
     std::atomic<bool> panicPending { false };   // PANIC entregue no proximo bloco
@@ -8728,35 +8770,19 @@ private:
     std::atomic<bool> layerIsOrgan[numLayers] {};
     std::atomic<bool> layerIsChurchOrgan[numLayers] {};
     std::atomic<int> layerChurchOrganFamily[numLayers] {};
-    std::atomic<int> lastChurchOrganChannelRotaryMode[numLayers] {
-        -1, -1, -1, -1, -1
-    };
+    std::atomic<int> lastChurchOrganChannelRotaryMode[numLayers] {};
     static constexpr int sustainStateUnknown = -1;
     static constexpr int sustainStateOff = 0;
     static constexpr int sustainStateOn = 1;
-    std::atomic<int> churchOrganSustainMirror[numLayers] {
-        sustainStateUnknown, sustainStateUnknown,
-        sustainStateUnknown, sustainStateUnknown,
-        sustainStateUnknown
-    };
-    std::atomic<int> pluginSustainMirror[numLayers] {
-        sustainStateUnknown, sustainStateUnknown,
-        sustainStateUnknown, sustainStateUnknown,
-        sustainStateUnknown
-    };
-    std::atomic<bool> pluginPitchCentresPending[numLayers] {
-        false, false, false, false, false
-    };
-    std::atomic<bool> pluginPrepared[numLayers] {
-        false, false, false, false, false
-    };
+    std::atomic<int> churchOrganSustainMirror[numLayers] {};
+    std::atomic<int> pluginSustainMirror[numLayers] {};
+    std::atomic<bool> pluginPitchCentresPending[numLayers] {};
+    std::atomic<bool> pluginPrepared[numLayers] {};
     juce::MemoryBlock pendingChurchOrganStates[numLayers];
     static_assert (
         std::atomic<float>::is_always_lock_free,
         "O trim por familia precisa ser lock-free no callback");
-    std::atomic<float> layerNativeFamilyTrim[numLayers] {
-        1.0f, 1.0f, 1.0f, 1.0f, 1.0f
-    };
+    std::atomic<float> layerNativeFamilyTrim[numLayers] {};
     juce::String layerCategory[numLayers];   // categoria do timbre carregado (para o Auto EQ)
     int lastBlockSize = 512;
     juce::MidiBuffer midiCopy, layerMidi;
@@ -9952,6 +9978,22 @@ public:
         title.setFont (juce::Font (juce::FontOptions (16.0f)).boldened());
         title.setColour (juce::Label::textColourId, NordLookAndFeel::nordRedBright());
         addAndMakeVisible (title);
+
+        // Navegacao entre os 14 canais (8 aparecem por vez).
+        for (auto* b : { &canalAnteriorBtn, &canalProximoBtn })
+        {
+            b->setColour (juce::TextButton::buttonColourId,
+                          juce::Colour (0xff262a31));
+            b->setColour (juce::TextButton::textColourOffId,
+                          juce::Colours::white.withAlpha (0.92f));
+            b->setWantsKeyboardFocus (false);   // seta nao rouba foco no culto
+            addChildComponent (*b);
+        }
+
+        canalAnteriorBtn.onClick = [this] { rolarCanais (-1); };
+        canalProximoBtn.onClick  = [this] { rolarCanais (+1); };
+        canalAnteriorBtn.setTooltip ("Canais anteriores");
+        canalProximoBtn.setTooltip ("Proximos canais");
 
         status.setJustificationType (juce::Justification::centredRight);
         status.setFont (juce::Font (juce::FontOptions (12.0f)));
@@ -11231,6 +11273,29 @@ public:
         }
     }
 
+    /** Roda do mouse sobre a faixa de canais anda de um em um. Fora dela
+        (fader, knob, master) o evento segue para quem estava embaixo. */
+    void mouseWheelMove (const juce::MouseEvent& e,
+                         const juce::MouseWheelDetails& wheel) override
+    {
+        if (TimbresProcessor::numLayers <= canaisNaTela
+             || ! faixaDeCanais.contains (e.getPosition()))
+        {
+            juce::AudioProcessorEditor::mouseWheelMove (e, wheel);
+            return;
+        }
+
+        // Mouse comum manda no eixo Y; trackpad manda no X. Aceitar os
+        // dois evita a sensacao de "a roda nao faz nada aqui".
+        const auto giro = std::abs (wheel.deltaX) > std::abs (wheel.deltaY)
+                            ? wheel.deltaX : wheel.deltaY;
+
+        if (std::abs (giro) < 0.08f)
+            return;
+
+        rolarCanais (giro > 0.0f ? -1 : 1);
+    }
+
     void resized() override
     {
         CHURCHDAW_UI_SCOPE ("TimbresEditor::resized");
@@ -11340,12 +11405,30 @@ public:
         for (auto& s : strips)
             s.tabBounds = {};
 
-        const int stripW = area.getWidth() / (TimbresProcessor::numLayers + 1);
+        // A largura do card e sempre a de canaisNaTela + master, mesmo com
+        // 14 canais existindo: card estreito demais e pior que rolar.
+        faixaDeCanais = area;
+        const int stripW = area.getWidth() / (canaisNaTela + 1);
         const bool phoneLayout = getHeight() < 380;
+
+        limitarPrimeiroCanalVisivel();
+        posicionarSetasDeCanal (area, stripW);
 
         for (int l = 0; l < TimbresProcessor::numLayers; ++l)
         {
             auto& s = strips[l];
+
+            const int coluna = l - primeiroCanalVisivel;
+
+            if (coluna < 0 || coluna >= canaisNaTela)
+            {
+                // Fora da janela de rolagem: esconder de verdade. Só dar
+                // bounds fora da tela deixaria os sliders capturando
+                // cliques e desenhando por cima do master.
+                esconderStrip (s);
+                continue;
+            }
+
             auto col = area.removeFromLeft (stripW);
             s.cardBounds = col.reduced (5, 0);
 
@@ -13705,6 +13788,102 @@ public:
 
     TimbresProcessor& proc;
     juce::TooltipWindow tooltipWindow { this, 650 };   // dicas ao passar o mouse
+
+    // MESA COM 14 CANAIS, 8 NA TELA.
+    //
+    // Dividir a largura por 14 deixava cada card com ~120 px: nome do
+    // timbre virava "...", os botoes viravam "Adic..." e os knobs
+    // sumiam. Oito e a conta que mantem o card legivel num monitor
+    // comum; o resto entra rolando de lado, com as setas ‹ › e a roda
+    // do mouse. Quem usa cinco canais nao ve diferenca nenhuma.
+    static constexpr int canaisNaTela = 8;
+    int primeiroCanalVisivel = 0;   // 0..numLayers-canaisNaTela
+    juce::TextButton canalAnteriorBtn { juce::String::fromUTF8 ("\xe2\x80\xb9") },
+                     canalProximoBtn  { juce::String::fromUTF8 ("\xe2\x80\xba") };
+    juce::Rectangle<int> faixaDeCanais;   // area onde a rolagem vale
+
+    void limitarPrimeiroCanalVisivel()
+    {
+        const int maximo = juce::jmax (
+            0, TimbresProcessor::numLayers - canaisNaTela);
+        primeiroCanalVisivel = juce::jlimit (0, maximo, primeiroCanalVisivel);
+    }
+
+    /** Tira o canal da tela zerando os bounds de tudo que ele desenha.
+        Componente de area zero nao pinta nem recebe clique — e, ao voltar
+        para a janela de rolagem, o proprio resized() devolve os bounds.
+        setVisible(false) aqui foi tentado antes e DESLIGAVA o canal para
+        sempre: os canais 9..14 voltavam sem titulo e sem controle, porque
+        nada no layout os liga de novo. */
+    void esconderStrip (Strip& s)
+    {
+        s.cardBounds = {};
+        s.tabBounds = {};
+        s.fxGroup = {};
+
+        const std::initializer_list<juce::Component*> partes {
+            &s.name, &s.timbreName, &s.transpLabel, &s.volDb,
+            &s.glyph, &s.activity, &s.combo, &s.vol, &s.transp,
+            &s.loop, &s.muteBtn, &s.soloBtn, &s.onBtn, &s.autoEqBtn,
+            &s.tonePageBtn, &s.pluginOpenBtn, &s.addButton, &s.clearBtn,
+            &s.rotaryModeBox, &s.compKnob, &s.dlyKnob, &s.echoKnob,
+            &s.rotaryKnob, &s.attackKnob, &s.releaseKnob, &s.lowKnob,
+            &s.midKnob, &s.highKnob, &s.compLabel, &s.dlyLabel,
+            &s.echoLabel, &s.rotaryLabel, &s.attackLabel,
+            &s.releaseLabel, &s.lowLabel, &s.midLabel, &s.highLabel
+        };
+
+        for (auto* c : partes)
+            c->setBounds ({});
+
+        if (s.meter != nullptr)
+            s.meter->setBounds ({});
+    }
+
+    void posicionarSetasDeCanal (juce::Rectangle<int> area, int stripW)
+    {
+        const bool precisaRolar =
+            TimbresProcessor::numLayers > canaisNaTela;
+
+        canalAnteriorBtn.setVisible (precisaRolar);
+        canalProximoBtn.setVisible (precisaRolar);
+
+        if (! precisaRolar)
+        {
+            canalAnteriorBtn.setBounds ({});
+            canalProximoBtn.setBounds ({});
+            return;
+        }
+
+        // As setas ficam nas pontas da faixa de canais, na altura do
+        // cabecalho do card, longe de fader e knobs.
+        const int lado = 26;
+        const int alturaBotao = 26;
+        const int y = area.getY() + 4;
+
+        canalAnteriorBtn.setBounds (area.getX() + 2, y, lado, alturaBotao);
+        canalProximoBtn.setBounds (
+            area.getX() + canaisNaTela * stripW - lado - 2, y, lado, alturaBotao);
+
+        canalAnteriorBtn.setEnabled (primeiroCanalVisivel > 0);
+        canalProximoBtn.setEnabled (
+            primeiroCanalVisivel
+                < TimbresProcessor::numLayers - canaisNaTela);
+    }
+
+    void rolarCanais (int passos)
+    {
+        const int antes = primeiroCanalVisivel;
+        primeiroCanalVisivel += passos;
+        limitarPrimeiroCanalVisivel();
+
+        if (primeiroCanalVisivel != antes)
+        {
+            resized();
+            repaint();
+        }
+    }
+
     Strip strips[TimbresProcessor::numLayers];
     juce::TextButton mobilePageButtons[TimbresProcessor::numLayers];
     juce::TextButton mobileMasterPageButton;

@@ -4088,10 +4088,22 @@ struct PluginListHolder final : public juce::Component,
         //
         // A fila abaixo dispara o proximo formato so quando o anterior
         // termina (isScanning() == false).
+        //
+        // ORDEM: Audio Unit ANTES de VST3 no macOS. A pasta de VST3 do
+        // cliente e a que tem os plugins problematicos (varredura longa,
+        // alguns travando); com AU no fim, uma varredura de VST3 que
+        // demorasse deixava o BigSky — que so existe como AU — sem nunca
+        // ser procurado. AU primeiro garante que o formato nativo do
+        // sistema entre na lista mesmo se o VST3 der trabalho depois.
         filaDeFormatos.clearQuick();
 
         for (auto* format : formats.getFormats())
-            filaDeFormatos.add (format);
+            if (format != nullptr && format->getName().containsIgnoreCase ("AudioUnit"))
+                filaDeFormatos.add (format);
+
+        for (auto* format : formats.getFormats())
+            if (format != nullptr && ! format->getName().containsIgnoreCase ("AudioUnit"))
+                filaDeFormatos.add (format);
 
         dispararProximoFormato();
     }

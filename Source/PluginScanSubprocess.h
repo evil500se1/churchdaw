@@ -245,10 +245,38 @@ private:
         if (! superprocess->sendMessageToWorker (block))
             return false;
 
+        // PRAZO POR PLUGIN.
+        //
+        // Sem isto o laco espera para sempre. Um plugin que MORRE derruba
+        // o filho e a conexao cai — isso o codigo ja tratava. Mas um
+        // plugin que TRAVA (fica girando dentro do proprio carregamento,
+        // esperando rede, ou abrindo dialogo invisivel) deixa o filho
+        // vivo e mudo: getResponse() devolve timeout indefinidamente e a
+        // varredura congela com o app inteiro parado na tela "Procurando
+        // plugins...". Foi o que travou o Mac de um cliente em 31/07/2026,
+        // e como a varredura nunca terminava os Audio Units — o BigSky
+        // dele entre eles — nem chegavam a ser procurados.
+        //
+        // 90 s cobre com folga um Kontakt grande carregando de disco
+        // lento; passou disso, o plugin fica na lista de problemas e a
+        // varredura segue para o proximo.
+        constexpr int prazoPorPluginMs = 90000;
+        const auto limite = juce::Time::getMillisecondCounter()
+                          + (juce::uint32) prazoPorPluginMs;
+
         for (;;)
         {
             if (shouldExit())
                 return true;
+
+            if (juce::Time::getMillisecondCounter() > limite)
+            {
+                juce::Logger::writeToLog (
+                    "PLUGINS: " + fileOrIdentifier
+                    + " nao respondeu em " + juce::String (prazoPorPluginMs / 1000)
+                    + " s — marcado como problematico e ignorado");
+                return false;   // entra na lista de problemas do JUCE
+            }
 
             const auto response = superprocess->getResponse();
 

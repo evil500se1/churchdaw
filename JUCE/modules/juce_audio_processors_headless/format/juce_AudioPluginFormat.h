@@ -180,4 +180,71 @@ private:
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (AudioPluginFormat)
 };
 
+//==============================================================================
+/** Optional diagnostics for hosts which validate third-party plug-ins.
+
+    This callback is deliberately process-global. A validation subprocess should
+    load a single plug-in at a time, install the callback before entering vendor
+    code, and clear it before returning to normal host operation. When no callback
+    is installed the checks below are a single atomic read and do not allocate.
+
+    The hook lives in the headless module because both the UI and headless VST3/AU
+    wrappers execute the same factory, initialise, activate and unload calls.
+*/
+namespace PluginHostDiagnostics
+{
+    enum class EventKind
+    {
+        begin,
+        end,
+        info
+    };
+
+    struct Event
+    {
+        EventKind kind = EventKind::info;
+        String stage;
+        String call;
+        String detail;
+        int64 resultCode = 0;
+        int64 elapsedMs = 0;
+        bool success = true;
+        bool critical = false;
+    };
+
+    using Callback = std::function<void (const Event&)>;
+
+    JUCE_API void setCallback (Callback);
+    JUCE_API void clearCallback();
+    JUCE_API bool isEnabled() noexcept;
+    JUCE_API void report (EventKind, const char* stage, const char* call,
+                          bool success, int64 resultCode, bool critical,
+                          int64 elapsedMs = 0, const String& detail = {});
+
+    /** Emits a begin/end pair and leaves a useful unfinished-call marker when an
+        exception unwinds through the scope. A hard crash naturally leaves only
+        the begin event, allowing the coordinator to name the exact failing call.
+    */
+    class ScopedCall
+    {
+    public:
+        ScopedCall (const char* stageToUse, const char* callToUse,
+                    bool isCritical = true, const String& detail = {});
+        ~ScopedCall();
+
+        void finish (bool success, int64 resultCode = 0,
+                     const String& detail = {});
+
+    private:
+        const char* stage = nullptr;
+        const char* call = nullptr;
+        uint32 startMs = 0;
+        bool active = false;
+        bool critical = false;
+        bool finished = false;
+
+        JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (ScopedCall)
+    };
+}
+
 } // namespace juce

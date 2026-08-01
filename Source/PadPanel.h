@@ -37,11 +37,45 @@ public:
         addAndMakeVisible (volLbl);
         refreshVolLabel();
 
+        // CORTE (pedido de cliente, 01/08/2026): abre e fecha o brilho do pad
+        // ao vivo. O parametro mora no PadProcessor, entao o mesmo controle
+        // pode ser mapeado num knob ou pedal pelo Mapear MIDI.
+        corte.setSliderStyle (juce::Slider::RotaryHorizontalVerticalDrag);
+        corte.setWantsKeyboardFocus (false);
+        corte.setTextBoxStyle (juce::Slider::NoTextBox, false, 0, 0);
+        corte.setRange (0.0, 1.0, 0.001);
+        corte.setDoubleClickReturnValue (true, 1.0);   // duplo clique = totalmente aberto
+        corte.setValue (pad != nullptr ? pad->getCutoff() : 1.0, juce::dontSendNotification);
+        corte.onValueChange = [this]
+        {
+            if (pad != nullptr)
+                pad->setCutoff ((float) corte.getValue());
+
+            refreshCorteLabel();
+        };
+        addAndMakeVisible (corte);
+
+        corteLbl.setFont (juce::Font (juce::FontOptions (9.0f)).boldened());
+        corteLbl.setJustificationType (juce::Justification::centred);
+        corteLbl.setColour (juce::Label::textColourId, NordLookAndFeel::dimText());
+        addAndMakeVisible (corteLbl);
+        refreshCorteLabel();
+
         stopBtn.setButtonText ("Parar");
         stopBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff8f0c21));
         stopBtn.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
-        stopBtn.onClick = [this] { select (-1); };
+        stopBtn.onClick = [this] { handleUserSelection (-1); };
         addAndMakeVisible (stopBtn);
+
+        // O desenho continua compacto, mas uma camada transparente de 44 px
+        // recebe o toque ao redor dele. O X antigo de 26x22 era um alvo de
+        // mouse em uma tela que tambem roda no palco por toque.
+        closeHitTarget.setColour (juce::TextButton::buttonColourId,
+                                  juce::Colours::transparentBlack);
+        closeHitTarget.setColour (juce::TextButton::buttonOnColourId,
+                                  juce::Colours::transparentBlack);
+        closeHitTarget.onClick = [this] { if (onClose) onClose(); };
+        addAndMakeVisible (closeHitTarget);
 
         closeBtn.setButtonText (juce::String::fromUTF8 ("\xc3\x97"));   // ×
         closeBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff2a2d34));
@@ -59,12 +93,25 @@ public:
     }
 
     std::function<void()> onClose;
+    std::function<void(int)> onMidiLearnTarget;
+
+    void setMidiLearnMode (bool active)
+    {
+        midiLearnMode = active;
+        stopBtn.setEnabled (active || current >= 0);
+    }
+
+    // O aprendizado de notas entra pelo MIDI Learn GLOBAL do app
+    // (onMidiLearnTarget + setMidiLearnMode acima), e nao por um botao
+    // proprio deste painel: e o mesmo gesto que o musico ja usa para mapear
+    // qualquer outro controle, e o passo 2 aparece no MidiLearnPanel.
 
     // ressincroniza o destaque com o motor (ex.: ao reabrir)
     void refreshState()
     {
         current = pad != nullptr ? pad->getKey() : -1;
-        stopBtn.setEnabled (current >= 0);
+        stopBtn.setEnabled (midiLearnMode || current >= 0);
+        refreshFromProcessor();
         repaint();
     }
 
@@ -72,6 +119,56 @@ public:
     {
         static const char* nm[12] = { "C","C#","D","D#","E","F","F#","G","G#","A","A#","B" };
         return nm[juce::jlimit (0, 11, i)];
+    }
+
+    // TECLAS FISICAS ATRIBUIDAS A CADA TOM.
+    //
+    // Sem isto o mapeamento por nota era invisivel: o unico sintoma de uma
+    // tecla mapeada — inclusive de uma mapeada POR ENGANO — era ela parar de
+    // tocar, sem nenhum lugar no app onde o musico pudesse descobrir o porque.
+    // Aqui o tom mostra a etiqueta da tecla que o comanda ("C1"), no mesmo
+    // teclado onde ele escolhe o tom.
+    //
+    // Cada posicao guarda o rotulo das teclas do tom 0..11; a ultima e a de
+    // Parar. Vazio = nenhuma tecla atribuida.
+    struct TeclaMapeada
+    {
+        juce::String rotulo;
+        bool aparelhoPresente = true;   // false = mapeado, mas esse teclado nao esta ligado agora
+    };
+
+    void setTeclasMapeadas (const std::array<TeclaMapeada, 12>& porTom, TeclaMapeada parar)
+    {
+        for (int i = 0; i < 12; ++i)
+        {
+            etiquetas[i] = porTom[(size_t) i].rotulo;
+            presente[i]  = porTom[(size_t) i].aparelhoPresente;
+        }
+
+        pararPresente = parar.aparelhoPresente;
+        etiquetaDeParar = std::move (parar.rotulo);
+
+        // NO PROPRIO BOTAO, nao so na dica.
+        //
+        // Dica de mouse nao existe em tela sensivel ao toque — que e onde este
+        // app roda no palco. E desde que a tecla de tom passou a SELECIONAR em
+        // vez de alternar, "Parar" virou a unica forma de calar o Pad pelo
+        // teclado: era justamente a atribuicao mais importante e a unica
+        // invisivel.
+        // fromUTF8 explicito, como no resto do projeto: o construtor simples de
+        // String com bytes crus saiu como "Â·" na tela.
+        stopBtn.setButtonText (etiquetaDeParar.isEmpty()
+                                 ? juce::String ("Parar")
+                                 : juce::String::fromUTF8 ("Parar  \xe2\x80\xa2  ") + etiquetaDeParar
+                                     + (pararPresente ? juce::String() : juce::String (" (?)")));
+
+        stopBtn.setTooltip (etiquetaDeParar.isEmpty()
+                              ? juce::String ("Desliga o Pad Continuo")
+                              : pararPresente
+                                  ? "Desliga o Pad Continuo  (tecla " + etiquetaDeParar + ")"
+                                  : juce::String::fromUTF8 ("Tecla ") + etiquetaDeParar
+                                      + juce::String::fromUTF8 (" mapeada noutro teclado, que n\xc3\xa3o est\xc3\xa1 ligado agora"));
+        repaint();
     }
 
     void toggle (int i) { select (current == i ? -1 : i); }
@@ -83,7 +180,7 @@ public:
         if (pad != nullptr)
             pad->setKey (k);
 
-        stopBtn.setEnabled (k >= 0);   // "Parar" sem nada tocando nao faz nada
+        stopBtn.setEnabled (midiLearnMode || k >= 0);
         repaint();
     }
 
@@ -91,6 +188,42 @@ public:
     {
         volLbl.setText ("VOLUME  " + juce::String (juce::roundToInt (vol.getValue() * 100.0)) + "%",
                         juce::dontSendNotification);
+    }
+
+    // Chamado quando algo mexe no Pad por fora (um CC mapeado, por exemplo).
+    // Sem isto o knob da tela continuaria mostrando o valor antigo enquanto o
+    // som ja tinha mudado.
+    void refreshFromProcessor()
+    {
+        if (pad == nullptr)
+            return;
+
+        vol.setValue (pad->getGain(), juce::dontSendNotification);
+        corte.setValue (pad->getCutoff(), juce::dontSendNotification);
+        refreshVolLabel();
+        refreshCorteLabel();
+    }
+
+    void refreshCorteLabel()
+    {
+        // Mostra a frequencia de verdade, nao a porcentagem do knob: "CORTE
+        // 1.5 kHz" diz ao musico o que ele esta fazendo; "CORTE 50%" nao diz
+        // nada. Com o knob no fim, "aberto" e mais honesto que "19.2 kHz",
+        // porque ali o filtro sai do caminho.
+        const double t = corte.getValue();
+
+        if (t >= 0.999)
+        {
+            corteLbl.setText ("CORTE  aberto", juce::dontSendNotification);
+            return;
+        }
+
+        const double hz = 120.0 * std::pow (160.0, t);
+
+        corteLbl.setText (hz >= 1000.0
+                            ? "CORTE  " + juce::String (hz / 1000.0, 1) + " kHz"
+                            : "CORTE  " + juce::String (juce::roundToInt (hz)) + " Hz",
+                          juce::dontSendNotification);
     }
 
     void mouseDown (const juce::MouseEvent& e) override
@@ -107,8 +240,8 @@ public:
         }
 
         draggingCard = false;
-        for (int i = 0; i < 5; ++i) if (blackRects[i].contains (pt)) { toggle (kBlack[i]); return; }
-        for (int i = 0; i < 7; ++i) if (whiteRects[i].contains (pt)) { toggle (kWhite[i]); return; }
+        for (int i = 0; i < 5; ++i) if (blackRects[i].contains (pt)) { handleUserSelection (kBlack[i]); return; }
+        for (int i = 0; i < 7; ++i) if (whiteRects[i].contains (pt)) { handleUserSelection (kWhite[i]); return; }
     }
 
     void mouseDrag (const juce::MouseEvent& e) override
@@ -167,7 +300,24 @@ public:
             g.setColour (juce::Colours::black.withAlpha (0.6f));
             g.drawRoundedRectangle (d.reduced (0.5f), 9.0f, 1.0f);
 
-            if (current >= 0)
+            // Com o MIDI Learn armado o visor vira instrucao: mapear e coisa
+            // de ensaio, e o musico precisa LER o que fazer em vez de
+            // adivinhar por que a tecla parou de ligar o pad.
+            if (midiLearnMode)
+            {
+                g.setFont (juce::Font (juce::FontOptions (9.5f)).boldened().withExtraKerningFactor (0.2f));
+                g.setColour (NordLookAndFeel::nordRedBright());
+                g.drawText ("MAPEAR NOTAS",
+                            d.toNearestInt().reduced (14, 8).removeFromTop (11),
+                            juce::Justification::centredLeft);
+
+                g.setFont (juce::Font (juce::FontOptions (12.5f)));
+                g.setColour (juce::Colours::white.withAlpha (0.9f));
+                g.drawText (juce::String::fromUTF8 ("Toque no tom que quer mapear"),
+                            d.toNearestInt().reduced (14, 4),
+                            juce::Justification::centred);
+            }
+            else if (current >= 0)
             {
                 // o rotulo "PAD" repetia o titulo do card logo acima — saiu
                 g.setFont (juce::Font (juce::FontOptions (9.5f)).boldened().withExtraKerningFactor (0.2f));
@@ -199,6 +349,13 @@ public:
 
         for (int w = 0; w < 7; ++w) drawWhite (g, whiteRects[w], kWhite[w]);
         for (int i = 0; i < 5; ++i) drawBlack (g, blackRects[i], kBlack[i]);
+
+        // As etiquetas vem DEPOIS das teclas pretas, que sao desenhadas por
+        // cima das brancas. Desenhadas junto com a tecla branca, a etiqueta do
+        // C ficava escondida atras do C# — some justamente onde o musico
+        // procura por ela.
+        for (int w = 0; w < 7; ++w) desenharEtiqueta (g, whiteRects[w], kWhite[w], kWhite[w] == current);
+        for (int i = 0; i < 5; ++i) desenharEtiqueta (g, blackRects[i], kBlack[i], kBlack[i] == current);
     }
 
     void drawWhite (juce::Graphics& g, juce::Rectangle<float> r, int key)
@@ -260,23 +417,68 @@ public:
         g.drawText (noteName (key), r.toNearestInt().removeFromBottom (18), juce::Justification::centred);
     }
 
+    // Etiqueta da tecla fisica, no ALTO da tecla desenhada — longe do nome do
+    // tom, que fica embaixo, e pequena o bastante para nao competir com ele.
+    // O ponto sozinho ja diria "tem alguma coisa aqui"; o rotulo diz QUAL
+    // tecla, que e o que o musico precisa para achar (ou desfazer) o mapa.
+    void desenharEtiqueta (juce::Graphics& g, juce::Rectangle<float> r, int key, bool on)
+    {
+        if (! juce::isPositiveAndBelow (key, 12) || etiquetas[key].isEmpty())
+            return;
+
+        auto faixa = r.toNearestInt().removeFromTop (juce::jmin (15, r.toNearestInt().getHeight() / 3));
+
+        // APARELHO AUSENTE NAO PODE PARECER TECLA VIVA.
+        //
+        // O mapa guarda o identificador da porta. Se o musico mapeou no teclado
+        // de casa e no domingo levou outro, a tecla nao responde — e uma
+        // etiqueta vermelha ali estaria prometendo justamente o que nao
+        // funciona. Apagada, ela conta a verdade: "isto esta mapeado, mas nao
+        // com o que esta plugado agora".
+        const bool vivo = presente[key];
+
+        g.setColour (! vivo ? NordLookAndFeel::dimText().withAlpha (0.55f)
+                            : on ? juce::Colours::white.withAlpha (0.92f)
+                                 : NordLookAndFeel::nordRed().withAlpha (0.95f));
+        g.setFont (juce::Font (juce::FontOptions (8.5f)).boldened());
+        g.drawText (etiquetas[key], faixa, juce::Justification::centred);
+    }
+
     void resized() override
     {
-        auto card = getLocalBounds().reduced (12);
-        closeBtn.setBounds (card.getRight() - 38, card.getY() + 10, 26, 22);
+        const bool narrow = getWidth() < 440 || getHeight() < 290;
+        auto card = getLocalBounds().reduced (narrow ? 8 : 12);
+        const auto closeHit = juce::Rectangle<int> (card.getRight() - 44,
+                                                    card.getY(), 44, 44);
+        closeHitTarget.setBounds (closeHit);
+        closeBtn.setBounds (closeHit.withSizeKeepingCentre (26, 22));
+        closeBtn.toFront (false);
 
-        auto area = card.reduced (22, 16);
-        titleBounds = area.removeFromTop (22);
-        area.removeFromTop (8);
-        displayBounds = area.removeFromTop (52).toFloat();
-        area.removeFromTop (14);
+        auto area = card.reduced (narrow ? 12 : 22, narrow ? 8 : 16);
+        titleBounds = area.removeFromTop (narrow ? 20 : 22);
+        area.removeFromTop (narrow ? 4 : 8);
+        displayBounds = area.removeFromTop (narrow ? 44 : 52).toFloat();
+        area.removeFromTop (narrow ? 6 : 14);
 
-        auto bottom = area.removeFromBottom (48);
-        auto volArea = bottom.removeFromLeft (86);
+        // 44 px reais para Parar e para os dois knobs. O grafismo dos knobs
+        // cresce apenas quatro pixels, mas o alvo deixa de exigir precisao de
+        // mouse. O botao Parar tambem ganha largura para "Parar • C#1 (?)".
+        auto bottom = area.removeFromBottom (narrow ? 52 : 54);
+
+        auto volArea = bottom.removeFromLeft (narrow ? 70 : 86);
         volLbl.setBounds (volArea.removeFromBottom (12));
-        vol.setBounds (volArea.withSizeKeepingCentre (40, 36));
-        stopBtn.setBounds (bottom.removeFromRight (104).withSizeKeepingCentre (104, 32));
-        area.removeFromBottom (12);
+        vol.setBounds (volArea.withSizeKeepingCentre (44, 44));
+
+        // O corte fica ao lado do volume: sao os dois controles continuos do
+        // pad, e o musico procura os dois no mesmo canto.
+        auto corteArea = bottom.removeFromLeft (narrow ? 80 : 96);
+        corteLbl.setBounds (corteArea.removeFromBottom (12));
+        corte.setBounds (corteArea.withSizeKeepingCentre (44, 44));
+
+        const int stopWidth = juce::jmin (narrow ? 144 : 148, bottom.getWidth());
+        stopBtn.setBounds (bottom.removeFromRight (stopWidth)
+                                .withSizeKeepingCentre (stopWidth, 44));
+        area.removeFromBottom (narrow ? 4 : 12);
 
         auto kb = area.toFloat();
         const float ww = kb.getWidth() / 7.0f;
@@ -290,10 +492,26 @@ public:
     }
 
 private:
+    void handleUserSelection (int key)
+    {
+        if (midiLearnMode && onMidiLearnTarget)
+        {
+            onMidiLearnTarget (key);
+            return;
+        }
+
+        if (key < 0)
+            select (-1);
+        else
+            toggle (key);
+    }
+
     PadProcessor* pad;
     juce::Label volLbl;
-    juce::TextButton stopBtn, closeBtn;
+    juce::TextButton stopBtn, closeHitTarget, closeBtn;
     juce::Slider vol;
+    juce::Slider corte;
+    juce::Label  corteLbl;
     int current = -1;
 
     juce::Rectangle<int> titleBounds;
@@ -304,6 +522,13 @@ private:
 
     juce::ComponentDragger dragger;
     bool draggingCard = false;
+    bool midiLearnMode = false;
+
+    // Rotulo da tecla fisica atribuida a cada tom (0..11) e a Parar.
+    juce::String etiquetas[12];
+    bool presente[12] { true, true, true, true, true, true, true, true, true, true, true, true };
+    juce::String etiquetaDeParar;
+    bool pararPresente = true;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (PadPanel)
 };

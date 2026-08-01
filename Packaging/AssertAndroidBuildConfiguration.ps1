@@ -431,9 +431,9 @@ Assert-AndroidCondition (
     -not $mainSource.Contains('const auto oldLibrary = AppPaths::legacySharedDataFolder()')
 ) "Oferta opcional do acervo antigo nao esta persistida ou ainda sonda arquivos antes da permissao"
 Assert-AndroidCondition (
-    $startupSource.Contains('Voce ja usava o ChurchDAW neste aparelho?') -and
-    $startupSource.Contains('Essa etapa e opcional') -and
-    $startupSource.Contains('Nada sera movido, copiado ou apagado') -and
+    $startupSource.Contains('Você já usava o ChurchDAW neste aparelho?') -and
+    $startupSource.Contains('Essa etapa é opcional') -and
+    $startupSource.Contains('Nada será movido, copiado ou apagado') -and
     -not $startupSource.Contains('Encontramos samples de uma versao anterior')
 ) "Tela inicial afirma ter encontrado samples antes da permissao ou nao explica a escolha"
 Assert-AndroidCondition (

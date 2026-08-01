@@ -39,7 +39,7 @@ public:
         eyebrow = "CHURCHDAW  /  ANDROID";
         title = juce::String::fromUTF8 ("Preparando seu instrumento");
         detail = juce::String::fromUTF8 (
-            "Verificando atualizacoes e o catalogo de bibliotecas...");
+            u8"Verificando atualizações e o catálogo de bibliotecas...");
         progress = -1.0f;
         primaryButton.setVisible (false);
         secondaryButton.setVisible (false);
@@ -50,15 +50,15 @@ public:
     {
         activeUpdatePolicy = std::move (policy);
         mode = Mode::requiredUpdate;
-        eyebrow = "ATUALIZACAO OBRIGATORIA";
-        title = "Atualize com seguranca no ChurchDAW";
+        eyebrow = juce::String::fromUTF8 (u8"ATUALIZAÇÃO OBRIGATÓRIA");
+        title = juce::String::fromUTF8 (u8"Atualize com segurança no ChurchDAW");
         const auto reason = activeUpdatePolicy.updateMessage.isNotEmpty()
                               ? activeUpdatePolicy.updateMessage
                               : juce::String::fromUTF8 (
-                                  "Uma nova versao e necessaria para continuar.");
+                                  u8"Uma nova versão é necessária para continuar.");
         detail = reason + "\n"
                + juce::String::fromUTF8 (
-                   "O APK assinado sera aberto no site oficial; confirme a instalacao no Android para continuar.");
+                   u8"O APK assinado será aberto no site oficial; confirme a instalação no Android para continuar.");
         footnote = "v" + juce::String (ChurchDAWServices::currentVersionName)
                  + "  ->  v" + activeUpdatePolicy.latestVersionName;
         progress = 0.0f;
@@ -69,9 +69,10 @@ public:
             if (auto* self = safe.getComponent())
             {
                 self->detail = juce::String::fromUTF8 (
-                    "Abrindo o APK assinado no churchdaw.com. "
-                    "Depois do download, confirme a instalacao exibida pelo Android.");
-                self->primaryButton.setButtonText ("Abrindo atualizacao...");
+                    u8"Abrindo o APK assinado no churchdaw.com. "
+                    u8"Depois do download, confirme a instalação exibida pelo Android.");
+                self->primaryButton.setButtonText (
+                    juce::String::fromUTF8 (u8"Abrindo atualização..."));
                 self->primaryButton.setEnabled (false);
                 self->repaint();
 
@@ -79,8 +80,8 @@ public:
                         self->activeUpdatePolicy.playStoreUrl))
                 {
                     self->detail = juce::String::fromUTF8 (
-                        "Nao foi possivel abrir a atualizacao segura agora. "
-                        "O ChurchDAW continuara bloqueado; tente novamente mais tarde.");
+                        u8"Não foi possível abrir a atualização segura agora. "
+                        u8"O ChurchDAW continuará bloqueado; tente novamente mais tarde.");
                     self->primaryButton.setButtonText ("Tentar novamente");
                     self->primaryButton.setEnabled (true);
                     self->repaint();
@@ -94,8 +95,8 @@ public:
                         if (auto* current = safe.getComponent())
                         {
                             current->detail = juce::String::fromUTF8 (
-                                "A instalacao ainda nao foi concluida. Baixe o APK no site oficial, "
-                                "confirme no Android e abra o ChurchDAW novamente.");
+                                u8"A instalação ainda não foi concluída. Baixe o APK no site oficial, "
+                                u8"confirme no Android e abra o ChurchDAW novamente.");
                             current->primaryButton.setButtonText ("Tentar novamente");
                             current->primaryButton.setEnabled (true);
                             current->repaint();
@@ -121,10 +122,15 @@ public:
             starterPack = std::make_unique<ChurchDAWServices::LibraryPack> (*starter);
 
         mode = Mode::starterChoice;
-        eyebrow = "PRIMEIRA CONFIGURACAO";
-        title = juce::String::fromUTF8 ("Baixe o Church Live completo ou entre sem samples");
+        eyebrow = juce::String::fromUTF8 (u8"PRIMEIRA CONFIGURAÇÃO");
+        title = starterRequiredForAccess
+                    ? juce::String::fromUTF8 (
+                          u8"Baixe o Church Live completo para iniciar a demonstração")
+                    : juce::String::fromUTF8 (
+                          "Baixe o Church Live completo ou entre sem samples");
         progress = 0.0f;
-        footnote = "Os samples ficam fora do APK, sobrevivem a atualizacoes e podem ser instalados depois.";
+        footnote = juce::String::fromUTF8 (
+            u8"Os samples ficam fora do APK, sobrevivem a atualizações e podem ser instalados depois.");
 
         // O cache pode desenhar o catalogo, mas uma primeira instalacao enorme
         // nao deve nascer de URL vencida quando nenhum servidor respondeu.
@@ -133,13 +139,14 @@ public:
             const auto temporaryBytes =
                 starterPack->downloadBytes + starterPack->installedBytes
                 + ChurchDAWServices::installerStorageReserve;
-            detail = "PACK COMPLETO  /  download "
+            detail = juce::String::fromUTF8 (u8"PACK COMPLETO  /  download ")
                    + ChurchDAWServices::humanBytes (starterPack->downloadBytes)
-                   + "\nPico estimado de espaco: "
+                   + juce::String::fromUTF8 (u8"\nPico estimado de espaço: ")
                    + ChurchDAWServices::humanBytes (temporaryBytes)
-                   + "\nPartes ja retomadas podem reduzir esse pico."
+                   + juce::String::fromUTF8 (u8"\nPartes já retomadas podem reduzir esse pico.")
                    + "\n" + starterPack->description
-                   + "\nPrefira Wi-Fi e mantenha o app aberto durante a instalacao.";
+                   + juce::String::fromUTF8 (
+                         u8"\nPrefira Wi-Fi e mantenha o app aberto durante a instalação.");
             primaryButton.setButtonText ("Baixar pack completo");
             primaryButton.setVisible (true);
             primaryButton.onClick = [safe = juce::Component::SafePointer<StartupPanel> (this)]
@@ -152,17 +159,40 @@ public:
         {
             detail = serverWasReached
                        ? juce::String::fromUTF8 (
-                           "O pack inicial ainda nao foi publicado no catalogo. Voce pode abrir o app e instalar depois em Bibliotecas.")
+                           u8"O pack inicial ainda não foi publicado no catálogo. Você pode abrir o app e instalar depois em Bibliotecas.")
                        : juce::String::fromUTF8 (
-                           "Nao foi possivel validar o catalogo agora. Downloads ficam pausados para sua seguranca; abra o app e tente novamente em Bibliotecas.");
-            primaryButton.setVisible (false);
+                           u8"Não foi possível falar com o servidor agora. Confira a internet do aparelho e toque em Tentar novamente.");
+
+            // Servidor fora do ar ou celular sem rede: sem este botao a tela
+            // fica sem saida nenhuma, porque o "Abrir sem baixar" tambem some
+            // quando a biblioteca e obrigatoria para a demonstracao.
+            if (! serverWasReached && onRetryCatalog != nullptr)
+            {
+                primaryButton.setButtonText ("Tentar novamente");
+                primaryButton.setEnabled (true);
+                primaryButton.setVisible (true);
+                primaryButton.onClick = [safe = juce::Component::SafePointer<StartupPanel> (this)]
+                {
+                    if (auto* self = safe.getComponent())
+                    {
+                        self->primaryButton.setButtonText ("Verificando...");
+                        self->primaryButton.setEnabled (false);
+                        if (self->onRetryCatalog != nullptr)
+                            self->onRetryCatalog();
+                    }
+                };
+            }
+            else
+            {
+                primaryButton.setVisible (false);
+            }
         }
 
         if (starterRequiredForAccess)
         {
             footnote = juce::String::fromUTF8 (
-                "A demonstracao so inicia depois que a biblioteca estiver instalada. "
-                "O tempo de 20 minutos nao corre durante o download.");
+                u8"A demonstração só inicia depois que a biblioteca estiver instalada. "
+                u8"O tempo de 20 minutos não corre durante o download.");
             secondaryButton.setVisible (false);
             secondaryButton.onClick = nullptr;
         }
@@ -191,7 +221,7 @@ public:
         mode = Mode::ready;
         eyebrow = "PRONTO";
         title = juce::String::fromUTF8 ("Abrindo o ChurchDAW");
-        detail = juce::String::fromUTF8 ("Iniciando audio, MIDI e seus timbres...");
+        detail = juce::String::fromUTF8 (u8"Iniciando áudio, MIDI e seus timbres...");
         footnote.clear();
         progress = 1.0f;
         primaryButton.setVisible (false);
@@ -203,14 +233,14 @@ public:
                            std::function<void()> skip)
     {
         mode = Mode::legacyAccess;
-        eyebrow = "ACERVO DE VERSOES ANTERIORES";
-        title = juce::String::fromUTF8 ("Voce ja usava o ChurchDAW neste aparelho?");
+        eyebrow = juce::String::fromUTF8 (u8"ACERVO DE VERSÕES ANTERIORES");
+        title = juce::String::fromUTF8 (u8"Você já usava o ChurchDAW neste aparelho?");
         detail = juce::String::fromUTF8 (
-            "Se voce guardou timbres em Music/ChurchDAW, podemos verificar esse acervo "
-            "depois que voce autorizar o acesso a arquivos de audio. "
-            "Essa etapa e opcional e pode ser ativada depois em Bibliotecas.");
+            u8"Se você guardou timbres em Music/ChurchDAW, podemos verificar esse acervo "
+            u8"depois que você autorizar o acesso a arquivos de áudio. "
+            u8"Essa etapa é opcional e pode ser ativada depois em Bibliotecas.");
         footnote = juce::String::fromUTF8 (
-            "Nada sera movido, copiado ou apagado. Novos packs ficam no armazenamento privado do app.");
+            u8"Nada será movido, copiado ou apagado. Novos packs ficam no armazenamento privado do app.");
         progress = 0.0f;
 
         primaryButton.setButtonText ("Verificar meu acervo");
@@ -221,7 +251,7 @@ public:
         };
         primaryButton.setVisible (true);
 
-        secondaryButton.setButtonText ("Agora nao");
+        secondaryButton.setButtonText (juce::String::fromUTF8 (u8"Agora não"));
         secondaryButton.onClick = [callback = std::move (skip)]
         {
             if (callback != nullptr)
@@ -397,6 +427,11 @@ public:
 
     std::function<void()> onContinue;
 
+    // Refaz a checagem de catalogo. Sem isso, quando o servidor nao responde
+    // na primeira configuracao a tela fica sem nenhum botao e o cliente so
+    // consegue sair fechando o app.
+    std::function<void()> onRetryCatalog;
+
 private:
     enum class Mode { checking, requiredUpdate, legacyAccess, starterChoice, downloading, ready };
 
@@ -421,7 +456,8 @@ private:
         eyebrow = "INSTALADOR DE BIBLIOTECAS";
         title = "Instalando " + starterPack->name;
         detail = "Preparando download...";
-        footnote = "Pode demorar em packs grandes. Nao feche o app durante a instalacao.";
+        footnote = juce::String::fromUTF8 (
+            u8"Pode demorar em packs grandes. Não feche o app durante a instalação.");
         progress = 0.0f;
         primaryButton.setVisible (false);
         secondaryButton.setButtonText ("Cancelar");
@@ -470,18 +506,19 @@ private:
                     else
                     {
                         self->mode = Mode::starterChoice;
-                        self->eyebrow = "NAO FOI POSSIVEL INSTALAR";
-                        self->title = "O download nao foi concluido";
+                        self->eyebrow = juce::String::fromUTF8 (u8"NÃO FOI POSSÍVEL INSTALAR");
+                        self->title = juce::String::fromUTF8 (u8"O download não foi concluído");
                         self->detail = result.getErrorMessage();
-                        self->footnote = "Nada incompleto foi ativado. Voce pode tentar de novo.";
+                        self->footnote = juce::String::fromUTF8 (
+                            u8"Nada incompleto foi ativado. Você pode tentar de novo.");
                         self->progress = 0.0f;
                         self->primaryButton.setButtonText ("Tentar novamente");
                         self->primaryButton.setVisible (true);
                         if (self->starterRequiredForAccess)
                         {
                             self->footnote = juce::String::fromUTF8 (
-                                "A demonstracao ainda nao foi reservada nem iniciada. "
-                                "Libere espaco ou corrija a rede e tente novamente.");
+                                u8"A demonstração ainda não foi reservada nem iniciada. "
+                                u8"Libere espaço ou corrija a rede e tente novamente.");
                             self->secondaryButton.setVisible (false);
                             self->secondaryButton.onClick = nullptr;
                         }
@@ -515,7 +552,8 @@ private:
             return;
 
         cancelRequested = true;
-        detail = "Cancelando com seguranca... As partes validas ficam salvas para retomar.";
+        detail = juce::String::fromUTF8 (
+            u8"Cancelando com segurança... As partes válidas ficam salvas para retomar.");
         secondaryButton.setButtonText ("Cancelando...");
         secondaryButton.setEnabled (false);
         installer->cancel();

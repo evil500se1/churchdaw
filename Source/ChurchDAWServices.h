@@ -32,8 +32,8 @@
 //==============================================================================
 namespace ChurchDAWServices
 {
-    inline constexpr int currentVersionCode = 10;
-    inline constexpr const char* currentVersionName = "1.5.4";
+    inline constexpr int currentVersionCode = 12;
+    inline constexpr const char* currentVersionName = "1.5.6";
     inline constexpr const char* packageId = "com.churchdaw.app";
     inline constexpr const char* updatePolicyUrl =
         "https://churchdaw.com/app/android/update-policy-v2.json";
@@ -42,8 +42,14 @@ namespace ChurchDAWServices
     inline constexpr const char* manifestUrl = "https://churchdaw.com/app/android/manifest.json";
     inline constexpr const char* fallbackManifestUrl =
         "https://www.churchdaw.com/app/android/manifest.json";
+    // URL de escape usada quando a policy nao carrega (celular sem internet no
+    // domingo, policy vencida). Ela TEM de terminar em "-signed.apk": a ponte
+    // Java exige isso em ChurchDAWUpdateBridge.isOfficialApkUrl e devolve false
+    // sem nem tentar abrir. Com o nome sem "-signed" o botao "Atualizar" ficava
+    // morto e, no gate obrigatorio, o cliente ficava preso — foi o que
+    // aconteceu em 31/07/2026.
     inline constexpr const char* defaultPlayStoreUrl =
-        "https://churchdaw.com/app/android/ChurchDAW-1.5.4.apk";
+        "https://churchdaw.com/app/android/ChurchDAW-1.5.6-signed.apk";
     inline constexpr int maximumUpdatePolicyBytes = 32 * 1024;
     inline constexpr int maximumSignedPolicyPayloadBytes = 24 * 1024;
     inline constexpr int maximumVersionNameCharacters = 48;
@@ -832,6 +838,35 @@ namespace ChurchDAWServices
             return AppPaths::managedLibrariesFolder().getChildFile (installFolder);
         }
 
+        // O catalogo atual instala o Pad em Libraries/Pads. Builds antigas
+        // usaram Libraries/pad-continuo/Pads e deixaram o marker no diretorio
+        // pai. O player ja reconhece esse layout; a loja precisa consultar o
+        // mesmo local para nao oferecer download de algo que esta instalado.
+        // O destino de novas instalacoes continua sendo installedFolder().
+        juce::File detectedInstalledFolderAt (const juce::File& librariesRoot) const
+        {
+            const auto canonical = librariesRoot.getChildFile (installFolder);
+
+            if (canonical.exists())
+                return canonical;
+
+            if (id == "pad-continuo")
+            {
+                const auto legacy =
+                    librariesRoot.getChildFile (id);
+
+                if (legacy.isDirectory())
+                    return legacy;
+            }
+
+            return canonical;
+        }
+
+        juce::File detectedInstalledFolder() const
+        {
+            return detectedInstalledFolderAt (AppPaths::managedLibrariesFolder());
+        }
+
         juce::File markerFile() const
         {
             return installedFolder().getChildFile (".churchdaw-library.json");
@@ -840,7 +875,7 @@ namespace ChurchDAWServices
         int installedVersion() const
         {
             if (const auto managedVersion = validLibraryMarkerVersion (
-                    installedFolder(), id);
+                    detectedInstalledFolder(), id);
                 managedVersion > 0)
                 return managedVersion;
 
@@ -2328,15 +2363,13 @@ namespace ChurchDAWServices
             juce::URL::InputStreamOptions (
                 juce::URL::ParameterHandling::inAddress)
                 .withConnectionTimeoutMs (timeoutMs)
-                // O host de fallback (www.churchdaw.com) responde 301 para o
-                // apex — com zero redirects o fallback NUNCA funcionou, e o
-                // app mostrava "nao foi possivel validar o catalogo" sempre
-                // que o endpoint principal falhava. Medido no CI do macOS em
-                // 30/07: "HTTP 301: Manifesto nao corresponde ao SHA-256".
-                // Seguir ate 2 saltos e seguro aqui porque o conteudo so e
-                // aceito se casar com o SHA-256 da policy assinada em RSA:
-                // um redirecionamento hostil nao consegue forjar o catalogo.
-                .withNumRedirectsToFollow (2)
+                // Requisicoes de catalogo podem levar o bearer da biblioteca.
+                // Nao siga redirects: a assinatura protege a integridade do
+                // JSON, mas nao impediria o cabecalho Authorization de ser
+                // encaminhado ao destino de um redirect. O endpoint www que
+                // hoje responde 301 continua sendo apenas uma tentativa de
+                // fallback; o endpoint apex acima serve o JSON diretamente.
+                .withNumRedirectsToFollow (0)
                 .withResponseHeaders (&responseHeaders)
                 .withStatusCode (&response.statusCode)
                 .withExtraHeaders (
@@ -4109,7 +4142,10 @@ namespace ChurchDAWServices
                 auto input = std::make_shared<juce::WebInputStream> (
                     juce::URL (downloadPart.downloadUrl), false);
                 input->withConnectionTimeout (12000)
-                     .withNumRedirectsToFollow (3)
+                     // O download pode carregar Authorization. A URL ja foi
+                     // validada como oficial; seguir um redirect sem revalidar
+                     // o host poderia vazar o bearer para outro destino.
+                     .withNumRedirectsToFollow (0)
                      .withExtraHeaders (headers);
                 ActiveDownloadRegistration activeDownload (*this, input);
 

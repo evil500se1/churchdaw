@@ -156,7 +156,7 @@ public:
         // querer evitar. Aqui chapa e nome dividem a MESMA linha.
         const bool tight = getHeight() < 90;
 
-        auto inner = b.reduced (tight ? 12.0f : 18.0f, tight ? 6.0f : 12.0f);
+        auto inner = b.reduced (tight ? 12.0f : 18.0f, tight ? 3.0f : 12.0f);
 
         // DUAS COLUNAS. Empilhado, o painel precisava ser estreito e sobrava meia
         // tela de preto de cada lado -- vazio sem intencao, que e o que mais
@@ -263,18 +263,22 @@ public:
 
         // ---- coluna direita: a lista dos canais, com titulo proprio ----
         {
-            auto head = right.removeFromTop (13.0f);
-            g.setFont (NordLookAndFeel::stageLabel (9.5f));
+            auto head = right.removeFromTop (tight ? 7.0f : 11.0f);
+            g.setFont (NordLookAndFeel::stageLabel (tight ? 7.5f : 9.0f));
             g.setColour (juce::Colours::white.withAlpha (0.38f));
             g.drawText ("CANAIS", head.toNearestInt(), juce::Justification::centredLeft, false);
 
-            right.removeFromTop (3.0f);
+            right.removeFromTop (tight ? 1.0f : 2.0f);
             g.setColour (juce::Colours::white.withAlpha (0.16f));
             g.fillRect (juce::Rectangle<float> (right.getX(), right.getY(), right.getWidth(), 1.0f));
-            right.removeFromTop (6.0f);
+            right.removeFromTop (tight ? 2.0f : 4.0f);
         }
 
-        const float rowH = juce::jlimit (13.0f, 18.0f, right.getHeight() / 5.0f);
+        // O painel desktop ficou 25--30% mais baixo. Cinco canais continuam
+        // visiveis porque a lista reduz o passo, nao porque corta as ultimas
+        // linhas ou desalinha titulo e valores.
+        const float rowH = juce::jlimit (tight ? 7.5f : 10.0f, 16.0f,
+                                         right.getHeight() / 5.0f);
 
         for (const auto& row : rows)
         {
@@ -293,19 +297,23 @@ public:
             // numero do canal (canal vazio nao ganha icone: um travessao ja diz
             // tudo -- dois simbolos apagados na mesma linha era ruido)
             {
-                auto num = line.removeFromLeft (11.0f);
+                auto num = line.removeFromLeft (tight ? 8.0f : 11.0f);
                 g.setColour (juce::Colours::white.withAlpha (0.45f * alpha));
-                g.setFont (juce::Font (juce::FontOptions (9.0f, juce::Font::bold)));
+                g.setFont (juce::Font (juce::FontOptions (
+                    tight ? 7.0f : rowH < 12.0f ? 8.0f : 9.0f,
+                    juce::Font::bold)));
                 g.drawText (juce::String (row.index), num.toNearestInt(),
                             juce::Justification::centredLeft, false);
 
-                auto ic = line.removeFromLeft (14.0f).withSizeKeepingCentre (11.0f, 9.0f);
+                auto ic = line.removeFromLeft (tight ? 10.0f : 14.0f)
+                              .withSizeKeepingCentre (tight ? 8.0f : 11.0f,
+                                                      tight ? 7.0f : 9.0f);
 
                 if (! row.empty)
                     paintIcon (g, ic, row.icon, juce::Colours::white.withAlpha (0.85f * alpha));
             }
 
-            line.removeFromLeft (5.0f);
+            line.removeFromLeft (tight ? 2.0f : 5.0f);
 
             if (! row.empty)
             {
@@ -313,11 +321,15 @@ public:
                 // quente em ambar, impulsionando ganho em vermelho
                 if (row.tag.isNotEmpty())
                 {
-                    auto tag = line.removeFromRight (52.0f);
+                    auto tag = line.removeFromRight (tight ? 38.0f
+                                                          : rowH < 12.0f ? 46.0f : 52.0f);
                     g.setColour (row.dbVal > 0.0f  ? juce::Colour (0xffe0503a).withAlpha (alpha)
                                : row.dbVal > -3.0f ? juce::Colour (0xffe0a83a).withAlpha (alpha)
                                                    : juce::Colours::white.withAlpha (0.65f * alpha));
-                    g.setFont (juce::Font (juce::FontOptions (10.5f, juce::Font::bold)));
+                    g.setFont (juce::Font (juce::FontOptions (
+                        juce::Font::getDefaultMonospacedFontName(),
+                        tight ? 7.2f : rowH < 12.0f ? 8.5f : 10.0f,
+                        juce::Font::bold)));
                     g.drawText (row.tag, tag.toNearestInt(), juce::Justification::centredRight, true);
                 }
 
@@ -326,7 +338,10 @@ public:
                 {
                     const size_t li = (size_t) juce::jlimit (0, (int) (sizeof (levels) / sizeof (levels[0])) - 1,
                                                              row.index - 1);
-                    auto met = line.removeFromRight (40.0f).withSizeKeepingCentre (34.0f, 3.0f);
+                    const float meterSlotW = tight ? 26.0f
+                                                   : rowH < 12.0f ? 32.0f : 40.0f;
+                    auto met = line.removeFromRight (meterSlotW)
+                                   .withSizeKeepingCentre (meterSlotW - 6.0f, 3.0f);
 
                     g.setColour (juce::Colours::white.withAlpha (0.10f * alpha));
                     g.fillRoundedRectangle (met, 1.5f);
@@ -339,15 +354,16 @@ public:
                         g.fillRoundedRectangle (met.removeFromLeft (met.getWidth() * lv), 1.5f);
                     }
 
-                    line.removeFromRight (6.0f);
+                    line.removeFromRight (tight ? 3.0f : 6.0f);
                 }
             }
 
             // contraste maior nos nomes da lista: 92% de branco puro num fundo
             // quase preto ainda lia fraco no tamanho 12
             g.setColour (juce::Colours::white.withAlpha ((row.focused ? 1.0f : row.empty ? 0.35f : 0.88f) * alpha));
-            g.setFont (juce::Font (juce::FontOptions (12.5f, row.focused ? juce::Font::bold
-                                                                         : juce::Font::plain)));
+            g.setFont (juce::Font (juce::FontOptions (
+                tight ? 8.2f : rowH < 12.0f ? 10.0f : 12.0f,
+                row.focused ? juce::Font::bold : juce::Font::plain)));
             g.drawText (row.name, line.toNearestInt(), juce::Justification::centredLeft, true);
         }
     }
@@ -473,7 +489,9 @@ private:
 
     juce::String slotText, titleText, chordText;
     std::vector<Row> rows;
-    float levels[8] = {};   // niveis atuais dos mini-medidores (0..1)
+    // Church Live possui 14 canais. Com apenas oito entradas, uma linha 9..14
+    // era clampada ao indice 7 e mostrava indevidamente o medidor do canal 8.
+    float levels[14] = {};   // niveis atuais dos mini-medidores (0..1)
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (OledDisplay)
 };

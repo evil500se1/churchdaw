@@ -61,6 +61,7 @@ jobs:
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$PLIST")" = "com.churchdaw.app"
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLIST")" = "$EXPECTED_VERSION"
           /usr/libexec/PlistBuddy -c 'Print :NSMicrophoneUsageDescription' "$PLIST" | grep -q "guitarra/microfone"
+          /usr/libexec/PlistBuddy -c 'Print :NSBluetoothAlwaysUsageDescription' "$PLIST" | grep -q "Bluetooth"
           ARCHS="$(lipo -archs "$EXE")"
           echo "Arquiteturas: $ARCHS"
           grep -qw arm64 <<<"$ARCHS"

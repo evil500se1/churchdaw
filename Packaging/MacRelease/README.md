@@ -38,7 +38,8 @@ de segredo ao sair.
 O job falha se qualquer item abaixo nao puder ser provado:
 
 - checkout limpo e exatamente no commit da tag;
-- versao, bundle ID, build number e deployment target esperados;
+- versao, bundle ID, build number, deployment target e descricoes de permissao
+  de microfone/Bluetooth esperados;
 - binario universal `arm64` + `x86_64`, sem dependencias do diretorio de build;
 - testes CTest de audio, atualizacao e licenciamento, mais o teste nativo da
   assinatura de licenca, aprovados;

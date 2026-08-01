@@ -55,6 +55,10 @@ public:
     // mostra "L" / "R" embaixo de cada barra (so faz sentido em medidor estereo)
     void setChannelLabels (bool shouldShow) { channelLabels = shouldShow; repaint(); }
 
+    // No master, alem do peak-hold grafico, mostra o pico numerico de cada lado.
+    // Nos meters de canal isto permanece desligado para conservar a grade enxuta.
+    void setPeakReadout (bool shouldShow) { peakReadout = shouldShow; repaint(); }
+
     // avisa o nivel exibido (0..1) a cada quadro. Serve pra acender o card do
     // canal sem criar um segundo timer nem um segundo leitor do nivel (o
     // readAndResetLayerLevel do processador ZERA a cada leitura: so pode ter um).
@@ -67,6 +71,10 @@ public:
         juce::Rectangle<float> labelRow;
         if (channelLabels && channels == 2)
             labelRow = bounds.removeFromBottom (13.0f);
+
+        juce::Rectangle<float> peakRow;
+        if (peakReadout && channels == 2)
+            peakRow = bounds.removeFromBottom (17.0f);
 
         g.setColour (juce::Colour (0xff15171b));
         g.fillRoundedRectangle (bounds, 5.0f);
@@ -86,12 +94,44 @@ public:
                 g.drawRoundedRectangle (clipArea.expanded (1.5f), 4.0f, 1.5f);
             }
 
+            g.setColour (clipSticky ? juce::Colours::white
+                                    : juce::Colours::white.withAlpha (0.34f));
+            g.setFont (juce::Font (juce::FontOptions (7.5f, juce::Font::bold))
+                           .withExtraKerningFactor (0.08f));
+            g.drawText ("CLIP", clipArea.toNearestInt(),
+                        juce::Justification::centred, false);
+
             bounds.removeFromTop (1.0f);
         }
 
         auto meterArea = bounds.reduced (channels == 1 ? 3.0f : 5.0f);
         const float gap = channels == 1 ? 0.0f : 4.0f;
         const float barWidth = (meterArea.getWidth() - gap * (float) (channels - 1)) / (float) channels;
+
+        if (! peakRow.isEmpty())
+        {
+            const auto mono = juce::Font (juce::FontOptions (
+                juce::Font::getDefaultMonospacedFontName(), 9.0f,
+                juce::Font::bold));
+            g.setFont (mono);
+
+            for (int ch = 0; ch < channels; ++ch)
+            {
+                auto cell = juce::Rectangle<float> (
+                    meterArea.getX() + (float) ch * (barWidth + gap),
+                    peakRow.getY(), barWidth, peakRow.getHeight());
+                const float db = peakDb[ch];
+                const auto value = db <= minDb + 0.5f
+                    ? juce::String::fromUTF8 ("\xe2\x88\x92\xe2\x88\x9e")
+                    : (db >= 0.0f ? "+" : juce::String())
+                        + juce::String (db, 1);
+
+                g.setColour (db >= -0.05f ? NordLookAndFeel::redClip()
+                                          : juce::Colours::white.withAlpha (0.72f));
+                g.drawFittedText (value, cell.toNearestInt(),
+                                  juce::Justification::centred, 1, 0.72f);
+            }
+        }
 
         for (int ch = 0; ch < channels; ++ch)
         {
@@ -305,6 +345,7 @@ private:
     int peakHoldFrames[2] { 0, 0 };
     bool clipSticky = false;
     bool channelLabels = false;
+    bool peakReadout = false;
     // Nasce true: medidor recem-construido (re-dock do editor) tambem encontra
     // acumulo de quando nao existia consumidor -- o primeiro tick sempre drena
     bool wasHidden = true;

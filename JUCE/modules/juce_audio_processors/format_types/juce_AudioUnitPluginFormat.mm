@@ -268,11 +268,14 @@ public:
 
     AudioProcessorEditor* createEditor() override
     {
+        PluginHostDiagnostics::ScopedCall createEditor (
+            "createEditor", "AU create Cocoa editor", true, getName());
         std::unique_ptr<AudioProcessorEditor> w (new AudioUnitPluginWindowCocoa (*this, false));
 
         if (! static_cast<AudioUnitPluginWindowCocoa*> (w.get())->isValid())
             w.reset (new AudioUnitPluginWindowCocoa (*this, true)); // use AUGenericView as a fallback
 
+        createEditor.finish (w != nullptr, w != nullptr ? noErr : -1, getName());
         return w.release();
     }
 };

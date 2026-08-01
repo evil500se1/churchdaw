@@ -1,8 +1,7 @@
 cmake_minimum_required(VERSION 3.22)
-# Versao unica do produto: acompanha o ChurchDAW.jucer (Android ja esta
-# em 1.5.5). Publicar conteudo novo com numero velho fazia o updater dos
-# clientes 1.4.0 achar que nao havia atualizacao.
-project(MinhaDAW VERSION 1.5.6)
+# Versao do produto desktop. O Android mantem versionName/versionCode no
+# ChurchDAW.jucer e pode ser publicado em um ciclo independente.
+project(MinhaDAW VERSION 1.5.7)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

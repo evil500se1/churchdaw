@@ -87,8 +87,9 @@ public final class ChurchDAWAudioDeviceBridge {
         if (manager == null)
             return "audio_manager=unavailable";
 
-        final AudioDeviceInfo[] devices =
-            manager.getDevices(AudioManager.GET_DEVICES_ALL).clone();
+        final AudioDeviceInfo[] devices = manager.getDevices(
+            AudioManager.GET_DEVICES_INPUTS |
+            AudioManager.GET_DEVICES_OUTPUTS).clone();
 
         Arrays.sort(devices, Comparator
             .comparingInt(AudioDeviceInfo::getId)

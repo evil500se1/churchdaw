@@ -82,9 +82,11 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          & .\JUCE\Projucer.exe --resave .\ChurchDAW.jucer
-          if ($LASTEXITCODE -ne 0) {
-            throw "Projucer terminou com codigo $LASTEXITCODE"
+          $projucer = Start-Process -FilePath .\JUCE\Projucer.exe `
+            -ArgumentList @('--resave', (Resolve-Path .\ChurchDAW.jucer).Path) `
+            -WindowStyle Hidden -Wait -PassThru
+          if ($projucer.ExitCode -ne 0) {
+            throw "Projucer terminou com codigo $($projucer.ExitCode)"
           }
 
           $source = (Resolve-Path .\Packaging\AndroidResources).Path

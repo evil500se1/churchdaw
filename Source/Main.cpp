@@ -693,7 +693,28 @@ public:
         return CHURCHDAW_APP_VERSION;
        #endif
     }
-    bool moreThanOneInstanceAllowed() override          { return false; }
+    bool moreThanOneInstanceAllowed() override
+    {
+       #if CHURCHDAW_HOSTS_PLUGINS
+        // O scanner relanca ESTE executavel como processo filho. O JUCE testa
+        // instancia unica em initialiseApp() ANTES de chamar initialise()
+        // (juce_ApplicationBase.cpp:287-293), entao com "false" fixo o filho
+        // morria sem nunca conectar ao pipe: cada plugin esperava o timeout
+        // de 8 s e ia direto para a lista de bloqueados. O resultado era o
+        // app congelado por minutos e terminando com a lista VAZIA — foi
+        // isto que fez o Pianoteq e o BigSky "sumirem" e o Korg Vox
+        // "travar" para os clientes.
+        //
+        // Segunda instancia continua proibida para o musico: so a linha de
+        // comando do scanner libera. getCommandLineParameters() e estatico e
+        // ja esta disponivel aqui.
+        if (juce::JUCEApplicationBase::getCommandLineParameters()
+                .contains (ChurchDAWPluginScan::processUID))
+            return true;
+       #endif
+
+        return false;
+    }
 
     void initialise (const juce::String& commandLine) override
     {
@@ -823,9 +844,9 @@ public:
             "\"Testing\" = \"Testando\"\n"
             "\"Scan complete\" = \"Escaneamento conclu\xc3\xad" "do\"\n"
             "\"Plugin Scanning\" = \"Escaneamento de plugins\"\n"
-            "\"Deactivated after failing to initialise correctly\" = \"Desativado: falhou ao iniciar\"\n"
-            "\"The following files encountered fatal errors during validation\" = \"Estes arquivos deram erro grave na verifica\xc3\xa7\xc3\xa3o\"\n"
-            "\"The following files appeared to be plugin files, but failed to load correctly\" = \"Estes pareciam plugins, mas n\xc3\xa3o carregaram\"\n"), false));
+            "\"Deactivated after failing to initialise correctly\" = \"Desativado: consulte etapa, chamada e c\xc3\xb3" "digo no relat\xc3\xb3rio de scan\"\n"
+            "\"The following files encountered fatal errors during validation\" = \"Falhas isoladas (crash, timeout ou incompatibilidade). O motivo exato foi salvo em Library/Logs/ChurchDAW/PluginScan\"\n"
+            "\"The following files appeared to be plugin files, but failed to load correctly\" = \"Plugins recusados na valida\xc3\xa7\xc3\xa3o. Consulte etapa, chamada, c\xc3\xb3" "digo e stack no relat\xc3\xb3rio de scan\"\n"), false));
 
        #if JUCE_ANDROID && defined (CHURCHDAW_ANDROID_UI_QA)
         // SOMENTE matriz visual local: permite abrir o mixer no emulador sem
@@ -1279,6 +1300,14 @@ public:
             return;
 
         auto safe = juce::Component::SafePointer<StartupPanel> (&startupWindow->panel);
+
+        // Permite que a tela de primeira configuracao repita a checagem quando
+        // o servidor nao respondeu, em vez de deixar o cliente sem nenhum botao.
+        startupWindow->panel.onRetryCatalog = [this]
+        {
+            if (applicationAlive->load())
+                startStartupCheck();
+        };
 
        #if JUCE_ANDROID
         if (check.localLibraryChecked)
@@ -1754,7 +1783,9 @@ public:
             holder = new ScaledHolder();
             setContentOwned (holder, true);
             setResizable (true, true);
-            setResizeLimits (960, 600, 32000, 32000);
+            // Limite provisório até o peer nativo informar a moldura. O mínimo
+            // final é derivado da work area logo abaixo.
+            setResizeLimits (760, 480, 32000, 32000);
             centreWithSize (getWidth(), getHeight());
             setVisible (true);
 
@@ -1783,7 +1814,70 @@ public:
                 // o dono relatou em 30/07 que nao havia como fechar o
                 // programa. setBoundsConstrained respeita a moldura e o
                 // gerenciador de janelas, entao a barra fica sempre visivel.
-                setBoundsConstrained (display->userBounds.toNearestInt());
+                const auto workArea = display->userBounds.getLargestIntegerWithin();
+                auto usable = workArea;
+                juce::BorderSize<int> nativeFrame;
+
+                // O bounds da DocumentWindow representa o conteudo. A moldura
+                // nativa e somada por fora; sem desconta-la, 680 px de work area
+                // viravam ~711 px de janela e o rodape acabava atras da taskbar.
+                if (auto* peer = getPeer())
+                {
+                    nativeFrame = peer->getFrameSize();
+                    usable = nativeFrame.subtractedFrom (usable);
+                }
+
+                auto targetContentBounds = usable;
+                int minimumContentWidth = juce::jmin (960, usable.getWidth());
+                int minimumContentHeight = juce::jmin (600, usable.getHeight());
+                const auto qaWindow = juce::SystemStats::getEnvironmentVariable (
+                    "CHURCHDAW_QA_WINDOW", {}).trim().toLowerCase();
+                const int separator = qaWindow.indexOfChar ('x');
+
+                if (separator > 0)
+                {
+                    const int requestedOuterWidth = qaWindow.substring (0, separator).getIntValue();
+                    const int requestedOuterHeight = qaWindow.substring (separator + 1).getIntValue();
+
+                    if (requestedOuterWidth > 0 && requestedOuterHeight > 0)
+                    {
+                        const int outerWidth = juce::jmin (requestedOuterWidth,
+                                                          workArea.getWidth());
+                        const int outerHeight = juce::jmin (requestedOuterHeight,
+                                                           workArea.getHeight());
+                        const auto targetOuter = juce::Rectangle<int> (outerWidth, outerHeight)
+                                                     .withCentre (workArea.getCentre());
+                        targetContentBounds = nativeFrame.subtractedFrom (targetOuter);
+                        // No hardware 960x600 real, userBounds tambem reduziria os
+                        // limites para este mesmo client. O override reproduz esse
+                        // viewport numa tela maior sem o limitador expandir a QA.
+                        minimumContentWidth = juce::jmin (minimumContentWidth,
+                                                          targetContentBounds.getWidth());
+                        minimumContentHeight = juce::jmin (minimumContentHeight,
+                                                           targetContentBounds.getHeight());
+                    }
+                }
+
+                setResizeLimits (minimumContentWidth, minimumContentHeight,
+                                 32000, 32000);
+                setBoundsConstrained (targetContentBounds);
+
+                const auto actualClient = getBounds();
+                const auto actualOuter = nativeFrame.addedTo (actualClient);
+                const auto dimensions = juce::String ("WINDOW: outer=")
+                    + juce::String (actualOuter.getWidth()) + "x"
+                    + juce::String (actualOuter.getHeight()) + " client="
+                    + juce::String (actualClient.getWidth()) + "x"
+                    + juce::String (actualClient.getHeight()) + " workArea="
+                    + juce::String (workArea.getWidth()) + "x"
+                    + juce::String (workArea.getHeight());
+                juce::Logger::writeToLog (dimensions);
+
+                // Facilita a evidencia visual automatizada sem alterar o produto:
+                // o titulo detalhado so aparece quando o QA pede um tamanho.
+                if (qaWindow.isNotEmpty())
+                    setName ("ChurchDAW [QA " + dimensions.fromFirstOccurrenceOf (
+                                 "WINDOW: ", false, false) + "]");
             }
             else
             {
@@ -1836,7 +1930,13 @@ public:
                 // Medido no Redmi 406x904 via uiautomator em 30/07/2026.
                 const float s = 1.0f;
                #else
-                const float s = juce::jmax (0.1f,
+                // Em janelas menores que a referencia, o MainComponent precisa
+                // receber o tamanho fisico real para que seus breakpoints facam
+                // reflow. Encolher abaixo de 1x mantinha o conteudo artificialmente
+                // em >= 1280x672 e transformava 960x600 numa miniatura ilegivel.
+                // Em telas maiores ainda ampliamos como antes, preservando a
+                // densidade visual pretendida em monitores de alta resolucao.
+                const float s = juce::jmax (1.0f,
                                             juce::jmin (getWidth()  / 1280.0f,
                                                         getHeight() / 672.0f));
                #endif

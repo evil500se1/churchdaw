@@ -17,14 +17,17 @@
 #include "MidiLearnPanel.h"
 #include "MidiMappingSafety.h"
 #include "OledDisplay.h"
+#include "LiveScenes.h"
+#include "LiveScenePanel.h"
 
 #if CHURCHDAW_HOSTS_PLUGINS
- #include "PluginScanSubprocess.h"
+ #include "PluginScanSubprocessV2.h"
 #endif
 
 #include <atomic>
 #include <map>
 #include <memory>
+#include <set>
 
 class PluginWindow;
 class TimbresProcessor;   // definido em TimbresProcessor.h (incluido so no .cpp)
@@ -77,11 +80,11 @@ private:
     static constexpr int numFxSlots = 3;
     static constexpr int numSlots   = numFxSlots + 1;   // slot 0 = instrumento
 
-    static constexpr int headerHeight    = 52;
+    static constexpr int headerHeight    = 64;
     static constexpr int mobileHeaderHeight = 38;
     // faixa propria do painel de programa, abaixo do cabecalho. Ele NAO e peca de
     // cabecalho: e um bloco centralizado, como o display no painel do Electro 7.
-    static constexpr int programBandHeight = 152;   // +16 para o respiro interno do visor
+    static constexpr int programBandHeight = 112;   // visor 29% mais baixo, sem perder as 5 linhas
     static constexpr int mobileProgramBandHeight = 44;
     juce::Rectangle<int> programBand;   // chapa de chassi onde o visor se apoia
     juce::String programLibrary;        // biblioteca do canal em foco (serigrafia direita)
@@ -130,6 +133,11 @@ private:
     // no momento em que o construtor pergunta.
     void refreshMidiInputs();
     juce::MidiDeviceListConnection midiListConnection;
+
+    // Entradas MIDI ligadas na ultima varredura. Serve para distinguir
+    // "apareceu um aparelho" (nao mexe no som) de "sumiu um aparelho"
+    // (ai sim pode haver nota presa e o panico se justifica).
+    juce::StringArray entradasMidiConhecidas;
     juce::AudioPluginFormatManager formatManager;
     juce::KnownPluginList knownPlugins;
     juce::AudioProcessorGraph graph;
@@ -147,10 +155,18 @@ private:
     void saveAudioStateNow();
     void restartAudioDevice();   // recupera o driver ASIO sem desplugar (anti-pipoco)
 
+   #if JUCE_ANDROID
+    void pollAndroidAudioTopology();
+    void reconcileAndroidAudioTopology();
+    void updateAndroidPreferredUsbSetupFromCurrent();
+   #endif
+
     // ---- interface ----
     juce::TextButton audioSettingsButton { "Audio / MIDI" };
     juce::TextButton scanButton { "Plugins" };
     juce::TextButton saveButton { "Salvar" };
+    juce::Colour corDoSalvoNormal;   // verde do "Salvo"; guardado para voltar apos um "FALHOU"
+    int geracaoDoAvisoDeSalvar = 0;  // so o clique mais recente manda no texto/cor do botao
     juce::TextButton padButton { "Pad" };   // mostra/oculta o card do Pad Continuo
     juce::TextButton librariesButton { "Bibliotecas" };
     std::unique_ptr<PadPanel> padPanel;     // card embutido (nao e janela separada)
@@ -187,6 +203,116 @@ private:
     // (MASTER FX) — sem isso o BigSky ficava fora do alcance do MIDI Learn.
     // paramName e a ancora de verdade: o indice sozinho aponta pra "o parametro
     // numero N do que estiver ali", e isso muda quando o plugin do slot e trocado.
+    // Identificador de "slot" do Pad Continuo no mapeamento MIDI. Ele nao e um
+    // slot de verdade (e um no proprio do grafo), entao ganha um numero fora
+    // da faixa, no mesmo espirito do -1 usado pelo master.
+    static constexpr int padSlotId = -3;
+
+    // MAPEAMENTO POR NOTA (pedido de cliente, 01/08/2026).
+    //
+    // Uma tecla do controlador vira comando em vez de nota: trocar o tom do
+    // Pad Continuo com a mao esquerda, sem ir na tela no meio do culto.
+    // VALORES EXPLICITOS: estes numeros vao para o disco.
+    //
+    // O saveNoteMap grava (int) kind cru. Sem numeros fixos, inserir uma acao
+    // nova no meio do enum re-apontaria em silencio o mapa de TODOS os
+    // clientes que ja gravaram — a tecla que trocava o tom do Pad passaria a
+    // fazer outra coisa, sem nada quebrar e sem nada avisar. Acoes novas so
+    // podem ser acrescentadas NO FIM, com numero proprio.
+    enum class NoteActionKind { none = 0, padKey = 1, padOff = 2 };
+
+    struct NoteAction
+    {
+        NoteActionKind kind = NoteActionKind::none;
+        int arg = -1;             // padKey: 0..11
+    };
+
+    // Mapa proprio, com a mesma chave e o mesmo lock dos CCs. Alargar a chave
+    // dos CCs reordenaria o mapa ja gravado dos clientes; um mapa paralelo
+    // nao toca em nada do que existe.
+    //
+    // Tipo escrito por extenso porque o apelido MidiControlKey so aparece
+    // mais abaixo neste mesmo cabecalho.
+    std::map<ChurchDAWMidiMapping::ControllerKey, NoteAction> noteMappings;
+
+    // 128 bits: "existe algum mapeamento para esta nota?". Lido na thread de
+    // MIDI a cada tecla, por isso atomico e sem lock. Reconstruido na thread
+    // de mensagens sempre que noteMappings muda.
+    std::atomic<juce::uint32> mascaraDeNotasMapeadas[4] { {}, {}, {}, {} };
+
+    // Note-ons suprimidos, incluindo a origem. Mais de uma entrada MIDI pode
+    // chamar o callback ao mesmo tempo; por isso o conjunto usa o mapLock.
+    // A chave completa impede o note-off de outro teclado de fechar a nota
+    // consumida do primeiro.
+    std::set<ChurchDAWMidiMapping::ControllerKey> notasSuprimidas;
+
+    // Espelho atomico do conjunto acima, por NUMERO de nota. Existe para o
+    // note-off poder desistir sem pegar lock e — principalmente — sem montar a
+    // chave, que custa uma alocacao de heap na thread de MIDI.
+    std::atomic<juce::uint32> mascaraDeNotasSuprimidas[4] { {}, {}, {}, {} };
+
+    // Alvo escolhido no painel do Pad enquanto o modo Learn espera a proxima
+    // tecla fisica. Estes campos, assim como o resultado mais recente, sao
+    // acessados pela thread MIDI sob mapLock.
+    NoteAction pendingNoteAction;
+    NoteAction lastMappedNoteAction;
+    ChurchDAWMidiMapping::ControllerKey lastMappedNoteKey;
+    std::atomic<int> lastMappedNote { -1 };
+
+    // ---- LIVE MODE: 10 cenas ----
+    ChurchDAWLive::Cena cenas[ChurchDAWLive::numeroDeCenas];
+    int cenaAtiva = -1;
+
+    // Cada pedido de cena feito pelo musico ganha uma geracao. As reaplicacoes
+    // adiadas (timbre carregando) so valem se a geracao ainda for a delas —
+    // assim a cena abandonada nunca vence a que ele escolheu depois.
+    int geracaoDaCena = 0;
+    LiveScenePanel liveScenePanel;
+    juce::TextButton liveButton { "Live" };
+
+    ChurchDAWLive::Resultado capturarCena (int indice);
+
+    // tentativa: so o reagendamento interno usa. Uma cena pedida enquanto um
+    // timbre carrega se aplica sozinha quando a carga termina, em vez de
+    // sumir sem explicacao.
+    ChurchDAWLive::Resultado aplicarCena (int indice, int tentativa = 0);
+
+    void renomearCena (int indice, juce::String nome);
+    void apagarCena (int indice);
+    bool salvarCenas();   // true = arquivo realmente gravado
+    void restaurarCenas();
+
+    // Arquivo de cenas em disco e de uma versao mais nova que esta: nao le e
+    // NAO GRAVA, pelo mesmo motivo do mapa de notas.
+    bool esquemaDeCenasDesconhecido = false;
+    // Nao e const: getUserSettings() do JUCE nao e const.
+    juce::File arquivoDeCenas();
+
+    bool notaFoiConsumida (juce::MidiInput* source, const juce::MidiMessage& message);
+
+    ChurchDAWMidiMapping::ControllerKey montarChaveDeNota (
+        juce::MidiInput* source, const juce::MidiMessage& message, int nota) const;
+
+    void executarAcaoDeNota (NoteAction acao);
+    void reconstruirMascaraDeNotas();
+    void atualizarEtiquetasDoPad();   // mostra no teclado do Pad qual tecla comanda cada tom
+    void reconstruirMascaraDeSuprimidas();   // chamar com o mapLock tomado
+    juce::File arquivoDoMapaDeCCs();
+    void avisarSobreArquivosDeVersaoFutura();   // conta na TELA o que nao pode ser lido
+    void guardarCopiaDeArquivoIlegivel (const juce::File& arquivo, const juce::String& rotulo);
+
+    // Arquivo de CCs em disco e de uma versao mais nova: nao le e nao grava.
+    bool esquemaDeCCsDesconhecido = false;
+
+    bool saveNoteMap();   // true = arquivo novo realmente gravado
+
+    // Arquivo de notas em disco e de uma versao mais nova que esta. Enquanto
+    // for true, o app nao le e NAO GRAVA — ler com as regras erradas ja seria
+    // ruim, mas gravar por cima destruiria o que a versao nova guardou.
+    bool esquemaDeNotasDesconhecido = false;
+    void restoreNoteMap();
+    juce::File arquivoDoMapaDeNotas();
+
     struct CCTarget
     {
         int slot = -2;
@@ -290,11 +416,28 @@ private:
     // real de xruns confirmar falta de prazo. Mantido na message thread.
     int androidLastXRunCount = 0;
     juce::uint32 androidLastBufferTuneMs = 0;
+
+    // AudioDeviceCallback Java so incrementa a geracao. Toda enumeracao,
+    // fechamento e reabertura acontece aqui, no timer da message thread.
+    juce::int64 androidAudioTopologyGeneration = 0;
+    juce::int64 androidPendingAudioTopologyGeneration = 0;
+    bool androidAudioReconcileScheduled = false;
+    bool androidForceAudioReconcile = false;
+    juce::String androidLastUsbAudioTopology;
+    bool androidUsbAudioTopologyInitialized = false;
+
+    // Se a interface USB some, a rota padrao assume sem apagar a preferencia.
+    // Quando o mesmo nome volta com outro AudioDeviceInfo.id, o scan novo o
+    // resolve e esta configuracao pode ser reaplicada automaticamente.
+    juce::AudioDeviceManager::AudioDeviceSetup androidPreferredUsbSetup;
+    bool androidHasPreferredUsbSetup = false;
    #endif
 
     juce::Image brandIcon;
     juce::Label statusInfo;   // taxa / buffer / CPU / MIDI (agora dentro do visor)
+    juce::Rectangle<int> engineStatusBounds;   // pill completo: titulo + valor tecnico
     OledDisplay oled;             // visor de programa, como o OLED do Stage 4
+    juce::TooltipWindow tooltipWindow { this, 650 };   // uma unica fonte para toda a janela
 
     // geometria calculada no resized() e reaproveitada no paint()
     int layoutHeaderHeight = headerHeight;
@@ -308,6 +451,9 @@ private:
     bool mobileShortLandscapeLayout = false;
     bool compactHeaderLayout = false;
     bool narrowHeaderLayout = false;
+    bool desktopHeaderTwoRows = false;
+    int qaOledChannel = 0;
+    bool qaOledSelectionApplied = false;
     juce::Rectangle<int> layoutContentBounds;
     juce::Rectangle<int> layoutDockHeaderBounds;
     juce::Rectangle<int> slotCardBounds[numSlots];
@@ -354,7 +500,7 @@ private:
     // (mapa inteiro — o slot unico coalesce pedidos) e no handleAsyncUpdate
     std::atomic<int> ccPickupToClear { -1 };
     bool ccHasPickedUp (const MidiControlKey&, float incoming, float current);
-    void saveMidiMap();
+    bool saveMidiMap();   // true = arquivo realmente gravado
     void restoreMidiMap();
 
     void rebuildGraphConnections();
@@ -365,8 +511,18 @@ private:
     juce::Rectangle<int> brandArea() const;   // area clicavel da marca no header
     void showPluginScanner();
     void showPadWindow();
-    void saveChainState();
+    // true = o ARQUIVO foi gravado. Plugin que se recusou a serializar nao
+    // derruba o retorno (seria falha permanente por causa de um VST que o
+    // musico nem usa) — o nome dele sai em pluginsQueNaoSalvaram.
+    bool saveChainState();
+    juce::StringArray pluginsQueNaoSalvaram;
+    bool jaAvisouSobrePluginSemEstado = false;   // o modal e uma vez por sessao, nao por clique
     void restoreChainState();
+
+    // Grava o setup pouco depois da ultima mudanca, para um fechamento
+    // anormal nao levar embora o que o musico montou.
+    void agendarGravacaoDoSetup();
+    int geracaoDaGravacaoDoSetup = 0;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MainComponent)
 };

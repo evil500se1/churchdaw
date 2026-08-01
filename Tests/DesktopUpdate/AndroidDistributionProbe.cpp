@@ -138,6 +138,43 @@ int main (int argc, char** argv)
         return fail (
             "marker local valido nao reconstruiu a biblioteca instalada");
 
+    // O Pad das builds antigas ficava em Libraries/pad-continuo/Pads,
+    // enquanto o catalogo atual declara install_folder=Pads. O card precisa
+    // consultar o pai legado (onde esta o marker), sem mudar o destino de uma
+    // futura reparacao/atualizacao.
+    const auto legacyPadFolder = fixtureRoot.getChildFile ("pad-continuo");
+    const auto legacyPadSamples = legacyPadFolder.getChildFile ("Pads");
+
+    if (legacyPadSamples.createDirectory().failed()
+         || ! legacyPadSamples.getChildFile ("pad_C.wav")
+                .replaceWithData ("x", 1))
+        return fail ("nao foi possivel criar fixture legada do Pad");
+
+    auto padMarker = std::make_unique<juce::DynamicObject>();
+    padMarker->setProperty ("schema_version", 1);
+    padMarker->setProperty ("id", "pad-continuo");
+    padMarker->setProperty ("name", "Pad Continuo");
+    padMarker->setProperty ("version", 1);
+    padMarker->setProperty ("version_name", "1.0");
+    padMarker->setProperty ("installed_bytes", 7);
+
+    if (! legacyPadFolder.getChildFile (".churchdaw-library.json")
+             .replaceWithText (juce::JSON::toString (
+                 juce::var (padMarker.release()), true)))
+        return fail ("nao foi possivel gravar marker legado do Pad");
+
+    ChurchDAWServices::LibraryPack catalogPad;
+    catalogPad.id = "pad-continuo";
+    catalogPad.installFolder = "Pads";
+    catalogPad.version = 1;
+
+    if (catalogPad.detectedInstalledFolderAt (fixtureRoot) != legacyPadFolder
+         || ChurchDAWServices::validLibraryMarkerVersion (
+                catalogPad.detectedInstalledFolderAt (fixtureRoot), catalogPad.id) != 1)
+        return fail ("catalogo nao reconheceu a instalacao legada do Pad");
+
+    fixtureRoot.deleteRecursively();
+
     std::cout << "PASS: politica serial " << policy.policySerial
               << ", catalogo vinculado e "
               << manifest.libraries.size()

@@ -52,12 +52,14 @@ public final class ChurchDAWActivity extends Activity {
         super.onCreate(savedInstanceState);
         getWindow().setSoftInputMode(
             WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
+        ChurchDAWAudioDeviceBridge.initialize(getApplicationContext());
         ChurchDAWLicenseBridge.initialize(this);
     }
 
     @Override
     protected void onResume() {
         super.onResume();
+        ChurchDAWAudioDeviceBridge.onResume();
         ChurchDAWUpdateBridge.resumeImmediateUpdate(this);
     }
 

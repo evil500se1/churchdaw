@@ -1008,7 +1008,35 @@ private:
                 return;
 
             openStreams();
-            start();
+
+            // Um AudioDeviceInfo recebe um ID novo quando a interface USB e
+            // reconectada. Reabrir imediatamente com o ID antigo pode falhar
+            // e deixar o aplicativo mudo ate ser reiniciado. Preserve a
+            // primeira tentativa (ela evita uma troca desnecessaria quando o
+            // ID ainda e valido), mas caia para a rota padrao do sistema se o
+            // dispositivo explicito desapareceu. A message thread fara o
+            // rescan e voltara ao ID novo assim que receber a nova geracao.
+            if (! openedOk()
+                 && ((numInputChannels > 0 && inputDeviceId != oboe::kUnspecified)
+                      || outputDeviceId != oboe::kUnspecified))
+            {
+                JUCE_OBOE_LOG ("AUDIO_ANDROID disconnect_reopen_failed; fallback=system_default");
+                destroyStreams();
+                inputDeviceId = oboe::kUnspecified;
+                outputDeviceId = oboe::kUnspecified;
+                openStreams();
+            }
+
+            if (openedOk())
+            {
+                JUCE_OBOE_LOG ("AUDIO_ANDROID disconnect_reopen_succeeded; output_device_id="
+                               + String (outputDeviceId));
+                start();
+            }
+            else
+            {
+                JUCE_OBOE_LOG ("AUDIO_ANDROID disconnect_reopen_failed; fallback_open_failed=1");
+            }
         }
 
         void destroyStreams()
@@ -1096,12 +1124,14 @@ public:
     OboeAudioIODeviceType()
         : AudioIODeviceType (OboeAudioIODevice::oboeTypeName)
     {
-        // Not using scanForDevices() to maintain behaviour backwards compatible with older APIs
-        checkAvailableDevices();
+        refreshDeviceCache (false);
     }
 
     //==============================================================================
-    void scanForDevices() override {}
+    void scanForDevices() override
+    {
+        refreshDeviceCache (true);
+    }
 
     StringArray getDeviceNames (bool wantInputNames) const override
     {
@@ -1166,12 +1196,88 @@ public:
     }
 
  private:
-    void checkAvailableDevices()
+    struct DeviceInfo
+    {
+        String name;
+        int id = -1;
+        int type = 0;
+        Array<int> sampleRates;
+        int numChannels = -1;
+    };
+
+    static bool intArraysMatch (const Array<int>& first, const Array<int>& second)
+    {
+        if (first.size() != second.size())
+            return false;
+
+        for (int i = 0; i < first.size(); ++i)
+            if (first.getUnchecked (i) != second.getUnchecked (i))
+                return false;
+
+        return true;
+    }
+
+    static bool deviceListsMatch (const Array<DeviceInfo>& first,
+                                  const Array<DeviceInfo>& second)
+    {
+        if (first.size() != second.size())
+            return false;
+
+        for (int i = 0; i < first.size(); ++i)
+        {
+            const auto& a = first.getReference (i);
+            const auto& b = second.getReference (i);
+
+            if (a.id != b.id
+                 || a.type != b.type
+                 || a.name != b.name
+                 || a.numChannels != b.numChannels
+                 || ! intArraysMatch (a.sampleRates, b.sampleRates))
+                return false;
+        }
+
+        return true;
+    }
+
+    static void sortDevices (Array<DeviceInfo>& devices)
+    {
+        std::sort (devices.begin(), devices.end(), [] (const auto& a, const auto& b)
+        {
+            if (a.id != b.id)       return a.id < b.id;
+            if (a.type != b.type)   return a.type < b.type;
+            return a.name.compare (b.name) < 0;
+        });
+    }
+
+    void refreshDeviceCache (bool notifyListeners)
+    {
+        Array<DeviceInfo> newInputs, newOutputs;
+        checkAvailableDevices (newInputs, newOutputs);
+        sortDevices (newInputs);
+        sortDevices (newOutputs);
+
+        if (deviceListsMatch (inputDevices, newInputs)
+             && deviceListsMatch (outputDevices, newOutputs))
+            return;
+
+        inputDevices = std::move (newInputs);
+        outputDevices = std::move (newOutputs);
+
+        JUCE_OBOE_LOG ("AUDIO_ANDROID topology_changed; inputs="
+                       + String (inputDevices.size())
+                       + "; outputs=" + String (outputDevices.size()));
+
+        if (notifyListeners)
+            callDeviceChangeListeners();
+    }
+
+    void checkAvailableDevices (Array<DeviceInfo>& foundInputs,
+                                Array<DeviceInfo>& foundOutputs)
     {
         auto sampleRates = OboeAudioIODevice::getDefaultSampleRates();
 
-        inputDevices .add ({ "System Default (Input)",  oboe::kUnspecified, sampleRates, 1 });
-        outputDevices.add ({ "System Default (Output)", oboe::kUnspecified, sampleRates, 2 });
+        foundInputs .add ({ "System Default (Input)",  oboe::kUnspecified, 0, sampleRates, 1 });
+        foundOutputs.add ({ "System Default (Output)", oboe::kUnspecified, 0, sampleRates, 2 });
 
         if (! supportsDevicesInfo())
             return;
@@ -1190,6 +1296,9 @@ public:
                                                                       AndroidContext.getSystemService,
                                                                       javaString ("audio").get()));
 
+        if (audioManager == nullptr)
+            return;
+
         static jmethodID getDevicesMethod = env->GetMethodID (audioManagerClass, "getDevices",
                                                               "(I)[Landroid/media/AudioDeviceInfo;");
 
@@ -1198,17 +1307,20 @@ public:
                                                                                      getDevicesMethod,
                                                                                      allDevices));
 
+        if (devices == nullptr)
+            return;
+
         const int numDevices = env->GetArrayLength (devices.get());
 
         for (int i = 0; i < numDevices; ++i)
         {
             auto device = LocalRef<jobject> ((jobject) env->GetObjectArrayElement (devices.get(), i));
-            addDevice (device, env);
+            addDevice (device, env, foundInputs, foundOutputs);
         }
 
         JUCE_OBOE_LOG ("-----InputDevices:");
 
-        for ([[maybe_unused]] auto& device : inputDevices)
+        for ([[maybe_unused]] auto& device : foundInputs)
         {
             JUCE_OBOE_LOG ("name = " << device.name);
             JUCE_OBOE_LOG ("id = " << String (device.id));
@@ -1218,7 +1330,7 @@ public:
 
         JUCE_OBOE_LOG ("-----OutputDevices:");
 
-        for ([[maybe_unused]] auto& device : outputDevices)
+        for ([[maybe_unused]] auto& device : foundOutputs)
         {
             JUCE_OBOE_LOG ("name = " << device.name);
             JUCE_OBOE_LOG ("id = " << String (device.id));
@@ -1232,7 +1344,9 @@ public:
         return true;
     }
 
-    void addDevice (const LocalRef<jobject>& device, JNIEnv* env)
+    void addDevice (const LocalRef<jobject>& device, JNIEnv* env,
+                    Array<DeviceInfo>& foundInputs,
+                    Array<DeviceInfo>& foundOutputs)
     {
         LocalRef<jclass> deviceClass { env->FindClass ("android/media/AudioDeviceInfo") };
 
@@ -1245,7 +1359,8 @@ public:
         jmethodID getChannelCountsMethod = env->GetMethodID (deviceClass, "getChannelCounts", "()[I");
         jmethodID isSourceMethod         = env->GetMethodID (deviceClass, "isSource", "()Z");
 
-        auto deviceTypeString = deviceTypeToString (env->CallIntMethod (device, getTypeMethod));
+        const auto type = env->CallIntMethod (device, getTypeMethod);
+        auto deviceTypeString = deviceTypeToString (type);
 
         if (deviceTypeString.isEmpty()) // unknown device
             return;
@@ -1261,9 +1376,9 @@ public:
         int numChannels = channelCounts.isEmpty() ? -1 : channelCounts.getLast();
 
         auto isInput  = env->CallBooleanMethod (device, isSourceMethod);
-        auto& devices = isInput ? inputDevices : outputDevices;
+        auto& devices = isInput ? foundInputs : foundOutputs;
 
-        devices.add ({ name, id, sampleRates, numChannels });
+        devices.add ({ name, id, type, sampleRates, numChannels });
     }
 
     static String deviceTypeToString (int type)
@@ -1320,14 +1435,6 @@ public:
         env->ReleaseIntArrayElements (jArray, jArrayElems, 0);
         return juceArray;
     }
-
-    struct DeviceInfo
-    {
-        String name;
-        int id = -1;
-        Array<int> sampleRates;
-        int numChannels;
-    };
 
     DeviceInfo getDeviceInfoForName (const String& name, bool isInput)
     {

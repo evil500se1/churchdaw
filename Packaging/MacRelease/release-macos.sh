@@ -252,6 +252,8 @@ plist_read() {
     || fail "CFBundlePackageType inesperado"
 [[ -n "$(plist_read NSMicrophoneUsageDescription)" ]] \
     || fail "NSMicrophoneUsageDescription vazio"
+[[ -n "$(plist_read NSBluetoothAlwaysUsageDescription)" ]] \
+    || fail "NSBluetoothAlwaysUsageDescription vazio"
 
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUMBER" "$plist" \
     || /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $BUILD_NUMBER" "$plist"

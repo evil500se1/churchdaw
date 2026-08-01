@@ -35,6 +35,85 @@
 namespace juce
 {
 
+namespace PluginHostDiagnostics
+{
+namespace
+{
+CriticalSection callbackLock;
+Callback callback;
+std::atomic<bool> callbackEnabled { false };
+}
+
+void setCallback (Callback newCallback)
+{
+    const ScopedLock lock (callbackLock);
+    callback = std::move (newCallback);
+    callbackEnabled.store (callback != nullptr, std::memory_order_release);
+}
+
+void clearCallback()
+{
+    const ScopedLock lock (callbackLock);
+    callbackEnabled.store (false, std::memory_order_release);
+    callback = {};
+}
+
+bool isEnabled() noexcept
+{
+    return callbackEnabled.load (std::memory_order_acquire);
+}
+
+void report (EventKind kind, const char* stage, const char* call,
+             bool success, int64 resultCode, bool critical,
+             int64 elapsedMs, const String& detail)
+{
+    if (! isEnabled())
+        return;
+
+    Callback callbackCopy;
+
+    {
+        const ScopedLock lock (callbackLock);
+        callbackCopy = callback;
+    }
+
+    if (callbackCopy != nullptr)
+        callbackCopy ({ kind, stage, call, detail, resultCode,
+                        elapsedMs, success, critical });
+}
+
+ScopedCall::ScopedCall (const char* stageToUse, const char* callToUse,
+                        bool isCritical, const String& detail)
+    : stage (stageToUse), call (callToUse),
+      startMs (Time::getMillisecondCounter()),
+      active (isEnabled()), critical (isCritical)
+{
+    if (active)
+        report (EventKind::begin, stage, call, true, 0, critical, 0, detail);
+}
+
+ScopedCall::~ScopedCall()
+{
+    if (active && ! finished)
+        report (EventKind::end, stage, call, false,
+                std::numeric_limits<int64>::min(), critical,
+                (int64) (Time::getMillisecondCounter() - startMs),
+                "call unwound without reporting a result");
+}
+
+void ScopedCall::finish (bool success, int64 resultCode, const String& detail)
+{
+    if (finished)
+        return;
+
+    finished = true;
+
+    if (active)
+        report (EventKind::end, stage, call, success, resultCode, critical,
+                (int64) (Time::getMillisecondCounter() - startMs), detail);
+}
+}
+
 AudioPluginFormat::AudioPluginFormat() {}
 AudioPluginFormat::~AudioPluginFormat() {}
 

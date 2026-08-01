@@ -626,9 +626,18 @@ public:
 
     VST3PluginWindow* createEditor() override
     {
-        if (VSTComSmartPtr view { tryCreatingView(), IncrementRef::no })
-            return new VST3PluginWindow (this, view);
+        PluginHostDiagnostics::ScopedCall createEditor (
+            "createEditor", "VST3 create editor wrapper", true, getName());
 
+        if (VSTComSmartPtr view { tryCreatingView(), IncrementRef::no })
+        {
+            auto* result = new VST3PluginWindow (this, view);
+            createEditor.finish (result != nullptr, result != nullptr ? 0 : -1,
+                                 getName());
+            return result;
+        }
+
+        createEditor.finish (false, -1, getName());
         return nullptr;
     }
 };

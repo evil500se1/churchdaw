@@ -57,6 +57,122 @@ static bool isProbablyRunningOnAndroidEmulator()
 
     return emulator;
 }
+
+static juce::LocalRef<jclass> findAndroidAudioDeviceBridge (JNIEnv* env)
+{
+    juce::LocalRef<jclass> bridge (
+        env->FindClass ("com/churchdaw/app/ChurchDAWAudioDeviceBridge"));
+
+    if (bridge.get() == nullptr && env->ExceptionCheck())
+        env->ExceptionClear();
+
+    return bridge;
+}
+
+static juce::int64 getAndroidAudioTopologyGeneration()
+{
+    auto* env = juce::getEnv();
+    if (env == nullptr)
+        return 0;
+
+    auto bridge = findAndroidAudioDeviceBridge (env);
+    if (bridge.get() == nullptr)
+        return 0;
+
+    const auto method = env->GetStaticMethodID (
+        bridge.get(), "getTopologyGeneration", "()J");
+
+    if (method == nullptr)
+    {
+        if (env->ExceptionCheck())
+            env->ExceptionClear();
+        return 0;
+    }
+
+    const auto generation = static_cast<juce::int64> (
+        env->CallStaticLongMethod (bridge.get(), method));
+
+    if (env->ExceptionCheck())
+    {
+        env->ExceptionClear();
+        return 0;
+    }
+
+    return generation;
+}
+
+static juce::String getAndroidAudioTopologySnapshot()
+{
+    auto* env = juce::getEnv();
+    if (env == nullptr)
+        return "jni=unavailable";
+
+    auto bridge = findAndroidAudioDeviceBridge (env);
+    if (bridge.get() == nullptr)
+        return "bridge=unavailable";
+
+    const auto method = env->GetStaticMethodID (
+        bridge.get(), "getSanitizedSnapshot", "()Ljava/lang/String;");
+
+    if (method == nullptr)
+    {
+        if (env->ExceptionCheck())
+            env->ExceptionClear();
+        return "snapshot_method=unavailable";
+    }
+
+    juce::LocalRef<jstring> snapshot (static_cast<jstring> (
+        env->CallStaticObjectMethod (bridge.get(), method)));
+
+    if (env->ExceptionCheck())
+    {
+        env->ExceptionClear();
+        return "snapshot=error";
+    }
+
+    return snapshot.get() != nullptr ? juce::juceString (snapshot.get())
+                                     : juce::String ("snapshot=empty");
+}
+
+static juce::String getAndroidUsbAudioTopologyFingerprint()
+{
+    auto* env = juce::getEnv();
+    if (env == nullptr)
+        return "jni=unavailable";
+
+    auto bridge = findAndroidAudioDeviceBridge (env);
+    if (bridge.get() == nullptr)
+        return "bridge=unavailable";
+
+    const auto method = env->GetStaticMethodID (
+        bridge.get(), "getUsbTopologyFingerprint", "()Ljava/lang/String;");
+
+    if (method == nullptr)
+    {
+        if (env->ExceptionCheck())
+            env->ExceptionClear();
+        return "fingerprint_method=unavailable";
+    }
+
+    juce::LocalRef<jstring> fingerprint (static_cast<jstring> (
+        env->CallStaticObjectMethod (bridge.get(), method)));
+
+    if (env->ExceptionCheck())
+    {
+        env->ExceptionClear();
+        return "fingerprint=error";
+    }
+
+    return fingerprint.get() != nullptr ? juce::juceString (fingerprint.get())
+                                        : juce::String ("fingerprint=empty");
+}
+
+static bool isAndroidUsbAudioDeviceName (const juce::String& name)
+{
+    return name.containsIgnoreCase (" USB device")
+        || name.containsIgnoreCase (" USB accessory")
+        || name.containsIgnoreCase (" USB headset");
+}
 #endif
 
 //==============================================================================
@@ -200,6 +316,14 @@ MainComponent::MainComponent()
         auto padNodePtr = graph.addNode (std::make_unique<PadProcessor>());
         padNode = padNodePtr->nodeID;
         padProcessor = static_cast<PadProcessor*> (padNodePtr->getProcessor());
+
+        // Escutar o Pad e o que permite o MIDI Learn saber que o musico
+        // encostou no corte ou no volume dele. Sem isto os knobs do Pad
+        // ficavam invisiveis para o mapeamento. Removido no destrutor.
+        //
+        // Qualificado porque PadProcessor herda de AudioProcessor E de
+        // juce::Thread, e as duas bases oferecem addListener.
+        padProcessor->juce::AudioProcessor::addListener (this);
     }
 
     player.setProcessor (&graph);
@@ -225,6 +349,24 @@ MainComponent::MainComponent()
    #endif
 
     deviceManager.initialise (numInputs, 2, savedAudio.get(), true);
+
+   #if JUCE_ANDROID
+    // O manager pode cair para System Default quando o USB salvo nao esta
+    // conectado na largada. Guarde o nome solicitado para restaura-lo quando
+    // a bridge anunciar que a interface reapareceu.
+    if (savedAudio != nullptr)
+    {
+        const auto savedOutput = savedAudio->getStringAttribute ("audioOutputDeviceName");
+        if (isAndroidUsbAudioDeviceName (savedOutput))
+        {
+            androidPreferredUsbSetup = deviceManager.getAudioDeviceSetup();
+            androidPreferredUsbSetup.outputDeviceName = savedOutput;
+            androidHasPreferredUsbSetup = true;
+        }
+    }
+
+    updateAndroidPreferredUsbSetupFromCurrent();
+   #endif
 
    #if JUCE_ANDROID || JUCE_IOS
     // Sem isto o app abre com 2048 samples (42,7 ms a 48 kHz) -- atraso que o
@@ -312,10 +454,71 @@ MainComponent::MainComponent()
         });
     });
 
-    deviceManager.addMidiInputDeviceCallback ({}, &player);
-
+    // O MainComponent e o UNICO destinatario do MIDI, e repassa ao player.
+    //
+    // Antes os dois eram registrados e cada um recebia uma COPIA — o
+    // MainComponent era so observador, e a nota ja tinha ido para o grafo
+    // quando ele a via. Assim era impossivel uma tecla mapeada trocar o tom
+    // do Pad sem tambem disparar voz nos canais (pedido de cliente, 01/08).
+    //
+    // O repasse e identico ao que o player fazia sozinho: o proprio
+    // AudioProcessorPlayer::handleIncomingMidiMessage so enfileira no
+    // getMidiMessageCollector(), que continua publico e sendo esvaziado
+    // pelo player, que segue registrado como callback de AUDIO.
     restoreMidiMap();
-    deviceManager.addMidiInputDeviceCallback ({}, this);   // para o MIDI Learn / mapeamentos
+    restoreNoteMap();
+    restaurarCenas();
+
+    liveScenePanel.onCarregarCena = [this] (int i)
+    {
+        const auto r = aplicarCena (i);
+        liveScenePanel.atualizar (cenas, cenaAtiva);
+        return r;
+    };
+
+    liveScenePanel.onGravarCena = [this] (int i)
+    {
+        const auto r = capturarCena (i);
+        liveScenePanel.atualizar (cenas, cenaAtiva);
+        return r;
+    };
+
+    liveScenePanel.onRenomearCena = [this] (int i, juce::String n) { renomearCena (i, std::move (n)); };
+    liveScenePanel.onApagarCena   = [this] (int i) { apagarCena (i); };
+
+    liveScenePanel.atualizar (cenas, cenaAtiva);
+    addChildComponent (liveScenePanel);
+
+    avisarSobreArquivosDeVersaoFutura();
+
+    liveButton.setWantsKeyboardFocus (false);
+    liveButton.setClickingTogglesState (true);
+    liveButton.setColour (juce::TextButton::buttonColourId, juce::Colours::transparentBlack);
+    liveButton.setColour (juce::TextButton::buttonOnColourId, NordLookAndFeel::nordRed());
+    liveButton.setColour (juce::TextButton::textColourOffId, juce::Colours::white.withAlpha (0.88f));
+    liveButton.setColour (juce::TextButton::textColourOnId, juce::Colours::white);
+    liveButton.onClick = [this]
+    {
+        const bool aberto = liveButton.getToggleState();
+
+        // Nunca com o aprendizado ligado: os dois disputam a mesma faixa.
+        if (aberto && mapButton.getToggleState())
+            mapButton.setToggleState (false, juce::sendNotificationSync);
+
+        liveScenePanel.setVisible (aberto);
+        oled.setVisible (! aberto && ! mapButton.getToggleState());
+
+        if (aberto)
+            liveScenePanel.atualizar (cenas, cenaAtiva);
+
+        // No celular a faixa CRESCE quando as cenas entram (ver resized), entao
+        // abrir ou fechar o Live tem de refazer o layout — no computador isto e
+        // so um recalculo barato.
+        resized();
+    };
+    addAndMakeVisible (liveButton);
+
+    deviceManager.addMidiInputDeviceCallback ({}, this);
 
     // alguns drivers ASIO abrem com o buffer padrao deles, ignorando o estado
     // salvo; reforca aqui a taxa e o buffer que o usuario escolheu
@@ -467,11 +670,15 @@ MainComponent::MainComponent()
    #endif
 
     addAndMakeVisible (padButton);
-    // vermelho = PAINEL ABERTO (antes era vermelho fixo, o que fazia o botao
-    // parecer sempre ativo e gastava a cor de destaque a toa)
+    // O Pad abre um painel flutuante; nao e uma segunda pagina de navegacao.
+    // Use ambar no estado aberto para ele nao competir com o vermelho primario
+    // de Instrumentos nem fazer as duas acoes parecerem selecionadas.
     padButton.setButtonText (juce::String::fromUTF8 ("\xe2\x97\x89 Pad"));   // ◉ Pad
-    padButton.setColour (juce::TextButton::buttonOnColourId, juce::Colour (0xffc4112e));
-    padButton.setColour (juce::TextButton::textColourOnId, juce::Colours::white);
+    padButton.setColour (juce::TextButton::buttonOnColourId,
+                         NordLookAndFeel::amberSolo().darker (0.30f));
+    padButton.setColour (juce::TextButton::textColourOnId,
+                         juce::Colours::black.withAlpha (0.88f));
+    padButton.setTooltip ("Abrir ou fechar o Pad Continuo");
     padButton.onClick = [this] { showPadWindow(); };
 
     // card do Pad Continuo EMBUTIDO na DAW (oculto ate clicar em "Pad")
@@ -482,44 +689,168 @@ MainComponent::MainComponent()
             padPanel->setVisible (false);
 
         padButton.setToggleState (false, juce::dontSendNotification);
+
+        // FECHAR O CARD DESISTE DO MAPEAMENTO.
+        //
+        // O alvo da nota e escolhido tocando um tom AQUI dentro. Se o musico
+        // escolhe "Pad D", se arrepende e fecha o card, o alvo continuava
+        // armado — invisivel, sem nada na tela dizendo isso — e a proxima
+        // tecla em que ele encostasse virava comando e parava de tocar. Fechar
+        // e o gesto universal de desistir; tem de desistir de verdade.
+        {
+            const juce::ScopedLock sl (mapLock);
+            pendingNoteAction = {};
+        }
+
+        if (midiLearnActive.load())
+            midiLearnPanel.showChooseTarget();
+    };
+
+    // O mapa de notas e restaurado la em cima, ANTES deste painel existir —
+    // entao a primeira pintura das etiquetas tem de acontecer aqui, senao o
+    // teclado abriria sem mostrar as teclas ja mapeadas do cliente.
+    atualizarEtiquetasDoPad();
+    padPanel->onMidiLearnTarget = [this] (int key)
+    {
+        if (! midiLearnActive.load())
+            return;
+
+        {
+            const juce::ScopedLock sl (mapLock);
+            pendingNoteAction = key >= 0 ? NoteAction { NoteActionKind::padKey, key }
+                                         : NoteAction { NoteActionKind::padOff, -1 };
+        }
+
+        const auto target = key >= 0 ? "Pad " + juce::String (PadPanel::noteName (key))
+                                     : juce::String ("Pad Parar");
+        midiLearnPanel.showPlayNote (target);
+        juce::Logger::writeToLog ("MIDI MAP: aguardando nota para " + target);
     };
     addChildComponent (*padPanel);
 
     addAndMakeVisible (saveButton);
     // vira um indicador de confianca: verde "Salvo" = autosave ligado, seu setup
     // esta guardado. Clicar forca salvar tudo e pisca "Salvo!"
+    // Guardado para poder VOLTAR ao verde depois de um "FALHOU" vermelho.
+   #if JUCE_ANDROID || JUCE_IOS
+    corDoSalvoNormal = juce::Colour (0xff5fd08a).withAlpha (0.82f);
+   #else
+    corDoSalvoNormal = juce::Colour (0xff5fd08a);
+   #endif
+
    #if JUCE_ANDROID || JUCE_IOS
     saveButton.setButtonText ("Salvo");
     saveButton.setColour (juce::TextButton::buttonColourId, juce::Colours::transparentBlack);
-    saveButton.setColour (juce::TextButton::textColourOffId,
-                          juce::Colour (0xff5fd08a).withAlpha (0.82f));
+    saveButton.setColour (juce::TextButton::textColourOffId, corDoSalvoNormal);
    #else
     saveButton.setButtonText (juce::String::fromUTF8 ("\xe2\x9c\x93 Salvo"));
-    saveButton.setColour (juce::TextButton::textColourOffId, juce::Colour (0xff5fd08a));
+    saveButton.setColour (juce::TextButton::buttonColourId,
+                          juce::Colours::transparentBlack);
+    saveButton.setColour (juce::TextButton::buttonOnColourId,
+                          juce::Colours::transparentBlack);
+    saveButton.setColour (juce::TextButton::textColourOffId, corDoSalvoNormal);
    #endif
+    saveButton.setTooltip ("Projeto salvo. Clique para salvar novamente agora.");
     saveButton.onClick = [this]
     {
         // salva TUDO agora: cadeia (timbres/volumes/efeitos), mapeamento MIDI e audio
-        saveChainState();
-        saveMidiMap();
+        const bool setupOk = saveChainState();
+        const bool ccsOk = saveMidiMap();
+        const bool notasOk = saveNoteMap();
+        const bool cenasOk = salvarCenas();
         saveAudioStateNow();
-        appProperties.getUserSettings()->saveIfNeeded();
+
+        // Este saveIfNeeded fecha o que o saveAudioStateNow deixou pendente —
+        // driver, taxa e buffer, ou seja, a configuracao que decide se SAI SOM
+        // no domingo. O retorno estava sendo descartado, e o botao piscava
+        // verde mesmo se ela nao tivesse ido para o disco.
+        const bool audioOk = appProperties.getUserSettings()->saveIfNeeded();
+
+        // O BOTAO E UM INDICADOR DE CONFIANCA: ele nao pode dizer "Salvo!" se
+        // alguma coisa nao foi para o disco. Antes ele piscava verde de
+        // qualquer jeito, e o musico ia para o culto acreditando num setup que
+        // nao existia mais.
+        //
+        // MAS: pular um arquivo de versao futura e RECUSA DELIBERADA, ja
+        // avisada em modal na abertura — nao e falha. Contando como falha, o
+        // botao ficava vermelho para sempre nessa maquina e o musico perdia a
+        // unica coisa que o indicador serve para dizer: a diferenca entre
+        // "estou protegendo um arquivo de proposito" e "meu disco esta
+        // morrendo e o setup NAO esta sendo gravado".
+        const bool ccsFalhou   = ! ccsOk   && ! esquemaDeCCsDesconhecido;
+        const bool notasFalhou = ! notasOk && ! esquemaDeNotasDesconhecido;
+        const bool cenasFalhou = ! cenasOk && ! esquemaDeCenasDesconhecido;
+
+        const bool tudoOk = setupOk && audioOk
+                              && ! ccsFalhou && ! notasFalhou && ! cenasFalhou;
 
        #if JUCE_ANDROID || JUCE_IOS
-        saveButton.setButtonText ("Salvo!");
+        saveButton.setButtonText (tudoOk ? "Salvo!" : "FALHOU");
        #else
-        saveButton.setButtonText (juce::String::fromUTF8 ("\xe2\x9c\x93 Salvo!"));
+        saveButton.setButtonText (tudoOk ? juce::String::fromUTF8 ("\xe2\x9c\x93 Salvo!")
+                                         : juce::String::fromUTF8 ("\xe2\x9a\xa0 FALHOU"));
        #endif
 
+        // A COR TEM DE CONCORDAR COM A PALAVRA. "FALHOU" escrito no verde de
+        // "Salvo" e pior que nao avisar nada: o olho le a cor antes do texto.
+        saveButton.setColour (juce::TextButton::textColourOffId,
+                              tudoOk ? corDoSalvoNormal : NordLookAndFeel::nordRedBright());
+
+        if (! tudoOk)
+            juce::Logger::writeToLog (juce::String ("SALVAR: falhou em ")
+                                      + (setupOk      ? "" : "setup ")
+                                      + (ccsFalhou    ? "mapa de CCs " : "")
+                                      + (notasFalhou  ? "mapa de notas " : "")
+                                      + (cenasFalhou  ? "cenas " : "")
+                                      + (audioOk      ? "" : "config de audio"));
+
+        // Plugin que nao entregou o estado NAO derruba o botao (seria falha
+        // permanente), mas o musico precisa saber QUAL — senao ele descobre no
+        // domingo que os ajustes daquele efeito voltaram ao padrao.
+        // UMA VEZ POR SESSAO, e nao por clique. Um VST antigo que falha sempre
+        // abria um modal a cada toque no Salvar: tres cliques nervosos antes do
+        // culto = tres janelas empilhadas sobre a mesa, cada uma exigindo
+        // "Entendi", com o mixer bloqueado ate a ultima.
+        if (! pluginsQueNaoSalvaram.isEmpty() && ! jaAvisouSobrePluginSemEstado)
+        {
+            jaAvisouSobrePluginSemEstado = true;
+
+            juce::AlertWindow::showMessageBoxAsync (
+                juce::MessageBoxIconType::WarningIcon,
+                juce::String::fromUTF8 ("Ajustes de plugin n\xc3\xa3o guardados"),
+                juce::String::fromUTF8 ("O setup foi salvo, mas ")
+                    + pluginsQueNaoSalvaram.joinIntoString (", ")
+                    + juce::String::fromUTF8 (
+                        " n\xc3\xa3o entregou os ajustes internos.\n\nEsse plugin vai "
+                        "reabrir no estado padr\xc3\xa3o. O resto do setup est\xc3\xa1 "
+                        "guardado normalmente."),
+                "Entendi");
+        }
+
+        // GERACAO, como no agendarGravacaoDoSetup.
+        //
+        // Sem ela, dois cliques proximos deixavam DOIS timers no ar e o do
+        // primeiro (sucesso, 1,4 s) apagava o aviso do segundo (falha, 3 s):
+        // o "FALHOU" durava 100 ms e virava "✓ Salvo" verde. O musico ia para
+        // o culto vendo verde com o setup nao gravado — exatamente o oposto do
+        // que este indicador promete.
+        const auto minhaGeracao = ++geracaoDoAvisoDeSalvar;
+
         juce::Component::SafePointer<MainComponent> safe (this);
-        juce::Timer::callAfterDelay (1400, [safe]
+        juce::Timer::callAfterDelay (tudoOk ? 1400 : 3000, [safe, minhaGeracao]
         {
             if (auto* c = safe.getComponent())
+            {
+                if (c->geracaoDoAvisoDeSalvar != minhaGeracao)
+                    return;   // um clique mais novo manda na tela
+
                #if JUCE_ANDROID || JUCE_IOS
                 c->saveButton.setButtonText ("Salvo");
                #else
                 c->saveButton.setButtonText (juce::String::fromUTF8 ("\xe2\x9c\x93 Salvo"));
                #endif
+                c->saveButton.setColour (juce::TextButton::textColourOffId, c->corDoSalvoNormal);
+            }
         });
     };
 
@@ -559,13 +890,24 @@ MainComponent::MainComponent()
             const juce::ScopedLock sl (mapLock);
             lastTouchedParamName.clear();
             lastTouchedParamId.clear();
+            pendingNoteAction = {};
         }
         clearMapConfirmationArmed = false;
         clearMapButton.setButtonText ("Limpar mapas");
         clearMapButton.setVisible (on);
         mapButton.setButtonText (on ? "Concluir" : "Mapear MIDI");
-        oled.setVisible (! on);
+        // Os tres ocupantes da faixa de programa sao mutuamente exclusivos.
+        // Entrar no aprendizado fecha o Live Mode: sao dois modos de ensaio
+        // diferentes e ver os dois ao mesmo tempo so confunde.
+        if (on)
+            liveButton.setToggleState (false, juce::dontSendNotification);
+
+        liveScenePanel.setVisible (! on && liveButton.getToggleState());
+        oled.setVisible (! on && ! liveScenePanel.isVisible());
         midiLearnPanel.setVisible (on);
+
+        if (padPanel != nullptr)
+            padPanel->setMidiLearnMode (on);
 
         if (on)
         {
@@ -620,16 +962,62 @@ MainComponent::MainComponent()
         {
             const juce::ScopedLock sl (mapLock);
             ccMappings.clear();
+            noteMappings.clear();
+            pendingNoteAction = {};
+
+            // LIMPAR O LIVRO DE NOTAS SUPRIMIDAS TAMBEM.
+            //
+            // Sem isto, o unico caminho de recuperacao que o app oferece podia
+            // deixar uma nota tocando PARA SEMPRE: se um note-off tivesse se
+            // perdido (falha de USB, Bluetooth caindo, sequenciador parado no
+            // meio da nota), a entrada ficava obsoleta no livro. O musico entao
+            // limpava os mapas para recuperar a tecla, tocava nela — o note-on
+            // passava, mas o note-off batia na entrada velha e era engolido.
+            // Tecla presa no meio do culto, com o PANIC como unica saida.
+            //
+            // O livro so faz sentido enquanto existem mapas. Zerando junto,
+            // "Limpar mapas" volta a ser o que promete: um recomeco.
+            notasSuprimidas.clear();
+            reconstruirMascaraDeSuprimidas();
+
+            lastTouchedParamName.clear();
+            lastTouchedParamId.clear();
         }
 
+        reconstruirMascaraDeNotas();
+        atualizarEtiquetasDoPad();
+        lastTouchedSlot.store (-2);
+        lastTouchedParam.store (-1);
+        lastTouchedInsert.store (-1);
+        lastMappedCC.store (-1);
+        lastMappedNote.store (-1);
         clearMapConfirmationArmed = false;
         clearMapButton.setButtonText ("Limpar mapas");
         ccPickup.clear();
-        saveMidiMap();
+
+        // Os DOIS mapas precisam ter ido para o disco; senao o que sobrou
+        // volta inteiro na proxima abertura.
+        const bool ccsApagados = saveMidiMap();
+        const bool apagouNoDisco = saveNoteMap() && ccsApagados;
         deviceBar.setMappingCount (0);
         midiLearnPanel.setMappingCount (0);
-        midiLearnPanel.showChooseTarget();
-        juce::Logger::writeToLog ("MIDI MAP: todos os mapeamentos foram apagados");
+
+        // Se o disco recusou, o mapa antigo VOLTA INTEIRO na proxima abertura —
+        // inclusive a tecla mapeada por engano que motivou a limpeza. O musico
+        // precisa saber disso agora, e nao no domingo.
+        if (apagouNoDisco)
+        {
+            midiLearnPanel.showChooseTarget();
+            juce::Logger::writeToLog ("MIDI MAP: todos os mapeamentos foram apagados");
+        }
+        else
+        {
+            midiLearnPanel.showAviso (
+                juce::String::fromUTF8 ("Limpou nesta sess\xc3\xa3o, mas N\xc3\x83O no disco"),
+                juce::String::fromUTF8 ("Os mapas antigos voltam ao reabrir o app"));
+            juce::Logger::writeToLog ("MIDI MAP: limpeza NAO gravada; o mapa antigo "
+                                      "volta na proxima abertura");
+        }
     };
 
     addChildComponent (midiLearnPanel);
@@ -649,9 +1037,11 @@ MainComponent::MainComponent()
                                                  BinaryData::icon_pngSize);
    #endif
 
-    statusInfo.setFont (juce::Font (juce::FontOptions (12.0f)));
+    statusInfo.setFont (juce::Font (juce::FontOptions (
+        juce::Font::getDefaultMonospacedFontName(), 9.5f,
+        juce::Font::bold)));
     statusInfo.setJustificationType (juce::Justification::centred);   // centrado no chip de vidro
-    statusInfo.setColour (juce::Label::textColourId, juce::Colours::white.withAlpha (0.58f));
+    statusInfo.setColour (juce::Label::textColourId, juce::Colours::white.withAlpha (0.86f));
     addAndMakeVisible (statusInfo);
     addAndMakeVisible (oled);
     oled.fetchChord = [this]() -> juce::String
@@ -665,8 +1055,20 @@ MainComponent::MainComponent()
 
         return {};
     };
+    qaOledChannel = juce::SystemStats::getEnvironmentVariable (
+                        "CHURCHDAW_QA_OLED_CHANNEL", {}).getIntValue();
+
     oled.fetchLevel = [this] (int l) -> float
     {
+        // Prova de integridade opt-in: permite confirmar visualmente que os
+        // indices 8 e 9 nao compartilham o mesmo slot de medidor. Fora do QA,
+        // o caminho e exatamente o nivel real do Church Live.
+        if (qaOledChannel == 9)
+        {
+            if (l == 7) return 0.12f;
+            if (l == 8) return 0.88f;
+        }
+
         if (auto* live = getChurchLive())
             return live->getLayerLevelShown (l);
 
@@ -783,6 +1185,15 @@ MainComponent::MainComponent()
 
 MainComponent::~MainComponent()
 {
+    // PRIMEIRA COISA A MORRER: o aviso de mudanca de dispositivos MIDI.
+    //
+    // O callback dele reposta um refreshMidiInputs() via callAsync com
+    // SafePointer, mas o WeakReference so e zerado em ~Component — depois do
+    // corpo deste destrutor e depois dos membros. Como graph.clear() abaixo
+    // destroi VST3/AU hospedados e isso bombeia a fila de mensagens no macOS,
+    // um refresh enfileirado podia rodar contra um objeto meio destruido.
+    midiListConnection = {};
+
     librariesPanel.reset();  // encerra rede/download antes de desmontar os processadores
     aboutPanel.reset();
     saveChainState();
@@ -790,8 +1201,10 @@ MainComponent::~MainComponent()
     masterProcessor->removeChangeListener (this);
     masterProcessor->removeListener (this);
 
+    if (padProcessor != nullptr)
+        padProcessor->juce::AudioProcessor::removeListener (this);   // par do addListener do construtor
+
     deviceManager.removeMidiInputDeviceCallback ({}, this);
-    deviceManager.removeMidiInputDeviceCallback ({}, &player);
     deviceManager.removeAudioCallback (&player);
     deviceManager.removeChangeListener (this);
     knownPlugins.removeChangeListener (this);
@@ -844,8 +1257,8 @@ void MainComponent::paint (juce::Graphics& g)
 
     g.setColour (juce::Colours::black.withAlpha (0.5f));
     g.fillRect (juce::Rectangle<int> (0, headerArea.getBottom() - 4, getWidth(), 4));
-    g.setColour (NordLookAndFeel::nordRed());
-    g.fillRect (juce::Rectangle<int> (0, headerArea.getBottom() - 2, getWidth(), 2));
+    g.setColour (NordLookAndFeel::nordRed().withAlpha (0.86f));
+    g.fillRect (juce::Rectangle<int> (0, headerArea.getBottom() - 1, getWidth(), 1));
 
     // Marca: o icone ja e um "app icon" vermelho vivo com forma propria — nao
     // precisa de chapa atras, so de uma sombra pra pousar no header.
@@ -982,7 +1395,11 @@ void MainComponent::paint (juce::Graphics& g)
     // CHAPA DE CHASSI do painel de programa. Na foto do Electro 7 o display esta
     // encaixado no corpo do instrumento, nao flutuando: sem esta chapa o visor
     // ficava solto num vazio preto e parecia um cartao jogado na tela.
-    if (! programBand.isEmpty() && (oled.isVisible() || midiLearnPanel.isVisible()))
+    // liveScenePanel e o TERCEIRO ocupante desta faixa. Faltava aqui, e o Live
+    // Mode desenhava direto sobre o fundo: um buraco retangular no meio do
+    // painel, sem chapa, sem vinco e sem o fio vermelho.
+    if (! programBand.isEmpty()
+         && (oled.isVisible() || midiLearnPanel.isVisible() || liveScenePanel.isVisible()))
     {
         auto plate = programBand.toFloat();
 
@@ -1047,15 +1464,20 @@ void MainComponent::paint (juce::Graphics& g)
     }
 
 
-    if (auto sb = statusInfo.getBounds(); ! sb.isEmpty())
+    if (auto sb = engineStatusBounds; ! sb.isEmpty())
     {
-        // mesmo rebaixamento dos chips de dispositivo: dado tecnico e contexto,
-        // nao acao -- nao pode ter o mesmo peso visual de um botao
         auto chip = sb.toFloat().reduced (0.0f, 1.0f);
-        g.setColour (juce::Colours::black.withAlpha (0.18f));
+        g.setColour (juce::Colours::black.withAlpha (0.32f));
         g.fillRoundedRectangle (chip, NordLookAndFeel::radiusControl);
-        g.setColour (juce::Colours::white.withAlpha (0.045f));
+        g.setColour (juce::Colours::white.withAlpha (0.09f));
         g.drawRoundedRectangle (chip.reduced (0.5f), NordLookAndFeel::radiusControl, 1.0f);
+
+        auto label = sb.reduced (8, 2).removeFromTop (10);
+        g.setColour (juce::Colours::white.withAlpha (0.64f));
+        g.setFont (juce::Font (juce::FontOptions (8.0f, juce::Font::bold))
+                       .withExtraKerningFactor (0.12f));
+        g.drawText (juce::String::fromUTF8 ("\xc3\x81UDIO ENGINE"), label,
+                    juce::Justification::centred, false);
     }
 
     // ---- cartoes ----
@@ -1159,9 +1581,62 @@ void MainComponent::refreshMidiInputs()
     // essa linha que revelou o problema do Android ("MIDI: 0 entrada(s)").
     juce::Logger::writeToLog ("MIDI: " + juce::String (midiIns.size()) + " entrada(s)");
 
+    // REDE DE SEGURANCA: nunca ficar sem NENHUMA entrada.
+    //
+    // O filtro de porta DAW e uma heuristica de NOME, e no Android o nome
+    // entregue e o do aparelho inteiro — um padrao infeliz derruba todas as
+    // portas de uma vez. Foi o que aconteceu na 1.5.4 com "MIDI Int", e o
+    // cliente ficou sem teclado nenhum. Se o filtro fosse desligar tudo, ele
+    // esta errado: e melhor um pad tocar nota errada do que o instrumento
+    // ficar mudo no meio do culto.
+    int candidatasALigar = 0;
+    for (auto& d : midiIns)
+        if (! LaunchkeyControl::isDawPort (d.name))
+            ++candidatasALigar;
+
+    const bool filtroDerrubariaTudo = midiIns.size() > 0 && candidatasALigar == 0;
+
+    if (filtroDerrubariaTudo)
+        juce::Logger::writeToLog (
+            "MIDI: o filtro de porta DAW desligaria TODAS as entradas — ignorado "
+            "nesta varredura para o teclado nao ficar mudo");
+
+    // A LISTA REGISTRADA TEM DE SER A QUE FOI LIGADA DE VERDADE.
+    //
+    // Faltava aqui a mesma excecao do laco de baixo: quando filtroDerrubariaTudo
+    // vale, o app LIGA todas as portas e esta lista registrava ZERO. Duas
+    // consequencias, e a segunda e grave:
+    //
+    //  1. As etiquetas do Pad, que cruzam o mapa com esta lista, apagavam todas
+    //     com o teclado plugado e tocando.
+    //  2. Com a lista vazia, o laco que detecta porta que SUMIU nunca roda,
+    //     alguemSaiu nunca fica true e resetMidiTransportState NUNCA e chamado.
+    //     Cabo solto com um acorde seguro e o pitch bend fora do centro =
+    //     nota presa e bend torto ate o PANIC manual. O panico existe
+    //     exatamente para isso.
+    juce::StringArray agora;
+    for (auto& d : midiIns)
+        if (filtroDerrubariaTudo || ! LaunchkeyControl::isDawPort (d.name))
+            agora.add (d.identifier);
+
+    // Feche primeiro os identificadores que desapareceram. Em especial no
+    // Android, apenas observar a lista nova nao solta necessariamente a porta
+    // antiga dentro do AudioDeviceManager. Se o mesmo teclado voltar com outro
+    // identificador, a conexao fantasma ficava aberta e cada hot-plug acumulava
+    // mais uma porta no MidiService.
+    bool alguemSaiu = false;
+    for (const auto& anterior : entradasMidiConhecidas)
+        if (! agora.contains (anterior))
+        {
+            deviceManager.setMidiInputDeviceEnabled (anterior, false);
+            alguemSaiu = true;
+            juce::Logger::writeToLog (
+                "MIDI IN removida e fechada: id=" + anterior);
+        }
+
     for (auto& d : midiIns)
     {
-        const bool daw = LaunchkeyControl::isDawPort (d.name);
+        const bool daw = ! filtroDerrubariaTudo && LaunchkeyControl::isDawPort (d.name);
         deviceManager.setMidiInputDeviceEnabled (d.identifier, ! daw);
 
         // O filtro de porta DAW procura "MIDIIN2"/"MIDIOUT2"/"DAW", que sao
@@ -1172,25 +1647,61 @@ void MainComponent::refreshMidiInputs()
                                    + (daw ? "  -> DAW (desligada)" : "  -> LIGADA"));
     }
 
+    // PANICO SO QUANDO ALGO SAIU.
+    //
     // Um cabo retirado com pitch bend fora do centro nunca envia a volta para
-    // 8192; o plugin ficaria desafinado indefinidamente. A lista mudou, entao
-    // encerra vozes pendentes e injeta reset/center nos 16 canais.
-    resetMidiTransportState();
+    // 8192, e notas seguradas ficariam presas — por isso o panico existe. Mas
+    // panicar a CADA mudanca de lista cortava o som quando um aparelho apenas
+    // APARECIA, e isso e um evento comum: no Android a descoberta e assincrona
+    // (o proprio JUCE agenda +2 s para Bluetooth) e no macOS parear qualquer
+    // coisa dispara uma rajada de eventos de endpoint. O musico via o som
+    // morrer sozinho e concluia que o app tinha perdido o teclado.
+    const bool primeiraVez = entradasMidiConhecidas.isEmpty() && agora.isEmpty();
+    const bool listaMudou = entradasMidiConhecidas != agora;
+    entradasMidiConhecidas = agora;
+
+    if (alguemSaiu && ! primeiraVez)
+        resetMidiTransportState();
+
+    // As etiquetas do Pad dizem QUAL tecla comanda cada tom, e apagam quando o
+    // teclado daquele mapa nao esta ligado. Trocar de controlador e exatamente
+    // o momento em que essa informacao muda — sem isto, o painel continuaria
+    // prometendo uma tecla do teclado que ficou em casa.
+    if (listaMudou)
+        atualizarEtiquetasDoPad();
 }
 
 void MainComponent::resetMidiTransportState()
 {
-    if (auto* live = getChurchLive())
     {
-        live->panic();
-        juce::Logger::writeToLog (
-            "MIDI SAFETY: transporte recentralizado apos hot-plug/resume");
+        const juce::ScopedLock sl (mapLock);
+        notasSuprimidas.clear();
+        reconstruirMascaraDeSuprimidas();
     }
+
+    // O panic direto abaixo atende o instrumento nativo. Injete tambem a
+    // sequencia MIDI completa no grafo: se o slot 1 estiver com um VST3/AU,
+    // ele nao conhece TimbresProcessor::panic() e ficaria com nota/bend preso
+    // depois de hot-plug ou resume.
+    juce::MidiBuffer panic;
+    panic.ensureSize (4096);
+    ChurchDAWPerformanceMidiSafety::appendFullPanic (panic, 0);
+
+    for (const auto metadata : panic)
+        player.getMidiMessageCollector().addMessageToQueue (
+            metadata.getMessage());
+
+    if (auto* live = getChurchLive())
+        live->panic();
+
+    juce::Logger::writeToLog (
+        "MIDI SAFETY: transporte recentralizado apos hot-plug/resume");
 }
 
 void MainComponent::resized()
 {
     CHURCHDAW_UI_SCOPE ("MainComponent::resized");
+    engineStatusBounds = {};
     const bool churchFull = (dockedNative && dockedEditor != nullptr);
     instrumentsButton.setVisible (churchFull);
 
@@ -1232,7 +1743,7 @@ void MainComponent::resized()
         layoutSafeBottom = juce::jlimit (0, 16, display->safeAreaInsets.getBottom());
     }
    #else
-    const bool compact = getHeight() < 560;
+    const bool compact = getHeight() < 600;
     layoutSafeLeft = 0;
     layoutSafeRight = 0;
     layoutSafeTop = 0;
@@ -1290,15 +1801,33 @@ void MainComponent::resized()
     // Android 16/freeform nao comprime seis botoes numa unica linha.
     layoutHeaderHeight = mobilePortraitLayout ? 108
                                               : mobileShortLandscapeLayout ? 32 : 56;
-    layoutProgramBandHeight = mobilePortraitLayout ? 52
-                                                   : mobileShortLandscapeLayout ? 32
+    // A FAIXA CRESCE PARA AS CENAS.
+    //
+    // O visor mostra texto e cabe em 52 px; as dez cenas sao ALVOS DE DEDO e
+    // nao cabem. Com 52 px, dez botoes lado a lado num celular de 360 dp davam
+    // 28 px de largura — no escuro, isso e tocar na cena errada, e a cena
+    // errada no meio do culto e a musica errada. Com 104 px o painel passa a
+    // usar duas fileiras de cinco: 57 px de largura por 40 de altura, que ja e
+    // um alvo de verdade.
+    //
+    // So cresce quando as cenas estao na tela: fora do Live Mode a faixa
+    // continua exatamente como era, e o resto do layout nao muda.
+    const bool cenasNaFaixa = liveScenePanel.isVisible();
+
+    layoutProgramBandHeight = mobilePortraitLayout ? (cenasNaFaixa ? 104 : 52)
+                                                   : mobileShortLandscapeLayout ? (cenasNaFaixa ? 56 : 32)
                                                                                 : mobileProgramBandHeight;
     layoutBrandWidth = narrowPhone ? 58
                                    : mobileShortLandscapeLayout ? 132 : 166;
+    desktopHeaderTwoRows = false;
    #else
-    layoutHeaderHeight = compact ? 46 : headerHeight;
-    layoutProgramBandHeight = compact ? 60 : programBandHeight;
-    layoutBrandWidth = narrowPhone ? 70 : compact ? 218 : 228;
+    desktopHeaderTwoRows = safeContentWidth < 1160;
+    layoutHeaderHeight = compact ? (desktopHeaderTwoRows ? 82 : 46)
+                                 : desktopHeaderTwoRows ? 96 : headerHeight;
+    layoutProgramBandHeight = compact ? 60
+                                      : desktopHeaderTwoRows ? 96
+                                                             : programBandHeight;
+    layoutBrandWidth = narrowPhone ? 70 : compact ? 190 : 190;
    #endif
     compactHeaderLayout = compact;
 
@@ -1330,6 +1859,15 @@ void MainComponent::resized()
                                 : programBand.withSizeKeepingCentre (juce::jmin (860, programBand.getWidth() - 48),
                                                                      programBand.getHeight() - 16));
         midiLearnPanel.setBounds (compact ? programBand.reduced (
+                                                mobileShortLandscapeLayout ? 6 : 8,
+                                                mobileShortLandscapeLayout ? 2 : 3)
+                                          : programBand.withSizeKeepingCentre (juce::jmin (960, programBand.getWidth() - 48),
+                                                                               programBand.getHeight() - 22));
+
+        // As cenas ocupam o MESMO retangulo do visor e do MIDI Learn: e uma
+        // superficie que ja alterna ocupantes, entao o Live Mode entra sem
+        // disputar largura no cabecalho, que no celular ja esta no limite.
+        liveScenePanel.setBounds (compact ? programBand.reduced (
                                                 mobileShortLandscapeLayout ? 6 : 8,
                                                 mobileShortLandscapeLayout ? 2 : 3)
                                           : programBand.withSizeKeepingCentre (juce::jmin (960, programBand.getWidth() - 48),
@@ -1366,7 +1904,7 @@ void MainComponent::resized()
 
     audioSettingsButton.setButtonText (narrowPhone ? juce::String::fromUTF8 ("\xc3\x81udio")
                                                    : juce::String::fromUTF8 ("\xc3\x81udio / MIDI"));
-    librariesButton.setButtonText (narrowPhone ? "Packs" : "Bibliotecas");
+    librariesButton.setButtonText ("Bibliotecas");
     instrumentsButton.setButtonText (narrowPhone ? "Timbres"
                                                  : juce::String::fromUTF8 ("\xe2\x97\x89 Instrumentos"));
     mapButton.setButtonText (learning ? "Concluir"
@@ -1382,7 +1920,8 @@ void MainComponent::resized()
     librariesButton.setVisible (! learning);
     padButton.setVisible (! learning);
     saveButton.setVisible (! learning);
-    statusInfo.setVisible (! compact && ! learning);
+    liveButton.setVisible (! learning);
+    statusInfo.setVisible ((! compact || desktopHeaderTwoRows) && ! learning);
 
    #if CHURCHDAW_HOSTS_PLUGINS
     scanButton.setVisible (! learning);
@@ -1409,6 +1948,12 @@ void MainComponent::resized()
         deviceBar.setBounds (identityRow);
         statusInfo.setBounds ({});
 
+        // Zera ANTES de distribuir. Sem isto, um botao que sai da barra nesta
+        // orientacao guarda os bounds da anterior: girar o tablet de paisagem
+        // para retrato deixava o Live como um botao invisivel porem clicavel
+        // por cima da fileira de identidade.
+        liveButton.setBounds ({});
+
         juce::Array<juce::Button*> actions;
 
         if (churchFull)
@@ -1421,6 +1966,10 @@ void MainComponent::resized()
         }
         else
         {
+            // O Live entra na barra de acoes do RETRATO. Faltava aqui, e o
+            // resultado era o modo simplesmente inalcancavel no celular em pe
+            // — que e como a maioria dos musicos segura o aparelho.
+            actions.add (&liveButton);
             actions.add (&mapButton);
             actions.add (&padButton);
             actions.add (&librariesButton);
@@ -1448,11 +1997,139 @@ void MainComponent::resized()
     else
    #endif
     {
+       #if ! JUCE_ANDROID && ! JUCE_IOS
+        // Desktop premium: quatro grupos com orcamentos independentes. A versao
+        // anterior removia todos os botoes da direita com larguras fixas e so
+        // depois entregava o que sobrasse aos cards de dispositivo; em 1280 px
+        // isso podia ser zero. Aqui cada grupo recebe largura antes do layout.
+        headerControls.removeFromLeft (layoutBrandWidth);
+        headerControls.removeFromRight (8);
+
+        for (auto* button : { &instrumentsButton, &liveButton, &mapButton,
+                              &clearMapButton, &saveButton, &padButton,
+                              &scanButton, &librariesButton,
+                              &audioSettingsButton })
+            button->setBounds ({});
+
+        auto layoutNavigation = [&] (juce::Rectangle<int> row)
+        {
+            juce::Array<juce::Button*> buttons;
+            juce::Array<int> weights;
+            auto add = [&] (juce::Button& button, int weight)
+            {
+                buttons.add (&button);
+                weights.add (weight);
+            };
+
+            if (churchFull)
+                // O destino primario precisa caber por extenso mesmo na work
+                // area de 1280; com o peso antigo virava "Instrument...".
+                add (instrumentsButton, 140);
+
+            if (learning)
+            {
+                add (clearMapButton, 96);
+                add (mapButton, 92);
+            }
+            else
+            {
+                add (liveButton, 54);
+                add (mapButton, 96);
+                add (saveButton, 70);
+                add (padButton, 54);
+
+               #if CHURCHDAW_HOSTS_PLUGINS
+                add (scanButton, 72);
+               #endif
+
+                add (librariesButton, 92);
+                add (audioSettingsButton, 100);
+            }
+
+            constexpr int navGap = 5;
+            const int gapTotal = navGap * juce::jmax (0, buttons.size() - 1);
+            const int usable = juce::jmax (1, row.getWidth() - gapTotal);
+            int totalWeight = 0;
+
+            for (auto weight : weights)
+                totalWeight += weight;
+
+            for (int i = 0; i < buttons.size(); ++i)
+            {
+                const int w = i == buttons.size() - 1
+                    ? row.getWidth()
+                    : juce::jmax (1, juce::roundToInt (
+                        (double) usable * (double) weights.getUnchecked (i)
+                            / (double) juce::jmax (1, totalWeight)));
+                buttons.getUnchecked (i)->setBounds (row.removeFromLeft (w));
+
+                if (i < buttons.size() - 1)
+                    row.removeFromLeft (navGap);
+            }
+        };
+
+        deviceBar.setCompact (compact && ! desktopHeaderTwoRows);
+        deviceBar.setVisible (true);
+
+        if (desktopHeaderTwoRows && ! learning)
+        {
+            constexpr int rowGap = 6;
+            auto statusRow = headerControls.removeFromTop (
+                (headerControls.getHeight() - rowGap) / 2);
+            headerControls.removeFromTop (rowGap);
+            auto navigationRow = headerControls;
+
+            auto engine = statusRow.removeFromRight (
+                juce::jmin (176, statusRow.getWidth()));
+            engineStatusBounds = engine;
+            statusInfo.setBounds (engine.withTrimmedTop (10).reduced (4, 0));
+            statusRow.removeFromRight (10);
+            deviceBar.setBounds (statusRow.removeFromLeft (
+                juce::jmin (420, statusRow.getWidth())));
+            layoutNavigation (navigationRow);
+        }
+        else
+        {
+            const int navW = learning
+                ? juce::jlimit (250, 390,
+                                juce::roundToInt (headerControls.getWidth() * 0.36f))
+                : compact
+                    ? juce::jlimit (420, 760,
+                                    juce::roundToInt (headerControls.getWidth() * 0.70f))
+                    : juce::jlimit (500, 600,
+                                    juce::roundToInt (headerControls.getWidth() * 0.54f));
+            auto navigationRow = headerControls.removeFromRight (
+                juce::jmin (navW, headerControls.getWidth()));
+            headerControls.removeFromRight (juce::jmin (12, headerControls.getWidth()));
+
+            if (! compact && ! learning)
+            {
+                engineStatusBounds = headerControls.removeFromRight (
+                    juce::jmin (176, headerControls.getWidth()));
+                statusInfo.setBounds (
+                    engineStatusBounds.withTrimmedTop (10).reduced (4, 0));
+                headerControls.removeFromRight (
+                    juce::jmin (10, headerControls.getWidth()));
+            }
+            else
+            {
+                statusInfo.setBounds ({});
+            }
+
+            deviceBar.setBounds (headerControls);
+            layoutNavigation (navigationRow);
+        }
+       #else
         headerControls.removeFromLeft (layoutBrandWidth);   // marca + separador
         headerControls.removeFromRight (compact ? 6 : 14);
 
         if (learning)
         {
+            // Durante o aprendizado o Live Mode sai do cabecalho: os dois
+            // ocupam a mesma faixa, e um botao visivel que nao pode ser usado
+            // e pior que botao nenhum.
+            liveButton.setBounds ({});
+
             mapButton.setBounds (headerControls.removeFromRight (mapW));
             headerControls.removeFromRight (gap);
             clearMapButton.setBounds (headerControls.removeFromRight (clearW));
@@ -1487,6 +2164,8 @@ void MainComponent::resized()
             saveButton.setBounds (headerControls.removeFromRight (saveW));
             headerControls.removeFromRight (gap);
             mapButton.setBounds (headerControls.removeFromRight (mapW));
+            headerControls.removeFromRight (gap);
+            liveButton.setBounds (headerControls.removeFromRight (62));
 
             if (churchFull)
             {
@@ -1509,6 +2188,7 @@ void MainComponent::resized()
         deviceBar.setVisible (true);
         deviceBar.setBounds (headerControls.removeFromLeft (juce::jmin (deviceW,
                                                                         headerControls.getWidth())));
+       #endif
     }
 
     // Church Live em tela cheia: a fileira de cima some inteira e a mesa
@@ -1662,6 +2342,7 @@ void MainComponent::resized()
         // nunca existe rolagem horizontal no editor nativo.
         if (dockedNative && compact)
         {
+           #if JUCE_ANDROID || JUCE_IOS
             if (mobileShortLandscapeLayout)
                 dockViewport.setViewPosition (0, 0);
 
@@ -1672,6 +2353,13 @@ void MainComponent::resized()
             const bool needsVerticalPage = ! mobileShortLandscapeLayout
                                         && area.getHeight() < 520;
             dockViewport.setScrollBarsShown (needsVerticalPage, false);
+           #else
+            // No desktop compacto o mouse/teclado nao exigem o piso touch de
+            // 520 dp. O editor ja possui uma grade vertical compacta e deve
+            // receber exatamente o viewport para manter o rodape visivel.
+            dockViewport.setViewPosition (0, 0);
+            dockViewport.setScrollBarsShown (false, false);
+           #endif
         }
         else
             dockViewport.setScrollBarsShown (! compact, true);
@@ -1691,11 +2379,18 @@ void MainComponent::resized()
             // tem um piso de 520 dp. Isso atende portrait/freeform sem esmagar
             // componentes; em paisagem baixa a pagina rola, mantendo todos os
             // comandos acessiveis e nenhum mixer sob a barra gestual.
-            dockedEditor->setSize (compact ? area.getWidth() : juce::jmax (1120, area.getWidth()),
-                                   compact ? (mobileShortLandscapeLayout
-                                                  ? area.getHeight()
-                                                  : juce::jmax (520, area.getHeight()))
-                                           : juce::jmax (400, area.getHeight()));
+           #if JUCE_ANDROID || JUCE_IOS
+            dockedEditor->setSize (
+                compact ? area.getWidth() : juce::jmax (1120, area.getWidth()),
+                compact ? (mobileShortLandscapeLayout
+                               ? area.getHeight()
+                               : juce::jmax (520, area.getHeight()))
+                        : juce::jmax (400, area.getHeight()));
+           #else
+            dockedEditor->setSize (
+                compact ? area.getWidth() : juce::jmax (1120, area.getWidth()),
+                compact ? area.getHeight() : juce::jmax (400, area.getHeight()));
+           #endif
         }
 
         layoutDockHolder();
@@ -1704,13 +2399,23 @@ void MainComponent::resized()
     // card do Pad Continuo: centrado, um pouco abaixo do meio (flutua no mixer)
     if (padPanel != nullptr)
     {
+        const bool seguePosicaoAutomatica = padPanelHome.isEmpty()
+                                          || padPanel->getBounds() == padPanelHome;
+        const int margem = compact ? 8 : 16;
+        const int topoDisponivel = layoutContentBounds.getY() + headerH + (compact ? 4 : 12);
+        auto disponivel = juce::Rectangle<int> (
+            layoutContentBounds.getX() + margem,
+            topoDisponivel,
+            juce::jmax (1, layoutContentBounds.getWidth() - margem * 2),
+            juce::jmax (1, layoutContentBounds.getBottom() - topoDisponivel - margem));
+        const int larguraPad = juce::jmin (560, disponivel.getWidth());
+        const int alturaPad = juce::jmin (318, disponivel.getHeight());
+
         // so re-centraliza enquanto o usuario nao arrastou o card (a posicao
         // atual ainda e a ultima que o codigo setou)
-        if (padPanelHome.isEmpty() || padPanel->getBounds() == padPanelHome)
+        if (seguePosicaoAutomatica)
         {
-            auto pb = layoutContentBounds.withSizeKeepingCentre (padPanel->getWidth(), padPanel->getHeight());
-            pb.setY (juce::jmax (layoutContentBounds.getY() + headerH + 12,
-                                 layoutContentBounds.getCentreY() - padPanel->getHeight() / 2 + 30));
+            auto pb = disponivel.withSizeKeepingCentre (larguraPad, alturaPad);
             padPanel->setBounds (pb);
             padPanelHome = pb;
         }
@@ -1718,14 +2423,14 @@ void MainComponent::resized()
         {
             // arrastado: respeita a posicao escolhida, so puxa de volta pra
             // dentro da janela se o resize deixou o card pra fora
-            auto pb = padPanel->getBounds();
-            pb.setX (juce::jlimit (layoutContentBounds.getX(),
-                                   juce::jmax (layoutContentBounds.getX(),
-                                               layoutContentBounds.getRight() - pb.getWidth()),
+            auto pb = padPanel->getBounds().withSizeKeepingCentre (larguraPad, alturaPad);
+            pb.setX (juce::jlimit (disponivel.getX(),
+                                   juce::jmax (disponivel.getX(),
+                                               disponivel.getRight() - pb.getWidth()),
                                    pb.getX()));
-            pb.setY (juce::jlimit (layoutContentBounds.getY() + headerH,
-                                   juce::jmax (layoutContentBounds.getY() + headerH,
-                                               layoutContentBounds.getBottom() - pb.getHeight()),
+            pb.setY (juce::jlimit (disponivel.getY(),
+                                   juce::jmax (disponivel.getY(),
+                                               disponivel.getBottom() - pb.getHeight()),
                                    pb.getY()));
             padPanel->setBounds (pb);
         }
@@ -1761,6 +2466,14 @@ void MainComponent::changeListenerCallback (juce::ChangeBroadcaster* source)
     }
     else if (source == &deviceManager)
     {
+       #if JUCE_ANDROID
+        // Mudanca feita dentro do painel e escolha explicita do usuario. Um
+        // fallback automatico acontece com o painel fechado e nao apaga o USB
+        // que deve ser restaurado quando voltar.
+        if (audioDialogOpen)
+            updateAndroidPreferredUsbSetupFromCurrent();
+       #endif
+
         // so grava enquanto o dialogo de audio esta aberto: um fallback de driver
         // na inicializacao nao pode sobrescrever a escolha do usuario
         if (! suppressAudioStateSave && audioDialogOpen)
@@ -1773,8 +2486,38 @@ void MainComponent::changeListenerCallback (juce::ChangeBroadcaster* source)
     {
         masterSlider.setValue (masterProcessor->getMasterDb(), juce::dontSendNotification);
     }
+    else if (source == getChurchLive())
+    {
+        // O setup do Church Live so ia para o disco no botao Salvar ou no
+        // destrutor. Se o app morre antes disso — e ele morria varrendo
+        // plugins — o cliente reabre SEM o setup dele, e a primeira
+        // execucao roda de novo o preset de fabrica: piano no canal 1 e
+        // pad no canal 2 que ele nunca escolheu. Foi a reclamacao do Mac
+        // em 31/07/2026.
+        //
+        // Grava com atraso porque este callback tambem chega quando o
+        // musico so mexe num fader; escrever XML a cada toque durante o
+        // culto seria pior que o problema.
+        agendarGravacaoDoSetup();
+    }
 
     appProperties.getUserSettings()->saveIfNeeded();
+}
+
+void MainComponent::agendarGravacaoDoSetup()
+{
+    // Uma geracao por pedido: se chegarem dez mudancas seguidas, so a
+    // ultima grava. Component::SafePointer cobre o app fechando no meio.
+    const auto geracao = ++geracaoDaGravacaoDoSetup;
+
+    juce::Timer::callAfterDelay (
+        2000,
+        [safe = juce::Component::SafePointer<MainComponent> (this), geracao]
+        {
+            if (auto* self = safe.getComponent())
+                if (self->geracaoDaGravacaoDoSetup == geracao)
+                    self->saveChainState();
+        });
 }
 
 void MainComponent::refreshSlotChoices()
@@ -1954,6 +2697,12 @@ void MainComponent::loadInternalTimbres (int slotIndex, const juce::MemoryBlock*
     s.openButton.setEnabled (true);
     s.proc.store (node->getProcessor());
     node->getProcessor()->addListener (this);
+
+    // Escutar o Church Live e o que permite gravar o setup logo depois de
+    // o musico escolher um timbre, em vez de so no botao Salvar. O
+    // unloadSlot tira o listener antes de destruir o processador.
+    if (auto* live = dynamic_cast<TimbresProcessor*> (node->getProcessor()))
+        live->addChangeListener (this);
     // O combo tem UMA entrada nativa so ("Church Live (nativo)", id timbresComboId)
     // desde que o instrumento passou a enxergar todas as bibliotecas. Selecionar
     // timbresComboId + libraryIndex apontava pra um item inexistente quando a
@@ -1978,6 +2727,11 @@ void MainComponent::unloadSlot (int slotIndex)
         if (auto* node = graph.getNodeForId (s.nodeID))
         {
             node->getProcessor()->removeListener (this);
+
+            // par do addChangeListener em loadInternalTimbres: sem isto o
+            // broadcaster ficaria com um ponteiro para este componente
+            if (auto* live = dynamic_cast<TimbresProcessor*> (node->getProcessor()))
+                live->removeChangeListener (this);
 
             // o card Audio/MIDI segura um attachment pro parametro de velocity
             // do Church Live; remover o no com o card aberto deixaria o
@@ -2059,6 +2813,17 @@ void MainComponent::dockNodeNow (juce::AudioProcessorGraph::NodeID nodeID)
             editor = std::make_unique<juce::GenericAudioProcessorEditor> (*proc);
 
         dockedEditor = std::move (editor);
+
+        if (auto* timbres = dynamic_cast<TimbresEditor*> (dockedEditor.get()))
+        {
+            auto safe = juce::Component::SafePointer<MainComponent> (this);
+            timbres->setOpenLibrariesCallback ([safe]
+            {
+                if (auto* component = safe.getComponent())
+                    component->showLibraries();
+            });
+        }
+
         dockedEditor->addComponentListener (this);
         dockHolder.addAndMakeVisible (*dockedEditor);
         dockedNodeID = nodeID;
@@ -2342,8 +3107,11 @@ void MainComponent::setupLaunchkey()
             return;
         }
 
-        if (note == LaunchkeyControl::padBottom0 + 7 && live != nullptr)
-            live->panic();
+        if (note == LaunchkeyControl::padBottom0 + 7)
+        {
+            resetMidiTransportState();
+            return;
+        }
     };
 
     launchkey->showLogo ("ChurchDAW");
@@ -2451,10 +3219,275 @@ void MainComponent::handleIncomingMidiMessage (juce::MidiInput* source,
         const juce::String sourceId =
             "midi:" + (source != nullptr ? source->getIdentifier()
                                          : juce::String ("unknown"));
+        const int controller = message.getControllerNumber();
+
+        // Alguns controladores encerram a frase somente com All Sound Off /
+        // All Notes Off, sem emitir um note-off individual. O instrumento
+        // recebe o CC logo abaixo; o ledger de teclas de comando tambem deve
+        // esquecer as notas desse aparelho/canal para nao carregar latches
+        // obsoletos para a proxima frase.
+        if (controller == 120 || controller == 123)
+        {
+            const int channel = juce::jlimit (1, 16, message.getChannel());
+            const juce::ScopedLock sl (mapLock);
+
+            for (auto it = notasSuprimidas.begin(); it != notasSuprimidas.end();)
+                if (it->sourceId == sourceId && it->channel == channel)
+                    it = notasSuprimidas.erase (it);
+                else
+                    ++it;
+
+            reconstruirMascaraDeSuprimidas();
+        }
+
         processControllerCC (
-            message.getControllerNumber(), message.getControllerValue(),
+            controller, message.getControllerValue(),
             sourceId, message.getChannel());
     }
+    else if (message.isNoteOnOrOff() || message.isAftertouch())
+    {
+        if (notaFoiConsumida (source, message))
+            return;   // tecla de comando: NAO vira nota no instrumento
+    }
+
+    // Tudo que nao foi consumido segue para o motor. Este repasse substitui o
+    // registro direto do player como callback de MIDI.
+    player.getMidiMessageCollector().addMessageToQueue (message);
+}
+
+// Chave completa da nota (aparelho + canal + numero). So e montada depois que
+// as mascaras dizem que ha algo a procurar — ela custa uma alocacao.
+ChurchDAWMidiMapping::ControllerKey MainComponent::montarChaveDeNota (
+    juce::MidiInput* source, const juce::MidiMessage& message, int nota) const
+{
+    return { "midi:" + (source != nullptr ? source->getIdentifier()
+                                          : juce::String ("unknown")),
+             juce::jlimit (1, 16, message.getChannel()),
+             nota };
+}
+
+// Espelha notasSuprimidas numa mascara atomica por NUMERO de nota, para o
+// note-off poder desistir sem lock e sem alocar. Chamar sempre com o mapLock
+// tomado; o conjunto tem, na pratica, as poucas teclas de comando que estao
+// pressionadas neste instante.
+void MainComponent::reconstruirMascaraDeSuprimidas()
+{
+    juce::uint32 nova[4] = { 0, 0, 0, 0 };
+
+    for (const auto& k : notasSuprimidas)
+        if (juce::isPositiveAndBelow (k.cc, 128))
+            nova[k.cc >> 5] |= 1u << (k.cc & 31);
+
+    for (int i = 0; i < 4; ++i)
+        mascaraDeNotasSuprimidas[i].store (nova[i], std::memory_order_relaxed);
+}
+
+// Decide se esta mensagem de nota e uma TECLA DE COMANDO mapeada pelo musico.
+//
+// Roda na thread de MIDI, entao o caminho comum precisa ser barato: um teste
+// de bit numa mascara atomica resolve 99,9% das notas sem tocar em lock
+// nenhum. So no acerto e que vale a pena pegar o mapLock.
+bool MainComponent::notaFoiConsumida (juce::MidiInput* source,
+                                      const juce::MidiMessage& message)
+{
+    const int nota = message.getNoteNumber();
+
+    if (! juce::isPositiveAndBelow (nota, 128))
+        return false;
+
+    const int palavra = nota >> 5;
+    const juce::uint32 bit = 1u << (nota & 31);
+
+    // NADA DE ALOCAR ANTES DOS TESTES BARATOS.
+    //
+    // Montar "midi:" + identificador cria uma String nova — alocacao de heap —
+    // e isto acontecia em TODA nota, tocada ou nao, antes de qualquer teste.
+    // Um teclado com aftertouch polifonico manda centenas de mensagens por
+    // segundo; era heap na thread de MIDI o tempo inteiro, mesmo sem nenhum
+    // mapeamento. As mascaras atomicas abaixo respondem "nao tem nada aqui"
+    // sem tocar em lock nem em memoria.
+    //
+    // NOTE-OFF E AFTERTOUCH SEGUEM O NOTE-ON, NAO O MAPA.
+    //
+    // Se o mapa mudar com a tecla pressionada, olhar o mapa aqui suprimiria
+    // um note-off cujo note-on passou (nota presa no culto) ou deixaria
+    // passar um note-off orfao. A memoria do que foi suprimido e a unica
+    // fonte de verdade para fechar o par.
+    if (! message.isNoteOn())
+    {
+        // Nenhuma nota com este numero esta suprimida em lugar nenhum.
+        if ((mascaraDeNotasSuprimidas[palavra].load (std::memory_order_relaxed) & bit) == 0)
+            return false;
+
+        const auto chaveOff = montarChaveDeNota (source, message, nota);
+        const juce::ScopedLock trava (mapLock);
+        const auto it = notasSuprimidas.find (chaveOff);
+        const bool eraSuprimida = it != notasSuprimidas.end();
+
+        if (message.isNoteOff() && eraSuprimida)
+        {
+            notasSuprimidas.erase (it);
+            reconstruirMascaraDeSuprimidas();
+        }
+
+        return eraSuprimida;
+    }
+
+    // Note-on: fora do Learn, sem bit ligado nao existe mapeamento para esta
+    // nota — devolve na hora, sem construir chave nenhuma.
+    if (! midiLearnActive.load()
+         && (mascaraDeNotasMapeadas[palavra].load (std::memory_order_relaxed) & bit) == 0)
+        return false;
+
+    const auto chave = montarChaveDeNota (source, message, nota);
+
+    // No modo Learn, tocar um tom no painel do Pad escolhe o alvo e a proxima
+    // nota fisica cria o mapa. O primeiro note-on serve apenas para aprender;
+    // ele e suprimido junto com seu note-off e nao dispara instrumento/Pad.
+    if (midiLearnActive.load())
+    {
+        NoteAction aprendida;
+        bool desmapeou = false;
+
+        {
+            const juce::ScopedLock trava (mapLock);
+            aprendida = pendingNoteAction;
+
+            if (aprendida.kind != NoteActionKind::none)
+            {
+                noteMappings[chave] = aprendida;
+                notasSuprimidas.insert (chave);
+                mascaraDeNotasSuprimidas[palavra].fetch_or (bit, std::memory_order_relaxed);
+
+                // O bit de MAPEADAS sobe aqui DENTRO do lock, junto com a
+                // escrita no mapa. Ligado la fora, uma reconstrucao que
+                // estivesse em curso na outra thread escrevia o snapshot velho
+                // por cima e apagava este bit — a tecla ficava gravada no
+                // disco, etiquetada na tela, e muda no culto.
+                mascaraDeNotasMapeadas[palavra].fetch_or (bit, std::memory_order_relaxed);
+
+                lastMappedNoteKey = chave;
+                lastMappedNoteAction = aprendida;
+                pendingNoteAction = {};
+            }
+            else
+            {
+                // DESMAPEAR: no Learn, sem alvo escolhido, tocar numa tecla JA
+                // mapeada devolve ela a tocar nota.
+                //
+                // Antes disto, mapear uma tecla era irreversivel: o unico
+                // caminho de remocao era "Limpar mapas", que apaga tambem
+                // todos os mapas de CC. Uma tecla mapeada por engano — e o
+                // engano e facil, basta encostar nela com um alvo armado —
+                // custava o mapa inteiro do controlador.
+                //
+                // O gesto e simetrico ao de mapear e cabe na mesma explicacao:
+                // dentro do Learn, a tecla e comando; fora, e nota.
+                const auto it = noteMappings.find (chave);
+
+                if (it != noteMappings.end())
+                {
+                    noteMappings.erase (it);
+                    notasSuprimidas.insert (chave);   // engole o par desta tecla
+                    mascaraDeNotasSuprimidas[palavra].fetch_or (bit, std::memory_order_relaxed);
+                    lastMappedNoteKey = chave;
+                    lastMappedNoteAction = {};
+                    desmapeou = true;
+                }
+            }
+        }
+
+        if (desmapeou)
+        {
+            // A mascara e um filtro por NUMERO de nota e a mesma nota pode
+            // seguir mapeada noutro canal ou noutro teclado. Reconstruir e a
+            // unica forma correta de apagar o bit — e nao pode acontecer aqui,
+            // na thread de MIDI, porque percorre o mapa inteiro.
+            lastMappedNote.store (nota);
+            lastLearnedAtMs.store (juce::Time::getMillisecondCounter());
+            triggerAsyncUpdate();
+            return true;
+        }
+
+        if (aprendida.kind != NoteActionKind::none)
+        {
+            // (o bit ja subiu sob o lock, junto com a escrita no mapa)
+            lastMappedNote.store (nota);
+            lastLearnedAtMs.store (juce::Time::getMillisecondCounter());
+            triggerAsyncUpdate();
+            return true;
+        }
+    }
+
+    // Caminho rapido: sem bit ligado, nem existe mapeamento para esta nota.
+    if ((mascaraDeNotasMapeadas[nota >> 5].load (std::memory_order_relaxed)
+          & (1u << (nota & 31))) == 0)
+        return false;
+
+    NoteAction acao;
+
+    {
+        const juce::ScopedLock trava (mapLock);
+        const auto it = noteMappings.find (chave);
+
+        if (it == noteMappings.end())
+            return false;
+
+        acao = it->second;
+
+        if (acao.kind != NoteActionKind::none)
+        {
+            notasSuprimidas.insert (chave);
+            mascaraDeNotasSuprimidas[palavra].fetch_or (bit, std::memory_order_relaxed);
+        }
+    }
+
+    if (acao.kind == NoteActionKind::none)
+        return false;
+
+    // A acao em si mexe em UI e no motor: sai da thread de MIDI.
+    juce::MessageManager::callAsync (
+        [safe = juce::Component::SafePointer<MainComponent> (this), acao]
+        {
+            if (auto* self = safe.getComponent())
+                self->executarAcaoDeNota (acao);
+        });
+
+    return true;
+}
+
+void MainComponent::executarAcaoDeNota (NoteAction acao)
+{
+    if (padProcessor == nullptr)
+        return;
+
+    switch (acao.kind)
+    {
+        case NoteActionKind::padKey:
+            // SELECIONA o tom, nao alterna.
+            //
+            // Alternar copiava o gesto dos pads do Launchkey, mas o Launchkey
+            // tem LED: ali o musico VE o estado antes de apertar. Uma tecla do
+            // piano nao tem retorno nenhum, e alternar as cegas quebra
+            // justamente o gesto mais comum do palco — a cena da musica ja pos
+            // o Pad em Sol e o tecladista aperta a tecla "Pad Sol" para se
+            // certificar. Com toggle, esse "certificar-se" DESLIGAVA o Pad no
+            // primeiro acorde. Selecionar e idempotente: apertar de novo
+            // confirma. Para calar o Pad existe a acao Parar, que e explicita.
+            padProcessor->setKey (acao.arg);
+            break;
+
+        case NoteActionKind::padOff:
+            padProcessor->setKey (-1);
+            break;
+
+        case NoteActionKind::none:
+        default:
+            return;
+    }
+
+    if (padPanel != nullptr)
+        padPanel->refreshState();
 }
 
 // Um unico caminho para CCs vindos da porta MIDI musical e da porta DAW do
@@ -2489,10 +3522,23 @@ bool MainComponent::processControllerCC (int cc, int value,
         const int slot = lastTouchedSlot.load();
         const int param = lastTouchedParam.load();
         const bool touchOnMaster = slot == -1;
-        const juce::String capturedParamName =
-            lastTouchedParamName;
-        const juce::String capturedParamId =
-            lastTouchedParamId;
+
+        // ESTAS DUAS COPIAS PRECISAM DO mapLock.
+        //
+        // Estamos na thread MIDI. Copiar juce::String incrementa o refcount de
+        // um StringHolder compartilhado; se audioProcessorParameterChanged
+        // reatribuir a String no mesmo instante (e o comentario dela diz que
+        // "pode chegar em qualquer thread"), esta copia pode reter um holder
+        // cujo refcount ja foi a zero — use-after-free. O header sempre
+        // declarou estes dois campos como "protegido por mapLock"; a leitura
+        // e que estava fora dele.
+        juce::String capturedParamName;
+        juce::String capturedParamId;
+        {
+            const juce::ScopedLock trava (mapLock);
+            capturedParamName = lastTouchedParamName;
+            capturedParamId = lastTouchedParamId;
+        }
 
         if (slot != -2)
         {
@@ -2624,6 +3670,30 @@ void MainComponent::audioProcessorParameterChanged (juce::AudioProcessor* proces
 
         lastTouchedSlot.store (-1);   // -1 = Master
         lastTouchedParam.store (-1);
+        lastTouchedInsert.store (-1);
+        triggerAsyncUpdate();
+        return;
+    }
+
+    // Pad Continuo: nao e slot nem insert, e um no proprio do grafo. Sem este
+    // ramo, mexer no corte ou no volume do Pad nao selecionava nada no modo
+    // de mapeamento, e os knobs dele eram inalcancaveis por controlador.
+    if (padProcessor != nullptr && processor == padProcessor)
+    {
+        const auto& params = processor->getParameters();
+
+        {
+            const juce::ScopedLock sl (mapLock);
+            lastTouchedParamName = juce::isPositiveAndBelow (parameterIndex, params.size())
+                                     ? params[parameterIndex]->getName (32)
+                                     : juce::String();
+            lastTouchedParamId = juce::isPositiveAndBelow (parameterIndex, params.size())
+                                   ? ChurchDAWMidiMapping::stableParameterId (params[parameterIndex])
+                                   : juce::String();
+        }
+
+        lastTouchedSlot.store (padSlotId);
+        lastTouchedParam.store (parameterIndex);
         lastTouchedInsert.store (-1);
         triggerAsyncUpdate();
         return;
@@ -2762,9 +3832,25 @@ void MainComponent::timerCallback()
     // A porta DAW tem de ficar FORA da entrada MIDI comum. O estado de audio
     // salvo e o proprio dialogo Audio/MIDI podem reabilita-la sem querer — e ai
     // pad volta a tocar nota e a porta fica ocupada pro LaunchkeyControl.
-    for (const auto& d : midiInputsCached (nowMs))
-        if (LaunchkeyControl::isDawPort (d.name) && deviceManager.isMidiInputDeviceEnabled (d.identifier))
-            deviceManager.setMidiInputDeviceEnabled (d.identifier, false);
+    //
+    // A MESMA rede de seguranca do refreshMidiInputs vale aqui, e por um motivo
+    // pratico: sem ela, o cliente que abrisse Audio/MIDI e marcasse a entrada
+    // na mao via este timer desmarcar em menos de 1 s. Nao havia contorno
+    // possivel pelo usuario — foi o que tornou a regressao da 1.5.4 tao grave.
+    {
+        const auto entradas = midiInputsCached (nowMs);
+
+        int sobrariam = 0;
+        for (const auto& d : entradas)
+            if (! LaunchkeyControl::isDawPort (d.name))
+                ++sobrariam;
+
+        if (entradas.size() == 0 || sobrariam > 0)
+            for (const auto& d : entradas)
+                if (LaunchkeyControl::isDawPort (d.name)
+                     && deviceManager.isMidiInputDeviceEnabled (d.identifier))
+                    deviceManager.setMidiInputDeviceEnabled (d.identifier, false);
+    }
 
     CHURCHDAW_UI_LAP ("timer:midi-daw");
 
@@ -2773,6 +3859,10 @@ void MainComponent::timerCallback()
     // a cada 5 s, sem ficar brigando com drivers de porta exclusiva.
 
    #if JUCE_ANDROID
+    pollAndroidAudioTopology();
+
+    CHURCHDAW_UI_LAP ("timer:android-audio-topology");
+
     // Tuner conservador de latencia. Ele roda na message thread, nunca no
     // callback de audio, ignora um xrun isolado e apenas AUMENTA o buffer.
     // Assim a primeira resposta continua em ~10,7 ms/48 kHz, mas um aparelho
@@ -2854,10 +3944,8 @@ void MainComponent::timerCallback()
 
     if (auto* device = deviceManager.getCurrentAudioDevice())
     {
-        // compacto de proposito: precisa caber inteiro no chip (o "smp" e o
-        // "kHz / " comiam a largura e o CPU sumia no reticencias)
-        txt << juce::String (device->getCurrentSampleRate() / 1000.0, 1) << "k" << sep
-            << device->getCurrentBufferSizeSamples() << sep << "CPU "
+        txt << juce::String (device->getCurrentSampleRate() / 1000.0, 1) << " kHz" << sep
+            << device->getCurrentBufferSizeSamples() << " smp" << sep << "CPU "
             << juce::roundToInt (deviceManager.getCpuUsage() * 100.0) << "%";
 
         ifaceName = prettifyDeviceName (device->getName());
@@ -2881,6 +3969,14 @@ void MainComponent::timerCallback()
 
         if (auto* live = getChurchLive())
         {
+            if (! qaOledSelectionApplied
+                 && juce::isPositiveAndBelow (qaOledChannel - 1,
+                                              TimbresProcessor::numLayers))
+            {
+                live->setSelectedLayer (qaOledChannel - 1);
+                qaOledSelectionApplied = true;
+            }
+
             const int sel = live->getSelectedLayer();
             const auto* timbresEditor =
                 dynamic_cast<const TimbresEditor*> (dockedEditor.get());
@@ -2888,55 +3984,113 @@ void MainComponent::timerCallback()
                 timbresEditor != nullptr
                 && timbresEditor->isMobileMasterPageActive();
 
-            auto nameOf = [live] (int l)
+            auto nameOf = [this, live] (int l)
             {
                 auto n = live->getLayerTimbre (l);
 
                 if (n.isEmpty())
                     n = live->getLayerInstrumentName (l);
 
+                if (n.isEmpty() && qaOledChannel == 9)
+                {
+                    if (l == 7) n = "QA Nivel C8";
+                    if (l == 8) n = "QA Nivel C9";
+                }
+
                 // MESMO nome limpo que a regua mostra: o visor vinha com o cru
                 // ("Black Upright LP4 FC") enquanto o canal ja mostrava limpo
                 return TimbresProcessor::prettyLabel (n);
             };
 
+            int loaded = 0, on = 0;
+
+            for (int l = 0; l < TimbresProcessor::numLayers; ++l)
+            {
+                const bool reallyLoaded = live->getLayerTimbre (l).isNotEmpty()
+                                       || live->getLayerInstrumentName (l).isNotEmpty();
+
+                if (reallyLoaded)
+                {
+                    ++loaded;
+
+                    if (live->getLayerOn (l))
+                        ++on;
+                }
+            }
+
+            const auto liveSummary = loaded == 0
+                ? juce::String ("NENHUM TIMBRE")
+                : on == loaded
+                    ? juce::String (on) + " CANAIS ATIVOS"
+                    : juce::String (on) + " / " + juce::String (loaded)
+                        + " CANAIS ATIVOS";
+            const auto summarySeparator = juce::String::fromUTF8 (" \xc2\xb7 ");
+
             // Nenhum canal em foco: em vez de deixar a coluna oca, o visor conta
             // o estado do setup. Produto premium tem que ser bonito PARADO.
             if (masterFocused)
             {
-                slot = "MASTER";
+                slot = juce::String ("MASTER") + summarySeparator + liveSummary;
                 title = juce::String (
                     juce::CharPointer_UTF8 ("Sa\xc3\xad" "da principal"));
             }
             else if (sel < 0)
             {
-                int loaded = 0, on = 0;
-
-                for (int l = 0; l < TimbresProcessor::numLayers; ++l)
-                    if (nameOf (l).isNotEmpty())
-                    {
-                        ++loaded;
-
-                        if (live->getLayerOn (l))
-                            ++on;
-                    }
-
                 slot = "CHURCH LIVE";
-                title = loaded == 0 ? juce::String ("Nenhum timbre")
-                                    : juce::String (on) + " de " + juce::String (loaded) + " ativos";
+                title = liveSummary;
             }
             else
             {
-                slot = "CANAL " + juce::String (sel + 1);
+                slot = juce::String ("CANAL ") + juce::String (sel + 1)
+                        + summarySeparator + liveSummary;
                 title = nameOf (sel);
 
                 if (title.isEmpty())
                     title = "vazio";
             }
 
-            // TODOS os canais, inclusive o em foco: o painel do Electro 7 existe
-            // justamente para mostrar de relance o que esta carregado em cada um
+            // O visor comporta cinco linhas. Escolhemos essas cinco aqui, em vez
+            // de enviar 14 e deixar o componente cortar silenciosamente depois do
+            // canal 5. O canal em foco vem primeiro na prioridade; depois entram
+            // canais carregados e ligados, carregados desligados e, por fim,
+            // vazios. A ordenacao final conserva a leitura natural pelo numero do
+            // canal sem nunca esconder uma selecao 6..14.
+            std::vector<int> visibleLayers;
+            visibleLayers.reserve (5);
+
+            auto includeLayer = [&visibleLayers] (int layer)
+            {
+                if (layer < 0 || layer >= TimbresProcessor::numLayers
+                    || visibleLayers.size() >= 5
+                    || std::find (visibleLayers.begin(), visibleLayers.end(), layer)
+                           != visibleLayers.end())
+                    return;
+
+                visibleLayers.push_back (layer);
+            };
+
+            if (! masterFocused)
+                includeLayer (sel);
+
+            // Um vizinho da selecao alta fornece contexto de pagina e deixa
+            // verificavel que canais 9..14 usam seu proprio mini-medidor.
+            if (! masterFocused && sel >= 5)
+                includeLayer (sel - 1);
+
             for (int l = 0; l < TimbresProcessor::numLayers; ++l)
+                if (nameOf (l).isNotEmpty() && live->getLayerOn (l))
+                    includeLayer (l);
+
+            for (int l = 0; l < TimbresProcessor::numLayers; ++l)
+                if (nameOf (l).isNotEmpty())
+                    includeLayer (l);
+
+            for (int l = 0; l < TimbresProcessor::numLayers; ++l)
+                includeLayer (l);
+
+            std::sort (visibleLayers.begin(), visibleLayers.end());
+
+            for (const int l : visibleLayers)
             {
                 auto n = nameOf (l);
                 const bool empty = n.isEmpty();
@@ -2956,8 +4110,11 @@ void MainComponent::timerCallback()
                     {
                         const float v = vp->get();
                         dbVal = v <= 0.0001f ? -200.0f : (float) juce::Decibels::gainToDecibels (v);
-                        tag = v <= 0.0001f ? juce::String ("-inf")
-                                           : juce::String (juce::Decibels::gainToDecibels (v), 1) + " dB";
+                        const float db = (float) juce::Decibels::gainToDecibels (v);
+                        tag = v <= 0.0001f
+                            ? juce::String::fromUTF8 ("\xe2\x88\x92\xe2\x88\x9e")
+                            : (db >= 0.0f ? "+" : juce::String())
+                                + juce::String (db, 1) + " dB";
                     }
 
                 // traducao categoria -> pictograma do visor. Fica AQUI porque e o
@@ -3035,11 +4192,82 @@ void MainComponent::handleAsyncUpdate()
     if (ccPickupToClear.exchange (-1) >= 0)
         ccPickup.clear();
 
+    bool noteMappingWasCompleted = false;
+    const int mappedNote = lastMappedNote.exchange (-1);
+
+    if (mappedNote >= 0)
+    {
+        // Se o disco recusou, a tecla funciona nesta sessao e SOME na proxima
+        // abertura. Dizer "PRONTO" aqui e a pior mentira do fluxo: e o unico
+        // caminho que grava varias vezes seguidas, entao o musico mapeia o
+        // culto inteiro achando que esta guardado.
+        const bool gravouNoDisco = saveNoteMap();
+
+        NoteAction mappedAction;
+        MidiControlKey mappedKey;
+        {
+            const juce::ScopedLock sl (mapLock);
+            mappedKey = lastMappedNoteKey;
+            mappedAction = lastMappedNoteAction;
+        }
+
+        // kind == none significa DESMAPEADA (a tecla voltou a tocar nota).
+        const bool desmapeada = mappedAction.kind == NoteActionKind::none;
+
+        // A mascara e filtro por NUMERO de nota, e a mesma nota pode continuar
+        // mapeada noutro canal ou noutro teclado. So a reconstrucao sabe se o
+        // bit ainda deve ficar ligado — apagar o bit direto cortaria os outros.
+        //
+        // Reconstroi SEMPRE, nao so no desmapeamento: lastMappedNote e um slot
+        // unico e a thread de MIDI pode desmapear uma tecla e mapear outra
+        // antes deste callback rodar. Olhando so a ultima acao, a reconstrucao
+        // do desmapeamento era perdida e sobrava um bit ligado sem mapa —
+        // inofensivo no som, mas custa alocacao e lock em toda nota daquele
+        // numero. Reconstruir e barato e nao depende de adivinhar a ordem.
+        reconstruirMascaraDeNotas();
+
+        // Toda mudanca no mapa — aprender OU devolver a tecla — tem de aparecer
+        // no teclado do Pad na mesma hora.
+        atualizarEtiquetasDoPad();
+
+        const auto acao = desmapeada
+                            ? juce::String ("volta a tocar nota")
+                            : mappedAction.kind == NoteActionKind::padOff
+                                ? juce::String ("Pad Parar")
+                                : "Pad " + juce::String (PadPanel::noteName (mappedAction.arg));
+
+        const int count = getMidiMappingCount();
+        midiLearnPanel.setMappingCount (count);
+        deviceBar.setMappingCount (count);
+
+        if (desmapeada)
+            midiLearnPanel.showUnmappedNote (
+                mappedNote,
+                gravouNoDisco ? juce::String ("Mapeamento salvo automaticamente")
+                              : juce::String::fromUTF8 (
+                                    "Vale s\xc3\xb3 nesta sess\xc3\xa3o \xe2\x80\x94 volta ao fechar"));
+        else
+            midiLearnPanel.showMappedNote (acao, mappedNote, gravouNoDisco);
+        juce::Logger::writeToLog (juce::String (desmapeada ? "MIDI MAP: DESMAPEADA nota "
+                                                           : "MIDI MAP: aprendida nota ")
+                                  + juce::String (mappedNote)
+                                  + " canal " + juce::String (mappedKey.channel)
+                                  + " de " + mappedKey.sourceId + " -> " + acao
+                                  + (gravouNoDisco ? "" : "  [NAO SALVOU]"));
+        noteMappingWasCompleted = true;
+    }
+
     const int mappedCC = lastMappedCC.exchange (-1);
 
     if (mappedCC >= 0)
     {
-        saveMidiMap();
+        // MESMA REGRA DA NOTA, 50 linhas acima: o painel nao pode confirmar um
+        // mapa que nao foi para o disco. Este e o caminho que grava MAIS vezes
+        // seguidas — o musico mapeia knob por knob no ensaio — e era o unico
+        // que ainda dizia "PRONTO" sem olhar o resultado. Com o arquivo
+        // recusado (versao futura, pasta somente-leitura, antivirus), ele
+        // reaprendia tudo e perdia tudo de novo na proxima abertura.
+        const bool gravouCC = saveMidiMap();
 
         CCTarget mappedTarget;
         MidiControlKey mappedKey;
@@ -3052,13 +4280,18 @@ void MainComponent::handleAsyncUpdate()
                 mappedTarget = it->second;
         }
 
-        const auto targetName = describeCCTarget (mappedTarget);
+        const auto alvo = describeCCTarget (mappedTarget);
+        const auto targetName = alvo.isNotEmpty() ? alvo : juce::String ("controle");
+
         const int count = getMidiMappingCount();
         midiLearnPanel.setMappingCount (count);
         deviceBar.setMappingCount (count);
-        midiLearnPanel.showMapped (targetName.isNotEmpty() ? targetName : "controle", mappedCC);
+        midiLearnPanel.showMapped (targetName, mappedCC, gravouCC);
         return;
     }
+
+    if (noteMappingWasCompleted)
+        return;
 
     if (! midiLearnActive.load())
         return;
@@ -3071,6 +4304,36 @@ void MainComponent::handleAsyncUpdate()
     if (slot == -1)
     {
         name = "Master";
+    }
+    else if (slot == padSlotId)
+    {
+        // O PAD PRECISA DE RAMO PROPRIO AQUI TAMBEM.
+        //
+        // Sem ele o slot -3 caia no "else" la embaixo, que APAGA o nome do
+        // parametro — a ancora que a thread de MIDI le para fechar o
+        // mapeamento. O resultado, medido na tela: mexer no knob de corte
+        // dentro do MIDI Learn nao saia do PASSO 1, e o knob que o cliente
+        // pediu simplesmente nao era mapeavel. O caminho de aplicacao ja
+        // existia; faltava o de APRENDIZADO.
+        if (padProcessor != nullptr)
+        {
+            const auto& params = padProcessor->getParameters();
+
+            if (juce::isPositiveAndBelow (param, params.size()))
+            {
+                const auto paramName = params[param]->getName (32);
+                const auto paramId = ChurchDAWMidiMapping::stableParameterId (params[param]);
+
+                // Os parametros do Pad ja se chamam "Pad Cutoff"/"Pad Volume".
+                // Prefixar sempre produzia "Pad  Pad Cutoff" na tela.
+                name = paramName.startsWithIgnoreCase ("Pad") ? paramName
+                                                              : "Pad  " + paramName;
+
+                const juce::ScopedLock sl (mapLock);
+                lastTouchedParamName = paramName;
+                lastTouchedParamId = paramId;
+            }
+        }
     }
     else if (slot >= 0 && slot < numSlots)
     {
@@ -3172,6 +4435,41 @@ void MainComponent::applyCCTarget (CCTarget target, float value01,
             pickupPending = true;
         }
     }
+    else if (target.slot == padSlotId)
+    {
+        // O PAD NAO E UM SLOT.
+        //
+        // Ele e um no proprio do grafo (padNode), ligado direto ao master, e
+        // nunca entrou em slots[]. Sem este ramo, expor parametros no
+        // PadProcessor nao servia de nada: nao havia como o MIDI Learn mirar
+        // neles. Cliente pediu justamente um knob de corte mapeavel (01/08).
+        if (padProcessor != nullptr)
+        {
+            const auto& params = padProcessor->getParameters();
+            const int index = ChurchDAWMidiMapping::resolveParameterIndex (
+                params, target.paramId, target.paramName);
+
+            if (juce::isPositiveAndBelow (index, params.size()))
+            {
+                valid = true;
+                auto* p = params[index];
+                const float cur = p->getValue();
+
+                if (! control.isValid() || ccHasPickedUp (control, value01, cur))
+                {
+                    p->setValueNotifyingHost (value01);
+                    applied = true;
+
+                    if (padPanel != nullptr)
+                        padPanel->refreshFromProcessor();
+                }
+                else
+                {
+                    pickupPending = true;
+                }
+            }
+        }
+    }
     else if (target.slot >= 0 && target.slot < numSlots)
     {
         juce::AudioProcessor* proc = slots[target.slot].proc.load();
@@ -3258,6 +4556,36 @@ juce::String MainComponent::describeCCTarget (const CCTarget& target) const
     if (target.slot == -1)
         return "Master";
 
+    // O Pad tem slot proprio (padSlotId) porque nao mora na cadeia de slots.
+    // Ele ganhou caminho no applyCCTarget e no audioProcessorParameterChanged,
+    // mas nao aqui — entao o mapa funcionava e mesmo assim o painel dizia
+    // "controle", o log dizia "alvo invalido" e a faixa de atividade aparecia
+    // sem nome. Metade de uma feature e pior que nenhuma: o usuario mapeia,
+    // ve um nome generico e nao confia que pegou.
+    if (target.slot == padSlotId)
+    {
+        juce::String nome = target.paramName;
+
+        // Resolve pelo mesmo caminho dos slots, em vez de comparar com nomes
+        // fixos: paramName aqui e o rotulo de exibicao, que muda se o
+        // parametro for renomeado — e um literal desatualizado voltaria a
+        // mostrar o generico sem ninguem perceber.
+        if (padProcessor != nullptr)
+        {
+            const auto& params = padProcessor->getParameters();
+            const int resolved = ChurchDAWMidiMapping::resolveParameterIndex (
+                params, target.paramId, target.paramName);
+
+            if (juce::isPositiveAndBelow (resolved, params.size()))
+                nome = params[resolved]->getName (32);
+        }
+
+        if (nome.isEmpty())
+            return "Pad";
+
+        return nome.startsWithIgnoreCase ("Pad") ? nome : "Pad  " + nome;
+    }
+
     if (! juce::isPositiveAndBelow (target.slot, numSlots))
         return {};
 
@@ -3291,12 +4619,901 @@ juce::String MainComponent::describeCCTarget (const CCTarget& target) const
 int MainComponent::getMidiMappingCount() const
 {
     const juce::ScopedLock sl (mapLock);
-    return (int) ccMappings.size();
+    return (int) (ccMappings.size() + noteMappings.size());
 }
 
-void MainComponent::saveMidiMap()
+//==============================================================================
+// LIVE MODE — 10 cenas
+//==============================================================================
+
+// A cena tem o proprio numero de canais porque LiveScenes.h nao conhece o
+// motor. Se um dia o motor crescer, a cena passaria a ignorar os canais novos
+// CALADA — o musico gravaria a cena e o canal 15 simplesmente nao voltaria.
+// Melhor quebrar o build aqui do que descobrir isso no culto.
+static_assert (ChurchDAWLive::numeroDeCanais == TimbresProcessor::numLayers,
+               "LIVE MODE: numeroDeCanais precisa acompanhar TimbresProcessor::numLayers");
+
+ChurchDAWLive::Resultado MainComponent::capturarCena (int indice)
 {
+    if (! juce::isPositiveAndBelow (indice, ChurchDAWLive::numeroDeCenas))
+        return ChurchDAWLive::Resultado::indisponivel;
+
+    auto* live = getChurchLive();
+
+    if (live == nullptr)
+        return ChurchDAWLive::Resultado::indisponivel;
+
+    // MESMA GUARDA DA APLICACAO, pelo motivo espelhado.
+    //
+    // Gravar durante uma carga captura um estado transitorio: um segundo
+    // depois o resetLayerParametersToDefaults do restore passa por cima e o
+    // motor vira outra coisa. A cena ficaria calada e errada — e teria
+    // sobrescrito a anterior, que nao volta. Melhor recusar e avisar.
+    if (live->isBusyLoading())
+        return ChurchDAWLive::Resultado::carregando;
+
+    auto& cena = cenas[indice];
+
+    // SOLO NAO ENTRA NA CENA — ele vira mute.
+    //
+    // Solo e ferramenta de ensaio e e global: se fosse gravado como esta, o
+    // musico ouviria UM canal ao gravar e a cena, que zera o solo ao aplicar,
+    // devolveria TODOS. A cena tocaria diferente do que ele ouviu quando
+    // apertou GRAVAR — o pior tipo de surpresa. Congelando o solo em mutes, a
+    // cena reproduz exatamente o que estava soando.
+    const bool haSolo = live->hasAnyLoadedSolo();
+
+    for (int l = 0; l < ChurchDAWLive::numeroDeCanais; ++l)
+    {
+        auto& canal = cena.canais[l];
+
+        if (auto* p = live->getLayerOnParam (l))
+            canal.ligado = p->getValue() > 0.5f;
+
+        const bool loaded = live->isLayerLoaded (l);
+        const bool soloDeste = loaded
+                            && live->getLayerSoloParam (l) != nullptr
+                            && live->getLayerSoloParam (l)->get();
+
+        // MUTE VENCE SOLO, igual ao motor (audible = on && !mute && (!anySolo
+        // || solo)). Escrever so "! soloDeste" transformava um canal que
+        // estava mudo E em solo — comparacao de dois patches no ensaio — em
+        // canal audivel na cena, e ele voltava tocando.
+        if (auto* p = live->getLayerMuteParam (l))
+            canal.mudo = p->get()
+                      || (loaded && haSolo && ! soloDeste);
+
+        canal.solo = false;   // nunca se grava solo; ver acima
+
+        if (auto* p = live->getLayerVolParam (l))    canal.volume = p->getValue();
+        if (auto* p = live->getLayerTransposeParam (l)) canal.transpose = p->get();
+        if (auto* p = live->getLayerReverbSendParam (l)) canal.envioDeReverb = p->get();
+
+        canal.rotuloDoTimbre = live->getLayerTimbre (l);
+    }
+
+    // Globais: o tecladista transpoe +2 para a musica e espera que a cena
+    // devolva isso. Sem capturar, o XML gravava valores de fabrica que nunca
+    // vieram do motor — mentia.
+    if (auto* p = live->getVolumeGeralParam())     cena.volumeGeral = p->get();
+    if (auto* p = live->getTransposeGeralParam())  cena.transposeGeral = p->get();
+    if (auto* p = live->getRetornoDeReverbParam()) cena.retornoDeReverb = p->get();
+    cena.temGlobais = true;
+
+    if (masterProcessor != nullptr)
+    {
+        cena.masterDb = masterProcessor->getMasterDb();
+        cena.temMaster = true;
+    }
+
+    if (padProcessor != nullptr)
+    {
+        cena.padTom    = padProcessor->getKey();
+        cena.padVolume = padProcessor->getGain();
+        cena.padCorte  = padProcessor->getCutoff();
+    }
+
+    cena.preenchida = true;
+    cena.gravadaEm  = juce::Time::getCurrentTime().toISO8601 (true);
+
+    // Gravar TORNA esta a cena corrente: o som que esta no ar agora e
+    // exatamente ela. Sem isto o painel fica sem nenhuma cena acesa logo
+    // depois de gravar, e no palco o musico perde a referencia de onde esta.
+    cenaAtiva = indice;
+
+    // GRAVOU NA MEMORIA NAO E GRAVOU.
+    //
+    // Se o disco recusou (arquivo de versao futura, permissao, disco cheio), a
+    // cena existe so nesta sessao e some ao fechar. Dizer "ok" aqui desarmaria
+    // o GRAVAR e deixaria o musico confiando numa cena que nao vai estar la no
+    // domingo — a mesma confianca falsa que ja custou caro no mapa de notas.
+    if (! salvarCenas())
+    {
+        juce::Logger::writeToLog ("LIVE: cena " + juce::String (indice + 1)
+                                    + " capturada, mas NAO gravada no disco");
+        return ChurchDAWLive::Resultado::naoGravou;
+    }
+
+    juce::Logger::writeToLog ("LIVE: cena " + juce::String (indice + 1) + " gravada");
+    return ChurchDAWLive::Resultado::ok;
+}
+
+ChurchDAWLive::Resultado MainComponent::aplicarCena (int indice, int tentativa)
+{
+    if (! juce::isPositiveAndBelow (indice, ChurchDAWLive::numeroDeCenas))
+        return ChurchDAWLive::Resultado::indisponivel;
+
+    // Um pedido NOVO do musico invalida qualquer cadeia de reaplicacao ainda
+    // no ar. Fica aqui em cima, e nao dentro do ramo de "carregando", para
+    // valer tambem quando a cena entra de primeira: senao uma cadeia velha
+    // ainda pendente aplicaria a cena abandonada por cima desta.
+    if (tentativa == 0)
+        ++geracaoDaCena;
+
+    const auto& cena = cenas[indice];
+
+    if (! cena.preenchida)
+        return ChurchDAWLive::Resultado::vazia;
+
+    auto* live = getChurchLive();
+
+    if (live == nullptr)
+        return ChurchDAWLive::Resultado::indisponivel;
+
+    // NAO APLICAR NO MEIO DE UM CARREGAMENTO.
+    //
+    // Um restore de timbre que termine depois passa por
+    // resetLayerParametersToDefaults e apagaria a cena que acabou de entrar —
+    // o musico veria a cena "voltar sozinha" segundos depois.
+    if (live->isBusyLoading())
+    {
+        // Adiar sem retomar era um beco: o musico tocava a cena, nada
+        // acontecia, e nada mais aconteceria nunca. Um timbre entra em menos
+        // de 2 s, entao reagendamos por ~3 s e desistimos — desistir calado
+        // depois do aviso na tela e melhor do que insistir para sempre.
+        constexpr int maximoDeTentativas = 12;
+
+        // GERACAO: so a ULTIMA cena pedida pode vencer.
+        //
+        // Sem isto, cada toque durante um carregamento criava uma cadeia
+        // propria e nenhuma cancelava a outra. O musico tocava a cena 3, via
+        // que nada acontecia, tocava a cena 5 — e a cena 5 entrava, e 200 ms
+        // depois a cadeia velha aplicava a 3 por cima. O app terminava na
+        // musica que ele abandonou, com o painel pulando sozinho.
+        //
+        // Vale tambem para o caso mais comum: tocar duas vezes na mesma cena
+        // (reacao natural quando "nao acontece nada") aplicava a cena duas
+        // vezes, e a segunda desfazia qualquer fader mexido no intervalo.
+        const auto minhaGeracao = geracaoDaCena;
+
+        if (tentativa < maximoDeTentativas)
+        {
+            juce::Timer::callAfterDelay (250,
+                [ref = juce::Component::SafePointer<MainComponent> (this),
+                 indice, tentativa, minhaGeracao]
+                {
+                    auto* self = ref.getComponent();
+
+                    if (self == nullptr || self->geracaoDaCena != minhaGeracao)
+                        return;   // o musico ja pediu outra cena
+
+                    if (self->aplicarCena (indice, tentativa + 1) == ChurchDAWLive::Resultado::ok)
+                        self->liveScenePanel.atualizar (self->cenas, self->cenaAtiva);
+                });
+        }
+        else
+        {
+            juce::Logger::writeToLog ("LIVE: cena " + juce::String (indice + 1)
+                                        + " desistiu, timbre ainda carregando");
+
+            // Desistir calado era voltar ao problema que o Resultado veio
+            // resolver: o aviso de "carregando" dura 2,6 s e as tentativas
+            // 3 s, entao a desistencia caia num silencio total.
+            liveScenePanel.avisar (juce::String::fromUTF8 (
+                "TIMBRE DEMOROU \xe2\x80\x94 TOQUE NA CENA DE NOVO"));
+        }
+
+        return ChurchDAWLive::Resultado::carregando;
+    }
+
+    // PASSO 1 — Pad primeiro: e o unico item que pode precisar ler do disco,
+    // e ele mantem o tom antigo tocando ate o novo chegar. Disparar agora
+    // esconde essa latencia atras do resto da troca.
+    if (padProcessor != nullptr)
+    {
+        padProcessor->setGain (cena.padVolume);
+        padProcessor->setCutoff (cena.padCorte);
+        padProcessor->setKey (cena.padTom);
+    }
+
+    // PASSO 2 — o que so afeta nota NOVA: seguro em qualquer instante.
+    for (int l = 0; l < ChurchDAWLive::numeroDeCanais; ++l)
+        if (auto* p = live->getLayerTransposeParam (l))
+            *p = cena.canais[l].transpose;
+
+    if (cena.temGlobais)
+        if (auto* p = live->getTransposeGeralParam())
+            *p = cena.transposeGeral;
+
+    // PASSO 3 — VOLUME, MUTE E SEND ANTES DE LIGAR.
+    //
+    // A ordem aqui e o que evita um susto audivel. Ligar primeiro e ajustar
+    // depois deixa uma janela de um ou dois blocos em que a thread de audio
+    // renderiza o canal recem-ligado com o volume da MUSICA ANTERIOR — que
+    // pode ser muito maior — e em que todo canal calado por um solo de ensaio
+    // volta a ser audivel com os valores velhos. A rampa de 20 ms limita a
+    // excursao, mas em bloco de 512 a 48k ela ja percorre metade do caminho
+    // num unico bloco: da para ouvir. Chegando com os valores certos ANTES do
+    // canal existir, nao ha janela nenhuma.
+    for (int l = 0; l < ChurchDAWLive::numeroDeCanais; ++l)
+    {
+        const auto& canal = cena.canais[l];
+
+        if (auto* p = live->getLayerVolParam (l))
+            p->setValueNotifyingHost (juce::jlimit (0.0f, 1.0f, canal.volume));
+
+        if (auto* p = live->getLayerReverbSendParam (l))
+            *p = canal.envioDeReverb;
+
+        if (auto* p = live->getLayerMuteParam (l))
+            *p = canal.mudo;
+    }
+
+    // PASSO 4 — solo zerado em TODOS. O solo e global (contamina canal que a
+    // cena nem citou) e e ferramenta de ensaio, nao valor de cena. A captura
+    // ja converteu o solo que existia em mutes, entao nada se perde.
+    for (int l = 0; l < ChurchDAWLive::numeroDeCanais; ++l)
+        if (auto* p = live->getLayerSoloParam (l))
+            *p = false;
+
+    // PASSO 5 — LIGAR, agora que cada canal ja tem o volume da cena nova.
+    for (int l = 0; l < ChurchDAWLive::numeroDeCanais; ++l)
+        if (cena.canais[l].ligado)
+            if (auto* p = live->getLayerOnParam (l))
+                p->setValueNotifyingHost (1.0f);
+
+    // Globais que faltavam: sem elas a cena devolvia o timbre certo com o
+    // volume geral e o reverb da musica anterior. Cena antiga (sem o bloco
+    // LIVE no arquivo) nao mexe em nada — ver o comentario de temGlobais.
+    if (cena.temGlobais)
+    {
+        if (auto* p = live->getVolumeGeralParam())
+            *p = cena.volumeGeral;
+
+        if (auto* p = live->getRetornoDeReverbParam())
+            *p = cena.retornoDeReverb;
+    }
+
+    // PASSO 6 — DESLIGAR por ultimo. E aqui que a musica anterior sai, e a
+    // rampa do pos-fader faz a cauda decair em vez de ser cortada.
+    for (int l = 0; l < ChurchDAWLive::numeroDeCanais; ++l)
+        if (! cena.canais[l].ligado)
+            if (auto* p = live->getLayerOnParam (l))
+                p->setValueNotifyingHost (0.0f);
+
+    // PASSO 7 — master, com a MESMA guarda de -infinito do restore do setup.
+    //
+    // Faltava aqui. Se o fade da licenca rodou, ou se o musico deixou o master
+    // no fim enquanto ajustava, a cena gravava -60 dB e passava a emudecer
+    // TUDO toda vez que fosse chamada — persistida, sem desfazer. O restore do
+    // chain ja tratava isso como artefato; a cena tem de tratar igual.
+    if (cena.temMaster && masterProcessor != nullptr)
+    {
+        // MASTER NO FUNDO: AVISA, NAO CORRIGE.
+        //
+        // Tentei corrigir para 0 dB, copiando o restore do setup. E errado
+        // aqui: -60 dB e o FIM DE CURSO do fader, nao so o artefato do fade de
+        // licenca. Uma cena gravada de proposito com o master no fundo — uma
+        // oracao, uma passagem so de voz — voltaria com +60 dB de salto na
+        // PA. Entre "a cena silenciou e o musico nao entende" e "a cena
+        // estourou o sistema de som", a segunda e pior e nao tem desfazer.
+        //
+        // Entao aplica o que foi gravado e conta na tela o que houve.
+        if (cena.masterDb <= MasterProcessor::minusInfinityDb + 0.5f)
+            juce::Logger::writeToLog ("LIVE: cena " + juce::String (indice + 1)
+                                        + " tem o master no fundo (-inf)");
+
+        masterProcessor->setMasterDb (cena.masterDb);
+        masterSlider.setValue (cena.masterDb, juce::dontSendNotification);
+    }
+
+    // PASSO 8 — REARMAR O SOFT-TAKEOVER.
+    //
+    // A cena acabou de mover volume, master e Pad por baixo dos controles
+    // fisicos, que continuam parados onde a musica anterior deixou. Sem zerar
+    // o pickup, o primeiro encostar no fader NAO seria um ajuste: seria um
+    // salto instantaneo do valor da cena de volta para a posicao fisica do
+    // fader. Fader em 100%, cena colocou o Pad em 30%, o dedo raspa no fader
+    // e o Pad volta a 100% no meio do louvor. O pickup existe exatamente para
+    // impedir esse salto, e trocar de cena e o momento em que ele mais
+    // importa — e o unico em que TUDO se desloca de uma vez.
+    //
+    // Message thread: mesma regra do clearMapButton e do handleAsyncUpdate.
+    ccPickup.clear();
+
+    cenaAtiva = indice;
+
+    // UMA fonte de verdade para a cena corrente: o mesmo XML que guarda as 10.
+    // Guardar o indice numa chave separada ja custou um bug — a chave era
+    // escrita aqui e ninguem a lia, entao ao reabrir o app nenhuma cena
+    // aparecia acesa mesmo depois de uma noite inteira tocando numa delas.
+    salvarCenas();
+
+    // NAO agendar a gravacao do setup aqui. Ja tentei, e o remedio era muito
+    // pior que a doenca.
+    //
+    // saveChainState() chama suspendProcessing(true) em cada slot, e o
+    // AudioProcessorGraph zera o buffer de no suspenso: 2 s depois de CADA
+    // troca de cena o instrumento era suspenso e saia SILENCIO pela saida
+    // enquanto o estado ia para o disco — com um Kontakt carregado, dezenas ou
+    // centenas de milissegundos de buraco no comeco de cada musica. Trocar um
+    // travamento de tela por um corte no audio ao vivo e um mau negocio.
+    //
+    // O que se perde sem isso: o Pad e o master que a cena deixou no ar nao
+    // entram no "chain" ate o proximo salvamento normal (mexer num fader,
+    // botao Salvar, fechar o app). A CENA em si esta a salvo — ela mora em
+    // live-scenes.xml e e gravada na hora.
+
+    if (padPanel != nullptr)
+        padPanel->refreshState();
+
+    juce::Logger::writeToLog ("LIVE: cena " + juce::String (indice + 1) + " aplicada");
+    return ChurchDAWLive::Resultado::ok;
+}
+
+void MainComponent::renomearCena (int indice, juce::String nome)
+{
+    if (! juce::isPositiveAndBelow (indice, ChurchDAWLive::numeroDeCenas)
+         || ! cenas[indice].preenchida)
+        return;
+
+    // Limite curto de proposito: o botao tem a largura de um dedo. Um nome que
+    // nao cabe vira reticencias e deixa de servir para achar a musica, que e a
+    // unica razao de existir o nome.
+    cenas[indice].nome = nome.trim().substring (0, 18);
+
+    const bool gravou = salvarCenas();
+    liveScenePanel.atualizar (cenas, cenaAtiva);
+
+    // Mesma regra do capturarCena: renomear que nao chegou ao disco volta ao
+    // nome antigo no proximo arranque, e o musico so descobre no domingo.
+    if (! gravou)
+        liveScenePanel.avisar (
+            ChurchDAWLive::avisoDoResultado (ChurchDAWLive::Resultado::naoGravou, indice));
+}
+
+void MainComponent::apagarCena (int indice)
+{
+    if (! juce::isPositiveAndBelow (indice, ChurchDAWLive::numeroDeCenas)
+         || ! cenas[indice].preenchida)
+        return;
+
+    const auto rotulo = ChurchDAWLive::rotuloDaCena (cenas[indice], indice);
+
+    // APAGAR PEDE CONFIRMACAO.
+    //
+    // Gravar por cima ao menos deixa uma cena no lugar; apagar nao deixa nada,
+    // e nao ha desfazer. O toque longo ja e deliberado, mas o item do menu
+    // fica ao lado de "Renomear" — o custo de um toque a mais e pequeno perto
+    // de perder o ajuste de uma musica inteira.
+    juce::AlertWindow::showOkCancelBox (
+        juce::MessageBoxIconType::WarningIcon,
+        "Apagar cena " + juce::String (indice + 1),
+        juce::String::fromUTF8 ("A cena \"") + rotulo
+            + juce::String::fromUTF8 ("\" ser\xc3\xa1 apagada. Isso n\xc3\xa3o tem como desfazer."),
+        "Apagar", "Cancelar", this,
+        juce::ModalCallbackFunction::create (
+            [this, indice] (int resultado)
+            {
+                if (resultado != 1)
+                    return;
+
+                cenas[indice] = ChurchDAWLive::Cena{};   // volta a ser slot vazio
+
+                // A cena apagada nao pode continuar acesa como "tocando".
+                if (cenaAtiva == indice)
+                    cenaAtiva = -1;
+
+                const bool gravou = salvarCenas();
+                liveScenePanel.atualizar (cenas, cenaAtiva);
+
+                // Apagar que nao foi ao disco e pior que gravar que nao foi: a
+                // cena some da tela e VOLTA INTEIRA no proximo arranque.
+                if (! gravou)
+                    liveScenePanel.avisar (
+                        ChurchDAWLive::avisoDoResultado (ChurchDAWLive::Resultado::naoGravou, indice));
+
+                juce::Logger::writeToLog ("LIVE: cena " + juce::String (indice + 1)
+                                            + (gravou ? " apagada" : " apagada SO na sessao"));
+            }));
+}
+
+// UMA implementacao do backup de arquivo ilegivel, usada pelos tres (cenas,
+// mapa de notas, mapa de CCs).
+//
+// Estavam copiadas tres vezes e cada copia divergia da outra — foi assim que
+// duas delas ficaram sem a guarda de 0 byte e as tres ficaram com a ordem
+// errada (apagar o backup antes de conseguir o novo). A regra:
+//
+//   1. arquivo vazio NAO vira backup (queda de energia deixa 0 byte, e copiar
+//      isso por cima do backup bom apaga justamente o que se queria salvar);
+//   2. move primeiro, apaga o backup antigo so se o move exigir;
+//   3. se nada der certo, DIZ isso — antes a falha do move era muda e o log
+//      afirmava que a copia estava guardada.
+void MainComponent::guardarCopiaDeArquivoIlegivel (const juce::File& arquivo,
+                                                   const juce::String& rotulo)
+{
+    if (! arquivo.existsAsFile())
+        return;
+
+    const auto guardado = arquivo.getSiblingFile (arquivo.getFileName() + ".corrompido");
+    const auto novo = arquivo.getSiblingFile (arquivo.getFileName() + ".corrompido.novo");
+
+    novo.deleteFile();
+
+    if (arquivo.getSize() <= 0 || ! arquivo.copyFileTo (novo))
+    {
+        juce::Logger::writeToLog (rotulo + ": arquivo ILEGIVEL e sem copia nova "
+                                           "(o backup anterior foi preservado)");
+        return;
+    }
+
+    bool trocou = novo.moveFileTo (guardado);
+
+    if (! trocou)
+    {
+        guardado.deleteFile();
+        trocou = novo.moveFileTo (guardado);
+    }
+
+    if (trocou)
+        juce::Logger::writeToLog (rotulo + ": arquivo ILEGIVEL; copia em "
+                                    + guardado.getFileName());
+    else
+        juce::Logger::writeToLog (rotulo + ": arquivo ILEGIVEL e NAO consegui guardar a copia; "
+                                           "ela ficou em " + novo.getFileName());
+}
+
+// Arquivo de versao futura = a sessao abre SEM aquilo, e isso tem de aparecer
+// na TELA. So o log nao serve: ninguem abre log no domingo, e o sintoma
+// (nenhum knob responde, nenhuma cena existe) parece defeito do app.
+void MainComponent::avisarSobreArquivosDeVersaoFutura()
+{
+    juce::StringArray perdidos;
+
+    if (esquemaDeCCsDesconhecido)   perdidos.add ("os mapeamentos de knobs/faders");
+    if (esquemaDeNotasDesconhecido) perdidos.add ("os mapeamentos de teclas");
+    if (esquemaDeCenasDesconhecido) perdidos.add ("as 10 cenas do Live Mode");
+
+    if (perdidos.isEmpty())
+        return;
+
+    juce::AlertWindow::showMessageBoxAsync (
+        juce::MessageBoxIconType::WarningIcon,
+        juce::String::fromUTF8 ("Arquivo de uma vers\xc3\xa3o mais nova"),
+        juce::String::fromUTF8 ("Esta vers\xc3\xa3o do ChurchDAW n\xc3\xa3o consegue ler ")
+            + perdidos.joinIntoString (", ")
+            + juce::String::fromUTF8 (
+                ".\n\nEles foram gravados por uma vers\xc3\xa3o mais recente. Nada foi "
+                "apagado — o app apenas n\xc3\xa3o vai us\xc3\xa1-los nem grav\xc3\xa1-los, "
+                "para n\xc3\xa3o destruir o que est\xc3\xa1 l\xc3\xa1.\n\n"
+                "Atualize o ChurchDAW para voltar a us\xc3\xa1-los."),
+        "Entendi");
+}
+
+juce::File MainComponent::arquivoDeCenas()
+{
+    return appProperties.getUserSettings()->getFile().getSiblingFile ("live-scenes.xml");
+}
+
+bool MainComponent::salvarCenas()
+{
+    // Mesma trava do mapa de notas: arquivo de uma versao futura nao se
+    // sobrescreve com as regras de hoje.
+    if (esquemaDeCenasDesconhecido)
+    {
+        juce::Logger::writeToLog ("LIVE: gravacao ignorada, o arquivo de cenas em disco "
+                                  "e de uma versao mais nova");
+        return false;
+    }
+
+    juce::XmlElement xml ("LIVESCENES");
+    xml.setAttribute ("schema", 1);
+    xml.setAttribute ("active", cenaAtiva);
+
+    for (int i = 0; i < ChurchDAWLive::numeroDeCenas; ++i)
+        ChurchDAWLive::escreverCena (xml, cenas[i], i);
+
+    // ARQUIVO PROPRIO, fora do settings.
+    //
+    // O settings guarda a chave "chain", e nela vai o estado binario de cada
+    // plugin em base64 — com um Kontakt carregado sao varios MB. Enquanto as
+    // cenas moravam la, trocar de cena obrigava a reescrever esse arquivo
+    // inteiro, sincronamente, na thread da interface, no instante exato da
+    // troca de musica: no tablet isso e a tela congelando no pior momento
+    // possivel. Aqui o arquivo tem poucos KB e a escrita nao aparece.
+    auto destino = arquivoDeCenas();
+    destino.getParentDirectory().createDirectory();
+
+    // Grava em temporario e so entao substitui: falta de energia no meio da
+    // escrita nao pode deixar o musico sem as 10 cenas.
+    juce::TemporaryFile temp (destino);
+    const bool gravou = xml.writeTo (temp.getFile()) && temp.overwriteTargetFileWithTemporary();
+
+    if (! gravou)
+        juce::Logger::writeToLog ("LIVE: FALHA ao gravar " + destino.getFullPathName());
+
+    return gravou;
+}
+
+void MainComponent::restaurarCenas()
+{
+    const auto arquivo = arquivoDeCenas();
+    auto xml = juce::parseXML (arquivo);
+
+    // ARQUIVO ILEGIVEL NAO PODE PARECER "NUNCA EXISTIU".
+    //
+    // parseXML devolve nullptr tanto para ausente quanto para truncado ou
+    // corrompido, e a raiz pode ate estar errada. Seguindo calado, o app
+    // abriria com 10 slots vazios e a PRIMEIRA gravacao passaria por cima do
+    // arquivo — as cenas do cliente sumiriam de vez, sem uma linha de log.
+    // Guardar a evidencia de lado custa nada e ainda deixa uma copia para
+    // recuperar a mao.
+    if (arquivo.existsAsFile() && (xml == nullptr || ! xml->hasTagName ("LIVESCENES")))
+    {
+        guardarCopiaDeArquivoIlegivel (arquivo, "LIVE (cenas)");
+        xml = nullptr;
+    }
+
+    bool veioDoFormatoAntigo = false;
+
+    // MIGRACAO: as primeiras versoes guardavam as cenas dentro do settings.
+    // Quem ja gravou cenas la nao pode perde-las ao atualizar. Vem DEPOIS do
+    // tratamento acima para que um arquivo novo corrompido ainda deixe a
+    // migracao tentar resgatar o formato antigo.
+    if (xml == nullptr)
+    {
+        xml = appProperties.getUserSettings()->getXmlValue ("liveScenes");
+        veioDoFormatoAntigo = xml != nullptr;
+    }
+
+    // Sem arquivo e sem chave = setup antigo, sem cenas. Abre com 10 slots
+    // vazios e zero efeito no audio — nenhuma cena e aplicada na largada.
+    if (xml == nullptr || ! xml->hasTagName ("LIVESCENES"))
+        return;
+
+    if (xml->getIntAttribute ("schema", 1) > 1)
+    {
+        // Igual ao mapa de notas: nao le E nao grava. Sem isto, o primeiro
+        // toque de GRAVAR reescreveria no formato velho o arquivo que uma
+        // versao mais nova deixou.
+        esquemaDeCenasDesconhecido = true;
+
+        juce::Logger::writeToLog ("LIVE: arquivo de cenas e de uma versao mais nova "
+                                  "(schema " + xml->getStringAttribute ("schema")
+                                  + "); leitura e gravacao suspensas");
+        return;
+    }
+
+    esquemaDeCenasDesconhecido = false;
+
+    cenaAtiva = juce::jlimit (-1, ChurchDAWLive::numeroDeCenas - 1,
+                              xml->getIntAttribute ("active", -1));
+
+    for (auto* c : xml->getChildWithTagNameIterator ("SCENE"))
+    {
+        const int i = c->getIntAttribute ("index", -1);
+
+        if (juce::isPositiveAndBelow (i, ChurchDAWLive::numeroDeCenas))
+            ChurchDAWLive::lerCena (*c, cenas[i]);
+    }
+
+    // Uma cena que aponta para um slot vazio nao pode ficar acesa.
+    if (cenaAtiva >= 0 && ! cenas[cenaAtiva].preenchida)
+        cenaAtiva = -1;
+
+    // Termina a migracao: grava no formato novo e so DEPOIS solta a chave
+    // antiga. Nessa ordem, uma queda no meio do caminho deixa o usuario com
+    // as cenas no lugar velho — nunca com nenhum dos dois.
+    if (veioDoFormatoAntigo)
+    {
+        // So solta a chave antiga se a gravacao NOVA deu certo. Perguntar "o
+        // arquivo existe?" respondia sim para o arquivo corrompido que motivou
+        // a migracao — e apagava a unica copia boa das 10 cenas do culto.
+        if (salvarCenas())
+        {
+            appProperties.getUserSettings()->removeValue ("liveScenes");
+            appProperties.getUserSettings()->removeValue ("liveSceneActive");   // chave orfa antiga
+            juce::Logger::writeToLog ("LIVE: cenas migradas para " + arquivoDeCenas().getFileName());
+        }
+        else
+        {
+            juce::Logger::writeToLog ("LIVE: migracao adiada, as cenas continuam no setup");
+        }
+    }
+}
+
+//==============================================================================
+// Mapa de NOTAS (tecla do controlador vira comando, nao nota tocada)
+//==============================================================================
+// Diz ao painel do Pad quais teclas fisicas comandam cada tom.
+//
+// Roda junto com a reconstrucao da mascara porque tem exatamente a mesma
+// causa: o mapa de notas mudou. Assim nao ha como a tela ficar contando uma
+// historia diferente do motor.
+void MainComponent::atualizarEtiquetasDoPad()
+{
+    if (padPanel == nullptr)
+        return;
+
+    std::array<PadPanel::TeclaMapeada, 12> porTom {};
+    PadPanel::TeclaMapeada paraParar;
+
+    {
+        const juce::ScopedLock sl (mapLock);
+
+        for (const auto& par : noteMappings)
+        {
+            // Duas teclas no mesmo tom acontecem (dois teclados, dois canais).
+            // Mostrar so a primeira mentiria menos que mostrar as duas
+            // espremidas num rotulo de 8 px — entao a segunda vira "+".
+            const auto etiqueta = juce::MidiMessage::getMidiNoteName (par.first.cc, true, true, 3);
+
+            // O sourceId e "midi:" + identificador da porta; entradasMidiConhecidas
+            // guarda os identificadores que estao ligados AGORA.
+            const bool ligado = entradasMidiConhecidas.contains (
+                par.first.sourceId.fromFirstOccurrenceOf ("midi:", false, false));
+
+            // A TECLA MOSTRADA TEM DE SER UMA QUE FUNCIONA.
+            //
+            // Antes, o primeiro mapeamento que chegasse definia o rotulo e os
+            // outros so viravam "+", enquanto "presente" era o OU de todos. A
+            // ordem do std::map e por identificador de porta, que nao tem
+            // relacao com qual teclado esta plugado — entao, no cenario que
+            // motivou o recurso (mapeou em casa, no domingo levou outro), a
+            // etiqueta acendia em VERMELHO mostrando a tecla de casa, que esta
+            // morta, e escondia atras do "+" a unica que funciona.
+            //
+            // Regra: uma tecla de aparelho ligado sempre toma o rotulo.
+            auto acrescentar = [&etiqueta, ligado] (PadPanel::TeclaMapeada& alvo)
+            {
+                const bool jaTinha = alvo.rotulo.isNotEmpty();
+                const bool promove = ! jaTinha || (ligado && ! alvo.aparelhoPresente);
+
+                if (promove)
+                {
+                    alvo.rotulo = etiqueta + (jaTinha ? "+" : "");
+                    alvo.aparelhoPresente = ligado;
+                }
+                else if (! alvo.rotulo.endsWith ("+"))
+                {
+                    alvo.rotulo += "+";
+                }
+            };
+
+            if (par.second.kind == NoteActionKind::padKey
+                 && juce::isPositiveAndBelow (par.second.arg, 12))
+                acrescentar (porTom[(size_t) par.second.arg]);
+            else if (par.second.kind == NoteActionKind::padOff)
+                acrescentar (paraParar);
+        }
+    }
+
+    padPanel->setTeclasMapeadas (porTom, paraParar);
+}
+
+void MainComponent::reconstruirMascaraDeNotas()
+{
+    juce::uint32 nova[4] = { 0, 0, 0, 0 };
+
+    // O SNAPSHOT E OS STORE PRECISAM ESTAR SOB O MESMO LOCK.
+    //
+    // Com o store fora, existia esta corrida — e ela apagava um mapeamento
+    // sem deixar rastro:
+    //
+    //   1. message thread monta o snapshot (sem a tecla nova) e SOLTA o lock;
+    //   2. neste instante a thread de MIDI aprende uma tecla: grava no mapa,
+    //      solta o lock e liga o bit dela;
+    //   3. a message thread retoma e escreve o snapshot velho por cima —
+    //      apagando o bit recem-ligado.
+    //
+    // O mapa no disco e a etiqueta no teclado do Pad ficavam dizendo que a
+    // tecla funciona; no culto ela tocava nota. Com as duas coisas dentro do
+    // lock, snapshot anterior ao insert implica store anterior ao insert, e a
+    // janela deixa de existir.
+    const juce::ScopedLock sl (mapLock);
+
+    for (const auto& par : noteMappings)
+        if (juce::isPositiveAndBelow (par.first.cc, 128)
+             && par.second.kind != NoteActionKind::none)
+            nova[par.first.cc >> 5] |= (1u << (par.first.cc & 31));
+
+    for (int i = 0; i < 4; ++i)
+        mascaraDeNotasMapeadas[i].store (nova[i], std::memory_order_relaxed);
+}
+
+juce::File MainComponent::arquivoDoMapaDeNotas()
+{
+    return appProperties.getUserSettings()->getFile().getSiblingFile ("midi-note-map.xml");
+}
+
+// Devolve TRUE so quando o arquivo novo foi realmente gravado.
+//
+// Era void, e a migracao decidia apagar a chave antiga perguntando
+// "o arquivo existe?" — pergunta errada: o arquivo CORROMPIDO que motivou a
+// migracao tambem existe. Bastava a gravacao falhar (arquivo ainda travado por
+// quem o corrompeu, permissao, disco cheio) para o app apagar a unica copia
+// boa e o cliente perder todas as teclas mapeadas.
+bool MainComponent::saveNoteMap()
+{
+    // Arquivo de uma versao futura: nao encostar. Devolve false para que a
+    // migracao (e qualquer outro chamador) saiba que nada foi gravado.
+    if (esquemaDeNotasDesconhecido)
+    {
+        juce::Logger::writeToLog ("MIDI MAP: gravacao ignorada, o arquivo em disco "
+                                  "e de uma versao mais nova");
+        return false;
+    }
+
+    juce::XmlElement xml ("NOTEMAP");
+
+    // Versao de esquema: o mapa das cenas ja tem, este nao tinha. Sem ela nao
+    // ha como migrar um formato futuro sem adivinhacao.
+    xml.setAttribute ("schema", 1);
+
+    {
+        const juce::ScopedLock sl (mapLock);
+
+        for (const auto& par : noteMappings)
+        {
+            auto* n = xml.createNewChildElement ("NOTE");
+            n->setAttribute ("source", par.first.sourceId);
+            n->setAttribute ("channel", par.first.channel);
+            n->setAttribute ("note", par.first.cc);
+            n->setAttribute ("action", (int) par.second.kind);
+            n->setAttribute ("arg", par.second.arg);
+        }
+    }
+
+    // ARQUIVO PROPRIO, pelo mesmo motivo das cenas.
+    //
+    // Isto era gravado dentro do settings — o arquivo que carrega o estado
+    // binario dos plugins em base64 e chega a varios MB com um Kontakt
+    // aberto — e a cada tecla aprendida. Era exatamente o arquivo do qual as
+    // cenas fugiram, escrito sincronamente na thread da interface. No ensaio
+    // dava um engasgo; junto com o botao Salvar durante o culto, dava a tela
+    // travando.
+    auto destino = arquivoDoMapaDeNotas();
+    destino.getParentDirectory().createDirectory();
+
+    juce::TemporaryFile temp (destino);
+    const bool gravou = xml.writeTo (temp.getFile()) && temp.overwriteTargetFileWithTemporary();
+
+    if (! gravou)
+        juce::Logger::writeToLog ("MIDI MAP: FALHA ao gravar " + destino.getFullPathName());
+
+    return gravou;
+}
+
+void MainComponent::restoreNoteMap()
+{
+    const auto arquivo = arquivoDoMapaDeNotas();
+    auto xml = juce::parseXML (arquivo);
+    bool veioDoFormatoAntigo = false;
+
+    // MIGRACAO do formato antigo (chave dentro do settings). Quem ja mapeou
+    // teclas nao pode perde-las ao atualizar.
+    if (xml == nullptr || ! xml->hasTagName ("NOTEMAP"))
+    {
+        guardarCopiaDeArquivoIlegivel (arquivo, "MIDI MAP (notas)");
+
+        xml = appProperties.getUserSettings()->getXmlValue ("midiNoteMap");
+        veioDoFormatoAntigo = xml != nullptr;
+    }
+
+    if (xml == nullptr || ! xml->hasTagName ("NOTEMAP"))
+        return;
+
+    // ESQUEMA DO FUTURO NAO SE LE COM AS REGRAS DE HOJE.
+    //
+    // O atributo existia so para ser escrito. Se um build mais novo gravar
+    // schema=2 e o cliente reabrir um build antigo (downgrade, ou duas
+    // maquinas), ler com as regras da versao 1 e interpretar errado — e o
+    // primeiro salvamento reescreveria o arquivo no formato velho, destruindo
+    // o que a versao nova gravou. Melhor nao tocar em nada.
+    if (xml->getIntAttribute ("schema", 1) > 1)
+    {
+        // TRAVA TAMBEM A GRAVACAO, nao so a leitura.
+        //
+        // Sozinha, a guarda era pior que nao ter guarda: ela deixava
+        // noteMappings VAZIO e nada impedia o proximo salvamento — e salvar
+        // acontece por rotina (botao Salvar, aprender uma tecla, Limpar mapas).
+        // O arquivo do futuro virava um NOTEMAP vazio no formato velho, e sem
+        // nem o .corrompido de consolo, porque o XML era valido e nunca passou
+        // pelo ramo de backup.
+        esquemaDeNotasDesconhecido = true;
+
+        juce::Logger::writeToLog ("MIDI MAP: arquivo de notas e de uma versao mais nova "
+                                  "(schema " + xml->getStringAttribute ("schema")
+                                  + "); leitura e gravacao suspensas");
+        return;
+    }
+
+    esquemaDeNotasDesconhecido = false;
+
+    {
+        const juce::ScopedLock sl (mapLock);
+        noteMappings.clear();
+
+        for (auto* n : xml->getChildWithTagNameIterator ("NOTE"))
+        {
+            const int nota  = n->getIntAttribute ("note", -1);
+            const int canal = n->getIntAttribute ("channel", 0);
+            const int tipo  = n->getIntAttribute ("action", 0);
+            const int arg   = n->getIntAttribute ("arg", -1);
+            const auto fonte = n->getStringAttribute ("source");
+
+            // Validacao estrita: um XML mexido a mao nao pode fazer o app
+            // sequestrar uma nota qualquer do teclado.
+            if (! juce::isPositiveAndBelow (nota, 128)
+                 || canal < 1 || canal > 16
+                 || fonte.isEmpty())
+                continue;
+
+            NoteAction acao;
+
+            if (tipo == (int) NoteActionKind::padKey && juce::isPositiveAndBelow (arg, 12))
+                acao = { NoteActionKind::padKey, arg };
+            else if (tipo == (int) NoteActionKind::padOff)
+                acao = { NoteActionKind::padOff, -1 };
+            else
+                continue;
+
+            noteMappings[ChurchDAWMidiMapping::ControllerKey { fonte, canal, nota }] = acao;
+        }
+    }
+
+    reconstruirMascaraDeNotas();
+    atualizarEtiquetasDoPad();
+
+    // Termina a migracao: grava no formato novo e so DEPOIS solta a chave
+    // antiga. Nessa ordem, uma falha no meio deixa o mapa no lugar velho —
+    // nunca em nenhum dos dois.
+    if (veioDoFormatoAntigo)
+    {
+        // So solta a chave antiga se a gravacao NOVA deu certo de verdade.
+        // Perguntar "o arquivo existe?" respondia sim para o arquivo ilegivel
+        // que motivou a migracao — e o cliente perdia o mapa inteiro.
+        if (saveNoteMap())
+        {
+            appProperties.getUserSettings()->removeValue ("midiNoteMap");
+            juce::Logger::writeToLog ("MIDI MAP: mapa de notas migrado para "
+                                        + arquivoDoMapaDeNotas().getFileName());
+        }
+        else
+        {
+            juce::Logger::writeToLog ("MIDI MAP: migracao adiada, o mapa antigo "
+                                      "continua no setup");
+        }
+    }
+}
+
+juce::File MainComponent::arquivoDoMapaDeCCs()
+{
+    return appProperties.getUserSettings()->getFile().getSiblingFile ("midi-cc-map.xml");
+}
+
+bool MainComponent::saveMidiMap()
+{
+    if (esquemaDeCCsDesconhecido)
+    {
+        juce::Logger::writeToLog ("MIDI MAP: gravacao de CCs ignorada, o arquivo em disco "
+                                  "e de uma versao mais nova");
+        return false;
+    }
+
     juce::XmlElement xml ("MIDIMAP");
+    xml.setAttribute ("schema", 1);
 
     {
         const juce::ScopedLock sl (mapLock);
@@ -3315,8 +5532,22 @@ void MainComponent::saveMidiMap()
         }
     }
 
-    appProperties.getUserSettings()->setValue ("midiMap", &xml);
-    appProperties.getUserSettings()->saveIfNeeded();
+    // ARQUIVO PROPRIO, o ultimo dos tres a sair do settings.
+    //
+    // Era gravado dentro do arquivo que carrega o estado binario dos plugins em
+    // base64 — varios MB com um Kontakt aberto — e a cada CC aprendido. As
+    // cenas sairam de la primeiro, depois o mapa de notas; este ficou para
+    // tras pelo mesmo motivo de sempre: ninguem tinha olhado.
+    auto destino = arquivoDoMapaDeCCs();
+    destino.getParentDirectory().createDirectory();
+
+    juce::TemporaryFile temp (destino);
+    const bool gravou = xml.writeTo (temp.getFile()) && temp.overwriteTargetFileWithTemporary();
+
+    if (! gravou)
+        juce::Logger::writeToLog ("MIDI MAP: FALHA ao gravar " + destino.getFullPathName());
+
+    return gravou;
 }
 
 void MainComponent::restoreMidiMap()
@@ -3324,12 +5555,60 @@ void MainComponent::restoreMidiMap()
     int restored = 0;
     int rejectedUnsafe = 0;
 
-    if (auto xml = appProperties.getUserSettings()->getXmlValue ("midiMap"))
+    const auto arquivo = arquivoDoMapaDeCCs();
+    auto xml = juce::parseXML (arquivo);
+    bool veioDoFormatoAntigo = false;
+
+    if (xml == nullptr || ! xml->hasTagName ("MIDIMAP"))
+    {
+        if (arquivo.existsAsFile())
+        {
+            guardarCopiaDeArquivoIlegivel (arquivo, "MIDI MAP (CCs)");
+        }
+
+        // MIGRACAO da chave antiga no settings.
+        //
+        // Exigir a RAIZ certa aqui, e nao so "parseou": um valor adulterado que
+        // ainda seja XML valido marcava veioDoFormatoAntigo, nada era lido, e o
+        // saveMidiMap gravava um <MIDIMAP> VAZIO com sucesso — e a chave, unica
+        // copia do mapa, era apagada. O ramo .corrompido cobre o ARQUIVO, nunca
+        // a chave do settings.
+        xml = appProperties.getUserSettings()->getXmlValue ("midiMap");
+
+        if (xml != nullptr && ! xml->hasTagName ("MIDIMAP"))
+        {
+            juce::Logger::writeToLog ("MIDI MAP: chave antiga de CCs com formato irreconhecivel; "
+                                      "mantida intacta");
+            return;
+        }
+
+        veioDoFormatoAntigo = xml != nullptr;
+    }
+
+    if (xml != nullptr && xml->hasTagName ("MIDIMAP")
+         && xml->getIntAttribute ("schema", 1) > 1)
+    {
+        // Nao le E nao grava, igual aos outros dois.
+        esquemaDeCCsDesconhecido = true;
+        juce::Logger::writeToLog ("MIDI MAP: arquivo de CCs e de uma versao mais nova "
+                                  "(schema " + xml->getStringAttribute ("schema")
+                                  + "); leitura e gravacao suspensas");
+        return;
+    }
+
+    esquemaDeCCsDesconhecido = false;
+
+    if (xml != nullptr)
         if (xml->hasTagName ("MIDIMAP"))
         {
             const juce::ScopedLock sl (mapLock);
 
-            for (auto* m : xml->getChildIterator())
+            // Iterar so por <MAP>, como o mapa de notas faz por <NOTE>. Com o
+            // iterador solto, qualquer filho de outro tipo reprovava na
+            // validacao, virava "legado ambiguo descartado" e — porque isso
+            // dispara regravacao — era APAGADO do arquivo em definitivo. Hoje
+            // nao existe outro filho; isto e a trava para o dia em que existir.
+            for (auto* m : xml->getChildWithTagNameIterator ("MAP"))
             {
                 CCTarget target {
                     m->getIntAttribute ("slot", -2),
@@ -3370,8 +5649,26 @@ void MainComponent::restoreMidiMap()
                               + juce::String (rejectedUnsafe)
                               + " legado(s) ambiguo(s) descartado(s)");
 
-    if (rejectedUnsafe > 0)
-        saveMidiMap();   // remove o alvo perigoso da proxima inicializacao
+    // Termina a migracao: grava no formato novo e so DEPOIS solta a chave
+    // antiga. Um alvo perigoso descartado tambem obriga a regravar, para ele
+    // nao voltar na proxima inicializacao.
+    if (veioDoFormatoAntigo || rejectedUnsafe > 0)
+    {
+        if (saveMidiMap())
+        {
+            if (veioDoFormatoAntigo)
+            {
+                appProperties.getUserSettings()->removeValue ("midiMap");
+                juce::Logger::writeToLog ("MIDI MAP: mapa de CCs migrado para "
+                                            + arquivoDoMapaDeCCs().getFileName());
+            }
+        }
+        else if (veioDoFormatoAntigo)
+        {
+            juce::Logger::writeToLog ("MIDI MAP: migracao de CCs adiada, o mapa antigo "
+                                      "continua no setup");
+        }
+    }
 }
 
 //==============================================================================
@@ -3799,9 +6096,219 @@ struct AudioSettingsHolder : public juce::Component,
 // re-enumeracao USB
 void MainComponent::restartAudioDevice()
 {
+   #if JUCE_ANDROID
+    // O botao manual tambem precisa renovar o cache: reabrir o mesmo objeto
+    // Oboe com o mesmo ID antigo nao recupera uma interface USB reconectada.
+    androidPendingAudioTopologyGeneration = juce::jmax (
+        androidPendingAudioTopologyGeneration,
+        juce::jmax (androidAudioTopologyGeneration,
+                    getAndroidAudioTopologyGeneration()) + 1);
+    androidForceAudioReconcile = true;
+    androidAudioReconcileScheduled = false;
+    reconcileAndroidAudioTopology();
+   #else
     deviceManager.closeAudioDevice();
     deviceManager.restartLastAudioDevice();
+   #endif
 }
+
+#if JUCE_ANDROID
+void MainComponent::updateAndroidPreferredUsbSetupFromCurrent()
+{
+    const auto setup = deviceManager.getAudioDeviceSetup();
+
+    if (isAndroidUsbAudioDeviceName (setup.outputDeviceName))
+    {
+        androidPreferredUsbSetup = setup;
+        androidHasPreferredUsbSetup = true;
+    }
+    else if (audioDialogOpen && deviceManager.getCurrentAudioDevice() != nullptr)
+    {
+        // System Default escolhido com o painel aberto e uma decisao do
+        // usuario, nao o fallback causado por um cabo removido.
+        androidHasPreferredUsbSetup = false;
+    }
+}
+
+void MainComponent::pollAndroidAudioTopology()
+{
+    const auto generation = getAndroidAudioTopologyGeneration();
+
+    if (generation <= 0 || generation == androidAudioTopologyGeneration)
+        return;
+
+    androidAudioTopologyGeneration = generation;
+    androidPendingAudioTopologyGeneration = generation;
+
+    if (androidAudioReconcileScheduled)
+        return;
+
+    androidAudioReconcileScheduled = true;
+    juce::Component::SafePointer<MainComponent> safe (this);
+
+    // Attach/detach costuma chegar em pequenos lotes (entrada + saida). Uma
+    // janela curta transforma todos eles em um unico fechamento/restart.
+    juce::Timer::callAfterDelay (250, [safe]
+    {
+        if (safe != nullptr && safe->androidAudioReconcileScheduled)
+            safe->reconcileAndroidAudioTopology();
+    });
+}
+
+void MainComponent::reconcileAndroidAudioTopology()
+{
+    jassert (juce::MessageManager::getInstance()->isThisTheMessageThread());
+
+    androidAudioReconcileScheduled = false;
+    const auto generation = androidPendingAudioTopologyGeneration;
+    const auto usbFingerprint = getAndroidUsbAudioTopologyFingerprint();
+    const bool forceReconcile = androidForceAudioReconcile;
+    androidForceAudioReconcile = false;
+
+    if (androidUsbAudioTopologyInitialized
+         && usbFingerprint == androidLastUsbAudioTopology
+         && ! forceReconcile)
+    {
+        juce::Logger::writeToLog (
+            "AUDIO_ANDROID topology_unchanged generation=" + juce::String (generation)
+            + " usb=" + usbFingerprint);
+        return;
+    }
+
+    const bool firstTopologySnapshot = ! androidUsbAudioTopologyInitialized;
+    androidUsbAudioTopologyInitialized = true;
+    androidLastUsbAudioTopology = usbFingerprint;
+
+    // initialize/onResume geram uma leitura mesmo sem cabo. Nesse caso o
+    // cache inicial do Oboe ja contem System Default; nao interrompa o som so
+    // para confirmar que continua sem USB.
+    if (firstTopologySnapshot && usbFingerprint == "usb=none" && ! forceReconcile)
+    {
+        juce::Logger::writeToLog (
+            "AUDIO_ANDROID topology_initialized generation=" + juce::String (generation)
+            + " usb=none restart=skipped");
+        return;
+    }
+
+    const auto snapshot = getAndroidAudioTopologySnapshot();
+    const auto setupBefore = deviceManager.getAudioDeviceSetup();
+
+    if (isAndroidUsbAudioDeviceName (setupBefore.outputDeviceName))
+    {
+        androidPreferredUsbSetup = setupBefore;
+        androidHasPreferredUsbSetup = true;
+    }
+
+    juce::Logger::writeToLog (
+        "AUDIO_ANDROID topology_change generation=" + juce::String (generation)
+        + " requested_output=\"" + setupBefore.outputDeviceName + "\" devices=" + snapshot);
+
+    auto* type = deviceManager.getCurrentDeviceTypeObject();
+    if (type == nullptr)
+    {
+        juce::Logger::writeToLog (
+            "AUDIO_ANDROID open_failed generation=" + juce::String (generation)
+            + " reason=no_device_type");
+        return;
+    }
+
+    // Fechar antes do scan impede que o listener sincrono do JUCE tente uma
+    // reabertura paralela. Depois ha exatamente uma tentativa escolhida aqui.
+    deviceManager.closeAudioDevice();
+    type->scanForDevices();
+
+    const auto outputNames = type->getDeviceNames (false);
+    const auto isAvailable = [&outputNames] (const juce::String& name)
+    {
+        return name.isNotEmpty() && outputNames.contains (name);
+    };
+
+    auto setupToOpen = setupBefore;
+    juce::String selectionReason { "current" };
+
+    if (androidHasPreferredUsbSetup
+         && isAvailable (androidPreferredUsbSetup.outputDeviceName))
+    {
+        setupToOpen = androidPreferredUsbSetup;
+        selectionReason = "usb_preferred";
+    }
+    else if (! isAvailable (setupToOpen.outputDeviceName))
+    {
+        const int defaultIndex = type->getDefaultDeviceIndex (false);
+
+        if (juce::isPositiveAndBelow (defaultIndex, outputNames.size()))
+        {
+            setupToOpen.outputDeviceName = outputNames[defaultIndex];
+            selectionReason = androidHasPreferredUsbSetup
+                                ? juce::String ("usb_missing_fallback")
+                                : juce::String ("current_missing_fallback");
+        }
+        else
+        {
+            setupToOpen.outputDeviceName.clear();
+            selectionReason = "no_output_available";
+        }
+    }
+
+    // ChurchDAW e sampler: nenhuma reconexao de saida deve habilitar entrada
+    // ou introduzir RECORD_AUDIO por acidente.
+    setupToOpen.inputDeviceName.clear();
+    setupToOpen.inputChannels.clear();
+    setupToOpen.useDefaultInputChannels = false;
+
+    juce::String error;
+    if (setupToOpen.outputDeviceName.isNotEmpty())
+        error = deviceManager.setAudioDeviceSetup (setupToOpen, false);
+    else
+        error = "nenhuma saida de audio enumerada";
+
+    // Se a interface ainda aparece mas a abertura explicita falha (energia,
+    // HAL ou rate incompatível), mantenha som pela rota padrao sem apagar a
+    // preferencia USB. Um novo callback tentara restaura-la.
+    if (error.isNotEmpty() && ! outputNames.isEmpty())
+    {
+        const int defaultIndex = type->getDefaultDeviceIndex (false);
+
+        if (juce::isPositiveAndBelow (defaultIndex, outputNames.size())
+             && setupToOpen.outputDeviceName != outputNames[defaultIndex])
+        {
+            juce::Logger::writeToLog (
+                "AUDIO_ANDROID open_failed generation=" + juce::String (generation)
+                + " output=\"" + setupToOpen.outputDeviceName
+                + "\" error=\"" + error + "\" fallback=system_default");
+
+            auto fallback = setupBefore;
+            fallback.outputDeviceName = outputNames[defaultIndex];
+            fallback.inputDeviceName.clear();
+            fallback.inputChannels.clear();
+            fallback.useDefaultInputChannels = false;
+            error = deviceManager.setAudioDeviceSetup (fallback, false);
+            selectionReason = "open_failed_fallback";
+        }
+    }
+
+    if (auto* device = deviceManager.getCurrentAudioDevice())
+    {
+        const auto activeOutputs = device->getActiveOutputChannels().countNumberOfSetBits();
+        juce::Logger::writeToLog (
+            "AUDIO_ANDROID open_succeeded generation=" + juce::String (generation)
+            + " reason=" + selectionReason
+            + " output=\"" + device->getName() + "\""
+            + " sample_rate_actual=" + juce::String (device->getCurrentSampleRate(), 0)
+            + " buffer_actual=" + juce::String (device->getCurrentBufferSizeSamples())
+            + " output_channels=" + juce::String (activeOutputs));
+
+        androidLastXRunCount = deviceManager.getXRunCount();
+        androidLastBufferTuneMs = juce::Time::getMillisecondCounter();
+    }
+    else
+    {
+        juce::Logger::writeToLog (
+            "AUDIO_ANDROID open_failed generation=" + juce::String (generation)
+            + " reason=" + selectionReason + " error=\"" + error + "\"");
+    }
+}
+#endif
 
 bool MainComponent::handleBackButton()
 {
@@ -3823,6 +6330,19 @@ bool MainComponent::handleBackButton()
     if (auto* timbres = dynamic_cast<TimbresEditor*> (dockedEditor.get()))
         if (timbres->handleBackRequest())
             return true;
+
+    // LIVE MODE fecha no BACK, como toda camada do app.
+    //
+    // Era a unica que nao fechava: o BACK devolvia false, o primeiro toque era
+    // engolido para armar os 2 s do "toque de novo para sair", e como nada
+    // acontecia na tela o musico tocava de novo — e o app fechava no meio do
+    // culto. Um painel aberto que ignora o BACK convida exatamente ao segundo
+    // toque que mata o aplicativo.
+    if (liveButton.getToggleState())
+    {
+        liveButton.setToggleState (false, juce::sendNotificationSync);
+        return true;
+    }
 
     return false;
 }
@@ -4061,8 +6581,21 @@ struct PluginListHolder final : public juce::Component,
 {
     PluginListHolder (juce::AudioPluginFormatManager& fm, juce::KnownPluginList& kl,
                       const juce::File& deadMansPedal, juce::PropertiesFile* props)
-        : formats (fm), list (fm, kl, deadMansPedal, props)
+        // O 5o argumento (allowPluginsWhichRequireAsynchronousInstantiation)
+        // NAO e so sobre AUv3: com ele em "false" o PluginListComponent usa
+        // numThreads = 0 (juce_PluginListComponent.cpp:446) e a varredura roda
+        // DENTRO do timerCallback, ou seja, na thread de mensagens. Cada plugin
+        // problematico segurava a interface inteira pelos 90 s do prazo — app
+        // "Nao Responde", barra parada e botao Cancelar inclicavel. Era o
+        // "travou no Korg Vox" e o "AUVectorPanner a 0%" dos clientes.
+        : formats (fm), list (fm, kl, deadMansPedal, props, true)
     {
+        // Uma thread so: os plugins ja sao abertos num processo separado, e
+        // varias threads abrindo plugins ao mesmo tempo e receita de conflito.
+        // Com pool != nullptr o shouldExit() do scanner passa a valer, entao
+        // "Cancelar" finalmente interrompe de verdade.
+        list.setNumberOfThreadsForScanning (1);
+
         list.setOptionsButtonText (juce::String::fromUTF8 ("Op\xc3\xa7\xc3\xb5" "es..."));
         addAndMakeVisible (list);
 
@@ -4397,17 +6930,36 @@ void MainComponent::showPadWindow()
        #if JUCE_ANDROID
         const auto help = juce::String::fromUTF8 (
             "Pad Cont\xc3\xadnuo n\xc3\xa3o instalado.\n\n"
-            "Instale a biblioteca Church Live em Packs para adicionar "
-            "os pads e abra esta tela novamente.");
+            "Instale ou repare o pack Pad Cont\xc3\xadnuo em Bibliotecas "
+            "e abra esta tela novamente.");
        #else
         const auto help = juce::String::fromUTF8 (
             "N\xc3\xa3o achei os WAVs de pad. Coloque pad_C.wav ... pad_B.wav "
             "na pasta 'ChurchDAW Pads' (ou 'Pads' ao lado do app).");
        #endif
 
-        juce::AlertWindow::showMessageBoxAsync (juce::MessageBoxIconType::InfoIcon,
-            juce::String::fromUTF8 ("Pad Cont\xc3\xadnuo"),
-            help);
+       #if JUCE_ANDROID
+        auto options = juce::MessageBoxOptions()
+            .withIconType (juce::MessageBoxIconType::InfoIcon)
+            .withTitle (juce::String::fromUTF8 ("Pad Cont\xc3\xadnuo"))
+            .withMessage (help)
+            .withButton ("Abrir Bibliotecas")
+            .withButton (juce::String::fromUTF8 ("Agora n\xc3\xa3o"))
+            .withAssociatedComponent (this);
+
+        juce::AlertWindow::showAsync (
+            options,
+            [safe = juce::Component::SafePointer<MainComponent> (this)] (int result)
+            {
+                if (result == 1)
+                    if (auto* self = safe.getComponent())
+                        self->showLibraries();
+            });
+       #else
+        juce::AlertWindow::showMessageBoxAsync (
+            juce::MessageBoxIconType::InfoIcon,
+            juce::String::fromUTF8 ("Pad Cont\xc3\xadnuo"), help);
+       #endif
         return;
     }
 
@@ -4423,13 +6975,25 @@ void MainComponent::showPadWindow()
 }
 
 //==============================================================================
-void MainComponent::saveChainState()
+bool MainComponent::saveChainState()
 {
+    int slotsQueNaoSalvaram = 0;
+    pluginsQueNaoSalvaram.clear();
+
     juce::XmlElement chain ("CHAIN");
     chain.setAttribute ("inputEnabled", inputToggle.getToggleState());
     chain.setAttribute ("masterDb", masterSlider.getValue());
     chain.setAttribute ("masterAutoEq", masterProcessor->getAutoEq());
     chain.setAttribute ("masterPunch", masterProcessor->getPunch());
+
+    if (padProcessor != nullptr)
+    {
+        juce::MemoryBlock padState;
+        padProcessor->getStateInformation (padState);
+
+        if (! padState.isEmpty())
+            chain.setAttribute ("padState", padState.toBase64Encoding());
+    }
 
     for (int i = 0; i < numSlots; ++i)
     {
@@ -4480,7 +7044,21 @@ void MainComponent::saveChainState()
                 processor->suspendProcessing (wasSuspended);
 
                 if (captured)
+                {
                     slotXml->setAttribute ("state", mb.toBase64Encoding());
+                }
+                else
+                {
+                    // O catch acima existe para nao derrubar o resto — mas
+                    // engolir sem dizer nada quer dizer que o usuario perde os
+                    // ajustes DESTE plugin sem nunca saber. O nome no log e o
+                    // que permite descobrir qual e o culpado.
+                    ++slotsQueNaoSalvaram;
+                    pluginsQueNaoSalvaram.addIfNotAlreadyThere (processor->getName());
+                    juce::Logger::writeToLog ("SETUP: nao consegui salvar o estado de \""
+                                                + processor->getName() + "\" (slot "
+                                                + juce::String (i) + ")");
+                }
             }
         }
         else if (slots[i].pendingIdentifier.isNotEmpty())
@@ -4493,7 +7071,26 @@ void MainComponent::saveChainState()
     }
 
     appProperties.getUserSettings()->setValue ("chain", &chain);
-    appProperties.getUserSettings()->saveIfNeeded();
+
+    // saveIfNeeded devolve true tambem quando nao havia o que gravar — que e o
+    // que queremos: "nada mudou" nao e falha. False aqui significa que o
+    // arquivo REALMENTE nao foi para o disco.
+    const bool escreveu = appProperties.getUserSettings()->saveIfNeeded();
+
+    if (! escreveu)
+        juce::Logger::writeToLog ("SETUP: FALHA ao gravar o arquivo de configuracao");
+
+    // SO O ARQUIVO decide o retorno.
+    //
+    // Antes eu misturava aqui "o arquivo nao gravou" com "um plugin nao
+    // serializou". Sao coisas diferentes: a primeira e falha dura e some
+    // sozinha quando o disco volta; a segunda pode ser PERMANENTE — um VST
+    // antigo que o musico deixou carregado e nem usa prende o botao em
+    // "⚠ FALHOU" para sempre, sem dizer qual e o culpado, e o indicador de
+    // confianca perde o valor exatamente onde ele foi criado para ter valor.
+    //
+    // Quem quiser saber dos plugins pergunta em pluginsQueNaoSalvaram.
+    return escreveu;
 }
 
 void MainComponent::restoreChainState()
@@ -4535,6 +7132,16 @@ void MainComponent::restoreChainState()
     masterProcessor->setMasterDb (masterDb);
     masterProcessor->setAutoEq (xml->getBoolAttribute ("masterAutoEq", false));
     masterProcessor->setPunch (xml->getBoolAttribute ("masterPunch", true));
+
+    if (padProcessor != nullptr && xml->hasAttribute ("padState"))
+    {
+        juce::MemoryBlock padState;
+
+        if (padState.fromBase64Encoding (xml->getStringAttribute ("padState"))
+             && ! padState.isEmpty())
+            padProcessor->setStateInformation (padState.getData(),
+                                                (int) padState.getSize());
+    }
 
     for (auto* slotXml : xml->getChildIterator())
     {

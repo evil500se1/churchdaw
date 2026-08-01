@@ -1,8 +1,7 @@
 cmake_minimum_required(VERSION 3.22)
-# Versao unica do produto: acompanha o ChurchDAW.jucer (Android ja esta
-# em 1.5.4). Publicar conteudo novo com numero velho fazia o updater dos
-# clientes 1.4.0 achar que nao havia atualizacao.
-project(MinhaDAW VERSION 1.5.4)
+# Versao do produto desktop. O Android mantem versionName/versionCode no
+# ChurchDAW.jucer e pode ser publicado em um ciclo independente.
+project(MinhaDAW VERSION 1.5.7)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -99,6 +98,18 @@ if(CHURCHDAW_BUILD_AUDIO_TESTS AND NOT ANDROID AND NOT IOS)
     juce_add_console_app(ChurchDAWChannelRotaryTests
         PRODUCT_NAME "ChurchDAWChannelRotaryTests")
 
+    juce_add_console_app(ChurchDAWPadProcessorTests
+        PRODUCT_NAME "ChurchDAWPadProcessorTests")
+
+    juce_add_console_app(ChurchDAWLibraryPackPathTests
+        PRODUCT_NAME "ChurchDAWLibraryPackPathTests")
+
+    juce_add_console_app(ChurchDAWLiveScenesTests
+        PRODUCT_NAME "ChurchDAWLiveScenesTests")
+
+    juce_add_console_app(ChurchDAWSceneFileWriteProbe
+        PRODUCT_NAME "ChurchDAWSceneFileWriteProbe")
+
     target_sources(ChurchDAWMasterLimiterTests PRIVATE
         Tests/Audio/StereoLookaheadLimiterTests.cpp)
 
@@ -111,10 +122,26 @@ if(CHURCHDAW_BUILD_AUDIO_TESTS AND NOT ANDROID AND NOT IOS)
     target_sources(ChurchDAWChannelRotaryTests PRIVATE
         Tests/Audio/ChannelRotarySpeakerTests.cpp)
 
+    target_sources(ChurchDAWPadProcessorTests PRIVATE
+        Tests/Audio/PadProcessorTests.cpp)
+
+    target_sources(ChurchDAWLibraryPackPathTests PRIVATE
+        Tests/Library/LibraryPackPathTests.cpp)
+
+    target_sources(ChurchDAWLiveScenesTests PRIVATE
+        Tests/Live/LiveScenesTests.cpp)
+
+    target_sources(ChurchDAWSceneFileWriteProbe PRIVATE
+        Tests/Live/SceneFileWriteProbe.cpp)
+
     target_include_directories(ChurchDAWMasterLimiterTests PRIVATE Source)
     target_include_directories(ChurchDAWChannelToneTests PRIVATE Source)
     target_include_directories(ChurchDAWMidiMappingSafetyTests PRIVATE Source)
     target_include_directories(ChurchDAWChannelRotaryTests PRIVATE Source)
+    target_include_directories(ChurchDAWPadProcessorTests PRIVATE Source)
+    target_include_directories(ChurchDAWLibraryPackPathTests PRIVATE Source)
+    target_include_directories(ChurchDAWLiveScenesTests PRIVATE Source)
+    target_include_directories(ChurchDAWSceneFileWriteProbe PRIVATE Source)
     target_compile_definitions(ChurchDAWMasterLimiterTests PRIVATE
         JUCE_WEB_BROWSER=0
         JUCE_PUSH_NOTIFICATIONS=0
@@ -128,6 +155,22 @@ if(CHURCHDAW_BUILD_AUDIO_TESTS AND NOT ANDROID AND NOT IOS)
         JUCE_PUSH_NOTIFICATIONS=0
         JUCE_USE_CURL=0)
     target_compile_definitions(ChurchDAWChannelRotaryTests PRIVATE
+        JUCE_WEB_BROWSER=0
+        JUCE_PUSH_NOTIFICATIONS=0
+        JUCE_USE_CURL=0)
+    target_compile_definitions(ChurchDAWPadProcessorTests PRIVATE
+        JUCE_WEB_BROWSER=0
+        JUCE_PUSH_NOTIFICATIONS=0
+        JUCE_USE_CURL=0)
+    target_compile_definitions(ChurchDAWLibraryPackPathTests PRIVATE
+        JUCE_WEB_BROWSER=0
+        JUCE_PUSH_NOTIFICATIONS=0
+        JUCE_USE_CURL=0)
+    target_compile_definitions(ChurchDAWLiveScenesTests PRIVATE
+        JUCE_WEB_BROWSER=0
+        JUCE_PUSH_NOTIFICATIONS=0
+        JUCE_USE_CURL=0)
+    target_compile_definitions(ChurchDAWSceneFileWriteProbe PRIVATE
         JUCE_WEB_BROWSER=0
         JUCE_PUSH_NOTIFICATIONS=0
         JUCE_USE_CURL=0)
@@ -159,11 +202,43 @@ if(CHURCHDAW_BUILD_AUDIO_TESTS AND NOT ANDROID AND NOT IOS)
         PUBLIC
             juce::juce_recommended_config_flags)
 
+    target_link_libraries(ChurchDAWPadProcessorTests
+        PRIVATE
+            juce::juce_audio_formats
+            juce::juce_audio_processors
+        PUBLIC
+            juce::juce_recommended_config_flags)
+
+    target_link_libraries(ChurchDAWLibraryPackPathTests
+        PRIVATE
+            juce::juce_cryptography
+            juce::juce_gui_extra
+        PUBLIC
+            juce::juce_recommended_config_flags)
+
+    # LiveScenes.h so precisa de juce_core (XmlElement, String, jlimit) — e
+    # isso e proposital: a serializacao das cenas nao conhece audio nem UI.
+    target_link_libraries(ChurchDAWLiveScenesTests
+        PRIVATE
+            juce::juce_core
+        PUBLIC
+            juce::juce_recommended_config_flags)
+
+    target_link_libraries(ChurchDAWSceneFileWriteProbe
+        PRIVATE
+            juce::juce_core
+        PUBLIC
+            juce::juce_recommended_config_flags)
+
     if(MSVC)
         target_compile_options(ChurchDAWMasterLimiterTests PRIVATE /utf-8)
         target_compile_options(ChurchDAWChannelToneTests PRIVATE /utf-8)
         target_compile_options(ChurchDAWMidiMappingSafetyTests PRIVATE /utf-8)
         target_compile_options(ChurchDAWChannelRotaryTests PRIVATE /utf-8)
+        target_compile_options(ChurchDAWPadProcessorTests PRIVATE /utf-8)
+        target_compile_options(ChurchDAWLibraryPackPathTests PRIVATE /utf-8)
+        target_compile_options(ChurchDAWLiveScenesTests PRIVATE /utf-8)
+        target_compile_options(ChurchDAWSceneFileWriteProbe PRIVATE /utf-8)
     endif()
 
     add_test(
@@ -181,12 +256,26 @@ if(CHURCHDAW_BUILD_AUDIO_TESTS AND NOT ANDROID AND NOT IOS)
     add_test(
         NAME ChurchDAWChannelRotary
         COMMAND ChurchDAWChannelRotaryTests)
+    add_test(
+        NAME ChurchDAWPadProcessor
+        COMMAND ChurchDAWPadProcessorTests)
+    add_test(
+        NAME ChurchDAWLibraryPackPath
+        COMMAND ChurchDAWLibraryPackPathTests)
+    add_test(
+        NAME ChurchDAWLiveScenes
+        COMMAND ChurchDAWLiveScenesTests)
+    add_test(
+        NAME ChurchDAWSceneFileWrite
+        COMMAND ChurchDAWSceneFileWriteProbe)
     set_tests_properties(
         ChurchDAWReverbPitch
         ChurchDAWMasterLimiter
         ChurchDAWChannelTone
         ChurchDAWMidiMappingSafety
         ChurchDAWChannelRotary
+        ChurchDAWPadProcessor
+        ChurchDAWLibraryPackPath
         PROPERTIES TIMEOUT 240)
 endif()
 
@@ -197,6 +286,25 @@ juce_add_gui_app(MinhaDAW
     BUNDLE_ID "com.churchdaw.app"
     MICROPHONE_PERMISSION_ENABLED TRUE
     MICROPHONE_PERMISSION_TEXT "O ChurchDAW usa a entrada de audio somente quando voce ativa guitarra/microfone em Audio/MIDI."
+
+    # SEM ESTA CHAVE O macOS MATA O APP.
+    #
+    # O ChurchDAW nao tem uma linha de codigo de Bluetooth. Mas o CoreMIDI
+    # toca no Bluetooth EM NOME DO APP quando existe (ou aparece) um
+    # dispositivo MIDI Bluetooth por perto, e o TCC nao pergunta quem pediu:
+    # sem NSBluetoothAlwaysUsageDescription no Info.plist ele encerra o
+    # processo na hora.
+    #
+    # Comprovado pelo relatorio de falha do cliente em 01/08/2026, ChurchDAW
+    # 1.5.5, macOS 26.6:
+    #   Termination Reason: Namespace TCC
+    #   "...must contain an NSBluetoothAlwaysUsageDescription key"
+    #   Thread 6: __TCC_CRASHING_DUE_TO_PRIVACY_VIOLATION__
+    # Ele foi parear um pedal nas configuracoes de Bluetooth do macOS e o app
+    # fechou sozinho. Nao era bug de MIDI nem de audio: era permissao.
+    BLUETOOTH_PERMISSION_ENABLED TRUE
+    BLUETOOTH_PERMISSION_TEXT "O ChurchDAW usa o Bluetooth apenas para receber notas de teclados e pedais MIDI sem fio."
+
     HARDENED_RUNTIME_ENABLED TRUE
     HARDENED_RUNTIME_OPTIONS
         "com.apple.security.device.audio-input"

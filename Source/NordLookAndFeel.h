@@ -317,6 +317,19 @@ public:
         g.setColour (accent ? base.brighter (0.45f).withAlpha (0.7f) : panelOutline());
         g.drawRoundedRectangle (bounds, r, 1.0f);
 
+       #if ! JUCE_ANDROID && ! JUCE_IOS
+        // Estado ativo de console: chapa acetinada + trilho inferior curto.
+        // A forma continua legivel mesmo sob luz forte sem recorrer a glow neon.
+        if (accent)
+        {
+            auto rail = bounds.reduced (8.0f, 0.0f)
+                              .removeFromBottom (3.0f)
+                              .withTrimmedBottom (0.8f);
+            g.setColour (base.brighter (0.62f).withAlpha (0.92f));
+            g.fillRoundedRectangle (rail, 1.1f);
+        }
+       #endif
+
        #if JUCE_ANDROID || JUCE_IOS
         // HALO nos botoes de acento (PANIC, pagina ativa, toggles ligados):
         // no OLED do palco a luz difusa em volta e o que diz "isto esta ACESO"
@@ -712,10 +725,39 @@ public:
     // NEUTRO (disciplina de vermelho: a setinha deixa de ser vermelha).
     // O combo mostra o PRESET -- a informacao que muda. Depois de rebaixar a
     // categoria a rotulo de apoio, ele passa a ser o texto principal do card.
+    juce::Font getTextButtonFont (juce::TextButton& button,
+                                  int buttonHeight) override
+    {
+        float height = juce::jlimit (9.0f, 15.0f,
+                                     (float) buttonHeight * 0.55f);
+
+        // As tres acoes no rodape de cada strip tem ~32 px. A fonte padrao
+        // desktop era grande demais e transformava LOOP/ORGAO em reticencias.
+       #if ! JUCE_ANDROID && ! JUCE_IOS
+        if (button.getWidth() < 44)
+            height = juce::jmin (height, 9.5f);
+        else if (button.getWidth() < 64)
+            height = juce::jmin (height, 11.0f);
+       #endif
+
+        return juce::Font (juce::FontOptions (height, juce::Font::bold));
+    }
+
     juce::Font getComboBoxFont (juce::ComboBox& box) override
     {
-        return juce::Font (juce::FontOptions (juce::jlimit (13.0f, 16.0f, (float) box.getHeight() * 0.52f),
-                                              juce::Font::bold));
+        float height = juce::jlimit (13.0f, 16.0f,
+                                     (float) box.getHeight() * 0.52f);
+
+        // Presets e slots de FX precisam caber completos na mesa de oito
+        // canais. No editor focado, onde ha largura, a fonte volta ao teto.
+       #if ! JUCE_ANDROID && ! JUCE_IOS
+        if (box.getWidth() < 96)
+            height = juce::jmin (height, 10.5f);
+        else if (box.getWidth() < 126)
+            height = juce::jmin (height, 12.5f);
+       #endif
+
+        return juce::Font (juce::FontOptions (height, juce::Font::bold));
     }
 
     // Balao de valor do knob, na mesma linguagem do visor de programa: vidro

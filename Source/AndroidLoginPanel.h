@@ -160,7 +160,11 @@ public:
         // hasAnyInstalledLibrary() recupera transacoes e consulta o filesystem;
         // executar isso no construtor travava a primeira pintura do login.
         setLibraryState (LibraryState::notStarted);
-        startTimerHz (30);
+        // O timer existe para a pequena animacao de login e para acompanhar o
+        // teclado virtual. 20 Hz continua fluido e evita pressionar o renderer
+        // Android durante a primeira pintura, especialmente em aparelhos de
+        // entrada e em emuladores que traduzem arm64.
+        startTimerHz (20);
         updateControls();
     }
 
@@ -1431,9 +1435,21 @@ private:
         auto card = cardArea.toFloat();
         juce::Path path;
         path.addRoundedRectangle (card, 20.0f);
-        juce::DropShadow (
-            juce::Colours::black.withAlpha (0.35f),
-            18, { 0, 7 }).drawForPath (g, path);
+
+        // DropShadow::drawForPath rasteriza e borra uma mascara temporaria.
+        // Como o spinner repinta durante a retomada da sessao, o login repetia
+        // esse trabalho sobre um card quase do tamanho da tela varias vezes
+        // por segundo. O smoke em 2400x1080 sob traducao arm64 teve ANR sem um
+        // stack de paint que prove causalidade; esta e uma reducao preventiva
+        // de custo para esse caminho quente. Duas camadas deslocadas preservam
+        // a profundidade visual sem blur, alocacao temporaria ou custo
+        // proporcional a uma mascara gigante.
+        g.setColour (juce::Colours::black.withAlpha (0.18f));
+        g.fillRoundedRectangle (
+            card.translated (0.0f, 7.0f).expanded (2.0f, 1.0f), 22.0f);
+        g.setColour (juce::Colours::black.withAlpha (0.11f));
+        g.fillRoundedRectangle (
+            card.translated (0.0f, 3.0f).expanded (1.0f), 21.0f);
         g.setColour (cardColour());
         g.fillPath (path);
         g.setColour (
@@ -1474,7 +1490,15 @@ private:
 
     void timerCallback() override
     {
-        if (++imePollCounter >= 4)
+        const bool editorFocused =
+            emailEditor.hasKeyboardFocus (true)
+            || passwordEditor.hasKeyboardFocus (true);
+
+        // Consultar WindowInsets por JNI no boot ocioso nao produz informacao
+        // util. Depois que o IME aparece, porem, continue acompanhando-o mesmo
+        // se o toque tirar o foco do editor; assim a volta a false restaura o
+        // layout normal quando o teclado finalmente fecha.
+        if ((editorFocused || imeVisible) && ++imePollCounter >= 4)
         {
             imePollCounter = 0;
             const bool nextImeVisible = readAndroidImeVisible();
@@ -1484,10 +1508,16 @@ private:
                 resized();
             }
         }
+        else if (! editorFocused)
+        {
+            imePollCounter = 0;
+        }
 
         if (busy)
         {
-            spinnerPhase += 0.18f;
+            // Mantem aproximadamente a mesma velocidade visual dos antigos
+            // 30 Hz depois de reduzir a frequencia do timer para 20 Hz.
+            spinnerPhase += 0.27f;
             if (spinnerPhase
                 > juce::MathConstants<float>::twoPi)
                 spinnerPhase -=

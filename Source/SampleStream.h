@@ -146,10 +146,46 @@ public:
         const Source* readerSource = nullptr;
         int readerGeneration = -1;
 
+        // JANELAS ALOCADAS SOB DEMANDA.
+        //
+        // Cada VoiceStream custa 2 x 32768 x 2 canais x 4 bytes = 512 KiB. Com
+        // o pool de 5 canais eram 256 vozes (128 MiB); com 14 canais o pool foi
+        // para 616 vozes e isso viraria 308 MiB reservados no prepareToPlay,
+        // mesmo com um unico timbre carregado. E MAIS do que os 268 MiB que
+        // fizeram a versao de janela 65536 ser rejeitada por consumo no Android
+        // (ver o comentario de windowSamples acima) — o app passava de 1 GB e
+        // era morto pelo sistema.
+        //
+        // Quem realmente toca ao mesmo tempo e uma fracao do pool. Entao a
+        // janela nasce vazia e so ganha memoria quando a voz vai de fato
+        // transmitir do disco. Quem aloca e SEMPRE a thread de leitura
+        // (garantirJanelas, chamado de fillImpl) — nunca a thread de audio.
         void prepare()
         {
             for (auto& b : buf)
-                b.setSize (2, windowSamples, false, true, false);
+                b.setSize (0, 0, false, false, false);
+        }
+
+        // So a thread de leitura chama. Devolve false se a alocacao falhar,
+        // para o chamador desistir da leitura em vez de tocar em buffer vazio.
+        bool garantirJanelas()
+        {
+            for (auto& b : buf)
+            {
+                if (b.getNumSamples() >= windowSamples && b.getNumChannels() >= 2)
+                    continue;
+
+                try
+                {
+                    b.setSize (2, windowSamples, false, true, false);
+                }
+                catch (...)
+                {
+                    return false;
+                }
+            }
+
+            return true;
         }
 
         // Chamado pela thread de AUDIO no note-on.
@@ -341,15 +377,21 @@ public:
 
         // Pede a janela que comeca em "start". Barato e idempotente: chamado a
         // cada bloco enquanto a nota se aproxima do fim da janela atual.
-        void request (juce::int64 start) noexcept
+        //
+        // Devolve TRUE se o pedido entrou de fato. Quem so pede uma vez por
+        // nota precisa dessa resposta: se marcar "ja pedi" sem o pedido ter
+        // entrado, uma falha passageira da leitura (arquivo que nao abriu,
+        // memoria que faltou) deixaria de ser retentada e viraria um clique
+        // audivel no fim do preload.
+        bool request (juce::int64 start) noexcept
         {
             // Nunca sobrescreve um decode em andamento. O store antigo podia
             // trocar wantStart enquanto o worker lia; ao terminar, ele ja nao
             // conseguia limpar o pedido e fazia uma leitura extra/desalinhada.
             juce::int64 expected = noRequest;
-            wantStart.compare_exchange_strong (expected, start,
-                                               std::memory_order_acq_rel,
-                                               std::memory_order_relaxed);
+            return wantStart.compare_exchange_strong (expected, start,
+                                                     std::memory_order_acq_rel,
+                                                     std::memory_order_relaxed);
         }
     };
 
@@ -520,6 +562,15 @@ private:
         }
 
         if (v.reader == nullptr)
+        {
+            finishRequest();
+            return false;
+        }
+
+        // As janelas desta voz podem nunca ter sido alocadas (ver prepare()).
+        // Este e o unico lugar onde elas ganham memoria, e estamos na thread
+        // de leitura — a de audio so le janela ja publicada.
+        if (! v.garantirJanelas())
         {
             finishRequest();
             return false;

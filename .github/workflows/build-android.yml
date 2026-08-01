@@ -18,7 +18,6 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 90
     env:
-      CHURCHDAW_UPLOAD_STORE_FILE: ${{ runner.temp }}\churchdaw-upload.jks
       CHURCHDAW_UPLOAD_STORE_PASSWORD: ${{ secrets.ANDROID_UPLOAD_STORE_PASSWORD }}
       CHURCHDAW_UPLOAD_KEY_ALIAS: ${{ secrets.ANDROID_UPLOAD_KEY_ALIAS }}
       CHURCHDAW_UPLOAD_KEY_PASSWORD: ${{ secrets.ANDROID_UPLOAD_KEY_PASSWORD }}
@@ -74,7 +73,10 @@ jobs:
           if ($bytes.Length -lt 1024) {
             throw 'Keystore decodificado e pequeno demais'
           }
-          [IO.File]::WriteAllBytes($env:CHURCHDAW_UPLOAD_STORE_FILE, $bytes)
+          $keystore = Join-Path $env:RUNNER_TEMP 'churchdaw-upload.jks'
+          [IO.File]::WriteAllBytes($keystore, $bytes)
+          "CHURCHDAW_UPLOAD_STORE_FILE=$keystore" |
+            Out-File $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Regenerar projeto Android e sincronizar recursos
         shell: pwsh

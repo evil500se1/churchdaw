@@ -7,6 +7,8 @@
 #if JUCE_ANDROID
  #include <jni.h>
  #include <juce_core/native/juce_JNIHelpers_android.h>
+#elif JUCE_IOS
+ #include "IOSPolicySignatureVerifier.h"
 #elif JUCE_WINDOWS || JUCE_MAC
  // Verificador RS256 nativo: no desktop nao existe JNI para chamar o
  // ChurchDAWSignedPolicyVerifier.java. Mesma chave, mesmo algoritmo.
@@ -1638,6 +1640,11 @@ namespace ChurchDAWServices
 
         env->DeleteLocalRef (clazz);
         return ok && verified;
+       #elif JUCE_IOS
+        // O iOS nao possui a bridge Java do Android nem compila o updater
+        // desktop. A mesma chave publica e validada pelo Security.framework.
+        return ChurchDAWIOSPolicy::verifySignedPolicyEnvelope (
+            payloadBase64, signatureBase64, keyId);
        #elif JUCE_WINDOWS || JUCE_MAC
         // Sem isto o desktop nunca obtem um catalog_sha256 confiavel, e
         // checkRemoteManifest() aborta com "Catalogo bloqueado" antes mesmo de

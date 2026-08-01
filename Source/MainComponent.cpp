@@ -348,7 +348,16 @@ MainComponent::MainComponent()
     const int numInputs = 2;
    #endif
 
-    deviceManager.initialise (numInputs, 2, savedAudio.get(), true);
+    const auto audioInitialiseError =
+        deviceManager.initialise (numInputs, 2, savedAudio.get(), true);
+
+   #if JUCE_IOS
+    if (audioInitialiseError.isNotEmpty())
+        juce::Logger::writeToLog (
+            "AUDIO_IOS initialise_failed error=\"" + audioInitialiseError + "\"");
+   #else
+    juce::ignoreUnused (audioInitialiseError);
+   #endif
 
    #if JUCE_ANDROID
     // O manager pode cair para System Default quando o USB salvo nao esta
@@ -413,7 +422,16 @@ MainComponent::MainComponent()
             chosen > 0 && setup.bufferSize != chosen)
         {
             setup.bufferSize = chosen;
-            deviceManager.setAudioDeviceSetup (setup, true);
+            const auto error = deviceManager.setAudioDeviceSetup (setup, true);
+
+           #if JUCE_IOS
+            if (error.isNotEmpty())
+                juce::Logger::writeToLog (
+                    "AUDIO_IOS default_buffer_setup_failed requested="
+                    + juce::String (chosen) + " error=\"" + error + "\"");
+           #else
+            juce::ignoreUnused (error);
+           #endif
         }
     }
    #endif
@@ -595,6 +613,13 @@ MainComponent::MainComponent()
                 juce::Logger::writeToLog ("AUDIO: buffer pedido " + juce::String (wantedBuffer)
                     + " -> obtido " + juce::String (deviceManager.getAudioDeviceSetup().bufferSize)
                     + (err.isEmpty() ? juce::String (" (sem erro)") : "  ERRO: " + err));
+               #elif JUCE_IOS
+                if (err.isNotEmpty())
+                    juce::Logger::writeToLog (
+                        "AUDIO_IOS saved_setup_failed requested_buffer="
+                        + juce::String (wantedBuffer)
+                        + " requested_rate=" + juce::String (wantedRate, 0)
+                        + " error=\"" + err + "\"");
                #endif
             }
         }
@@ -5755,7 +5780,7 @@ struct AudioSettingsHolder : public juce::Component,
         mc.audioDialogOpen = true;
         brandIcon = juce::ImageCache::getFromMemory (BinaryData::icon_png, BinaryData::icon_pngSize);
 
-       #if JUCE_ANDROID
+       #if JUCE_ANDROID || JUCE_IOS
         selector.setItemHeight (38);
         selectorViewport.setViewedComponent (&selector, false);
         selectorViewport.setScrollBarsShown (true, false);
@@ -5871,7 +5896,7 @@ struct AudioSettingsHolder : public juce::Component,
         // 616 deixava ~140px de buraco embaixo do seletor: o card parecia
         // inacabado. A altura agora acompanha o conteudo real do JUCE.
         // +42 = a linha da resposta do teclado, acrescentada acima da faixa de baixo
-       #if JUCE_ANDROID
+       #if JUCE_ANDROID || JUCE_IOS
         // O tamanho final vem de showAudioSettings(), usando a janela real.
         // O seletor permanece em escala 1:1 e rola somente a regiao de
         // configuracao quando a altura e curta.
@@ -5885,7 +5910,7 @@ struct AudioSettingsHolder : public juce::Component,
     {
         stopTimer();
 
-       #if JUCE_ANDROID
+       #if JUCE_ANDROID || JUCE_IOS
         selectorViewport.setViewedComponent (nullptr, false);
        #endif
 
@@ -5992,7 +6017,7 @@ struct AudioSettingsHolder : public juce::Component,
     void resized() override
     {
         auto card = getLocalBounds().reduced (margin);
-       #if JUCE_ANDROID
+       #if JUCE_ANDROID || JUCE_IOS
         closeBtn.setBounds (
             card.getRight() - 48, card.getY() + 4, 48, 48);
 
@@ -6079,7 +6104,7 @@ struct AudioSettingsHolder : public juce::Component,
 
     juce::Component::SafePointer<MainComponent> owner;
     juce::AudioDeviceSelectorComponent selector;
-   #if JUCE_ANDROID
+   #if JUCE_ANDROID || JUCE_IOS
     juce::Viewport selectorViewport;
    #endif
     juce::TextButton restartBtn, closeBtn;
@@ -6365,7 +6390,7 @@ void MainComponent::showAudioSettings()
     audioPanel.reset (holder);
     addAndMakeVisible (holder);
 
-   #if JUCE_ANDROID
+   #if JUCE_ANDROID || JUCE_IOS
     // No celular isto e uma PAGINA, nao um card flutuante de desktop: o
     // modal de 620x650 centrado deixava texto apertado, scrollbar interna e
     // o "Reiniciar audio" espremido (revisao de design de 30/07). A pagina

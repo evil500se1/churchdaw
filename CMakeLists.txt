@@ -31,9 +31,10 @@ option(CHURCHDAW_UPDATE_ALLOW_LOCALHOST
 # runtime do C++ embutido no exe: roda em qualquer PC sem instalar redistribuivel
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
-# Apple Silicon + Intel no mesmo binario — precisa valer para TODOS os alvos
-# (app, assets, juceaide), senao o linker mistura arquiteturas e falha.
-if(APPLE)
+# Apple Silicon + Intel no mesmo binario do macOS. Nao force estas arquiteturas
+# no iOS: o Xcode precisa selecionar arm64 para aparelho e a arquitetura do
+# simulador para a maquina de build.
+if(APPLE AND NOT IOS)
     set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "" FORCE)
 
     # PISO DE COMPATIBILIDADE DO macOS.
@@ -50,6 +51,10 @@ if(APPLE)
     # as duas arquiteturas do binario universal sem excluir maquinas Intel
     # ainda em uso nas igrejas.
     set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "" FORCE)
+elseif(IOS)
+    # Sem um piso explicito, o bundle herda o SDK da maquina de build e pode
+    # sair restrito ao iOS mais novo. iOS/iPadOS 14 cobre as APIs usadas aqui.
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "14.0" CACHE STRING "" FORCE)
 endif()
 
 add_subdirectory(JUCE)
@@ -279,13 +284,48 @@ if(CHURCHDAW_BUILD_AUDIO_TESTS AND NOT ANDROID AND NOT IOS)
         PROPERTIES TIMEOUT 240)
 endif()
 
+# As propriedades JUCE precisam ser passadas no momento de criar o alvo. Separe
+# capacidades de macOS das de iOS para nao injetar entitlements desktop no
+# bundle movel nem pedir microfone quando o app abre 0 canais de entrada.
+if(IOS)
+    set(CHURCHDAW_PLATFORM_APP_OPTIONS
+        BUILD_VERSION "1.5.7"
+        MICROPHONE_PERMISSION_ENABLED FALSE
+        TARGETED_DEVICE_FAMILY "1,2"
+        STATUS_BAR_HIDDEN TRUE
+        REQUIRES_FULL_SCREEN FALSE
+        BACKGROUND_AUDIO_ENABLED TRUE
+        FILE_SHARING_ENABLED TRUE
+        IPHONE_SCREEN_ORIENTATIONS
+            UIInterfaceOrientationPortrait
+            UIInterfaceOrientationLandscapeLeft
+            UIInterfaceOrientationLandscapeRight
+        IPAD_SCREEN_ORIENTATIONS
+            UIInterfaceOrientationPortrait
+            UIInterfaceOrientationPortraitUpsideDown
+            UIInterfaceOrientationLandscapeLeft
+            UIInterfaceOrientationLandscapeRight)
+else()
+    set(CHURCHDAW_PLATFORM_APP_OPTIONS
+        MICROPHONE_PERMISSION_ENABLED TRUE
+        MICROPHONE_PERMISSION_TEXT
+            "O ChurchDAW usa a entrada de audio somente quando voce ativa guitarra/microfone em Audio/MIDI.")
+
+    if(APPLE)
+        list(APPEND CHURCHDAW_PLATFORM_APP_OPTIONS
+            HARDENED_RUNTIME_ENABLED TRUE
+            HARDENED_RUNTIME_OPTIONS
+                "com.apple.security.device.audio-input"
+                "com.apple.security.cs.disable-library-validation")
+    endif()
+endif()
+
 juce_add_gui_app(MinhaDAW
     PRODUCT_NAME "ChurchDAW"
     COMPANY_NAME "ChurchDAW"
     VERSION "${PROJECT_VERSION}"
     BUNDLE_ID "com.churchdaw.app"
-    MICROPHONE_PERMISSION_ENABLED TRUE
-    MICROPHONE_PERMISSION_TEXT "O ChurchDAW usa a entrada de audio somente quando voce ativa guitarra/microfone em Audio/MIDI."
+    ${CHURCHDAW_PLATFORM_APP_OPTIONS}
 
     # SEM ESTA CHAVE O macOS MATA O APP.
     #
@@ -305,10 +345,6 @@ juce_add_gui_app(MinhaDAW
     BLUETOOTH_PERMISSION_ENABLED TRUE
     BLUETOOTH_PERMISSION_TEXT "O ChurchDAW usa o Bluetooth apenas para receber notas de teclados e pedais MIDI sem fio."
 
-    HARDENED_RUNTIME_ENABLED TRUE
-    HARDENED_RUNTIME_OPTIONS
-        "com.apple.security.device.audio-input"
-        "com.apple.security.cs.disable-library-validation"
     ICON_BIG "${CMAKE_CURRENT_SOURCE_DIR}/Assets/icon.png"
     ICON_SMALL "${CMAKE_CURRENT_SOURCE_DIR}/Assets/icon.png")
 
@@ -357,6 +393,17 @@ target_sources(MinhaDAW PRIVATE
     Source/Main.cpp
     Source/MainComponent.cpp
     ${CHURCHDAW_ORGAN_SOURCES})
+
+if(IOS)
+    # O catalogo usa a mesma policy RSA do Android/desktop. No iOS nao ha JNI
+    # e o updater desktop e deliberadamente excluido, portanto um verificador
+    # pequeno baseado no Security.framework fecha esta lacuna.
+    target_sources(MinhaDAW PRIVATE
+        Source/IOSPolicySignatureVerifier.cpp)
+    target_link_libraries(MinhaDAW PRIVATE
+        "-framework Security"
+        juce::juce_opengl)
+endif()
 
 if(CHURCHDAW_ENABLE_DESKTOP_LICENSING AND NOT ANDROID AND NOT IOS)
     target_sources(MinhaDAW PRIVATE

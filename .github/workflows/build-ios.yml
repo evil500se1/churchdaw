@@ -1,0 +1,114 @@
+name: CI iOS e iPadOS (simulador)
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-simulator-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-ios-simulator:
+    name: Compilar para iPhone e iPad Simulator
+    runs-on: macos-14
+    timeout-minutes: 60
+
+    steps:
+      - name: Baixar codigo e submodulos
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Exibir ambiente Xcode
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphonesimulator --show-sdk-version
+
+      - name: Configurar CMake para iOS
+        run: >-
+          cmake -S . -B build-ios -G Xcode
+          -DCMAKE_SYSTEM_NAME=iOS
+          -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0
+          -DCMAKE_XCODE_GENERATE_SCHEME=ON
+
+      - name: Compilar ChurchDAW Release para o simulador
+        run: |
+          cmake --build build-ios \
+            --config Release \
+            --target MinhaDAW \
+            --parallel 3 \
+            -- \
+            -sdk iphonesimulator \
+            -destination "generic/platform=iOS Simulator" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=""
+
+      - name: Validar e empacotar o app
+        run: |
+          APP="$(find build-ios -type d -name ChurchDAW.app -print -quit)"
+          test -n "$APP"
+
+          PLIST="$APP/Info.plist"
+          test -f "$PLIST"
+          test -x "$APP/ChurchDAW"
+          plutil -lint "$PLIST"
+
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$PLIST")" = \
+            "com.churchdaw.app"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLIST")" = \
+            "1.5.7"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$PLIST")" = \
+            "1.5.7"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :UIRequiresFullScreen' "$PLIST")" = \
+            "false"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :UIFileSharingEnabled' "$PLIST")" = \
+            "true"
+
+          if /usr/libexec/PlistBuddy \
+              -c 'Print :NSMicrophoneUsageDescription' "$PLIST" >/dev/null 2>&1; then
+            echo "O bundle output-only nao pode declarar uso de microfone" >&2
+            exit 1
+          fi
+
+          DEVICE_FAMILY="$(
+            /usr/libexec/PlistBuddy -c 'Print :UIDeviceFamily' "$PLIST" |
+              awk '/^[[:space:]]*[0-9]+[[:space:]]*$/ { print $1 }' |
+              paste -sd, -
+          )"
+          test "$DEVICE_FAMILY" = "1,2"
+
+          plutil -extract UIBackgroundModes xml1 -o - "$PLIST" |
+            grep -q '<string>audio</string>'
+
+          plutil -extract UISupportedInterfaceOrientations xml1 -o - "$PLIST" |
+            grep -q '<string>UIInterfaceOrientationPortrait</string>'
+          plutil -extract UISupportedInterfaceOrientations xml1 -o - "$PLIST" |
+            grep -q '<string>UIInterfaceOrientationLandscapeLeft</string>'
+          plutil -extract 'UISupportedInterfaceOrientations~ipad' xml1 -o - "$PLIST" |
+            grep -q '<string>UIInterfaceOrientationPortraitUpsideDown</string>'
+
+          while IFS= read -r ENTITLEMENTS; do
+            if grep -Eq \
+                'com\.apple\.security\.(device\.audio-input|cs\.disable-library-validation)' \
+                "$ENTITLEMENTS"; then
+              echo "Entitlement exclusivo de macOS vazou para o iOS: $ENTITLEMENTS" >&2
+              exit 1
+            fi
+          done < <(find build-ios -type f -name '*.entitlements' -print)
+
+          ditto -c -k --sequesterRsrc --keepParent \
+            "$APP" ChurchDAW-1.5.7-iOS-iPadOS-Simulator.zip
+
+      - name: Publicar artefato do simulador
+        uses: actions/upload-artifact@v4
+        with:
+          name: ChurchDAW-1.5.7-iOS-iPadOS-Simulator
+          path: ChurchDAW-1.5.7-iOS-iPadOS-Simulator.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14

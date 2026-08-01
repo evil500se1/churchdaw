@@ -682,10 +682,6 @@ struct CoreMidiHelpers
                     break;
 
                 case kMIDIMsgSetupChanged:
-               #if JUCE_IOS
-                case kMIDIMsgInternalStart:
-               #endif
-
                 default:
                     break;
             }

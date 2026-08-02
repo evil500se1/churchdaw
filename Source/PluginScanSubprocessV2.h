@@ -819,6 +819,11 @@ public:
             "PLUGIN_SCAN report=" + reportWriter.getFile().getFullPathName());
     }
 
+    juce::File getReportFile() const
+    {
+        return reportWriter.getFile();
+    }
+
     bool findPluginTypesFor (juce::AudioPluginFormat& format,
                              juce::OwnedArray<juce::PluginDescription>& result,
                              const juce::String& fileOrIdentifier) override
@@ -1082,6 +1087,15 @@ private:
             return true;
         }
 
+        // O inventario bem-sucedido tambem e evidencia: sem este registro o
+        // suporte via JSONL via apenas as classes carregadas e nao conseguia
+        // provar quantos indices a factory anunciou ou se todos foram tentados.
+        {
+            auto report = reportForAttempt (
+                inventory, inventoryAttempt, environment, nullptr);
+            reportWriter.appendPlugin (*report);
+        }
+
         CandidateValidationAccumulator accumulator { result };
         int audioClasses = 0;
 
@@ -1117,7 +1131,12 @@ private:
                  && attempt.xml != nullptr
                  && attempt.xml->getStringAttribute ("status")
                         == "class_skipped")
+            {
+                auto report = reportForAttempt (
+                    validation, attempt, environment, nullptr);
+                reportWriter.appendPlugin (*report);
                 continue;
+            }
 
             juce::PluginDescription validatedDescription;
             const bool loaded = attempt.workerReaped

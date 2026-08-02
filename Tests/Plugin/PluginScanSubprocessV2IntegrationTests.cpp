@@ -145,6 +145,18 @@ private:
             1, juce::SystemStats::getEnvironmentVariable (
                    "CHURCHDAW_PLUGIN_SCAN_MIN_LOADED", "1")
                    .getIntValue());
+        const int minimumFactoryClasses = juce::jmax (
+            1, juce::SystemStats::getEnvironmentVariable (
+                   "CHURCHDAW_PLUGIN_SCAN_MIN_FACTORY_CLASSES", "1")
+                   .getIntValue());
+        const int minimumFailedClasses = juce::jmax (
+            0, juce::SystemStats::getEnvironmentVariable (
+                   "CHURCHDAW_PLUGIN_SCAN_MIN_FAILED_CLASSES", "0")
+                   .getIntValue());
+        const auto requiredFailureStatus =
+            juce::SystemStats::getEnvironmentVariable (
+                "CHURCHDAW_PLUGIN_SCAN_REQUIRED_FAILURE_STATUS", {})
+                .trim();
 
         if (fixtureValue.isEmpty())
         {
@@ -173,8 +185,9 @@ private:
                 "VST3 format was not registered in the Windows probe");
 
         juce::KnownPluginList knownPlugins;
-        knownPlugins.setCustomScanner (
-            std::make_unique<ChurchDAWPluginScanner>());
+        auto scanner = std::make_unique<ChurchDAWPluginScanner>();
+        const auto reportFile = scanner->getReportFile();
+        knownPlugins.setCustomScanner (std::move (scanner));
         juce::OwnedArray<juce::PluginDescription> found;
         const auto candidate = fixture.getFullPathName();
         const bool added = vst3 != nullptr
@@ -213,6 +226,91 @@ private:
 
         expect (everyIdentityBelongsToCandidate,
                 "A loaded VST3 identity was empty, duplicated or outside the fixture candidate");
+
+        int factoryClassCount = -1;
+        int loadedClassReports = 0;
+        int failedClassReports = 0;
+        juce::Array<int> attemptedClassIndexes;
+        juce::StringArray classTokens;
+        bool classRecordsValid = true;
+        bool requiredFailureStatusObserved = requiredFailureStatus.isEmpty();
+
+        if (reportFile.existsAsFile())
+        {
+            juce::StringArray reportLines;
+            reportFile.readLines (reportLines);
+
+            for (const auto& line : reportLines)
+            {
+                const auto record = juce::JSON::parse (line);
+                const auto* object = record.getDynamicObject();
+
+                if (object == nullptr
+                     || object->getProperty ("recordType").toString()
+                            != "plugin")
+                    continue;
+
+                const auto phase = object->getProperty ("phase").toString();
+                const auto status = object->getProperty ("status").toString();
+
+                if (phase == "vst3_inventory" && status == "inventoried")
+                    factoryClassCount = object->getProperty ("classCount")
+                                            .toString().getIntValue();
+
+                if (phase != "vst3_class_validation")
+                    continue;
+
+                const auto classIndexText = object->getProperty ("classIndex")
+                                                .toString();
+                const auto token = object->getProperty ("token").toString();
+                const bool indexIsInteger = object->hasProperty ("classIndex")
+                    && classIndexText.isNotEmpty()
+                    && classIndexText.containsOnly ("0123456789");
+                const int classIndex = indexIsInteger
+                    ? classIndexText.getIntValue() : -1;
+
+                classRecordsValid &= indexIsInteger
+                    && token.isNotEmpty()
+                    && ! classTokens.contains (token);
+
+                attemptedClassIndexes.add (classIndex);
+                classTokens.add (token);
+
+                if (status == "loaded_success")
+                    ++loadedClassReports;
+                else if (status != "class_skipped")
+                {
+                    ++failedClassReports;
+                    requiredFailureStatusObserved |=
+                        status == requiredFailureStatus;
+                }
+            }
+        }
+
+        expect (factoryClassCount >= minimumFactoryClasses,
+                "The VST3 inventory record was missing or announced too few classes");
+        expect (classRecordsValid,
+                "A V2 class report omitted a numeric classIndex or a unique token");
+        expect (attemptedClassIndexes.size() == factoryClassCount,
+                "The V2 report does not contain one attempt for every factory class index");
+
+        for (int classIndex = 0; classIndex < factoryClassCount; ++classIndex)
+        {
+            int occurrences = 0;
+
+            for (const auto attempted : attemptedClassIndexes)
+                occurrences += attempted == classIndex ? 1 : 0;
+
+            expect (occurrences == 1,
+                    "The V2 report skipped or duplicated a factory class index");
+        }
+
+        expect (loadedClassReports == found.size(),
+                "Loaded VST3 descriptions and successful class reports disagree");
+        expect (failedClassReports >= minimumFailedClasses,
+                "The VST3 fixture produced fewer failed class attempts than required");
+        expect (requiredFailureStatusObserved,
+                "The VST3 fixture did not produce the required failure status");
        #else
         expect (false, "This integration probe must run on macOS or Windows");
        #endif
@@ -221,8 +319,9 @@ private:
        #if JUCE_WINDOWS
             std::cout
                 << "Plugin scanner V2 vendor smoke passed: " << found.size()
-                << " VST3 class(es) loaded from the Windows fixture and the "
-                   "candidate was not blacklisted\n";
+                << " VST3 class(es) loaded from " << factoryClassCount
+                << " inventoried factory class(es), " << failedClassReports
+                << " failed class attempt(s), and the candidate was not blacklisted\n";
        #else
             std::cout
                 << "Plugin scanner V2 integration passed: "

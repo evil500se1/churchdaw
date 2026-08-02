@@ -621,8 +621,8 @@ inline juce::String avisoDoResultado (Resultado r, int indice)
         case Resultado::naoGravou:    return juce::String::fromUTF8 ("N\xc3\x83O GRAVOU NO DISCO");
         case Resultado::indisponivel: return juce::String::fromUTF8 ("MOTOR AINDA INICIANDO");
         case Resultado::paginaInvalida:
-            return "CENA " + juce::String (indice + 1)
-                 + " — PAGINA DE SOM AUSENTE OU DANIFICADA";
+            return juce::String::fromUTF8 ("CENA ") + juce::String (indice + 1)
+                 + juce::String::fromUTF8 (" \xe2\x80\x94 P\xc3\x81GINA DE SOM AUSENTE OU DANIFICADA");
         case Resultado::ok:           break;
     }
 

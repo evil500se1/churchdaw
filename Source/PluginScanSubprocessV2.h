@@ -1434,7 +1434,7 @@ private:
                 report->setAttribute ("stack",
                                       attempt.stack.isNotEmpty()
                                           ? attempt.stack
-                                          : "stack unavailable; inspect the macOS .ips crash report");
+                                          : "stack unavailable; worker crashed before a stack could be captured");
                 break;
 
             case PhaseFinish::timeout:

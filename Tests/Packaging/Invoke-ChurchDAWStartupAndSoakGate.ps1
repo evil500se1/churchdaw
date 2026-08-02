@@ -10,7 +10,7 @@ param(
     [string] $OutputDirectory,
     [ValidateRange(1, 604800)]
     [int] $DurationSeconds = 14400,
-    [ValidateRange(100, 120000)]
+    [ValidateRange(100, 2000)]
     [int] $StartupLimitMs = 2000,
     [ValidateRange(1, 600)]
     [int] $HeartbeatSeconds = 60,
@@ -24,6 +24,7 @@ $ErrorActionPreference = 'Stop'
 $minimumQualifyingSeconds = 4 * 60 * 60
 $minimumCoverageRatio = 0.95
 $nominalMidiCycleSeconds = 1.5
+$mainWindowLogMarker = 'WINDOW: outer='
 $minimumHeartbeatCount = [Math]::Max(1, [int] [Math]::Floor(
     ($minimumQualifyingSeconds / [double] $HeartbeatSeconds) * $minimumCoverageRatio))
 $minimumMidiCycles = [Math]::Max(1, [int] [Math]::Floor(
@@ -34,6 +35,7 @@ function Test-StartupAndSoakResult
     param([hashtable] $Result)
 
     return $Result.StartupReady `
+        -and $Result.StartupMarkerObserved `
         -and $Result.StartupMs -le $Result.StartupLimitMs `
         -and $Result.RequestedDurationSeconds -ge $minimumQualifyingSeconds `
         -and $Result.ActualDurationSeconds -ge $minimumQualifyingSeconds `
@@ -52,6 +54,7 @@ if ($SelfTest)
 {
     $passing = @{
         StartupReady = $true
+        StartupMarkerObserved = $true
         StartupMs = 1999
         StartupLimitMs = 2000
         RequestedDurationSeconds = 14400
@@ -72,6 +75,7 @@ if ($SelfTest)
     $cases = @(
         @{ Name = 'qualifying'; Expected = $true; Value = $passing.Clone() },
         @{ Name = 'startup-over-limit'; Expected = $false; Value = $passing.Clone() },
+        @{ Name = 'missing-startup-marker'; Expected = $false; Value = $passing.Clone() },
         @{ Name = 'short-duration'; Expected = $false; Value = $passing.Clone() },
         @{ Name = 'insufficient-heartbeats'; Expected = $false; Value = $passing.Clone() },
         @{ Name = 'insufficient-midi-cycles'; Expected = $false; Value = $passing.Clone() },
@@ -83,14 +87,15 @@ if ($SelfTest)
     )
 
     $cases[1].Value.StartupMs = 2001
-    $cases[2].Value.ActualDurationSeconds = 14399
-    $cases[3].Value.HeartbeatCount = $minimumHeartbeatCount - 1
-    $cases[4].Value.Cycles = $minimumMidiCycles - 1
-    $cases[5].Value.AllHeartbeatsResponding = $false
-    $cases[6].Value.AppLogRead = $false
-    $cases[7].Value.SuspiciousLogLines = 1
-    $cases[8].Value.StderrBytes = 1
-    $cases[9].Value.NormalExit = $false
+    $cases[2].Value.StartupMarkerObserved = $false
+    $cases[3].Value.ActualDurationSeconds = 14399
+    $cases[4].Value.HeartbeatCount = $minimumHeartbeatCount - 1
+    $cases[5].Value.Cycles = $minimumMidiCycles - 1
+    $cases[6].Value.AllHeartbeatsResponding = $false
+    $cases[7].Value.AppLogRead = $false
+    $cases[8].Value.SuspiciousLogLines = 1
+    $cases[9].Value.StderrBytes = 1
+    $cases[10].Value.NormalExit = $false
 
     foreach ($case in $cases)
     {
@@ -253,6 +258,40 @@ function Write-GateLine([string] $Message)
     $line | Tee-Object -FilePath $gateLogPath -Append
 }
 
+function Get-NewChurchDawLogText
+{
+    if (-not (Test-Path -LiteralPath $ChurchDawLog -PathType Leaf))
+    {
+        return ''
+    }
+
+    try
+    {
+        $stream = [IO.File]::Open($ChurchDawLog, 'Open', 'Read', 'ReadWrite')
+
+        try
+        {
+            # Se o FileLogger girou o arquivo depois do launch, leia o novo
+            # arquivo inteiro; caso contrario ignore marcadores de execucoes
+            # anteriores.
+            $seekOffset = if ($stream.Length -ge $logStartLength) { $logStartLength } else { 0 }
+            $stream.Seek($seekOffset, [IO.SeekOrigin]::Begin) | Out-Null
+            $reader = [IO.StreamReader]::new($stream)
+            return $reader.ReadToEnd()
+        }
+        finally
+        {
+            $stream.Dispose()
+        }
+    }
+    catch
+    {
+        # O logger pode estar entre criacao e primeiro flush. O polling tenta
+        # novamente; uma leitura ausente nunca qualifica o startup.
+        return ''
+    }
+}
+
 function Send-Midi([IntPtr] $Handle, [int] $Status, [int] $Data1, [int] $Data2)
 {
     $message = [uint32] ($Status -bor ($Data1 -shl 8) -bor ($Data2 -shl 16))
@@ -266,6 +305,7 @@ function Send-Midi([IntPtr] $Handle, [int] $Status, [int] $Data1, [int] $Data2)
 
 $result = @{
     StartupReady = $false
+    StartupMarkerObserved = $false
     StartupMs = [long]::MaxValue
     StartupLimitMs = $StartupLimitMs
     RequestedDurationSeconds = $DurationSeconds
@@ -291,6 +331,7 @@ $midiDeviceName = ''
 $cycles = 0
 $failure = ''
 $logStartLength = if (Test-Path -LiteralPath $ChurchDawLog) { (Get-Item -LiteralPath $ChurchDawLog).Length } else { 0 }
+$lastStartupMarkerPollMs = -1000
 
 try
 {
@@ -313,7 +354,18 @@ try
         $windows = @([ChurchDawStabilityNative]::GetVisibleWindows($application.Id))
         $largeWindows = @($windows | Where-Object { $_.Width -ge 900 -and $_.Height -ge 480 })
 
-        if ($application.Responding -and $largeWindows.Count -eq 1 -and $windows.Count -eq 1)
+        if (-not $result.StartupMarkerObserved `
+             -and $startupWatch.ElapsedMilliseconds - $lastStartupMarkerPollMs -ge 100)
+        {
+            $lastStartupMarkerPollMs = $startupWatch.ElapsedMilliseconds
+            $result.StartupMarkerObserved = (Get-NewChurchDawLogText).Contains(
+                $mainWindowLogMarker)
+        }
+
+        if ($result.StartupMarkerObserved `
+             -and $application.Responding `
+             -and $largeWindows.Count -eq 1 `
+             -and $windows.Count -eq 1)
         {
             $startupWatch.Stop()
             $result.StartupReady = $true
@@ -327,7 +379,7 @@ try
 
     if (-not $result.StartupReady)
     {
-        throw 'Main performance window did not become uniquely visible and responsive within 120 seconds.'
+        throw "Main performance window did not become uniquely visible, responsive and log-confirmed within 120 seconds. marker=$($result.StartupMarkerObserved)"
     }
 
     if ($result.StartupMs -gt $StartupLimitMs)
@@ -505,7 +557,7 @@ finally
 
 $qualified = Test-StartupAndSoakResult $result
 $evidence = [ordered]@{
-    schema = 'churchdaw-startup-soak-v1'
+    schema = 'churchdaw-startup-soak-v2'
     generatedAtUtc = [DateTime]::UtcNow.ToString('o')
     candidate = [ordered]@{
         path = $candidate
@@ -517,11 +569,15 @@ $evidence = [ordered]@{
         sha256 = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash
     }
     startup = [ordered]@{
-        definition = 'Only one visible responsive top-level process window, at least 900x480; startup/login/splash windows do not qualify.'
+        definition = 'A new WINDOW: log marker plus exactly one visible responsive top-level process window at least 900x480; startup/login/splash windows do not qualify; the qualifying limit cannot exceed 2000 ms.'
+        marker = $mainWindowLogMarker
+        markerObserved = $result.StartupMarkerObserved
         ready = $result.StartupReady
         elapsedMs = $result.StartupMs
         limitMs = $StartupLimitMs
-        pass = $result.StartupReady -and $result.StartupMs -le $StartupLimitMs
+        pass = $result.StartupReady `
+            -and $result.StartupMarkerObserved `
+            -and $result.StartupMs -le $StartupLimitMs
     }
     soak = [ordered]@{
         minimumQualifyingSeconds = $minimumQualifyingSeconds

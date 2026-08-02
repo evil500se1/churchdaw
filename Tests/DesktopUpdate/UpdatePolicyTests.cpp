@@ -5,7 +5,7 @@
 // codificacao da mensagem ou a chave embutida estiverem errados, A1 reprova --
 // e um "compilou" nunca teria percebido.
 //
-// Uso: UpdatePolicyTests <raiz-do-repo> <policy-serial-4.json> <policy-serial-5.json>
+// Uso: UpdatePolicyTests <raiz-do-repo> <policy-serial-1.json> <policy-serial-2.json>
 
 #include "../../Source/DesktopUpdater.h"
 
@@ -112,7 +112,7 @@ int main (int argc, char* argv[])
 {
     if (argc < 4)
     {
-        std::cerr << "uso: UpdatePolicyTests <raiz> <policy-serial-4> <policy-serial-5>"
+        std::cerr << "uso: UpdatePolicyTests <raiz> <policy-serial-1> <policy-serial-2>"
                   << std::endl;
         return 2;
     }
@@ -348,12 +348,12 @@ int main (int argc, char* argv[])
         Policy policy;
         juce::String e;
         check (parseSignedPolicy (desktopPolicy5.loadFileAsString(), policy, e),
-               "D1 serial 5 aceito depois do 4", e);
+               "D1 serial 2 aceito depois do 1", e);
 
         Policy older;
         juce::String e2;
         check (! parseSignedPolicy (desktopPolicy4.loadFileAsString(), older, e2),
-               "D2 serial 4 RECUSADO depois do 5 (anti-replay)", e2);
+               "D2 serial 1 RECUSADO depois do 2 (anti-replay)", e2);
     }
 
     //==========================================================================

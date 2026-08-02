@@ -5,17 +5,20 @@
 #
 # O que este script protege:
 #   - o SHA-256 de cada instalador e calculado do ARQUIVO REAL, nunca digitado;
-#   - o serial so sobe, entao uma politica antiga nao pode ser reapresentada;
+#   - o serial avanca exatamente de um em um e exige a politica anterior
+#     assinada, entao nao pode pular nem reiniciar a cadeia;
+#   - uma politica normal sempre aumenta latest_version_code;
 #   - uma politica "normal" nao consegue BAIXAR o minimum_version_code (so um
 #     rollback declarado consegue, e ele precisa revogar o serial anterior);
 #   - depois de assinar, confere a assinatura com a chave PUBLICA oficial: se a
 #     privada for a errada, nada e gravado.
 #
 # Uso tipico:
-#   .\SignDesktopUpdatePolicy.ps1 -PolicySerial 1 `
+#   .\SignDesktopUpdatePolicy.ps1 -PolicySerial 2 `
 #       -LatestVersionCode 10200 -MinimumVersionCode 10100 `
 #       -LatestVersionName 1.2.0 `
 #       -UpdateMessage "Correcao de estabilidade no motor de audio." `
+#       -PreviousPolicy .\update-policy-v1.json `
 #       -WindowsInstaller ..\dist\ChurchDAW-1.2.0-Setup.exe `
 #       -WindowsInstallerUrl https://churchdaw.com/app/desktop/ChurchDAW-1.2.0-Setup.exe
 
@@ -53,6 +56,7 @@ param(
     [ValidateRange(1, 180)]
     [int] $ValidDays = 90,
     [string] $PrivateKey = '',
+    [string] $PreviousPolicy = '',
     [string] $Output = ''
 )
 
@@ -128,6 +132,18 @@ function Resolve-Installer {
 function Read-VerifiedPreviousPolicy {
     param([string] $Path, [string] $TemporaryDirectory)
 
+    function Test-JsonInteger {
+        param($Value)
+        return $Value -is [int] -or $Value -is [long]
+    }
+    function Get-JsonPropertyValue {
+        param($Object, [string] $Name)
+        if ($null -eq $Object) { return $null }
+        $property = $Object.PSObject.Properties[$Name]
+        if ($null -eq $property) { return $null }
+        return $property.Value
+    }
+
     $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
     try {
         $envelope = [IO.File]::ReadAllText($Path, $strictUtf8) | ConvertFrom-Json
@@ -136,15 +152,25 @@ function Read-VerifiedPreviousPolicy {
         throw "Envelope anterior invalido: $($_.Exception.Message)"
     }
 
+    $envelopeSchema = Get-JsonPropertyValue $envelope 'schema_version'
+    $envelopeAlgorithm = Get-JsonPropertyValue $envelope 'algorithm'
+    $envelopeKeyId = Get-JsonPropertyValue $envelope 'key_id'
+    $envelopePayload = Get-JsonPropertyValue $envelope 'payload'
+    $envelopeSignature = Get-JsonPropertyValue $envelope 'signature'
     if ($null -eq $envelope -or
-        $envelope.schema_version -ne 1 -or
-        $envelope.algorithm -cne 'SHA256withRSA' -or
-        $envelope.key_id -cne $keyId) {
+        -not (Test-JsonInteger $envelopeSchema) -or
+        [long] $envelopeSchema -ne 1 -or
+        $envelopeAlgorithm -isnot [string] -or
+        [string] $envelopeAlgorithm -cne 'SHA256withRSA' -or
+        $envelopeKeyId -isnot [string] -or
+        [string] $envelopeKeyId -cne $keyId -or
+        $envelopePayload -isnot [string] -or
+        $envelopeSignature -isnot [string]) {
         throw 'Envelope anterior tem metadados invalidos'
     }
 
-    $payloadBytes = [Convert]::FromBase64String([string] $envelope.payload)
-    $signatureBytes = [Convert]::FromBase64String([string] $envelope.signature)
+    $payloadBytes = [Convert]::FromBase64String([string] $envelopePayload)
+    $signatureBytes = [Convert]::FromBase64String([string] $envelopeSignature)
     if ($signatureBytes.Length -ne 384) {
         throw 'Assinatura anterior nao tem 384 bytes'
     }
@@ -166,12 +192,42 @@ function Read-VerifiedPreviousPolicy {
         throw 'Assinatura da politica anterior invalida'
     }
 
-    $previous = [Text.UTF8Encoding]::new($false, $true).GetString($payloadBytes) |
-        ConvertFrom-Json
+    try {
+        $previous = [Text.UTF8Encoding]::new($false, $true).
+            GetString($payloadBytes) | ConvertFrom-Json
+    }
+    catch {
+        throw "Payload anterior invalido: $($_.Exception.Message)"
+    }
+
+    $schema = Get-JsonPropertyValue $previous 'schema_version'
+    $product = Get-JsonPropertyValue $previous 'product_id'
+    $previousMode = Get-JsonPropertyValue $previous 'mode'
+    $serial = Get-JsonPropertyValue $previous 'policy_serial'
+    $latest = Get-JsonPropertyValue $previous 'latest_version_code'
+    $minimum = Get-JsonPropertyValue $previous 'minimum_version_code'
+    $revokes = Get-JsonPropertyValue $previous 'revokes_policy_serial'
+    if ($null -eq $previous -or
+        -not (Test-JsonInteger $schema) -or [long] $schema -ne 1 -or
+        $product -isnot [string] -or [string] $product -cne $productId -or
+        $previousMode -isnot [string] -or
+        ([string] $previousMode -cne 'normal' -and
+         [string] $previousMode -cne 'rollback') -or
+        -not (Test-JsonInteger $serial) -or [long] $serial -lt 1 -or
+        -not (Test-JsonInteger $latest) -or [long] $latest -lt 1 -or
+        -not (Test-JsonInteger $minimum) -or [long] $minimum -lt 1 -or
+        [long] $latest -lt [long] $minimum -or
+        -not (Test-JsonInteger $revokes) -or [long] $revokes -lt 0 -or
+        ([string] $previousMode -ceq 'normal' -and [long] $revokes -ne 0) -or
+        ([string] $previousMode -ceq 'rollback' -and [long] $revokes -lt 1)) {
+        throw 'Payload anterior tem produto, schema, modo ou versoes invalidos'
+    }
 
     [pscustomobject] @{
-        PolicySerial = [long] $previous.policy_serial
-        MinimumVersionCode = [long] $previous.minimum_version_code
+        PolicySerial = [long] $serial
+        LatestVersionCode = [long] $latest
+        MinimumVersionCode = [long] $minimum
+        Mode = [string] $previousMode
     }
 }
 
@@ -306,16 +362,42 @@ $temporaryDirectory = Join-Path ([IO.Path]::GetTempPath()) (
 $payloadFile = Join-Path $temporaryDirectory 'payload.json'
 $signatureFile = Join-Path $temporaryDirectory 'payload.sig'
 $outputFullPath = [IO.Path]::GetFullPath($Output)
+$previousPolicyFullPath = ''
+
+if (-not [string]::IsNullOrWhiteSpace($PreviousPolicy)) {
+    if (-not (Test-Path -LiteralPath $PreviousPolicy -PathType Leaf)) {
+        throw "Politica anterior nao encontrada: $PreviousPolicy"
+    }
+    $previousPolicyFullPath = [IO.Path]::GetFullPath($PreviousPolicy)
+}
+if ($PolicySerial -gt 1 -and
+    [string]::IsNullOrWhiteSpace($previousPolicyFullPath)) {
+    throw 'PolicySerial maior que 1 exige -PreviousPolicy verificada'
+}
+if ($PolicySerial -eq 1 -and
+    -not [string]::IsNullOrWhiteSpace($previousPolicyFullPath)) {
+    throw 'PolicySerial 1 inicia a cadeia e nao aceita -PreviousPolicy'
+}
+if ($PolicySerial -eq 1 -and
+    (Test-Path -LiteralPath $outputFullPath -PathType Leaf)) {
+    throw 'PolicySerial 1 nao pode sobrescrever uma politica existente'
+}
 
 New-Item -ItemType Directory -Path $temporaryDirectory | Out-Null
 try {
-    if (Test-Path -LiteralPath $outputFullPath -PathType Leaf) {
-        $previous = Read-VerifiedPreviousPolicy -Path $outputFullPath `
+    if (-not [string]::IsNullOrWhiteSpace($previousPolicyFullPath)) {
+        $previous = Read-VerifiedPreviousPolicy -Path $previousPolicyFullPath `
             -TemporaryDirectory $temporaryDirectory
 
-        if ([long] $PolicySerial -le $previous.PolicySerial) {
-            throw ("PolicySerial deve ser maior que o anterior " +
-                   "($($previous.PolicySerial))")
+        $expectedPolicySerial = $previous.PolicySerial + 1
+        if ([long] $PolicySerial -ne $expectedPolicySerial) {
+            throw ("PolicySerial deve ser exatamente o anterior + 1 " +
+                   "($expectedPolicySerial)")
+        }
+        if ($Mode -eq 'normal' -and
+            [long] $LatestVersionCode -le $previous.LatestVersionCode) {
+            throw ("Politica normal deve aumentar latest_version_code acima " +
+                   "de $($previous.LatestVersionCode)")
         }
         if ($Mode -eq 'normal' -and
             [long] $MinimumVersionCode -lt $previous.MinimumVersionCode) {

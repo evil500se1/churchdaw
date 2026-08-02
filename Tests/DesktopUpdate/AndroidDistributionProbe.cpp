@@ -20,12 +20,11 @@ int main (int argc, char** argv)
             "uso: probe <update-policy-v2.json> <manifest.json> <unix-time>");
 
     const juce::String officialApkUrl =
-        "https://churchdaw.com/app/android/ChurchDAW-1.5.0.apk";
+        "https://churchdaw.com/app/android/ChurchDAW-1.5.0-signed.apk";
     if (! ChurchDAWServices::isSafeWebsiteUpdateUrl (officialApkUrl))
         return fail ("URL oficial do APK foi rejeitada");
-    if (! ChurchDAWServices::isSafeWebsiteUpdateUrl (
-            "https://churchdaw.com/app/android/"
-            "ChurchDAW-1.5.0-signed.apk")
+    if (ChurchDAWServices::isSafeWebsiteUpdateUrl (
+            "https://churchdaw.com/app/android/ChurchDAW-1.5.0.apk")
         || ChurchDAWServices::isSafeWebsiteUpdateUrl (
             officialApkUrl + "?arquivo=outro")
         || ChurchDAWServices::isSafeWebsiteUpdateUrl (
@@ -58,7 +57,7 @@ int main (int argc, char** argv)
         ChurchDAWServices::currentVersionCode + 1;
     futurePolicy.playStoreUrl =
         "https://churchdaw.com/app/android/"
-        "ChurchDAW-9.9.9.apk";
+        "ChurchDAW-9.9.9-signed.apk";
 
     if (ChurchDAWServices::requiredUpdateDownloadUrl (
             futurePolicy, futurePolicy.latestVersionCode)
@@ -71,6 +70,77 @@ int main (int argc, char** argv)
             futurePolicy, futurePolicy.latestVersionCode)
             != ChurchDAWServices::defaultPlayStoreUrl)
         return fail ("gate aceitou URL externa como download obrigatorio");
+
+    using UpdateDecision =
+        ChurchDAWServices::AndroidUpdatePromptDecision;
+
+    futurePolicy.minimumVersionCode =
+        ChurchDAWServices::currentVersionCode - 1;
+    futurePolicy.playStoreUrl =
+        "https://churchdaw.com/app/android/ChurchDAW-9.9.9-signed.apk";
+
+    if (ChurchDAWServices::decideAndroidUpdatePrompt (
+            futurePolicy, ChurchDAWServices::currentVersionCode,
+            futurePolicy.minimumVersionCode)
+        != UpdateDecision::optionalUpdate)
+        return fail ("policy assinada futura nao gerou oferta opcional");
+
+    auto candidate = futurePolicy;
+    candidate.cryptographicallyVerified = false;
+    if (ChurchDAWServices::decideAndroidUpdatePrompt (
+            candidate, ChurchDAWServices::currentVersionCode,
+            candidate.minimumVersionCode)
+        != UpdateDecision::noPrompt)
+        return fail ("policy sem assinatura gerou oferta opcional");
+
+    candidate = futurePolicy;
+    candidate.valid = false;
+    if (ChurchDAWServices::decideAndroidUpdatePrompt (
+            candidate, ChurchDAWServices::currentVersionCode,
+            candidate.minimumVersionCode)
+        != UpdateDecision::noPrompt)
+        return fail ("falha de rede/cache invalido bloqueou a inicializacao");
+
+    candidate = futurePolicy;
+    candidate.playStoreUrl =
+        "https://example.com/app/android/ChurchDAW-9.9.9-signed.apk";
+    if (ChurchDAWServices::decideAndroidUpdatePrompt (
+            candidate, ChurchDAWServices::currentVersionCode,
+            candidate.minimumVersionCode)
+        != UpdateDecision::noPrompt)
+        return fail ("URL externa gerou oferta opcional");
+
+    candidate = futurePolicy;
+    candidate.latestVersionCode = ChurchDAWServices::currentVersionCode;
+    if (ChurchDAWServices::decideAndroidUpdatePrompt (
+            candidate, ChurchDAWServices::currentVersionCode,
+            candidate.minimumVersionCode)
+        != UpdateDecision::noPrompt)
+        return fail ("versao atual gerou oferta opcional");
+
+    candidate = futurePolicy;
+    candidate.minimumVersionCode =
+        ChurchDAWServices::currentVersionCode + 1;
+    if (ChurchDAWServices::decideAndroidUpdatePrompt (
+            candidate, ChurchDAWServices::currentVersionCode,
+            candidate.minimumVersionCode)
+        != UpdateDecision::requiredUpdate)
+        return fail ("versao abaixo do piso nao preservou gate obrigatorio");
+
+    candidate.valid = false;
+    if (ChurchDAWServices::decideAndroidUpdatePrompt (
+            candidate, ChurchDAWServices::currentVersionCode,
+            candidate.minimumVersionCode)
+        != UpdateDecision::requiredUpdate)
+        return fail ("falha de rede apagou piso obrigatorio ja confirmado");
+
+    candidate = futurePolicy;
+    candidate.minimumVersionCode =
+        ChurchDAWServices::currentVersionCode + 1;
+    if (ChurchDAWServices::decideAndroidUpdatePrompt (
+            candidate, ChurchDAWServices::currentVersionCode, 1)
+        != UpdateDecision::noPrompt)
+        return fail ("policy com minimo futuro nao armado virou oferta opcional");
 
     const auto policyFile = juce::File (juce::String::fromUTF8 (argv[1]));
     const auto manifestFile = juce::File (juce::String::fromUTF8 (argv[2]));

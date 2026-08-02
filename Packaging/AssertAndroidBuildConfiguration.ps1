@@ -652,7 +652,7 @@ Assert-AndroidCondition (
 ) "Faixa de versoes invalida na politica update-only"
 Assert-AndroidCondition (
     [string] $updatePolicy.play_store_url -match
-        '^https://churchdaw\.com/app/android/ChurchDAW-[0-9A-Za-z._+-]{1,48}(?:-signed)?\.apk$'
+        '^https://churchdaw\.com/app/android/ChurchDAW-[0-9A-Za-z._+-]{1,48}-signed\.apk$'
 ) "URL de APK inesperada na politica update-only"
 Assert-AndroidCondition (
     ([string] $updatePolicy.latest_version_name).Length -le 48 -and

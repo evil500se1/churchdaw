@@ -11,8 +11,8 @@ param(
     [Parameter(Mandatory = $true)]
     [ValidateLength(0, 640)]
     [string] $UpdateMessage,
-    [ValidatePattern('^https://churchdaw\.com/app/android/ChurchDAW-[0-9A-Za-z._+-]{1,48}(?:-signed)?\.apk$')]
-    [string] $UpdateApkUrl = 'https://churchdaw.com/app/android/ChurchDAW-1.5.0.apk',
+    [ValidatePattern('^https://churchdaw\.com/app/android/ChurchDAW-[0-9A-Za-z._+-]{1,48}-signed\.apk$')]
+    [string] $UpdateApkUrl = 'https://churchdaw.com/app/android/ChurchDAW-1.5.0-signed.apk',
     [ValidateSet('normal', 'rollback')]
     [string] $Mode = 'normal',
     [int] $RevokesPolicySerial = 0,
@@ -290,7 +290,7 @@ function Read-VerifiedPreviousPolicy {
         $previousMessage.IndexOfAny([char[]] "`0`r`n") -ge 0 -or
         $previousPlayStoreUrl -isnot [string] -or
         $previousPlayStoreUrl -cnotmatch
-            '^https://churchdaw\.com/app/android/ChurchDAW-[0-9A-Za-z._+-]{1,48}(?:-signed)?\.apk$') {
+            '^https://churchdaw\.com/app/android/ChurchDAW-[0-9A-Za-z._+-]{1,48}-signed\.apk$') {
         throw 'Payload da politica anterior tem strings invalidas'
     }
 

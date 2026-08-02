@@ -4,7 +4,7 @@
   "latest_version_code": 13,
   "minimum_version_code": 9,
   "latest_version_name": "1.5.7",
-  "update_message": "ChurchDAW 1.5.7 melhora cenas independentes, restaura plugins com seguranca e corrige audio USB no Android.",
+  "update_message": "ChurchDAW 1.5.7 traz Modo Palco premium, cenas independentes, atualizacao opcional segura e audio USB mais confiavel no Android.",
   "play_store_url": "https://churchdaw.com/app/android/ChurchDAW-1.5.7-signed.apk",
   "libraries": [
     {
@@ -68,6 +68,57 @@
       "featured": false,
       "price_label": "Em breve",
       "purchase_url": "https://churchdaw.com/#bibliotecas"
+    },
+    {
+      "id": "pad-continuo",
+      "name": "Pad Cont\u00ednuo",
+      "description": "Pads sustentados em loop nos 7 tons naturais, para o Pad Cont\u00ednuo do ChurchDAW.",
+      "version": 1,
+      "version_name": "1.0",
+      "install_folder": "Pads",
+      "download_bytes": 246848779,
+      "installed_bytes": 370440308,
+      "included": true,
+      "featured": false,
+      "price_label": "Inclusa",
+      "purchase_url": "",
+      "parts": [
+        {
+          "download_url": "https://churchdaw.com/api/v1/library/files/pad-continuo-v1-c.zip",
+          "sha256": "8d6e87c2f384ebdfd01fbb58a6f5d5437f321648203cb3eb181e19696105a082",
+          "download_bytes": 35838255
+        },
+        {
+          "download_url": "https://churchdaw.com/api/v1/library/files/pad-continuo-v1-d.zip",
+          "sha256": "b3cd0705a96a6ae42facb084f6f731ac2b6c46430c7abb8fb1f8bd95ca4018b7",
+          "download_bytes": 35092591
+        },
+        {
+          "download_url": "https://churchdaw.com/api/v1/library/files/pad-continuo-v1-e.zip",
+          "sha256": "a3736db4a94f47fa7253d5d1f201e77d4a9e0edcb06dc15f1484653da3b682a5",
+          "download_bytes": 36062618
+        },
+        {
+          "download_url": "https://churchdaw.com/api/v1/library/files/pad-continuo-v1-f.zip",
+          "sha256": "3d5412f58a6b91b804c9567a73ade963e0999741578bdb53a557d6d147530f69",
+          "download_bytes": 36205540
+        },
+        {
+          "download_url": "https://churchdaw.com/api/v1/library/files/pad-continuo-v1-g.zip",
+          "sha256": "bed8df3bbe658995be5c495804b9983525df472250548eab16b9e464d975c05d",
+          "download_bytes": 34709816
+        },
+        {
+          "download_url": "https://churchdaw.com/api/v1/library/files/pad-continuo-v1-a.zip",
+          "sha256": "0730ed8d739404a4302fa82ee156a0a13cbf8833f2aaebd3a656de18a8576192",
+          "download_bytes": 34324303
+        },
+        {
+          "download_url": "https://churchdaw.com/api/v1/library/files/pad-continuo-v1-b.zip",
+          "sha256": "8568c2072a5a6344ec4bdaaa1b0da5c6b040f01b3855f718733534f08a02f2c8",
+          "download_bytes": 34615656
+        }
+      ]
     }
   ]
 }

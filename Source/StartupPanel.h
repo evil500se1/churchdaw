@@ -111,6 +111,84 @@ public:
         repaint();
     }
 
+    void showOptionalUpdate (ChurchDAWServices::UpdatePolicy policy)
+    {
+        activeUpdatePolicy = std::move (policy);
+        mode = Mode::optionalUpdate;
+        eyebrow = juce::String::fromUTF8 (u8"NOVA VERS\u00c3O DISPON\u00cdVEL");
+        title = juce::String::fromUTF8 (u8"Seu ChurchDAW pode ficar ainda melhor");
+        const auto reason = activeUpdatePolicy.updateMessage.isNotEmpty()
+                              ? activeUpdatePolicy.updateMessage
+                              : juce::String::fromUTF8 (
+                                  u8"H\u00e1 uma nova vers\u00e3o dispon\u00edvel para seu aparelho.");
+        detail = reason + "\n"
+               + juce::String::fromUTF8 (
+                   u8"Voc\u00ea pode atualizar agora pelo site oficial ou continuar normalmente.");
+        footnote = "v" + juce::String (ChurchDAWServices::currentVersionName)
+                 + "  ->  v" + activeUpdatePolicy.latestVersionName;
+        progress = 0.0f;
+
+        primaryButton.setButtonText ("Atualizar");
+        primaryButton.setEnabled (true);
+        primaryButton.onClick = [safe = juce::Component::SafePointer<StartupPanel> (this)]
+        {
+            if (auto* self = safe.getComponent())
+            {
+                if (! ChurchDAWServices::isSafeWebsiteUpdateUrl (
+                        self->activeUpdatePolicy.playStoreUrl))
+                {
+                    self->detail = juce::String::fromUTF8 (
+                        u8"A atualiza\u00e7\u00e3o recebida n\u00e3o passou pela valida\u00e7\u00e3o de seguran\u00e7a. "
+                        u8"Voc\u00ea pode continuar usando o ChurchDAW.");
+                    self->primaryButton.setEnabled (false);
+                    self->repaint();
+                    return;
+                }
+
+                self->detail = juce::String::fromUTF8 (
+                    u8"Abrindo a atualiza\u00e7\u00e3o assinada no churchdaw.com. "
+                    u8"Se preferir instalar depois, volte e toque em Depois.");
+                self->primaryButton.setButtonText (
+                    juce::String::fromUTF8 (u8"Abrindo atualiza\u00e7\u00e3o..."));
+                self->primaryButton.setEnabled (false);
+                self->repaint();
+
+                if (! ChurchDAWServices::startWebsiteUpdate (
+                        self->activeUpdatePolicy.playStoreUrl))
+                {
+                    self->detail = juce::String::fromUTF8 (
+                        u8"N\u00e3o foi poss\u00edvel abrir a atualiza\u00e7\u00e3o agora. "
+                        u8"Voc\u00ea pode tentar novamente ou continuar normalmente.");
+                    self->primaryButton.setButtonText ("Tentar novamente");
+                    self->primaryButton.setEnabled (true);
+                    self->repaint();
+                }
+            }
+        };
+        primaryButton.setVisible (true);
+
+        secondaryButton.setButtonText ("Depois");
+        secondaryButton.setEnabled (true);
+        secondaryButton.onClick = [safe = juce::Component::SafePointer<StartupPanel> (this)]
+        {
+            if (auto* self = safe.getComponent())
+            {
+                // Consome a continuacao antes de chama-la: dois toques rapidos
+                // nunca repetem login/catalogo nem recriam esta oferta.
+                auto continuation = self->onContinue;
+                self->onContinue = nullptr;
+                self->secondaryButton.setEnabled (false);
+
+                if (continuation != nullptr)
+                    continuation();
+            }
+        };
+        secondaryButton.setVisible (true);
+
+        resized();
+        repaint();
+    }
+
     void showStarterChoice (const ChurchDAWServices::LibraryPack* starter,
                             bool serverWasReached,
                             bool requireInstalledLibrary = false)
@@ -433,7 +511,16 @@ public:
     std::function<void()> onRetryCatalog;
 
 private:
-    enum class Mode { checking, requiredUpdate, legacyAccess, starterChoice, downloading, ready };
+    enum class Mode
+    {
+        checking,
+        requiredUpdate,
+        optionalUpdate,
+        legacyAccess,
+        starterChoice,
+        downloading,
+        ready
+    };
 
     static void configureButton (juce::TextButton& button, bool primary)
     {

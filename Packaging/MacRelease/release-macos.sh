@@ -47,6 +47,8 @@ release_version="${RELEASE_TAG#v}"
     || fail "EXPECTED_BUNDLE_ID invalido"
 [[ "$MACOSX_DEPLOYMENT_TARGET" =~ ^[0-9]+\.[0-9]+$ ]] \
     || fail "MACOSX_DEPLOYMENT_TARGET invalido"
+[[ "$MACOSX_DEPLOYMENT_TARGET" == "10.15" ]] \
+    || fail "o release desktop deve manter Catalina 10.15 no slice Intel"
 [[ "$APPLE_TEAM_ID" =~ ^[A-Z0-9]{10}$ ]] \
     || fail "APPLE_TEAM_ID deve conter 10 caracteres A-Z/0-9"
 [[ "$APPLE_NOTARY_KEY_ID" =~ ^[A-Z0-9]{10}$ ]] \
@@ -269,13 +271,35 @@ grep -qw x86_64 <<<"$architectures" || fail "slice x86_64 ausente"
     || fail "arquiteturas inesperadas: $architectures"
 
 vtool -show-build "$executable" | tee "$logs_dir/macho-build-versions.txt"
-minos_count="$(
-    vtool -show-build "$executable" \
-        | awk -v expected="$MACOSX_DEPLOYMENT_TARGET" \
-            '$1 == "minos" && $2 == expected { count++ } END { print count + 0 }'
-)"
-[[ "$minos_count" -eq 2 ]] \
-    || fail "deployment target nao aparece nas duas slices"
+minos_dir="$temp_root/minos-slices"
+mkdir -p "$minos_dir"
+lipo "$executable" -thin x86_64 -output "$minos_dir/ChurchDAW-x86_64"
+lipo "$executable" -thin arm64 -output "$minos_dir/ChurchDAW-arm64"
+
+require_slice_minos() {
+    local binary="$1"
+    local expected="$2"
+    local architecture="$3"
+    local actual platform
+    actual="$(
+        vtool -show-build "$binary" \
+            | awk '$1 == "minos" { print $2; exit }'
+    )"
+    platform="$(
+        vtool -show-build "$binary" \
+            | awk '$1 == "platform" { print $2; exit }'
+    )"
+    [[ "$actual" == "$expected" ]] \
+        || fail "$architecture minos=$actual; esperado=$expected"
+    [[ "$platform" == "MACOS" ]] \
+        || fail "$architecture usa plataforma Mach-O inesperada: $platform"
+    printf '%s minos=%s platform=%s\n' "$architecture" "$actual" "$platform"
+}
+
+# Catalina e o piso do produto Intel; Apple Silicon nasceu no macOS 11.
+require_slice_minos \
+    "$minos_dir/ChurchDAW-x86_64" "$MACOSX_DEPLOYMENT_TARGET" x86_64
+require_slice_minos "$minos_dir/ChurchDAW-arm64" "11.0" arm64
 
 otool -L "$executable" | tee "$logs_dir/macho-dependencies.txt"
 if grep -Eq '/Users/|build-mac-commercial' "$logs_dir/macho-dependencies.txt"; then

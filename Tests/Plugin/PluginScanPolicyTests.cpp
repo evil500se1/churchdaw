@@ -2,6 +2,7 @@
 
 #include "PluginScanPolicy.h"
 
+#include <initializer_list>
 #include <iostream>
 
 namespace
@@ -32,12 +33,64 @@ int main()
             "A host protocol failure must not blacklist the plugin");
     expect (deveEntrarNaBlacklistPersistente (PhaseFinish::crash),
             "A crashing plugin must remain isolated by the blacklist");
-    expect (deveEntrarNaBlacklistPersistente (PhaseFinish::timeout),
-            "A timed-out plugin must remain isolated by the blacklist");
+    expect (! deveEntrarNaBlacklistPersistente (PhaseFinish::timeout),
+            "A timed-out plugin must remain retryable");
+    expect (ehTentativaInconclusiva (PhaseFinish::timeout)
+             && ehTentativaInconclusiva (PhaseFinish::launchFailed)
+             && ehTentativaInconclusiva (PhaseFinish::sendFailed),
+            "Timeout and transport failures must remain inconclusive");
+    expect (! ehTentativaInconclusiva (PhaseFinish::crash)
+             && ! ehTentativaInconclusiva (PhaseFinish::result)
+             && ! ehTentativaInconclusiva (PhaseFinish::cancelled),
+            "Crash, result and cancellation must not masquerade as inconclusive transport");
+
+    const auto aggregateIsFatal = [] (
+        int loaded,
+        std::initializer_list<PhaseFinish> attempts,
+        int retryableOrSkipped = 0)
+    {
+        CandidateValidationSummary summary;
+        summary.loaded = loaded;
+        summary.retryableOrSkipped = retryableOrSkipped;
+
+        for (const auto finish : attempts)
+            if (deveEntrarNaBlacklistPersistente (finish))
+                ++summary.fatal;
+            else
+                ++summary.retryableOrSkipped;
+
+        return deveEntrarNaBlacklistPersistente (
+            summary);
+    };
+
+    expect (! aggregateIsFatal (
+                0, { PhaseFinish::crash, PhaseFinish::launchFailed }),
+            "A crashing shell class plus a host error must remain retryable");
+    expect (! aggregateIsFatal (
+                0, { PhaseFinish::timeout, PhaseFinish::result }),
+            "A timed-out shell class plus an initialization failure must remain retryable");
+    expect (! aggregateIsFatal (0, { PhaseFinish::crash }, 1),
+            "An architecture-skipped sibling must protect the whole shell from blacklist");
+    expect (aggregateIsFatal (0, { PhaseFinish::crash }),
+            "A crash-only candidate must be blacklisted");
+    expect (aggregateIsFatal (
+                0, { PhaseFinish::crash, PhaseFinish::crash }),
+            "A shell whose attempted classes all crash must be blacklisted");
+    expect (! aggregateIsFatal (0, { PhaseFinish::timeout }),
+            "A timeout-only candidate must remain retryable");
+    expect (! aggregateIsFatal (
+                0, { PhaseFinish::crash, PhaseFinish::timeout }),
+            "A crashing shell class plus a timed-out sibling is inconclusive");
+    expect (! aggregateIsFatal (
+                1, { PhaseFinish::crash, PhaseFinish::timeout }),
+            "Any loaded shell class must protect the whole bundle from blacklist");
+    expect (! aggregateIsFatal (0, {}),
+            "An empty or inconclusive candidate must not be called a crash");
     expect (precisaRevalidarBlacklistLegada (0)
              && precisaRevalidarBlacklistLegada (1)
-             && ! precisaRevalidarBlacklistLegada (2),
-            "Legacy blacklist semantics migration must run exactly before v2");
+             && precisaRevalidarBlacklistLegada (2)
+             && ! precisaRevalidarBlacklistLegada (3),
+            "Legacy blacklist semantics migration must run exactly before v3");
 
     const juce::String appleMixer =
         "AudioUnit:Mixers/aumx,mcmx,appl";

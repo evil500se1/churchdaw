@@ -7,6 +7,7 @@
 #include "TimbreToneMemory.h"
 #include "ChannelRotarySpeaker.h"
 #include "PerformanceMidiSafety.h"
+#include "AndroidStageLayout.h"
 #include "UiProfiler.h"
 #include "ChurchOrgan/ChurchOrganEditor.h"
 #include "ChurchOrgan/ChurchOrganLayerProcessor.h"
@@ -11586,7 +11587,30 @@ public:
                                   juce::Colours::white);
         editToneButton.onClick = [this]
         {
-           #if ! JUCE_ANDROID && ! JUCE_IOS
+           #if JUCE_ANDROID
+            // No touch, o editor focado continua sendo a mesa de edicao. O
+            // Modo Palco abre as reguas compactas com fader, meter, M/S e
+            // master atualizando juntas, como no Windows/macOS. A troca e so
+            // visual: attachments e audio nunca sao desmontados.
+            mobileStageMode = ! mobileStageMode;
+            mobileMasterPage = false;
+            editToneButton.setToggleState (mobileStageMode,
+                                           juce::dontSendNotification);
+            editToneButton.setButtonText (mobileStageMode
+                                            ? "EDITAR CANAL"
+                                            : "MODO PALCO");
+            editToneButton.setTooltip (mobileStageMode
+                ? "Voltar ao canal em foco para editar todos os controles"
+                : "Ver faders, meters, Mute, Solo e Master em tempo real");
+
+            // O layout conhece quantas reguas cabem nesta tela. Ele centraliza
+            // o canal editado na primeira pagina somente depois de calcular
+            // esse numero, evitando paginas parciais no fim da lista.
+            androidStageRevealSelected = mobileStageMode;
+
+            resized();
+            repaint();
+           #elif ! JUCE_IOS
             desktopToneEditMode = ! desktopToneEditMode;
             mobileMasterPage = false;
             editToneButton.setToggleState (desktopToneEditMode,
@@ -13027,13 +13051,61 @@ public:
                                               shortLandscapeMobileLayout ? 4 : 6);
         // +15% de legibilidade no aparelho real (pedido do dono, 30/07):
         // 14->16 e 10->11,5 na paisagem curta, com a linha acompanhando.
+       #if JUCE_ANDROID
+        // O seletor de modo e uma acao de palco, nao um link miudo. Reserva um
+        // alvo touch de 44/48 dp e deixa o restante do editor refluindo abaixo.
+        auto top = area.removeFromTop (shortLandscapeMobileLayout ? 44 : 48);
+       #else
         auto top = area.removeFromTop (shortLandscapeMobileLayout ? 21 : 22);
+       #endif
         title.setFont (juce::Font (juce::FontOptions (16.0f)).boldened());
         status.setFont (juce::Font (juce::FontOptions (
                              shortLandscapeMobileLayout ? 11.5f : 12.0f)));
-        title.setBounds (top.removeFromLeft (shortLandscapeMobileLayout ? 150 : 160));
+       #if JUCE_ANDROID
+        // Remove primeiro os alvos touch e entrega ao titulo apenas o que
+        // realmente sobrou. Na largura de 320/360 dp, reservar o titulo antes
+        // das setas fazia a segunda seta nascer com largura negativa.
+        const int modeButtonW = juce::jlimit (98, 124,
+                                               top.getWidth() / 3);
+        editToneButton.setVisible (true);
+        editToneButton.setToggleState (mobileStageMode,
+                                       juce::dontSendNotification);
+        editToneButton.setButtonText (mobileStageMode
+                                        ? "EDITAR CANAL"
+                                        : "MODO PALCO");
+        editToneButton.setTooltip (mobileStageMode
+            ? "Voltar ao canal em foco para editar todos os controles"
+            : "Ver faders, meters, Mute, Solo e Master em tempo real");
+        editToneButton.setBounds (top.removeFromRight (
+            juce::jmin (modeButtonW, top.getWidth())));
+        top.removeFromRight (juce::jmin (4, top.getWidth()));
+
+        if (mobileStageMode)
+        {
+            const int arrowW = juce::jmin (44, top.getHeight());
+            canalProximoBtn.setVisible (true);
+            canalProximoBtn.setBounds (top.removeFromRight (arrowW));
+            top.removeFromRight (juce::jmin (3, top.getWidth()));
+            canalAnteriorBtn.setVisible (true);
+            canalAnteriorBtn.setBounds (top.removeFromRight (arrowW));
+            top.removeFromRight (juce::jmin (4, top.getWidth()));
+        }
+        else
+        {
+            canalAnteriorBtn.setVisible (false);
+            canalProximoBtn.setVisible (false);
+            canalAnteriorBtn.setBounds ({});
+            canalProximoBtn.setBounds ({});
+        }
+
+        const int titleW = juce::jmin (160, top.getWidth());
+        title.setBounds (top.removeFromLeft (titleW));
+       #else
+        title.setBounds (top.removeFromLeft (
+            shortLandscapeMobileLayout ? 150 : 160));
         editToneButton.setVisible (false);
         editToneButton.setBounds ({});
+       #endif
         status.setBounds (top);
         area.removeFromTop (shortLandscapeMobileLayout ? 2 : 4);
        #else
@@ -13059,11 +13131,14 @@ public:
         masterUtilityGroupBounds = {};
 
        #if JUCE_ANDROID || JUCE_IOS
-        // Celular e tablet usam a mesma hierarquia: cinco abas persistentes,
-        // um canal grande para editar e o master ao lado. A area extra do tablet
-        // vira controles maiores; ela nao volta a espremer seis reguas lado a
-        // lado. No desktop a mesa tradicional de seis colunas permanece.
+        // O touch abre no editor focado (14 abas + Master). No Android, o
+        // Modo Palco explicito usa duas, quatro ou seis reguas por pagina,
+        // meters simultaneos e Master sempre ao lado.
+       #if JUCE_ANDROID
+        focusedMobileLayout = ! mobileStageMode;
+       #else
         focusedMobileLayout = true;
+       #endif
        #else
         // O mesmo editor focado do touch vira o painel de edicao detalhada do
         // desktop. Assim Windows, macOS e Android compartilham a hierarquia e
@@ -13084,8 +13159,20 @@ public:
         if (! focusedMobileLayout)
             mobileMasterPageButton.setBounds ({});
 
+       #if JUCE_ANDROID
+        if (mobileStageMode)
+        {
+            layoutAndroidStageMode (area);
+            return;
+        }
+       #endif
+
         if (focusedMobileLayout)
         {
+            canalAnteriorBtn.setVisible (false);
+            canalProximoBtn.setVisible (false);
+            canalAnteriorBtn.setBounds ({});
+            canalProximoBtn.setBounds ({});
             layoutFocusedMobile (area);
             return;
         }
@@ -13693,8 +13780,247 @@ public:
     }
 
 private:
+   #if JUCE_ANDROID
+    void layoutAndroidStageMode (juce::Rectangle<int> area)
+    {
+        focusedMobileLayout = false;
+        mobileMasterPage = false;
+        mobileMasterTabBounds = {};
+        bottomPanelBounds = {};
+        masterFxGroupBounds = {};
+        masterLevelGroupBounds = {};
+        masterLiveGroupBounds = {};
+        masterUtilityGroupBounds = {};
+        fxDivider = {};
+
+        // O palco mostra apenas os controles de performance. Os componentes e
+        // attachments continuam vivos: zerar a geometria nao altera um unico
+        // parametro nem interrompe os meters.
+        for (auto& s : strips)
+            esconderStrip (s);
+
+        fxTitle.setBounds ({});
+        gTranspSlider.setBounds ({});
+        gTranspLabel.setBounds ({});
+        sustainToggle.setBounds ({});
+        invPedalToggle.setBounds ({});
+        reverbTypeCombo.setBounds ({});
+        reverbTypeCombo.setVisible (false);
+        reverbReturnSlider.setBounds ({});
+        reverbReturnSlider.setVisible (false);
+        reverbReturnLabel.setBounds ({});
+        reverbReturnLabel.setVisible (false);
+
+        for (int i = 0; i < TimbresProcessor::numInserts; ++i)
+        {
+            insertCombos[i].setBounds ({});
+            insertOpenButtons[i].setBounds ({});
+        }
+
+        canaisNaTela = juce::jmin (
+            TimbresProcessor::numLayers,
+            ChurchDAWAndroidStageLayout::stageChannelCountForWidth (
+                area.getWidth()));
+
+        if (androidStageLastChannelsOnScreen != canaisNaTela)
+        {
+            androidStageLastChannelsOnScreen = canaisNaTela;
+            androidStageRevealSelected = true;
+        }
+
+        if (androidStageRevealSelected)
+        {
+            int focus = selectedStrip;
+
+            if (! juce::isPositiveAndBelow (focus,
+                                             TimbresProcessor::numLayers))
+                focus = proc.getSelectedLayer();
+
+            if (juce::isPositiveAndBelow (focus,
+                                          TimbresProcessor::numLayers))
+                primeiroCanalVisivel =
+                    ChurchDAWAndroidStageLayout::pageContaining (
+                        focus, canaisNaTela,
+                        TimbresProcessor::numLayers);
+
+            androidStageRevealSelected = false;
+        }
+
+        limitarPrimeiroCanalVisivel();
+
+        constexpr int stageGap = 4;
+        const auto stageColumns =
+            ChurchDAWAndroidStageLayout::calculateStageColumns (
+                area.getWidth(), canaisNaTela);
+        const int masterW = stageColumns.masterWidth;
+
+        auto channelArea = area;
+        auto masterArea = channelArea.removeFromRight (
+            juce::jmin (masterW, channelArea.getWidth()));
+        channelArea.removeFromRight (
+            juce::jmin (stageGap, channelArea.getWidth()));
+        faixaDeCanais = channelArea;
+
+        const int maxStart = juce::jmax (
+            0, TimbresProcessor::numLayers - canaisNaTela);
+        const bool canPage = TimbresProcessor::numLayers > canaisNaTela;
+        canalAnteriorBtn.setVisible (canPage);
+        canalProximoBtn.setVisible (canPage);
+        canalAnteriorBtn.setEnabled (primeiroCanalVisivel > 0);
+        canalProximoBtn.setEnabled (primeiroCanalVisivel < maxStart);
+        canalAnteriorBtn.setTooltip ("Pagina anterior de canais");
+        canalProximoBtn.setTooltip ("Proxima pagina de canais");
+        canalAnteriorBtn.toFront (false);
+        canalProximoBtn.toFront (false);
+
+        auto remainingChannels = channelArea;
+        int remainingColumns = canaisNaTela;
+
+        for (int column = 0; column < canaisNaTela; ++column)
+        {
+            const int layer = primeiroCanalVisivel + column;
+            auto cell = column == canaisNaTela - 1
+                          ? remainingChannels
+                          : remainingChannels.removeFromLeft (
+                                remainingChannels.getWidth()
+                                    / remainingColumns);
+            --remainingColumns;
+
+            if (! juce::isPositiveAndBelow (layer,
+                                             TimbresProcessor::numLayers))
+                continue;
+
+            auto& s = strips[layer];
+            s.cardBounds = cell.reduced (1, 0);
+            s.activity.setBounds (s.cardBounds.getX() + 4,
+                                  s.cardBounds.getY() + 3,
+                                  juce::jmax (0,
+                                      s.cardBounds.getWidth() - 8), 2);
+
+            auto inner = s.cardBounds.reduced (4);
+            const bool loaded =
+                proc.getLayerTimbre (layer).isNotEmpty()
+                || proc.getLayerInstrument (layer) != nullptr
+                || proc.isLayerChurchOrgan (layer);
+
+            auto header = inner.removeFromTop (
+                juce::jmin (44, inner.getHeight()));
+            auto power = header.removeFromRight (
+                juce::jmin (44, header.getWidth()));
+            header.removeFromRight (juce::jmin (3, header.getWidth()));
+            s.name.setBounds (header);
+            s.onBtn.setBounds (loaded ? power
+                                      : juce::Rectangle<int>());
+            inner.removeFromTop (juce::jmin (3, inner.getHeight()));
+
+            if (! loaded)
+            {
+                // Palco e deliberadamente somente leitura para configuracao:
+                // o anel vazio continua identificando o slot, mas nenhum toque
+                // acidental abre biblioteca/seletor durante a apresentacao.
+                s.addButton.setBounds ({});
+                continue;
+            }
+
+            // O preset fica legivel, mas somente leitura neste modo. Trocar som
+            // ao vivo exige voltar ao editor focado, evitando um popup aberto
+            // por toque acidental entre fader e medidor.
+            s.combo.setInterceptsMouseClicks (false, false);
+            s.combo.setWantsKeyboardFocus (false);
+            s.combo.setBounds (inner.removeFromTop (
+                juce::jmin (36, inner.getHeight())));
+            inner.removeFromTop (juce::jmin (4, inner.getHeight()));
+
+            auto actions = inner.removeFromBottom (
+                juce::jmin (44, inner.getHeight()));
+            constexpr int actionGap = 4;
+            const int actionW = juce::jmax (
+                1, (actions.getWidth() - actionGap) / 2);
+            s.muteBtn.setBounds (actions.removeFromLeft (actionW));
+            actions.removeFromLeft (
+                juce::jmin (actionGap, actions.getWidth()));
+            s.soloBtn.setBounds (actions);
+            inner.removeFromBottom (juce::jmin (4, inner.getHeight()));
+
+            if (inner.getHeight() >= 112)
+            {
+                auto db = inner.removeFromBottom (18);
+                s.volDb.setBounds (db);
+                inner.removeFromBottom (juce::jmin (2, inner.getHeight()));
+            }
+
+            s.vol.setSliderStyle (juce::Slider::LinearVertical);
+            s.vol.setTextBoxStyle (juce::Slider::NoTextBox,
+                                   false, 0, 0);
+
+            if (s.meter != nullptr)
+            {
+                const int meterW = juce::jlimit (
+                    18, 28, inner.getWidth() / 4);
+                s.meter->setBounds (inner.removeFromRight (meterW)
+                                         .reduced (1, 2));
+                inner.removeFromRight (juce::jmin (4, inner.getWidth()));
+            }
+
+            s.vol.setBounds (inner.withSizeKeepingCentre (
+                juce::jmin (48, inner.getWidth()), inner.getHeight()));
+        }
+
+        // MASTER fixo: saida e PANIC nunca saem da tela enquanto as setas
+        // paginam apenas os canais. Em telas largas, EQ/PESO ocupam uma segunda
+        // fileira; em telefones estreitos cedem espaco ao fader e ao PANIC.
+        masterCardBounds = masterArea;
+        auto masterInner = masterCardBounds.reduced (4);
+        masterName.setBounds (masterInner.removeFromTop (
+            juce::jmin (28, masterInner.getHeight())));
+        masterInner.removeFromTop (
+            juce::jmin (4, masterInner.getHeight()));
+
+        panicButton.setBounds (masterInner.removeFromBottom (
+            juce::jmin (48, masterInner.getHeight())));
+        masterInner.removeFromBottom (
+            juce::jmin (4, masterInner.getHeight()));
+
+        // O contrato do Modo Palco e simples e seguro: canais, faders,
+        // meters, M/S, preset e PANIC. EQ/PESO/inserts continuam no editor,
+        // evitando mudancas de timbre por toque acidental no show.
+        masterAutoEqBtn.setBounds ({});
+        masterPunchBtn.setBounds ({});
+
+        masterDbSlider.setSliderStyle (juce::Slider::LinearVertical);
+        masterDbSlider.setTextBoxStyle (juce::Slider::NoTextBox,
+                                        false, 0, 0);
+
+        if (masterMeter != nullptr)
+        {
+            const int meterW = juce::jlimit (
+                20, 30, masterInner.getWidth() / 3);
+            masterMeter->setBounds (masterInner.removeFromRight (meterW)
+                                         .reduced (1, 2));
+            masterInner.removeFromRight (
+                juce::jmin (4, masterInner.getWidth()));
+        }
+
+        masterDbSlider.setBounds (masterInner.withSizeKeepingCentre (
+            juce::jmin (48, masterInner.getWidth()),
+            masterInner.getHeight()));
+    }
+   #endif
+
     void layoutFocusedMobile (juce::Rectangle<int> area)
     {
+       #if JUCE_ANDROID
+        // O Modo Palco transforma o combo em leitura. Reentrar no editor
+        // detalhado restaura imediatamente toque, teclado e D-pad.
+        faixaDeCanais = {};
+
+        for (auto& s : strips)
+        {
+            s.combo.setInterceptsMouseClicks (true, true);
+            s.combo.setWantsKeyboardFocus (true);
+        }
+       #endif
+
         // Garante que sempre exista um canal em foco. Na primeira abertura
         // prefere o primeiro carregado; se a mesa esta vazia, o canal 1 vira o
         // convite inicial.
@@ -13754,15 +14080,82 @@ private:
                 s.meter->setBounds ({});
         }
 
-        // C1--C5 + MASTER sao paginas. O master deixou de disputar 30% da
-        // largura com o canal: em portrait/freeform essa divisao criava uma
-        // coluna de ~130 dp e controles impossiveis de tocar.
-        constexpr int numMobilePages = TimbresProcessor::numLayers + 1;
+        // Canais + MASTER sao paginas. No Android, a faixa tambem e paginada:
+        // quinze celulas simultaneas davam apenas ~21 dp em portrait. As setas,
+        // o Master e cada aba ficam agora com alvo minimo de 44 dp.
         const int tabsH = shortLandscapeMobileLayout
                             ? juce::jmin (48, area.getHeight())
                             : juce::jlimit (48, 56, area.getHeight() / 7);
         auto tabs = area.removeFromTop (tabsH);
         const int gap = shortLandscapeMobileLayout ? 2 : 3;
+
+       #if JUCE_ANDROID
+        for (int l = 0; l < TimbresProcessor::numLayers; ++l)
+        {
+            strips[l].tabBounds = {};
+            mobilePageButtons[l].setBounds ({});
+        }
+
+        constexpr int arrowW = 44;
+        constexpr int masterTabW = 48;
+        canalAnteriorBtn.setVisible (true);
+        canalAnteriorBtn.setBounds (
+            tabs.removeFromLeft (juce::jmin (arrowW, tabs.getWidth())));
+        tabs.removeFromLeft (juce::jmin (gap, tabs.getWidth()));
+
+        mobileMasterTabBounds = tabs.removeFromRight (
+            juce::jmin (masterTabW, tabs.getWidth()));
+        mobileMasterPageButton.setBounds (mobileMasterTabBounds);
+        tabs.removeFromRight (juce::jmin (gap, tabs.getWidth()));
+
+        canalProximoBtn.setVisible (true);
+        canalProximoBtn.setBounds (
+            tabs.removeFromRight (juce::jmin (arrowW, tabs.getWidth())));
+        tabs.removeFromRight (juce::jmin (gap, tabs.getWidth()));
+
+        canaisNaTela =
+            ChurchDAWAndroidStageLayout::focusedChannelCountForWidth (
+                tabs.getWidth(), gap);
+        canaisNaTela = juce::jmin (canaisNaTela,
+                                   TimbresProcessor::numLayers);
+
+        if (focus < primeiroCanalVisivel
+             || focus >= primeiroCanalVisivel + canaisNaTela)
+            primeiroCanalVisivel =
+                ChurchDAWAndroidStageLayout::pageContaining (
+                    focus, canaisNaTela,
+                    TimbresProcessor::numLayers);
+
+        limitarPrimeiroCanalVisivel();
+        const int maxStart = juce::jmax (
+            0, TimbresProcessor::numLayers - canaisNaTela);
+        canalAnteriorBtn.setEnabled (primeiroCanalVisivel > 0);
+        canalProximoBtn.setEnabled (primeiroCanalVisivel < maxStart);
+        canalAnteriorBtn.setTooltip ("Canais anteriores");
+        canalProximoBtn.setTooltip ("Proximos canais");
+
+        const int tabW = juce::jmax (
+            1, (tabs.getWidth() - gap * (canaisNaTela - 1))
+                   / canaisNaTela);
+
+        for (int column = 0; column < canaisNaTela; ++column)
+        {
+            const int l = primeiroCanalVisivel + column;
+
+            if (! juce::isPositiveAndBelow (
+                    l, TimbresProcessor::numLayers))
+                break;
+
+            strips[l].tabBounds = column == canaisNaTela - 1
+                                    ? tabs
+                                    : tabs.removeFromLeft (tabW);
+            mobilePageButtons[l].setBounds (strips[l].tabBounds);
+
+            if (column < canaisNaTela - 1)
+                tabs.removeFromLeft (juce::jmin (gap, tabs.getWidth()));
+        }
+       #else
+        constexpr int numMobilePages = TimbresProcessor::numLayers + 1;
         const int tabW = juce::jmax (1, (tabs.getWidth() - gap * (numMobilePages - 1))
                                         / numMobilePages);
 
@@ -13775,6 +14168,7 @@ private:
 
         mobileMasterTabBounds = tabs;
         mobileMasterPageButton.setBounds (mobileMasterTabBounds);
+       #endif
         area.removeFromTop (shortLandscapeMobileLayout ? 4 : 6);
 
         auto clearMasterGeometry = [this]
@@ -15164,8 +15558,8 @@ private:
 
 public:
     // Botao BACK do Android (via MainComponent::handleBackButton): fecha a
-    // camada de cima — seletor de timbres primeiro, depois o organ — em vez
-    // de deixar o app morrer no palco.
+    // camada de cima — seletor de timbres, organ ou Modo Palco — em vez de
+    // deixar o app morrer durante a apresentacao.
     bool handleBackRequest()
     {
         if (picker != nullptr)
@@ -15179,6 +15573,23 @@ public:
             closeChurchOrganEditor();
             return true;
         }
+
+       #if JUCE_ANDROID
+        if (mobileStageMode)
+        {
+            mobileStageMode = false;
+            mobileMasterPage = false;
+            androidStageRevealSelected = false;
+            editToneButton.setToggleState (false,
+                                           juce::dontSendNotification);
+            editToneButton.setButtonText ("MODO PALCO");
+            editToneButton.setTooltip (
+                "Ver faders, meters, Mute, Solo e Master em tempo real");
+            resized();
+            repaint();
+            return true;
+        }
+       #endif
 
         return false;
     }
@@ -15904,7 +16315,13 @@ public:
                             || proc.getLayerTimbre (l).isNotEmpty()
                             || proc.getLayerInstrument (l) != nullptr;
 
+       #if JUCE_ANDROID
+        // Mesmo que o ultimo canal seja limpo enquanto o palco esta aberto, a
+        // saida para o editor detalhado nunca pode desaparecer.
+        editToneButton.setEnabled (hasLoadedChannel || mobileStageMode);
+       #else
         editToneButton.setEnabled (hasLoadedChannel);
+       #endif
         repaint (0, 0, getWidth(), 46);
     }
 
@@ -15925,9 +16342,10 @@ public:
 
     void limitarPrimeiroCanalVisivel()
     {
-        const int maximo = juce::jmax (
-            0, TimbresProcessor::numLayers - canaisNaTela);
-        primeiroCanalVisivel = juce::jlimit (0, maximo, primeiroCanalVisivel);
+        primeiroCanalVisivel =
+            ChurchDAWAndroidStageLayout::clampPageStart (
+                primeiroCanalVisivel, canaisNaTela,
+                TimbresProcessor::numLayers);
     }
 
     /** Tira o canal da tela zerando os bounds de tudo que ele desenha.
@@ -15999,6 +16417,34 @@ public:
 
     void rolarCanais (int passos)
     {
+       #if JUCE_ANDROID
+        if (mobileStageMode || focusedMobileLayout)
+        {
+            const int antes = primeiroCanalVisivel;
+            if (passos > 0)
+                primeiroCanalVisivel =
+                    ChurchDAWAndroidStageLayout::nextPageStart (
+                        primeiroCanalVisivel, canaisNaTela,
+                        TimbresProcessor::numLayers);
+            else if (passos < 0)
+                primeiroCanalVisivel =
+                    ChurchDAWAndroidStageLayout::previousPageStart (
+                        primeiroCanalVisivel, canaisNaTela,
+                        TimbresProcessor::numLayers);
+
+            androidStageRevealSelected = false;
+            limitarPrimeiroCanalVisivel();
+
+            if (primeiroCanalVisivel != antes)
+            {
+                resized();
+                repaint();
+            }
+
+            return;
+        }
+       #endif
+
         const int antes = primeiroCanalVisivel;
         primeiroCanalVisivel += passos;
         limitarPrimeiroCanalVisivel();
@@ -16051,6 +16497,11 @@ public:
     bool focusedMobileLayout = false;
     bool shortLandscapeMobileLayout = false;
     bool mobileMasterPage = false;
+   #if JUCE_ANDROID
+    bool mobileStageMode = false;
+    bool androidStageRevealSelected = false;
+    int androidStageLastChannelsOnScreen = 0;
+   #endif
     bool libraryMissing = false;
     std::function<void()> onOpenLibraries;
     juce::Rectangle<int> mobileMasterTabBounds;

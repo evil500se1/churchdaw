@@ -278,16 +278,13 @@ namespace ChurchDAWServices
             "https://churchdaw.com/app/android/ChurchDAW-";
 
         if (! text.startsWith (prefix) || text.length() > 320
-             || ! text.endsWith (".apk")
+             || ! text.endsWith ("-signed.apk")
              || text.containsAnyOf ("?#\r\n"))
             return false;
 
         auto name = text.fromFirstOccurrenceOf (prefix, false, false)
                         .dropLastCharacters (
-                            (int) juce::String (".apk").length());
-        if (name.endsWith ("-signed"))
-            name = name.dropLastCharacters (
-                (int) juce::String ("-signed").length());
+                            (int) juce::String ("-signed.apk").length());
 
         return isSafeUpdateVersionName (name);
     }
@@ -1370,6 +1367,37 @@ namespace ChurchDAWServices
         bool cryptographicallyVerified = false;
         bool valid = false;
     };
+
+    enum class AndroidUpdatePromptDecision
+    {
+        noPrompt,
+        optionalUpdate,
+        requiredUpdate
+    };
+
+    // Decisao pura compartilhada pela UI e pelo probe de distribuicao. O piso
+    // efetivo pode vir de uma policy assinada aceita anteriormente; por isso o
+    // gate obrigatorio continua valendo mesmo quando a consulta atual falha.
+    // A oferta opcional, ao contrario, exige a policy atual/cacheada completa,
+    // criptograficamente verificada e com URL oficial valida.
+    inline AndroidUpdatePromptDecision decideAndroidUpdatePrompt (
+        const UpdatePolicy& policy,
+        int installedVersionCode,
+        int effectiveMinimum)
+    {
+        if (installedVersionCode < effectiveMinimum)
+            return AndroidUpdatePromptDecision::requiredUpdate;
+
+        if (installedVersionCode < 1
+             || ! policy.valid
+             || ! policy.cryptographicallyVerified
+             || policy.minimumVersionCode > installedVersionCode
+             || policy.latestVersionCode <= installedVersionCode
+             || ! isSafeWebsiteUpdateUrl (policy.playStoreUrl))
+            return AndroidUpdatePromptDecision::noPrompt;
+
+        return AndroidUpdatePromptDecision::optionalUpdate;
+    }
 
     inline juce::String requiredUpdateDownloadUrl (
         const UpdatePolicy& policy,
@@ -2844,6 +2872,8 @@ namespace ChurchDAWServices
 
     inline bool startWebsiteUpdate (const juce::String& updateUrl)
     {
+        if (! isSafeWebsiteUpdateUrl (updateUrl))
+            return false;
        
 #if JUCE_ANDROID
         auto* env = juce::getEnv();
@@ -2889,8 +2919,8 @@ namespace ChurchDAWServices
         }
        #endif
 
-        // O gate permanece dentro do ChurchDAW. Se o navegador/JNI nao estiver
-        // disponivel, o cliente continua bloqueado e pode tentar novamente.
+        // O chamador decide se a tela e obrigatoria ou opcional. Falhar ao
+        // entregar o Intent nunca abre uma URL alternativa nem muda esse estado.
         return false;
     }
 

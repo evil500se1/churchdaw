@@ -14,7 +14,7 @@ concurrency:
 jobs:
   build-ios-simulator:
     name: Compilar para iPhone e iPad Simulator
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 60
 
     steps:
@@ -61,9 +61,9 @@ jobs:
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$PLIST")" = \
             "com.churchdaw.app"
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLIST")" = \
-            "1.5.7"
+            "1.5.8"
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$PLIST")" = \
-            "1.5.7"
+            "1.5.8"
           test "$(/usr/libexec/PlistBuddy -c 'Print :UIRequiresFullScreen' "$PLIST")" = \
             "false"
           test "$(/usr/libexec/PlistBuddy -c 'Print :UIFileSharingEnabled' "$PLIST")" = \
@@ -102,13 +102,13 @@ jobs:
           done < <(find build-ios -type f -name '*.entitlements' -print)
 
           ditto -c -k --sequesterRsrc --keepParent \
-            "$APP" ChurchDAW-1.5.7-iOS-iPadOS-Simulator.zip
+            "$APP" ChurchDAW-1.5.8-iOS-iPadOS-Simulator.zip
 
       - name: Publicar artefato do simulador
         uses: actions/upload-artifact@v4
         with:
-          name: ChurchDAW-1.5.7-iOS-iPadOS-Simulator
-          path: ChurchDAW-1.5.7-iOS-iPadOS-Simulator.zip
+          name: ChurchDAW-1.5.8-iOS-iPadOS-Simulator
+          path: ChurchDAW-1.5.8-iOS-iPadOS-Simulator.zip
           if-no-files-found: error
           compression-level: 0
           retention-days: 14

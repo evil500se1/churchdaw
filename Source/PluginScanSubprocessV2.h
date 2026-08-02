@@ -726,7 +726,7 @@ public:
 
         int discovered = 0;
         int validated = 0;
-        bool fatalPluginFailure = false;
+        CandidateValidationSummary validationSummary;
 
         for (const auto* item : descriptions->getChildIterator())
         {
@@ -738,6 +738,7 @@ public:
             if (! description.loadFromXml (*item))
             {
                 scanHadInconclusive.store (true);
+                ++validationSummary.retryableOrSkipped;
                 continue;
             }
 
@@ -751,6 +752,7 @@ public:
                     format.getName(), fileOrIdentifier, &description,
                     environment);
                 reportWriter.appendPlugin (*report);
+                ++validationSummary.retryableOrSkipped;
                 continue;
             }
 
@@ -770,9 +772,6 @@ public:
             if (validationAttempt.finish == PhaseFinish::cancelled)
                 return true;
 
-            fatalPluginFailure = fatalPluginFailure
-                || deveEntrarNaBlacklistPersistente (validationAttempt.finish);
-
             auto report = reportForAttempt (validation, validationAttempt,
                                             environment, &description);
             reportWriter.appendPlugin (*report);
@@ -781,20 +780,31 @@ public:
             {
                 result.add (new juce::PluginDescription (description));
                 ++validated;
+                ++validationSummary.loaded;
             }
+            else if (deveEntrarNaBlacklistPersistente (
+                         validationAttempt.finish))
+                ++validationSummary.fatal;
+            else
+                ++validationSummary.retryableOrSkipped;
         }
 
         juce::Logger::writeToLog (
             "PLUGIN_SCAN candidate_done format=" + format.getName()
             + " path=" + fileOrIdentifier
             + " discovered=" + juce::String (discovered)
-            + " validated=" + juce::String (validated));
+            + " validated=" + juce::String (validated)
+            + " fatal=" + juce::String (validationSummary.fatal)
+            + " retryable_or_skipped="
+            + juce::String (validationSummary.retryableOrSkipped));
 
-        // false significa exclusivamente crash/timeout sem nenhuma classe
-        // sobrevivente. Falha de arquitetura, protocolo, licenca ou carga fica
-        // no JSONL/failedFiles e pode ser tentada de novo sem limpar blacklist.
-        // Em shells, qualquer classe valida preserva o bundle inteiro.
-        return validated > 0 || ! fatalPluginFailure;
+        // false significa exclusivamente crash observado em todas as classes.
+        // Timeout, arquitetura, protocolo, licenca ou carga ficam no
+        // JSONL/failedFiles e podem ser tentados de novo sem limpar blacklist.
+        // Em shells, qualquer classe valida, retryable/inconclusiva ou pulada
+        // por arquitetura preserva o bundle inteiro. A blacklist por ARQUIVO
+        // so e segura quando todas as classes observadas foram fatais.
+        return ! deveEntrarNaBlacklistPersistente (validationSummary);
     }
 
     void scanFinished() override
@@ -824,14 +834,14 @@ private:
 
     void noteInconclusiveAttempt (const PhaseAttempt& attempt)
     {
-        const bool transportFailure = attempt.finish == PhaseFinish::launchFailed
-                                   || attempt.finish == PhaseFinish::sendFailed;
+        const bool inconclusiveFinish =
+            ehTentativaInconclusiva (attempt.finish);
         const bool protocolFailure = attempt.finish == PhaseFinish::result
                                   && (attempt.xml == nullptr
                                       || attempt.xml->getStringAttribute ("status")
                                              == "host_internal_error");
 
-        if (transportFailure || protocolFailure)
+        if (inconclusiveFinish || protocolFailure)
             scanHadInconclusive.store (true);
     }
 

@@ -926,7 +926,12 @@ public:
             installedVersionCode,
             check.immediateUpdateEligibility);
 
-        if (installedVersionCode < effectiveMinimum)
+        const auto updateDecision =
+            ChurchDAWServices::decideAndroidUpdatePrompt (
+                check.policy, installedVersionCode, effectiveMinimum);
+
+        if (updateDecision
+             == ChurchDAWServices::AndroidUpdatePromptDecision::requiredUpdate)
         {
             foregroundRevalidationPending = false;
             requiredUpdateGateActive = true;
@@ -939,6 +944,29 @@ public:
 
         requiredUpdateGateActive = false;
         requiredUpdateFloor = 0;
+
+        if (updateDecision
+             == ChurchDAWServices::AndroidUpdatePromptDecision::optionalUpdate)
+        {
+            // Esta oferta e consumida uma unica vez neste cold start. "Depois"
+            // segue exatamente para o gate de licenca/biblioteca que ja existia,
+            // sem consultar a mesma policy de novo e sem criar loop.
+            auto guard = applicationAlive;
+            startupWindow->panel.onContinue = [this, guard]
+            {
+                juce::MessageManager::callAsync ([this, guard]
+                {
+                    if (! guard->load() || startupWindow == nullptr)
+                        return;
+
+                    startupWindow = nullptr;
+                    beginAndroidLicenseGate();
+                });
+            };
+            startupWindow->panel.showOptionalUpdate (std::move (check.policy));
+            return;
+        }
+
         startupWindow = nullptr;
         beginAndroidLicenseGate();
     }

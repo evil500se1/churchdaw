@@ -15,11 +15,24 @@ concurrency:
 
 jobs:
   build-mac:
-    runs-on: macos-14
-    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
     steps:
       - name: Baixar codigo
         uses: actions/checkout@v4
+
+      - name: Confirmar arquitetura nativa do runner
+        run: |
+          echo "runner=$(uname -m) esperado=${{ matrix.arch }}"
+          test "$(uname -m)" = "${{ matrix.arch }}"
 
       - name: Configurar CMake
         run: >-
@@ -36,6 +49,47 @@ jobs:
         run: >-
           ctest --test-dir build-mac -C Release
           --output-on-failure --no-tests=error
+
+      - name: Coletar diagnostico do scanner V2
+        if: always()
+        run: |
+          REPORT_ROOT="$HOME/Library/Logs/ChurchDAW/PluginScan"
+          DESTINATION=plugin-scan-diagnostics
+          mkdir -p "$DESTINATION"
+          if [[ -d "$REPORT_ROOT" ]]; then
+            find "$REPORT_ROOT" -maxdepth 1 -type f -name 'PluginScan-*.jsonl' \
+              -exec cp {} "$DESTINATION/" \;
+          fi
+
+      - name: Provar scanner V2 com Audio Unit real
+        run: |
+          DESTINATION=plugin-scan-diagnostics
+          DESTINATION="$DESTINATION" python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+
+          destination = pathlib.Path(os.environ["DESTINATION"])
+          reports = sorted(destination.glob("PluginScan-*.jsonl"))
+          if not reports:
+              raise SystemExit("scanner V2 nao produziu relatorio JSONL")
+
+          loaded_dls = False
+          for report in reports:
+              for number, line in enumerate(report.read_text(encoding="utf-8").splitlines(), 1):
+                  try:
+                      record = json.loads(line)
+                  except json.JSONDecodeError as exc:
+                      raise SystemExit(f"JSONL invalido em {report}:{number}: {exc}")
+                  if (record.get("recordType") == "plugin"
+                          and record.get("status") == "loaded_success"
+                          and ",dls ,appl" in str(record.get("path", "")).lower()):
+                      loaded_dls = True
+
+          if not loaded_dls:
+              raise SystemExit("nenhum loaded_success do DLSMusicDevice no scanner V2")
+          print(f"scanner V2: {len(reports)} relatorio(s), DLSMusicDevice loaded_success")
+          PY
 
       - name: Testar CSPRNG e assinatura de licença no macOS
         run: |
@@ -60,12 +114,36 @@ jobs:
           plutil -lint "$PLIST"
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$PLIST")" = "com.churchdaw.app"
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLIST")" = "$EXPECTED_VERSION"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$PLIST")" = "10.15"
           /usr/libexec/PlistBuddy -c 'Print :NSMicrophoneUsageDescription' "$PLIST" | grep -q "guitarra/microfone"
           /usr/libexec/PlistBuddy -c 'Print :NSBluetoothAlwaysUsageDescription' "$PLIST" | grep -q "Bluetooth"
           ARCHS="$(lipo -archs "$EXE")"
           echo "Arquiteturas: $ARCHS"
           grep -qw arm64 <<<"$ARCHS"
           grep -qw x86_64 <<<"$ARCHS"
+          test "$(wc -w <<<"$ARCHS" | tr -d ' ')" -eq 2
+
+          MINOS_DIR="$(mktemp -d)"
+          cleanup_minos() { rm -rf "$MINOS_DIR"; }
+          trap cleanup_minos EXIT
+          lipo "$EXE" -thin x86_64 -output "$MINOS_DIR/ChurchDAW-x86_64"
+          lipo "$EXE" -thin arm64 -output "$MINOS_DIR/ChurchDAW-arm64"
+
+          require_minos() {
+            local binary="$1"
+            local expected="$2"
+            local architecture="$3"
+            local actual
+            actual="$(vtool -show-build "$binary" | awk '$1 == "minos" { print $2; exit }')"
+            echo "$architecture minos=$actual esperado=$expected"
+            test "$actual" = "$expected"
+            vtool -show-build "$binary" | awk '$1 == "platform" { print $2; exit }' | grep -qx MACOS
+          }
+
+          require_minos "$MINOS_DIR/ChurchDAW-x86_64" 10.15 x86_64
+          require_minos "$MINOS_DIR/ChurchDAW-arm64" 11.0 arm64
+          cleanup_minos
+          trap - EXIT
           otool -L "$EXE"
           plutil -lint Packaging/ChurchDAW.entitlements
 
@@ -81,6 +159,21 @@ jobs:
             signed-entitlements.plist | grep -q true
           /usr/libexec/PlistBuddy -c 'Print :com.apple.security.cs.disable-library-validation' \
             signed-entitlements.plist | grep -q true
+
+      - name: Provar scanner sob Hardened Runtime
+        run: |
+          SCANNER_TEST="$(find build-mac -type f -name ChurchDAWPluginScanIntegrationTests -perm -111 -print -quit)"
+          test -n "$SCANNER_TEST"
+          codesign --force --sign - --options runtime \
+            --entitlements Packaging/ChurchDAW.entitlements "$SCANNER_TEST"
+          codesign --verify --strict --verbose=2 "$SCANNER_TEST"
+          "$SCANNER_TEST"
+
+          REPORT_ROOT="$HOME/Library/Logs/ChurchDAW/PluginScan"
+          if [[ -d "$REPORT_ROOT" ]]; then
+            find "$REPORT_ROOT" -maxdepth 1 -type f -name 'PluginScan-*.jsonl' \
+              -exec cp {} plugin-scan-diagnostics/ \;
+          fi
 
       - name: Compilar binário isolado para autotestes de áudio
         run: |
@@ -238,12 +331,13 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: diagnostico-audio-macos
+          name: diagnostico-audio-macos-${{ matrix.arch }}
           path: |
             mac-selftest.log
             mac-restore.log
             mac-external-midi.log
             mac-midi-helper.log
+            plugin-scan-diagnostics/
 
       - name: Teste visual do app
         run: |
@@ -257,7 +351,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: prints-macos
+          name: prints-macos-${{ matrix.arch }}
           path: prints/
 
       - name: Gerar imagem de teste (nao distribuir)
@@ -293,7 +387,7 @@ jobs:
       - name: Publicar imagem de CI nao distribuivel
         uses: actions/upload-artifact@v4
         with:
-          name: ChurchDAW-macOS-CI-NAO-DISTRIBUIR
+          name: ChurchDAW-macOS-CI-NAO-DISTRIBUIR-${{ matrix.arch }}
           path: ChurchDAW-CI-UNSIGNED.dmg
           if-no-files-found: error
           retention-days: 3
@@ -359,7 +453,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: prova-de-vida-dmg
+          name: prova-de-vida-dmg-${{ matrix.arch }}
           path: |
             dist-launch.log
             dist-launch.png
@@ -369,7 +463,7 @@ jobs:
       - name: Publicar imagem de distribuicao direta
         uses: actions/upload-artifact@v4
         with:
-          name: ChurchDAW-macOS-Direct
+          name: ChurchDAW-macOS-Direct-${{ matrix.arch }}
           path: ChurchDAW-*-macOS-Direct.dmg
           if-no-files-found: error
           retention-days: 7

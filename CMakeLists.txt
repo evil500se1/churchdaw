@@ -1,7 +1,22 @@
 cmake_minimum_required(VERSION 3.22)
+
+# Configure o target Apple ANTES de project()/enable_language(). Caso contrario,
+# CMake pode inicializar o compilador com o SDK atual e gravar um minos novo
+# demais nos objetos antes de CMAKE_OSX_DEPLOYMENT_TARGET ser alterado.
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "14.0" CACHE STRING "" FORCE)
+elseif(CMAKE_HOST_SYSTEM_NAME STREQUAL "Darwin"
+       AND (NOT CMAKE_SYSTEM_NAME OR CMAKE_SYSTEM_NAME STREQUAL "Darwin"))
+    # O piso geral e do Info.plist e Catalina para o slice Intel. O toolchain
+    # Apple eleva automaticamente o slice arm64 ao piso real da arquitetura,
+    # macOS 11.0; os workflows verificam cada slice com lipo + vtool.
+    set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "" FORCE)
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "10.15" CACHE STRING "" FORCE)
+endif()
+
 # Versao do produto desktop. O Android mantem versionName/versionCode no
 # ChurchDAW.jucer e pode ser publicado em um ciclo independente.
-project(MinhaDAW VERSION 1.5.7)
+project(MinhaDAW VERSION 1.5.8)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -30,32 +45,6 @@ option(CHURCHDAW_UPDATE_ALLOW_LOCALHOST
 
 # runtime do C++ embutido no exe: roda em qualquer PC sem instalar redistribuivel
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
-
-# Apple Silicon + Intel no mesmo binario do macOS. Nao force estas arquiteturas
-# no iOS: o Xcode precisa selecionar arm64 para aparelho e a arquitetura do
-# simulador para a maquina de build.
-if(APPLE AND NOT IOS)
-    set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "" FORCE)
-
-    # PISO DE COMPATIBILIDADE DO macOS.
-    #
-    # Sem esta linha o piso vira o SDK da maquina que compilou. Medido em
-    # 28/07/2026 no Mac de build (Xcode 26.5): o binario saiu com
-    # "minos 26.0" -- ou seja, recusaria abrir em qualquer macOS anterior ao
-    # 26. Praticamente nenhum comprador teria essa versao.
-    #
-    # E uma falha silenciosa: compila, roda na maquina de build, e so quebra
-    # no computador do cliente. E piora sozinha a cada atualizacao do Xcode.
-    #
-    # 11.0 (Big Sur, 2020) e o primeiro macOS com Apple Silicon, entao cobre
-    # as duas arquiteturas do binario universal sem excluir maquinas Intel
-    # ainda em uso nas igrejas.
-    set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "" FORCE)
-elseif(IOS)
-    # Sem um piso explicito, o bundle herda o SDK da maquina de build e pode
-    # sair restrito ao iOS mais novo. iOS/iPadOS 14 cobre as APIs usadas aqui.
-    set(CMAKE_OSX_DEPLOYMENT_TARGET "14.0" CACHE STRING "" FORCE)
-endif()
 
 add_subdirectory(JUCE)
 
@@ -118,6 +107,9 @@ if(CHURCHDAW_BUILD_AUDIO_TESTS AND NOT ANDROID AND NOT IOS)
     juce_add_console_app(ChurchDAWPluginScanPolicyTests
         PRODUCT_NAME "ChurchDAWPluginScanPolicyTests")
 
+    add_executable(ChurchDAWAndroidStageLayoutTests
+        Tests/UI/AndroidStageLayoutTests.cpp)
+
     target_sources(ChurchDAWMasterLimiterTests PRIVATE
         Tests/Audio/StereoLookaheadLimiterTests.cpp)
 
@@ -154,6 +146,7 @@ if(CHURCHDAW_BUILD_AUDIO_TESTS AND NOT ANDROID AND NOT IOS)
     target_include_directories(ChurchDAWLiveScenesTests PRIVATE Source)
     target_include_directories(ChurchDAWSceneFileWriteProbe PRIVATE Source)
     target_include_directories(ChurchDAWPluginScanPolicyTests PRIVATE Source)
+    target_include_directories(ChurchDAWAndroidStageLayoutTests PRIVATE Source)
     target_compile_definitions(ChurchDAWMasterLimiterTests PRIVATE
         JUCE_WEB_BROWSER=0
         JUCE_PUSH_NOTIFICATIONS=0
@@ -252,6 +245,45 @@ if(CHURCHDAW_BUILD_AUDIO_TESTS AND NOT ANDROID AND NOT IOS)
         PUBLIC
             juce::juce_recommended_config_flags)
 
+    if(APPLE)
+        # Prova real do protocolo V2 no macOS. O mesmo executavel funciona como
+        # coordenador e como processo filho descartavel, carrega apenas o
+        # DLSMusicDevice do sistema e nunca abre dispositivo de audio/janela.
+        juce_add_console_app(ChurchDAWPluginScanIntegrationTests
+            PRODUCT_NAME "ChurchDAWPluginScanIntegrationTests")
+
+        target_sources(ChurchDAWPluginScanIntegrationTests PRIVATE
+            Tests/Plugin/PluginScanSubprocessV2IntegrationTests.cpp)
+        target_include_directories(
+            ChurchDAWPluginScanIntegrationTests PRIVATE Source)
+        target_compile_definitions(
+            ChurchDAWPluginScanIntegrationTests PRIVATE
+            JUCE_PLUGINHOST_AU=1
+            JUCE_PLUGINHOST_VST3=1
+            JUCE_WEB_BROWSER=0
+            JUCE_PUSH_NOTIFICATIONS=0
+            JUCE_USE_CURL=0)
+        target_compile_options(
+            ChurchDAWPluginScanIntegrationTests PRIVATE
+            -Werror=unguarded-availability-new)
+        target_link_libraries(
+            ChurchDAWPluginScanIntegrationTests
+            PRIVATE
+                juce::juce_audio_processors
+                "-framework AudioUnit"
+                "-framework AudioToolbox"
+                "-framework CoreAudioKit"
+            PUBLIC
+                juce::juce_recommended_config_flags)
+
+        add_test(
+            NAME ChurchDAWPluginScanIntegration
+            COMMAND ChurchDAWPluginScanIntegrationTests)
+        set_tests_properties(
+            ChurchDAWPluginScanIntegration
+            PROPERTIES TIMEOUT 300)
+    endif()
+
     if(MSVC)
         target_compile_options(ChurchDAWMasterLimiterTests PRIVATE /utf-8)
         target_compile_options(ChurchDAWChannelToneTests PRIVATE /utf-8)
@@ -262,6 +294,7 @@ if(CHURCHDAW_BUILD_AUDIO_TESTS AND NOT ANDROID AND NOT IOS)
         target_compile_options(ChurchDAWLiveScenesTests PRIVATE /utf-8)
         target_compile_options(ChurchDAWSceneFileWriteProbe PRIVATE /utf-8)
         target_compile_options(ChurchDAWPluginScanPolicyTests PRIVATE /utf-8)
+        target_compile_options(ChurchDAWAndroidStageLayoutTests PRIVATE /utf-8)
     endif()
 
     add_test(
@@ -294,6 +327,9 @@ if(CHURCHDAW_BUILD_AUDIO_TESTS AND NOT ANDROID AND NOT IOS)
     add_test(
         NAME ChurchDAWPluginScanPolicy
         COMMAND ChurchDAWPluginScanPolicyTests)
+    add_test(
+        NAME ChurchDAWAndroidStageLayout
+        COMMAND ChurchDAWAndroidStageLayoutTests)
     set_tests_properties(
         ChurchDAWReverbPitch
         ChurchDAWMasterLimiter
@@ -303,6 +339,7 @@ if(CHURCHDAW_BUILD_AUDIO_TESTS AND NOT ANDROID AND NOT IOS)
         ChurchDAWPadProcessor
         ChurchDAWLibraryPackPath
         ChurchDAWPluginScanPolicy
+        ChurchDAWAndroidStageLayout
         PROPERTIES TIMEOUT 240)
 endif()
 
@@ -311,7 +348,7 @@ endif()
 # bundle movel nem pedir microfone quando o app abre 0 canais de entrada.
 if(IOS)
     set(CHURCHDAW_PLATFORM_APP_OPTIONS
-        BUILD_VERSION "1.5.7"
+        BUILD_VERSION "1.5.8"
         MICROPHONE_PERMISSION_ENABLED FALSE
         TARGETED_DEVICE_FAMILY "1,2"
         STATUS_BAR_HIDDEN TRUE
@@ -513,6 +550,11 @@ target_compile_definitions(MinhaDAW PRIVATE
 if(APPLE AND NOT IOS)
     target_compile_definitions(MinhaDAW PRIVATE
         JUCE_PLUGINHOST_AU=1)
+
+    # Catalina e o contrato do slice Intel. Qualquer API mais nova usada sem
+    # @available deve quebrar a compilacao, nao somente falhar no Mac do cliente.
+    target_compile_options(MinhaDAW PRIVATE
+        -Werror=unguarded-availability-new)
 
     set_target_properties(MinhaDAW PROPERTIES
         XCODE_ATTRIBUTE_CLANG_CXX_LIBRARY "libc++"

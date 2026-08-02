@@ -22,15 +22,47 @@ enum class PhaseFinish
 
 inline bool deveEntrarNaBlacklistPersistente (PhaseFinish finish)
 {
-    return finish == PhaseFinish::crash || finish == PhaseFinish::timeout;
+    // O contrato do JUCE permite devolver false somente quando o processo do
+    // plugin CAIU. Timeout prova apenas que a tentativa nao terminou no prazo:
+    // primeira autorizacao, licenca ou inicializacao lenta continuam retryable.
+    return finish == PhaseFinish::crash;
+}
+
+inline bool ehTentativaInconclusiva (PhaseFinish finish)
+{
+    return finish == PhaseFinish::timeout
+        || finish == PhaseFinish::launchFailed
+        || finish == PhaseFinish::sendFailed;
+}
+
+// Resultado agregado de TODAS as classes descobertas dentro de um candidato.
+// Um arquivo VST3 pode ser um shell com varias classes; a blacklist do JUCE,
+// entretanto, e por arquivo. Portanto uma classe que caiu nao pode esconder
+// uma irma valida, incompatível com a arquitetura atual ou apenas inconclusiva.
+struct CandidateValidationSummary
+{
+    int loaded = 0;
+    int fatal = 0;
+    int retryableOrSkipped = 0;
+};
+
+inline bool deveEntrarNaBlacklistPersistente (
+    const CandidateValidationSummary& summary)
+{
+    // false no CustomScanner significa "o ARQUIVO caiu". Isso so foi provado
+    // quando existe ao menos uma tentativa fatal e nao existe uma unica classe
+    // sobrevivente, retryable/inconclusiva ou pulada por arquitetura.
+    return summary.loaded == 0
+        && summary.fatal > 0
+        && summary.retryableOrSkipped == 0;
 }
 
 inline bool precisaRevalidarBlacklistLegada (int semanticsVersion)
 {
-    // v1 misturava crash de plugin com arquitetura, licenca e falha do host.
-    // No scanner isolado v2 e seguro tentar tudo uma vez e deixar apenas
-    // crash/timeout reais voltarem para a blacklist.
-    return semanticsVersion < 2;
+    // v1 misturava crash com arquitetura/licenca/host; v2 ainda transformava
+    // timeout em blacklist. No v3 somente um crash observado volta a lista
+    // persistente, e todos os estados antigos sao revalidados uma vez.
+    return semanticsVersion < 3;
 }
 
 // Alguns componentes da Apple fazem parte da infraestrutura do sistema (mixers,
@@ -70,7 +102,7 @@ inline juce::StringArray filtrarAudioUnitsHospedaveis (
 }
 
 // Migra somente falsos positivos criados pela politica antiga. Blacklists de
-// plugins de terceiros continuam intactas para que crash/timeout reais nao
+// plugins de terceiros continuam intactas para que crashes reais nao
 // sejam mascarados.
 inline int removerAudioUnitsDeSistemaDaBlacklist (juce::KnownPluginList& list)
 {

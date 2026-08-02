@@ -34,7 +34,7 @@ jobs:
       RELEASE_TAG: ${{ inputs.release_tag }}
       BUILD_NUMBER: ${{ github.run_number }}
       EXPECTED_BUNDLE_ID: com.churchdaw.app
-      MACOSX_DEPLOYMENT_TARGET: '11.0'
+      MACOSX_DEPLOYMENT_TARGET: '10.15'
       RELEASE_OUTPUT_ROOT: release-macos
       MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
       MACOS_CERTIFICATE_P12_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_P12_PASSWORD }}

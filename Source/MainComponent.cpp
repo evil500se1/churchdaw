@@ -312,11 +312,12 @@ MainComponent::MainComponent()
             pluginSettings->setValue ("pluginList", migratedXml.get());
     }
 
-    // A blacklist v1 misturava crash real com arquitetura, licenca e falha do
-    // host. NAO a libera no startup: um tipo crashante salvo continuaria no
-    // combo antes do scan. Apenas guarda backup/marker; a remocao acontece
+    // Blacklists anteriores misturavam crash real com arquitetura, licenca,
+    // timeout e falha do host. NAO a libera no startup: um tipo crashante
+    // salvo continuaria no combo antes do scan. Apenas guarda backup/marker;
+    // a remocao acontece
     // dentro do dialogo imediatamente antes da revalidacao isolada.
-    constexpr int blacklistSemanticsVersion = 2;
+    constexpr int blacklistSemanticsVersion = 3;
     int legacyBlacklistCount = 0;
     int legacyDeadMansCount = 0;
 
@@ -3795,6 +3796,11 @@ void MainComponent::handleIncomingMidiMessage (juce::MidiInput* source,
                                                const juce::MidiMessage& message)
 {
     // roda na thread de MIDI - nao mexer em componentes daqui
+    // O LED do header representa execucao musical, nao so knobs aprendidos.
+    // Atomico e barato: note-on/off agora acende o mesmo pulso visual dos CCs.
+    if (message.isNoteOnOrOff())
+        lastMidiActivityMs.store (juce::Time::getMillisecondCounter());
+
     if (message.isController())
     {
         const juce::String sourceId =
@@ -8317,8 +8323,9 @@ struct PluginListHolder final : public juce::Component,
             if (! completed)
                 remaining.addArray (revalidationTargets);
 
-            // Crash/timeout voltaram para a blacklist pelo CustomScanner e
-            // tambem precisam continuar na barreira do editor/restauracao.
+            // Crashes voltaram para a blacklist pelo CustomScanner e tambem
+            // precisam continuar na barreira do editor/restauracao. Timeouts
+            // entram em unresolvedTargets, sem falso "desativado" permanente.
             const auto blacklisted = knownPlugins.getBlacklistedFiles();
             for (const auto& identifier : revalidationTargets)
                 if (blacklisted.contains (identifier, true))
@@ -8393,7 +8400,7 @@ struct PluginListHolder final : public juce::Component,
             ! persistentQuarantine.isEmpty());
 
         if (persistentQuarantine.isEmpty())
-            propertiesToUse->setValue ("pluginBlacklistSemanticsVersion", 2);
+            propertiesToUse->setValue ("pluginBlacklistSemanticsVersion", 3);
 
         if (includeKnownPluginList)
             if (auto xml = knownPlugins.createXml())
@@ -8515,7 +8522,7 @@ void MainComponent::showPluginScanner()
                         ! self->pluginScanQuarantine.isEmpty());
 
                     if (completed && self->pluginScanQuarantine.isEmpty())
-                        settings->setValue ("pluginBlacklistSemanticsVersion", 2);
+                        settings->setValue ("pluginBlacklistSemanticsVersion", 3);
 
                     if (auto xml = self->knownPlugins.createXml())
                         settings->setValue ("pluginList", xml.get());
@@ -8541,8 +8548,8 @@ void MainComponent::showPluginScanner()
             "abrir Plugins novamente.");
     }
 
-    // Primeira vez ou migracao v1 -> v2: ja dispara AU + VST3. O scanner
-    // isolado recoloca somente crash/timeout reais na blacklist.
+    // Primeira vez ou migracao para v3: ja dispara AU + VST3. O scanner
+    // isolado recoloca somente crashes observados na blacklist.
     if (! needsBlacklistRevalidation && knownPlugins.getNumTypes() == 0)
         holder->scanNow();
 }

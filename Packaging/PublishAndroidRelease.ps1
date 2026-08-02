@@ -261,6 +261,100 @@ function Get-AndroidRecoveryPolicyPlan {
     }
 }
 
+function New-AndroidCandidateSite {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)] [string] $Source,
+        [Parameter(Mandatory = $true)] [string] $Destination,
+        [Parameter(Mandatory = $true)]
+        [ValidatePattern('^[0-9]+\.[0-9]+\.[0-9]+$')]
+        [string] $PreviousVersion,
+        [Parameter(Mandatory = $true)]
+        [ValidatePattern('^[0-9]+\.[0-9]+\.[0-9]+$')]
+        [string] $ReleaseVersion,
+        [Parameter(Mandatory = $true)] [string] $PreviousApkUrl,
+        [Parameter(Mandatory = $true)] [string] $ReleaseApkUrl
+    )
+
+    if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) {
+        throw "Site anterior ausente: $Source"
+    }
+    if (Test-Path -LiteralPath $Destination) {
+        throw "Site candidato preexistente: $Destination"
+    }
+    if ($PreviousVersion -ceq $ReleaseVersion) {
+        throw 'Versao Android anterior e candidata precisam ser diferentes'
+    }
+
+    $expectedPreviousUrl =
+        "https://churchdaw.com/app/android/ChurchDAW-$PreviousVersion-signed.apk"
+    $expectedReleaseUrl =
+        "https://churchdaw.com/app/android/ChurchDAW-$ReleaseVersion-signed.apk"
+    Assert-OrdinalEqual $PreviousApkUrl $expectedPreviousUrl `
+        'URL Android anterior/site'
+    Assert-OrdinalEqual $ReleaseApkUrl $expectedReleaseUrl `
+        'URL Android candidata/site'
+
+    $sourceText = [IO.File]::ReadAllText($Source, $script:utf8)
+    $candidateText = $sourceText
+    $replacements = @(
+        [pscustomobject] @{
+            Label = 'URLs Android'
+            Old = $PreviousApkUrl
+            New = $ReleaseApkUrl
+            Count = 3
+        },
+        [pscustomobject] @{
+            Label = 'rotulos acessiveis Android'
+            Old = "Baixar ChurchDAW $PreviousVersion para Android em formato APK"
+            New = "Baixar ChurchDAW $ReleaseVersion para Android em formato APK"
+            Count = 2
+        },
+        [pscustomobject] @{
+            Label = 'rotulos visiveis Android'
+            Old = "APK $PreviousVersion"
+            New = "APK $ReleaseVersion"
+            Count = 5
+        }
+    )
+
+    foreach ($replacement in $replacements) {
+        $oldCount = [regex]::Matches(
+            $candidateText,
+            [regex]::Escape([string] $replacement.Old)).Count
+        if ($oldCount -ne [int] $replacement.Count) {
+            throw ("Site anterior tem contagem inesperada para " +
+                   "$($replacement.Label): $oldCount != $($replacement.Count)")
+        }
+        $newCount = [regex]::Matches(
+            $candidateText,
+            [regex]::Escape([string] $replacement.New)).Count
+        if ($newCount -ne 0) {
+            throw ("Site anterior ja contem token candidato para " +
+                   "$($replacement.Label): $newCount")
+        }
+        $candidateText = $candidateText.Replace(
+            [string] $replacement.Old,
+            [string] $replacement.New)
+    }
+
+    # Uma reversao exata prova que nenhum byte logico fora dos tokens Android
+    # auditados mudou. O HTML do tag continua sendo a fase desktop; este arquivo
+    # temporario e a segunda fase, criada depois de provar o estado anterior.
+    $roundTripText = $candidateText
+    for ($index = $replacements.Count - 1; $index -ge 0; --$index) {
+        $replacement = $replacements[$index]
+        $roundTripText = $roundTripText.Replace(
+            [string] $replacement.New,
+            [string] $replacement.Old)
+    }
+    if ($roundTripText -cne $sourceText) {
+        throw 'Site candidato alterou conteudo fora dos tokens Android auditados'
+    }
+
+    [IO.File]::WriteAllText($Destination, $candidateText, $script:writeUtf8)
+}
+
 function Invoke-AndroidPromotionTransaction {
     [CmdletBinding()]
     param(
@@ -1277,6 +1371,7 @@ $previousManifestPath = Join-Path $tempRoot 'manifest-before.json'
 $previousLegacyPath = Join-Path $tempRoot 'legacy-before.json'
 $previousPolicyPath = Join-Path $tempRoot 'policy-before.json'
 $previousSitePath = Join-Path $tempRoot 'index-before.html'
+$candidateSitePath = Join-Path $tempRoot 'index.release.html'
 $candidateManifestPath = Join-Path $tempRoot 'manifest.release.json'
 $candidateLegacyPath = Join-Path $tempRoot 'update-policy.release.json'
 $releasePolicyPath = Join-Path $tempRoot 'update-policy-v2.release.json'
@@ -1345,6 +1440,8 @@ try {
     $previousLegacyRecord = Get-FileRecord $previousLegacyPath
     $previousPolicyRecord = Get-FileRecord $previousPolicyPath
     $previousSiteRecord = Get-FileRecord $previousSitePath
+    Assert-FileRecord $SiteIndex $previousSiteRecord `
+        'site do tag/site remoto anterior'
     Save-AuditFile $previousManifestPath 'backup-manifest.json' `
         $previousManifestRecord
     Save-AuditFile $previousLegacyPath 'backup-update-policy.json' `
@@ -1480,11 +1577,18 @@ try {
         $previousManifestRecord.sha256 $previousApkUrl $recoveryMode `
         $recoveryRevokesSerial
 
-    $siteText = [IO.File]::ReadAllText($SiteIndex, $script:utf8)
+    New-AndroidCandidateSite `
+        -Source $previousSitePath `
+        -Destination $candidateSitePath `
+        -PreviousVersion $previousVersion `
+        -ReleaseVersion $version `
+        -PreviousApkUrl $previousApkUrl `
+        -ReleaseApkUrl $apkUrl
+    $siteText = [IO.File]::ReadAllText($candidateSitePath, $script:utf8)
     if (-not $siteText.Contains($apkUrl)) {
         throw "Site nao contem URL obrigatoria do Android: $apkUrl"
     }
-    $candidateSiteRecord = Get-FileRecord $SiteIndex
+    $candidateSiteRecord = Get-FileRecord $candidateSitePath
     if ($siteText.Contains('-macOS-Direct.dmg')) {
         throw 'Site candidato ainda aponta para DMG Direct nao comercial'
     }
@@ -1500,8 +1604,14 @@ try {
         $siteText,
         'https://churchdaw\.com/app/desktop/ChurchDAW-[0-9]+\.[0-9]+\.[0-9]+-macOS\.dmg') |
         ForEach-Object { $_.Value } | Sort-Object -Unique)
+    $expectedWindowsUrl =
+        "https://churchdaw.com/app/desktop/ChurchDAW-$version-Setup.exe"
+    $expectedMacUrl =
+        "https://churchdaw.com/app/desktop/ChurchDAW-$version-macOS.dmg"
     if ($androidUrls.Count -ne 1 -or $androidUrls[0] -cne $apkUrl -or
-        $windowsUrls.Count -ne 1 -or $macUrls.Count -ne 1) {
+        $windowsUrls.Count -ne 1 -or
+        $windowsUrls[0] -cne $expectedWindowsUrl -or
+        $macUrls.Count -ne 1 -or $macUrls[0] -cne $expectedMacUrl) {
         throw 'Site precisa conter exatamente um download oficial por plataforma'
     }
     foreach ($label in @(
@@ -1527,7 +1637,7 @@ try {
         $releasePolicyRecord
     Save-AuditFile $recoveryPolicyPath 'recovery-update-policy-v2.json' `
         $recoveryPolicyRecord
-    Save-AuditFile $SiteIndex 'candidate-index.html' $candidateSiteRecord
+    Save-AuditFile $candidateSitePath 'candidate-index.html' $candidateSiteRecord
 
     $null = Invoke-AndroidPromotionTransaction `
         -AssertTag { Assert-RemoteReleaseTag } `
@@ -1556,7 +1666,7 @@ try {
         } `
         -PromoteSite {
             $script:sitePromotionAttempted = $true
-            $null = Replace-FtpsFile $SiteIndex $RemoteRootDirectory `
+            $null = Replace-FtpsFile $candidateSitePath $RemoteRootDirectory `
                 'index.html' -ExpectedCurrentRecord $previousSiteRecord `
                 -BeforeRename { Assert-RemoteReleaseTag }
         } `

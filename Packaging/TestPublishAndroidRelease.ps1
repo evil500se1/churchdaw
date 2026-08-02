@@ -257,6 +257,93 @@ function Invoke-ReplaceOrderingProbe {
     }
 }
 
+function Invoke-AndroidCandidateSiteProbe {
+    param([switch] $RemoveOneAndroidUrl)
+
+    $siteSource = Join-Path $PSScriptRoot 'SiteProduction\index.html'
+    $jucerPath = Join-Path $PSScriptRoot '..\ChurchDAW.jucer'
+    [xml] $jucer = [IO.File]::ReadAllText($jucerPath)
+    $releaseVersion = [string] $jucer.JUCERPROJECT.version
+    $siteText = [IO.File]::ReadAllText($siteSource, $script:utf8)
+    $urlMatches = @([regex]::Matches(
+        $siteText,
+        'https://churchdaw\.com/app/android/ChurchDAW-(?<version>[0-9]+\.[0-9]+\.[0-9]+)-signed\.apk') |
+        ForEach-Object { $_.Value } | Sort-Object -Unique)
+    if ($urlMatches.Count -ne 1) {
+        throw 'Fixture real precisa conter uma unica URL Android anterior'
+    }
+    $previousUrl = [string] $urlMatches[0]
+    $versionMatch = [regex]::Match(
+        $previousUrl,
+        'ChurchDAW-(?<version>[0-9]+\.[0-9]+\.[0-9]+)-signed\.apk$')
+    if (-not $versionMatch.Success) {
+        throw 'Fixture real nao revelou a versao Android anterior'
+    }
+    $previousVersion = [string] $versionMatch.Groups['version'].Value
+    $releaseUrl =
+        "https://churchdaw.com/app/android/ChurchDAW-$releaseVersion-signed.apk"
+
+    $ownedName = 'churchdaw-android-site-test-' +
+        [Guid]::NewGuid().ToString('N')
+    $ownedRoot = Join-Path ([IO.Path]::GetTempPath()) $ownedName
+    New-Item -ItemType Directory -Path $ownedRoot | Out-Null
+    $sourceCopy = Join-Path $ownedRoot 'index-before.html'
+    $candidate = Join-Path $ownedRoot 'index-release.html'
+    Copy-Item -LiteralPath $siteSource -Destination $sourceCopy
+    if ($RemoveOneAndroidUrl) {
+        $tampered = [IO.File]::ReadAllText($sourceCopy, $script:utf8)
+        $offset = $tampered.IndexOf($previousUrl, [StringComparison]::Ordinal)
+        if ($offset -lt 0) { throw 'URL para adulteracao nao encontrada' }
+        $tampered = $tampered.Remove($offset, $previousUrl.Length).
+            Insert($offset, 'about:blank')
+        [IO.File]::WriteAllText($sourceCopy, $tampered, $script:writeUtf8)
+    }
+    $sourceBefore = Get-FileRecord $sourceCopy
+
+    try {
+        $failure = $null
+        try {
+            New-AndroidCandidateSite `
+                -Source $sourceCopy `
+                -Destination $candidate `
+                -PreviousVersion $previousVersion `
+                -ReleaseVersion $releaseVersion `
+                -PreviousApkUrl $previousUrl `
+                -ReleaseApkUrl $releaseUrl
+        }
+        catch { $failure = $_.Exception.Message }
+
+        $sourceAfter = Get-FileRecord $sourceCopy
+        $candidateText = if (Test-Path -LiteralPath $candidate) {
+            [IO.File]::ReadAllText($candidate, $script:utf8)
+        }
+        else { '' }
+        return [pscustomobject] @{
+            Failure = $failure
+            SourceUnchanged =
+                ($sourceBefore.bytes -eq $sourceAfter.bytes -and
+                 $sourceBefore.sha256 -ceq $sourceAfter.sha256)
+            CandidateExists = (Test-Path -LiteralPath $candidate)
+            CandidateText = $candidateText
+            PreviousVersion = $previousVersion
+            ReleaseVersion = $releaseVersion
+            PreviousUrl = $previousUrl
+            ReleaseUrl = $releaseUrl
+        }
+    }
+    finally {
+        $resolved = [IO.Path]::GetFullPath($ownedRoot).TrimEnd('\') + '\'
+        $base = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\') + '\'
+        if (-not $resolved.StartsWith(
+                $base,
+                [StringComparison]::OrdinalIgnoreCase) -or
+            [IO.Path]::GetFileName($ownedRoot) -cne $ownedName) {
+            throw 'Recusando limpar fixture do site sem prova de posse'
+        }
+        Remove-Item -LiteralPath $ownedRoot -Recurse -Force
+    }
+}
+
 Test-Case 'sucesso promove policy v2 por ultimo' {
     $result = Invoke-Scenario
     Assert-True ($null -eq $result.Failure) 'cenario de sucesso falhou'
@@ -388,6 +475,68 @@ Test-Case 'promocao recusa elevar piso sem gate posterior' {
     }
     Assert-True $caught `
         'publicador aceitou piso sem recovery universal'
+}
+
+Test-Case 'site real suporta fase desktop seguida da fase Android' {
+    $result = Invoke-AndroidCandidateSiteProbe
+    Assert-True ($null -eq $result.Failure) `
+        "geracao do site candidato falhou: $($result.Failure)"
+    Assert-True $result.SourceUnchanged `
+        'gerador alterou o site anterior comprovado'
+    Assert-True $result.CandidateExists 'site candidato nao foi criado'
+    Assert-True ($result.PreviousVersion -cne $result.ReleaseVersion) `
+        'fixture deixou de representar a fase desktop com Android anterior'
+    Assert-True (-not $result.CandidateText.Contains($result.PreviousUrl)) `
+        'site candidato preservou URL Android anterior'
+    $releaseUrlCount = [regex]::Matches(
+        $result.CandidateText,
+        [regex]::Escape($result.ReleaseUrl)).Count
+    Assert-True ($releaseUrlCount -eq 3) `
+        "site candidato tem $releaseUrlCount URLs Android, esperado 3"
+    foreach ($label in @(
+        "Baixar ChurchDAW $($result.ReleaseVersion) para Android em formato APK",
+        "APK $($result.ReleaseVersion)",
+        "Baixar APK $($result.ReleaseVersion)"
+    )) {
+        Assert-True $result.CandidateText.Contains($label) `
+            "site candidato sem rotulo Android: $label"
+    }
+    Assert-True $result.CandidateText.Contains(
+        "ChurchDAW-$($result.ReleaseVersion)-Setup.exe") `
+        'site da fase desktop nao fixa o EXE da mesma release'
+    Assert-True $result.CandidateText.Contains(
+        "ChurchDAW-$($result.ReleaseVersion)-macOS.dmg") `
+        'site da fase desktop nao fixa o DMG da mesma release'
+}
+
+Test-Case 'gerador recusa deriva quando formato Android muda' {
+    $result = Invoke-AndroidCandidateSiteProbe -RemoveOneAndroidUrl
+    Assert-True ($null -ne $result.Failure -and
+        $result.Failure.Contains('contagem inesperada')) `
+        'gerador aceitou site anterior com uma URL Android ausente'
+    Assert-True $result.SourceUnchanged `
+        'falha do gerador alterou o site anterior'
+    Assert-True (-not $result.CandidateExists) `
+        'falha do gerador deixou candidato parcial'
+}
+
+Test-Case 'publicador deriva e promove somente o site temporario auditado' {
+    $proofIndex = $script:publisherSource.IndexOf(
+        'Assert-FileRecord $SiteIndex $previousSiteRecord',
+        [StringComparison]::Ordinal)
+    $deriveIndex = $script:publisherSource.IndexOf(
+        '-Source $previousSitePath',
+        [StringComparison]::Ordinal)
+    $promoteIndex = $script:publisherSource.IndexOf(
+        'Replace-FtpsFile $candidateSitePath $RemoteRootDirectory',
+        [StringComparison]::Ordinal)
+    Assert-True ($proofIndex -ge 0 -and $deriveIndex -gt $proofIndex) `
+        'site nao e derivado depois de provar tag igual ao remoto anterior'
+    Assert-True ($promoteIndex -gt $deriveIndex) `
+        'publicador nao promove o site temporario derivado'
+    Assert-True (-not $script:publisherSource.Contains(
+        'Replace-FtpsFile $SiteIndex $RemoteRootDirectory')) `
+        'publicador ainda promove diretamente o HTML imutavel do tag'
 }
 
 Test-Case 'arquivo versionado remoto identico e reutilizado sem upload' {

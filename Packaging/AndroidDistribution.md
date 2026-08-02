@@ -80,10 +80,14 @@ site, manifesto, policy legada e policy v2. Eles implementam concorrência
 otimista. O grupo `desktop-production-publish` é compartilhado deliberadamente
 com o publicador desktop, criando um único escritor global para o HostGator.
 
-O `Packaging/SiteProduction/index.html` do commit da tag precisa apontar para o
-novo APK e preservar os links desktop já publicados. O publicador verifica os
-três downloads antes de qualquer alteração fixa e recusa promover um site que
-anuncie artefato ausente.
+O `Packaging/SiteProduction/index.html` do commit da tag representa a primeira
+fase: aponta para os novos instaladores desktop e mantém o APK Android anterior,
+que já precisa estar acessível. Depois da publicação desktop, o publicador
+Android prova que esse baseline é byte a byte igual ao `index.html` remoto,
+deriva um `index.release.html` temporário alterando somente URL e rótulos
+Android com contagens estritas, e exige que EXE e DMG continuem na mesma versão
+da tag. O baseline imutável nunca é editado nem promovido diretamente pela
+segunda fase.
 
 Teste local da máquina de estados, sem rede e sem publicação:
 
@@ -202,19 +206,24 @@ Ela nunca deve ser copiada para o APK, site ou repositório.
 
 Nunca aumente o piso antes de o novo APK estar acessível publicamente.
 
-1. aumente `versionCode` e `versionName` e prepare o site candidato;
+1. aumente `versionCode` e `versionName` e prepare o site baseline com EXE/DMG
+   novos e APK anterior ainda válido;
 2. gere uma build limpa e assinada a partir da tag imutável;
 3. valide o APK exato em aparelho ARM64 real e teste upgrade sobre 1.5.7;
-4. despache o publicador com run ID, commit e hashes anteriores exatos;
-5. o publicador baixa os quatro arquivos públicos anteriores, confirma FTPS e
+4. publique primeiro o desktop e o baseline do site, que só referencia
+   downloads já acessíveis;
+5. despache o publicador Android com run ID, commit e hashes anteriores exatos;
+6. o publicador baixa os quatro arquivos públicos anteriores, confirma FTPS e
    HTTPS e preserva backups com hashes na auditoria;
-6. o APK sobe com nome temporário, volta por download/hash e só então recebe o
+7. ele prova que o site do tag é igual ao remoto e deriva o candidato Android
+   temporário, sem mudar nenhum outro byte lógico;
+8. o APK sobe com nome temporário, volta por download/hash e só então recebe o
    nome versionado final por `RNFR`/`RNTO`;
-7. o APK público canônico e com nonce precisa coincidir byte a byte;
-8. promovem-se, nesta ordem, `index.html`, `manifest.json` e
+9. o APK público canônico e com nonce precisa coincidir byte a byte;
+10. promovem-se, nesta ordem, `index.html`, `manifest.json` e
    `update-policy.json`;
-9. `update-policy-v2.json` é sempre a última mutação do caminho normal;
-10. todos os endpoints voltam a ser baixados e comparados após a promoção.
+11. `update-policy-v2.json` é sempre a última mutação do caminho normal;
+12. todos os endpoints voltam a ser baixados e comparados após a promoção.
 
 Antes da v2, uma falha restaura site/manifesto/legada somente se o hash ativo
 ainda for o anterior ou o candidato desta execução. Depois que a v2 pode ter

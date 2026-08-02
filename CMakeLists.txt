@@ -262,10 +262,13 @@ if(CHURCHDAW_BUILD_AUDIO_TESTS AND NOT ANDROID AND NOT IOS)
         PUBLIC
             juce::juce_recommended_config_flags)
 
-    if(APPLE)
-        # Prova real do protocolo V2 no macOS. O mesmo executavel funciona como
-        # coordenador e como processo filho descartavel, carrega apenas o
-        # DLSMusicDevice do sistema e nunca abre dispositivo de audio/janela.
+    if(APPLE OR WIN32)
+        # Smoke real do transporte V2. O mesmo executavel funciona como
+        # coordenador e como processo filho descartavel. No macOS usa o
+        # DLSMusicDevice; no Windows exige um VST3 indicado pelo ambiente.
+        # A matriz shell/crash continua no teste deterministico de politica;
+        # uma fixture vendor de uma classe nao deve ser descrita como prova de
+        # isolamento multi-classe.
         juce_add_console_app(ChurchDAWPluginScanIntegrationTests
             PRODUCT_NAME "ChurchDAWPluginScanIntegrationTests")
 
@@ -275,30 +278,54 @@ if(CHURCHDAW_BUILD_AUDIO_TESTS AND NOT ANDROID AND NOT IOS)
             ChurchDAWPluginScanIntegrationTests PRIVATE Source)
         target_compile_definitions(
             ChurchDAWPluginScanIntegrationTests PRIVATE
-            JUCE_PLUGINHOST_AU=1
             JUCE_PLUGINHOST_VST3=1
             JUCE_WEB_BROWSER=0
             JUCE_PUSH_NOTIFICATIONS=0
             JUCE_USE_CURL=0)
-        target_compile_options(
-            ChurchDAWPluginScanIntegrationTests PRIVATE
-            -Werror=unguarded-availability-new)
         target_link_libraries(
             ChurchDAWPluginScanIntegrationTests
             PRIVATE
                 juce::juce_audio_processors
-                "-framework AudioUnit"
-                "-framework AudioToolbox"
-                "-framework CoreAudioKit"
             PUBLIC
                 juce::juce_recommended_config_flags)
 
-        add_test(
-            NAME ChurchDAWPluginScanIntegration
-            COMMAND ChurchDAWPluginScanIntegrationTests)
-        set_tests_properties(
-            ChurchDAWPluginScanIntegration
-            PROPERTIES TIMEOUT 300)
+        if(APPLE)
+            target_compile_definitions(
+                ChurchDAWPluginScanIntegrationTests PRIVATE
+                JUCE_PLUGINHOST_AU=1)
+            target_compile_options(
+                ChurchDAWPluginScanIntegrationTests PRIVATE
+                -Werror=unguarded-availability-new)
+            target_link_libraries(
+                ChurchDAWPluginScanIntegrationTests PRIVATE
+                "-framework AudioUnit"
+                "-framework AudioToolbox"
+                "-framework CoreAudioKit")
+
+            add_test(
+                NAME ChurchDAWPluginScanIntegration
+                COMMAND ChurchDAWPluginScanIntegrationTests)
+            set_tests_properties(
+                ChurchDAWPluginScanIntegration
+                PROPERTIES TIMEOUT 300)
+        elseif(DEFINED ENV{CHURCHDAW_PLUGIN_SCAN_FIXTURE}
+               AND NOT "$ENV{CHURCHDAW_PLUGIN_SCAN_FIXTURE}" STREQUAL "")
+            # A fixture e o APPDATA isolado sao impostos externamente ao
+            # executavel. Sem fixture, o alvo continua compilavel, mas nao vira
+            # um CTest que falharia por configuracao ausente.
+            set(churchdaw_plugin_scan_test_appdata
+                "${CMAKE_CURRENT_BINARY_DIR}/plugin-scan-integration-appdata")
+            file(MAKE_DIRECTORY "${churchdaw_plugin_scan_test_appdata}")
+            add_test(
+                NAME ChurchDAWPluginScanIntegration
+                COMMAND ChurchDAWPluginScanIntegrationTests)
+            set_tests_properties(
+                ChurchDAWPluginScanIntegration
+                PROPERTIES
+                    TIMEOUT 300
+                    ENVIRONMENT
+                        "CHURCHDAW_PLUGIN_SCAN_FIXTURE=$ENV{CHURCHDAW_PLUGIN_SCAN_FIXTURE};APPDATA=${churchdaw_plugin_scan_test_appdata}")
+        endif()
     endif()
 
     if(MSVC)
@@ -313,6 +340,7 @@ if(CHURCHDAW_BUILD_AUDIO_TESTS AND NOT ANDROID AND NOT IOS)
         target_compile_options(ChurchDAWPluginScanPolicyTests PRIVATE /utf-8)
         target_compile_options(ChurchDAWChildProcessReapTests PRIVATE /utf-8)
         target_compile_options(ChurchDAWAndroidStageLayoutTests PRIVATE /utf-8)
+        target_compile_options(ChurchDAWPluginScanIntegrationTests PRIVATE /utf-8)
     endif()
 
     add_test(

@@ -134,14 +134,100 @@ private:
             expect (exactLoadedDescription,
                     "Loaded result did not preserve the DLS AU identity");
         }
+       #elif JUCE_WINDOWS
+        using namespace ChurchDAWPluginScan;
+
+        const auto fixtureValue = juce::SystemStats::getEnvironmentVariable (
+                                      "CHURCHDAW_PLUGIN_SCAN_FIXTURE", {})
+                                      .trim()
+                                      .unquoted();
+        const int minimumLoaded = juce::jmax (
+            1, juce::SystemStats::getEnvironmentVariable (
+                   "CHURCHDAW_PLUGIN_SCAN_MIN_LOADED", "1")
+                   .getIntValue());
+
+        if (fixtureValue.isEmpty())
+        {
+            failAndQuit (
+                "CHURCHDAW_PLUGIN_SCAN_FIXTURE must name one VST3 fixture");
+            return;
+        }
+
+        const auto fixture = juce::File::isAbsolutePath (fixtureValue)
+            ? juce::File (fixtureValue)
+            : juce::File::getCurrentWorkingDirectory().getChildFile (
+                  fixtureValue);
+
+        if (! fixture.exists())
+        {
+            failAndQuit ("VST3 fixture does not exist: "
+                         + fixture.getFullPathName());
+            return;
+        }
+
+        juce::AudioPluginFormatManager formats;
+        formats.addFormat (std::make_unique<juce::VST3PluginFormat>());
+        auto* vst3 = formats.getFormat (0);
+
+        expect (vst3 != nullptr && vst3->getName() == "VST3",
+                "VST3 format was not registered in the Windows probe");
+
+        juce::KnownPluginList knownPlugins;
+        knownPlugins.setCustomScanner (
+            std::make_unique<ChurchDAWPluginScanner>());
+        juce::OwnedArray<juce::PluginDescription> found;
+        const auto candidate = fixture.getFullPathName();
+        const bool added = vst3 != nullptr
+            && knownPlugins.scanAndAddFile (
+                candidate, false, found, *vst3);
+        knownPlugins.scanFinished();
+
+        expect (added, "Windows VST3 fixture did not produce a loaded result");
+        expect (found.size() >= minimumLoaded,
+                "V2 returned fewer PluginDescriptions than required for the Windows fixture");
+        expect (! knownPlugins.isBlacklisted (candidate, true),
+                "The Windows VST3 fixture was added to the blacklist");
+
+        bool everyIdentityBelongsToCandidate = ! found.isEmpty();
+        juce::StringArray uniqueIdentifiers;
+
+        for (const auto* description : found)
+        {
+            const auto identifier = description != nullptr
+                ? description->createIdentifierString()
+                : juce::String();
+            const bool belongs = description != nullptr
+                && description->name.isNotEmpty()
+                && identifier.isNotEmpty()
+                && ! uniqueIdentifiers.contains (identifier)
+                && description->pluginFormatName == "VST3"
+                && (juce::File (description->fileOrIdentifier) == fixture
+                    || (fixture.isDirectory()
+                        && juce::File (description->fileOrIdentifier)
+                               .isAChildOf (fixture)));
+            everyIdentityBelongsToCandidate &= belongs;
+
+            if (identifier.isNotEmpty())
+                uniqueIdentifiers.add (identifier);
+        }
+
+        expect (everyIdentityBelongsToCandidate,
+                "A loaded VST3 identity was empty, duplicated or outside the fixture candidate");
        #else
-        expect (false, "This integration probe must run on macOS");
+        expect (false, "This integration probe must run on macOS or Windows");
        #endif
 
         if (failures == 0)
+       #if JUCE_WINDOWS
+            std::cout
+                << "Plugin scanner V2 vendor smoke passed: " << found.size()
+                << " VST3 class(es) loaded from the Windows fixture and the "
+                   "candidate was not blacklisted\n";
+       #else
             std::cout
                 << "Plugin scanner V2 integration passed: "
                    "DLSMusicDevice loaded in a disposable child and was not blacklisted\n";
+       #endif
 
         setApplicationReturnValue (failures == 0 ? 0 : 1);
         quit();

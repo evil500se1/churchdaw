@@ -128,6 +128,21 @@ inline bool deserialiseRequest (const juce::MemoryBlock& block,
 
 inline juce::File getReportDirectory()
 {
+    const auto overridePath = juce::SystemStats::getEnvironmentVariable (
+                                  "CHURCHDAW_PLUGIN_SCAN_REPORT_DIR", {})
+                                  .trim()
+                                  .unquoted();
+
+    if (overridePath.isNotEmpty())
+    {
+        auto directory = juce::File::isAbsolutePath (overridePath)
+            ? juce::File (overridePath)
+            : juce::File::getCurrentWorkingDirectory().getChildFile (
+                  overridePath);
+        directory.createDirectory();
+        return directory;
+    }
+
    #if JUCE_MAC
     auto directory = juce::File::getSpecialLocation (juce::File::userHomeDirectory)
                          .getChildFile ("Library")

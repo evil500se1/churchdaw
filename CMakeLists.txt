@@ -266,9 +266,29 @@ if(CHURCHDAW_BUILD_AUDIO_TESTS AND NOT ANDROID AND NOT IOS)
         # Smoke real do transporte V2. O mesmo executavel funciona como
         # coordenador e como processo filho descartavel. No macOS usa o
         # DLSMusicDevice; no Windows exige um VST3 indicado pelo ambiente.
-        # A matriz shell/crash continua no teste deterministico de politica;
-        # uma fixture vendor de uma classe nao deve ser descrita como prova de
-        # isolamento multi-classe.
+        # No Windows, uma fixture sintetica adicional prova em processo real
+        # que uma classe valida sobrevive ao crash da classe irma no mesmo DLL.
+        if(WIN32)
+            set(churchdaw_vst3_sdk_dir
+                "${CMAKE_CURRENT_SOURCE_DIR}/JUCE/modules/juce_audio_processors_headless/format_types/VST3_SDK")
+
+            add_library(ChurchDAWVST3MultiClassCrashFixture MODULE
+                Tests/Plugin/Fixtures/VST3MultiClassCrashFixture.cpp
+                "${churchdaw_vst3_sdk_dir}/pluginterfaces/base/funknown.cpp"
+                "${churchdaw_vst3_sdk_dir}/pluginterfaces/base/coreiids.cpp"
+                "${churchdaw_vst3_sdk_dir}/public.sdk/source/vst/vstinitiids.cpp")
+            target_include_directories(
+                ChurchDAWVST3MultiClassCrashFixture PRIVATE
+                "${churchdaw_vst3_sdk_dir}")
+            target_link_libraries(
+                ChurchDAWVST3MultiClassCrashFixture PRIVATE ole32)
+            set_target_properties(
+                ChurchDAWVST3MultiClassCrashFixture PROPERTIES
+                PREFIX ""
+                OUTPUT_NAME "ChurchDAWVST3MultiClassCrashFixture"
+                SUFFIX ".vst3")
+        endif()
+
         juce_add_console_app(ChurchDAWPluginScanIntegrationTests
             PRODUCT_NAME "ChurchDAWPluginScanIntegrationTests")
 
@@ -310,9 +330,10 @@ if(CHURCHDAW_BUILD_AUDIO_TESTS AND NOT ANDROID AND NOT IOS)
                 PROPERTIES TIMEOUT 300)
         elseif(DEFINED ENV{CHURCHDAW_PLUGIN_SCAN_FIXTURE}
                AND NOT "$ENV{CHURCHDAW_PLUGIN_SCAN_FIXTURE}" STREQUAL "")
-            # A fixture e o APPDATA isolado sao impostos externamente ao
-            # executavel. Sem fixture, o alvo continua compilavel, mas nao vira
-            # um CTest que falharia por configuracao ausente.
+            # A fixture e o diretorio isolado de relatorios sao impostos
+            # externamente ao executavel. Sem fixture, o alvo continua
+            # compilavel, mas nao vira um CTest que falharia por configuracao
+            # ausente.
             set(churchdaw_plugin_scan_test_appdata
                 "${CMAKE_CURRENT_BINARY_DIR}/plugin-scan-integration-appdata")
             file(MAKE_DIRECTORY "${churchdaw_plugin_scan_test_appdata}")
@@ -324,7 +345,34 @@ if(CHURCHDAW_BUILD_AUDIO_TESTS AND NOT ANDROID AND NOT IOS)
                 PROPERTIES
                     TIMEOUT 300
                     ENVIRONMENT
-                        "CHURCHDAW_PLUGIN_SCAN_FIXTURE=$ENV{CHURCHDAW_PLUGIN_SCAN_FIXTURE};APPDATA=${churchdaw_plugin_scan_test_appdata}")
+                        "CHURCHDAW_PLUGIN_SCAN_FIXTURE=$ENV{CHURCHDAW_PLUGIN_SCAN_FIXTURE};CHURCHDAW_PLUGIN_SCAN_REPORT_DIR=${churchdaw_plugin_scan_test_appdata}/reports")
+        endif()
+
+        if(WIN32)
+            add_dependencies(
+                ChurchDAWPluginScanIntegrationTests
+                ChurchDAWVST3MultiClassCrashFixture)
+
+            set(churchdaw_plugin_scan_synthetic_appdata
+                "${CMAKE_CURRENT_BINARY_DIR}/plugin-scan-synthetic-appdata")
+            file(MAKE_DIRECTORY
+                "${churchdaw_plugin_scan_synthetic_appdata}")
+
+            add_test(
+                NAME ChurchDAWPluginScanSyntheticShell
+                COMMAND "${CMAKE_COMMAND}" -E env
+                    "CHURCHDAW_PLUGIN_SCAN_REPORT_DIR=${churchdaw_plugin_scan_synthetic_appdata}/reports"
+                    "CHURCHDAW_PLUGIN_SCAN_FIXTURE=$<TARGET_FILE:ChurchDAWVST3MultiClassCrashFixture>"
+                    "CHURCHDAW_PLUGIN_SCAN_MIN_LOADED=1"
+                    "CHURCHDAW_PLUGIN_SCAN_MIN_FACTORY_CLASSES=2"
+                    "CHURCHDAW_PLUGIN_SCAN_MIN_FAILED_CLASSES=1"
+                    "CHURCHDAW_PLUGIN_SCAN_REQUIRED_FAILURE_STATUS=crash"
+                    "CHURCHDAW_PLUGIN_SCAN_STRICT_SYNTHETIC=1"
+                    "$<TARGET_FILE:ChurchDAWPluginScanIntegrationTests>")
+            set_tests_properties(
+                ChurchDAWPluginScanSyntheticShell PROPERTIES
+                TIMEOUT 120
+                WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
         endif()
     endif()
 
@@ -341,6 +389,10 @@ if(CHURCHDAW_BUILD_AUDIO_TESTS AND NOT ANDROID AND NOT IOS)
         target_compile_options(ChurchDAWChildProcessReapTests PRIVATE /utf-8)
         target_compile_options(ChurchDAWAndroidStageLayoutTests PRIVATE /utf-8)
         target_compile_options(ChurchDAWPluginScanIntegrationTests PRIVATE /utf-8)
+        if(TARGET ChurchDAWVST3MultiClassCrashFixture)
+            target_compile_options(
+                ChurchDAWVST3MultiClassCrashFixture PRIVATE /utf-8)
+        endif()
     endif()
 
     add_test(

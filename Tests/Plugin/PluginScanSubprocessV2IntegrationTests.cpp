@@ -157,6 +157,10 @@ private:
             juce::SystemStats::getEnvironmentVariable (
                 "CHURCHDAW_PLUGIN_SCAN_REQUIRED_FAILURE_STATUS", {})
                 .trim();
+        const bool strictSynthetic =
+            juce::SystemStats::getEnvironmentVariable (
+                "CHURCHDAW_PLUGIN_SCAN_STRICT_SYNTHETIC", {})
+                .trim() == "1";
 
         if (fixtureValue.isEmpty())
         {
@@ -234,6 +238,11 @@ private:
         juce::StringArray classTokens;
         bool classRecordsValid = true;
         bool requiredFailureStatusObserved = requiredFailureStatus.isEmpty();
+        juce::String classZeroStatus;
+        juce::String classZeroToken;
+        juce::String classOneStatus;
+        juce::String classOneFailureStage;
+        juce::String classOneToken;
 
         if (reportFile.existsAsFile())
         {
@@ -276,6 +285,19 @@ private:
                 attemptedClassIndexes.add (classIndex);
                 classTokens.add (token);
 
+                if (classIndex == 0)
+                {
+                    classZeroStatus = status;
+                    classZeroToken = token;
+                }
+                else if (classIndex == 1)
+                {
+                    classOneStatus = status;
+                    classOneFailureStage =
+                        object->getProperty ("failureStage").toString();
+                    classOneToken = token;
+                }
+
                 if (status == "loaded_success")
                     ++loadedClassReports;
                 else if (status != "class_skipped")
@@ -311,6 +333,29 @@ private:
                 "The VST3 fixture produced fewer failed class attempts than required");
         expect (requiredFailureStatusObserved,
                 "The VST3 fixture did not produce the required failure status");
+
+        if (strictSynthetic)
+        {
+            expect (factoryClassCount == 2,
+                    "The synthetic VST3 factory must expose exactly two classes");
+            expect (found.size() == 1,
+                    "Exactly one synthetic VST3 class must survive validation");
+            expect (found.size() == 1 && found[0] != nullptr
+                     && found[0]->name == "ChurchDAW Fixture Valid",
+                    "The surviving synthetic class has the wrong identity");
+            expect (loadedClassReports == 1 && failedClassReports == 1,
+                    "The synthetic shell must report one load and one crash");
+            expect (classZeroStatus == "loaded_success",
+                    "Synthetic factory class 0 did not load successfully");
+            expect (classOneStatus == "crash",
+                    "Synthetic factory class 1 was not classified as a crash");
+            expect (classOneFailureStage == "creation",
+                    "Synthetic factory class 1 did not crash during creation");
+            expect (classZeroToken.isNotEmpty()
+                     && classOneToken.isNotEmpty()
+                     && classZeroToken != classOneToken,
+                    "Synthetic class attempts did not use distinct non-empty tokens");
+        }
        #else
         expect (false, "This integration probe must run on macOS or Windows");
        #endif

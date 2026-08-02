@@ -115,6 +115,8 @@ jobs:
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$PLIST")" = "com.churchdaw.app"
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLIST")" = "$EXPECTED_VERSION"
           test "$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$PLIST")" = "10.15"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersionByArchitecture:x86_64' "$PLIST")" = "10.15"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersionByArchitecture:arm64' "$PLIST")" = "11.0"
           /usr/libexec/PlistBuddy -c 'Print :NSMicrophoneUsageDescription' "$PLIST" | grep -q "guitarra/microfone"
           /usr/libexec/PlistBuddy -c 'Print :NSBluetoothAlwaysUsageDescription' "$PLIST" | grep -q "Bluetooth"
           ARCHS="$(lipo -archs "$EXE")"

@@ -371,7 +371,12 @@ else()
             "O ChurchDAW usa a entrada de audio somente quando voce ativa guitarra/microfone em Audio/MIDI.")
 
     if(APPLE)
+        file(READ
+            "${CMAKE_CURRENT_SOURCE_DIR}/Packaging/ChurchDAW-macOS-Info.plist"
+            CHURCHDAW_MACOS_PLIST_TO_MERGE)
         list(APPEND CHURCHDAW_PLATFORM_APP_OPTIONS
+            PLIST_TO_MERGE
+                "${CHURCHDAW_MACOS_PLIST_TO_MERGE}"
             HARDENED_RUNTIME_ENABLED TRUE
             HARDENED_RUNTIME_OPTIONS
                 "com.apple.security.device.audio-input"

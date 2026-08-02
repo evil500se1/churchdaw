@@ -263,6 +263,10 @@ plist_read() {
     || fail "CFBundleVersion nao recebeu o build monotonicamente crescente"
 [[ "$(plist_read LSMinimumSystemVersion)" == "$MACOSX_DEPLOYMENT_TARGET" ]] \
     || fail "LSMinimumSystemVersion diverge do deployment target"
+[[ "$(plist_read LSMinimumSystemVersionByArchitecture:x86_64)" == "$MACOSX_DEPLOYMENT_TARGET" ]] \
+    || fail "piso x86_64 do Info.plist diverge do deployment target"
+[[ "$(plist_read LSMinimumSystemVersionByArchitecture:arm64)" == "11.0" ]] \
+    || fail "piso arm64 do Info.plist precisa ser 11.0"
 
 architectures="$(lipo -archs "$executable")"
 grep -qw arm64 <<<"$architectures" || fail "slice arm64 ausente"

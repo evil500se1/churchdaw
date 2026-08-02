@@ -219,6 +219,14 @@ public:
     bool killWorkerProcessAndWait (int gracefulShutdownTimeoutMs = 500,
                                    int forcedKillTimeoutMs = 2000);
 
+    /** Returns true while the launched worker process is still alive.
+
+        This is intentionally independent of the IPC heartbeat timeout. It
+        lets coordinators distinguish an already-terminated worker from a
+        temporarily silent but still-running plug-in process.
+    */
+    bool isWorkerProcessRunning() const;
+
     [[deprecated ("Replaced by killWorkerProcess.")]]
     void killSlaveProcess() { killWorkerProcess(); }
 

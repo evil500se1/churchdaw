@@ -215,11 +215,17 @@ void ChildProcessCoordinator::killWorkerProcess()
 }
 
 bool ChildProcessCoordinator::killWorkerProcessAndWait (int gracefulShutdownTimeoutMs,
-                                                        int forcedKillTimeoutMs)
+                                                         int forcedKillTimeoutMs)
 {
     if (connection != nullptr)
     {
-        sendMessageToWorker ({ killMessage, specialMessageSize });
+        // Once the worker has exited, sending through the server-side named
+        // pipe may wait for a new client for the full IPC timeout. There is no
+        // process left to receive a graceful-shutdown request in that case, so
+        // close the connection directly instead.
+        if (childProcess != nullptr && childProcess->isRunning())
+            sendMessageToWorker ({ killMessage, specialMessageSize });
+
         connection->disconnect();
         connection.reset();
     }
@@ -245,6 +251,12 @@ bool ChildProcessCoordinator::killWorkerProcessAndWait (int gracefulShutdownTime
 
     childProcess.reset();
     return true;
+}
+
+bool ChildProcessCoordinator::isWorkerProcessRunning() const
+{
+    const auto process = childProcess;
+    return process != nullptr && process->isRunning();
 }
 
 //==============================================================================

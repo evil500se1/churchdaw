@@ -731,7 +731,16 @@ public:
 
         if (! condition.wait_for (lock, std::chrono::milliseconds { 50 },
                                   [&] { return gotResult || lost; }))
+        {
+            // O pipe do JUCE usa 15 s para tolerar um Mac lento na conexao
+            // inicial. Depois de conectado, entretanto, um crash real pode
+            // ser confirmado diretamente pelo handle do processo em vez de
+            // congelar cada classe defeituosa ate o heartbeat expirar.
+            if (! isWorkerProcessRunning())
+                return { State::connectionLost, nullptr };
+
             return {};
+        }
 
         if (lost)
             return { State::connectionLost, nullptr };

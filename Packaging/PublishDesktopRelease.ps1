@@ -115,7 +115,10 @@ param(
 
     [Parameter(Mandatory = $true)]
     [ValidatePattern('^[0-9a-fA-F]{64}$')]
-    [string] $VerifiedMacManifestSha256
+    [string] $VerifiedMacManifestSha256,
+
+    [ValidatePattern('^$|^https://churchdaw\.com/app/android/ChurchDAW-[0-9]+\.[0-9]+\.[0-9]+-signed\.apk$')]
+    [string] $ExpectedAndroidDownloadUrl = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -1091,10 +1094,31 @@ try {
         $signature.SignerThumbprint
 
     $siteText = [IO.File]::ReadAllText($SiteIndex, $utf8)
+    $androidUrls = @([regex]::Matches(
+        $siteText,
+        'https://churchdaw\.com/app/android/ChurchDAW-[0-9]+\.[0-9]+\.[0-9]+-signed\.apk') |
+        ForEach-Object { $_.Value } | Sort-Object -Unique)
+    if ($androidUrls.Count -ne 1) {
+        throw 'Site precisa conter exatamente um download Android oficial'
+    }
+    $androidDownloadUrl = [string] $androidUrls[0]
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedAndroidDownloadUrl) -and
+        $androidDownloadUrl -cne $ExpectedAndroidDownloadUrl) {
+        throw 'Download Android do site diverge do pin solicitado'
+    }
+    $androidHead = Invoke-Curl -AllowFailure -Label 'HEAD Android do site' `
+        -Arguments @(
+            '--disable', '--silent', '--show-error', '--fail', '--location',
+            '--head', '--proto', '=https', '--tlsv1.2',
+            '--connect-timeout', '30', '--max-time', '60',
+            '--header', 'Cache-Control: no-cache', $androidDownloadUrl)
+    if ($androidHead.ExitCode -ne 0) {
+        throw "Download Android do site esta indisponivel: $androidDownloadUrl"
+    }
     foreach ($required in @(
         "$PublicDesktopBaseUrl/$($windowsRecord.name)",
         "$PublicDesktopBaseUrl/$($macRecord.name)",
-        'https://churchdaw.com/app/android/ChurchDAW-1.5.7-signed.apk'
+        $androidDownloadUrl
     )) {
         if (-not $siteText.Contains($required)) {
             throw "Site nao contem URL obrigatoria: $required"

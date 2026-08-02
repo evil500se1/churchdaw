@@ -23,7 +23,7 @@
 namespace ChurchDAWPluginScan
 {
 
-inline constexpr int protocolVersion = 2;
+inline constexpr int protocolVersion = 3;
 
 inline juce::String serialiseDiagnosticJsonLine (const juce::var& value)
 {
@@ -33,12 +33,22 @@ inline juce::String serialiseDiagnosticJsonLine (const juce::var& value)
 enum class ScanPhase : int
 {
     discovery = 1,
-    validation = 2
+    validation = 2,
+    vst3Inventory = 3,
+    vst3ClassValidation = 4
 };
 
 inline juce::String toString (ScanPhase phase)
 {
-    return phase == ScanPhase::discovery ? "discovery" : "validation";
+    switch (phase)
+    {
+        case ScanPhase::discovery:            return "discovery";
+        case ScanPhase::validation:           return "validation";
+        case ScanPhase::vst3Inventory:        return "vst3_inventory";
+        case ScanPhase::vst3ClassValidation:  return "vst3_class_validation";
+    }
+
+    return "unknown";
 }
 
 struct ScanRequest
@@ -49,6 +59,7 @@ struct ScanRequest
     juce::String identifier;
     juce::String descriptionXml;
     juce::String environmentXml;
+    int classIndex = -1;
 };
 
 inline juce::MemoryBlock serialiseRequest (const ScanRequest& request)
@@ -62,6 +73,7 @@ inline juce::MemoryBlock serialiseRequest (const ScanRequest& request)
     stream.writeString (request.identifier);
     stream.writeString (request.descriptionXml);
     stream.writeString (request.environmentXml);
+    stream.writeInt (request.classIndex);
     stream.flush();
     return block;
 }
@@ -81,7 +93,9 @@ inline bool deserialiseRequest (const juce::MemoryBlock& block,
     const auto rawPhase = stream.readInt();
 
     if (rawPhase != (int) ScanPhase::discovery
-         && rawPhase != (int) ScanPhase::validation)
+         && rawPhase != (int) ScanPhase::validation
+         && rawPhase != (int) ScanPhase::vst3Inventory
+         && rawPhase != (int) ScanPhase::vst3ClassValidation)
     {
         error = "invalid scanner phase";
         return false;
@@ -93,11 +107,19 @@ inline bool deserialiseRequest (const juce::MemoryBlock& block,
     request.identifier = stream.readString();
     request.descriptionXml = stream.readString();
     request.environmentXml = stream.readString();
+    request.classIndex = stream.readInt();
 
     if (request.token.isEmpty() || request.format.isEmpty()
          || request.identifier.isEmpty())
     {
         error = "scanner request is missing token, format or identifier";
+        return false;
+    }
+
+    if (request.phase == ScanPhase::vst3ClassValidation
+         && request.classIndex < 0)
+    {
+        error = "VST3 class validation is missing its class index";
         return false;
     }
 
@@ -716,6 +738,10 @@ inline std::unique_ptr<juce::XmlElement> diagnosticEventToXml (
     xml->setAttribute ("protocol", protocolVersion);
     xml->setAttribute ("token", request.token);
     xml->setAttribute ("phase", toString (request.phase));
+
+    if (request.classIndex >= 0)
+        xml->setAttribute ("classIndex", request.classIndex);
+
     xml->setAttribute ("stage", event.stage);
     xml->setAttribute ("call", event.call);
     xml->setAttribute ("event", diagnosticEventKindToString (event.kind));

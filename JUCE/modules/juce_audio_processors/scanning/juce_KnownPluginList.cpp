@@ -190,6 +190,40 @@ bool KnownPluginList::scanAndAddFile (const String& fileOrIdentifier,
     if (blacklist.contains (fileOrIdentifier))
         return false;
 
+    // A rescan is a proof of the plug-in as it exists now. Remove descriptions
+    // from the previous scan before entering third-party code, so a timeout,
+    // architecture mismatch, or clean initialisation failure cannot leave an
+    // obsolete version selectable. A successful scan adds the current
+    // descriptions back below.
+    bool removedStaleDescription = false;
+
+    {
+        ScopedLock lock (typesArrayLock);
+        const auto formatName = format.getName();
+        const File candidate { fileOrIdentifier };
+        const bool candidateIsVST3Bundle =
+            formatName == "VST3" && candidate.isDirectory();
+
+        for (int i = types.size(); --i >= 0;)
+        {
+            const auto& description = types.getReference (i);
+            const bool sameCandidate =
+                description.fileOrIdentifier == fileOrIdentifier
+                || (candidateIsVST3Bundle
+                     && File (description.fileOrIdentifier)
+                            .isAChildOf (candidate));
+
+            if (description.pluginFormatName == formatName && sameCandidate)
+            {
+                types.remove (i);
+                removedStaleDescription = true;
+            }
+        }
+    }
+
+    if (removedStaleDescription)
+        sendChangeMessage();
+
     OwnedArray<PluginDescription> found;
 
     {

@@ -11,10 +11,11 @@
 
 // Scanner ChurchDAW v2
 //
-// Cada candidato passa por dois processos descartaveis:
-//   1. discovery: bundle/componente -> factory -> PluginDescription(s)
-//   2. validation: uma descricao -> create -> initialize -> activate
-//                  -> release -> unload
+// Cada candidato comum passa por discovery e depois por um processo de
+// validacao para cada descricao. VST3 usa uma regra ainda mais estreita:
+//   1. inventory: abre apenas factory/countClasses
+//   2. class validation: UM filho novo por indice da factory, do getClassInfo
+//      ate create/initialize/activate/release/unload
 //
 // A separacao e importante para shells VST3: se uma classe do bundle quebrar,
 // as descricoes ja descobertas continuam no pai e cada classe restante ganha
@@ -225,6 +226,9 @@ private:
         result->setAttribute ("format", request.format);
         result->setAttribute ("path", request.identifier);
 
+        if (request.classIndex >= 0)
+            result->setAttribute ("classIndex", request.classIndex);
+
         if (auto environment = juce::parseXML (request.environmentXml))
             if (environment->hasTagName ("ENVIRONMENT"))
                 for (int i = 0; i < environment->getNumAttributes(); ++i)
@@ -269,6 +273,94 @@ private:
                     event != nullptr
                         ? event->getStringAttribute ("call")
                         : juce::String{});
+    }
+
+    std::unique_ptr<juce::XmlElement> inventoryVST3 (
+        const ScanRequest& request, juce::AudioPluginFormat& format)
+    {
+        auto result = makeBaseResult (request);
+        auto* vst3 = dynamic_cast<juce::VST3PluginFormatHeadless*> (&format);
+
+        if (vst3 == nullptr)
+        {
+            setFailure (*result, "host_internal_error", "factory",
+                        "not_vst3_format",
+                        "VST3 inventory requested for another format");
+            return result;
+        }
+
+        juce::PluginHostDiagnostics::ScopedCall inventory (
+            "inventory", "VST3 IPluginFactory::countClasses", true,
+            request.identifier);
+        const int classCount = vst3->getNumClassesForFile (request.identifier);
+        inventory.finish (classCount >= 0, classCount,
+                          juce::String (classCount) + " factory class(es)");
+
+        if (classCount < 0)
+        {
+            setFailureFromLastEvent (
+                *result, "initialization_failure", "inventory",
+                "vst3_factory_unavailable",
+                "VST3 module did not expose a plugin factory");
+            return result;
+        }
+
+        result->setAttribute ("status", "inventoried");
+        result->setAttribute ("failureStage", "none");
+        result->setAttribute ("errorCode", "0");
+        result->setAttribute ("errorMessage", "");
+        result->setAttribute ("classCount", classCount);
+        return result;
+    }
+
+    std::unique_ptr<juce::XmlElement> validateVST3Class (
+        const ScanRequest& request, juce::AudioPluginFormat& format)
+    {
+        auto result = makeBaseResult (request);
+        auto* vst3 = dynamic_cast<juce::VST3PluginFormatHeadless*> (&format);
+
+        if (vst3 == nullptr)
+        {
+            setFailure (*result, "host_internal_error", "factory",
+                        "not_vst3_format",
+                        "VST3 class validation requested for another format");
+            return result;
+        }
+
+        juce::OwnedArray<juce::PluginDescription> descriptions;
+        vst3->findTypeForFileAtClassIndex (
+            descriptions, request.identifier, request.classIndex);
+
+        if (descriptions.isEmpty())
+        {
+            if (lastFailureCopy() != nullptr)
+                setFailureFromLastEvent (
+                    *result, "plugin_internal_error", "discovery_class",
+                    "class_metadata_failed",
+                    "VST3 factory did not describe this class");
+            else
+            {
+                result->setAttribute ("status", "class_skipped");
+                result->setAttribute ("failureStage", "none");
+                result->setAttribute ("errorCode", "0");
+                result->setAttribute ("errorMessage", "");
+            }
+
+            return result;
+        }
+
+        if (descriptions.size() != 1)
+        {
+            setFailure (*result, "host_internal_error", "protocol",
+                        "multiple_descriptions_for_class",
+                        "one VST3 factory class returned multiple descriptions");
+            return result;
+        }
+
+        auto validationRequest = request;
+        validationRequest.descriptionXml = descriptions[0]->createXml()->toString (
+            juce::XmlElement::TextFormat().singleLine());
+        return validate (validationRequest, format);
     }
 
     std::unique_ptr<juce::XmlElement> discover (
@@ -411,6 +503,42 @@ private:
             result->setAttribute ("editorAdvertised", hasEditor);
             result->setAttribute ("editorValidation", "deferred_until_open");
 
+            if (request.phase == ScanPhase::vst3ClassValidation)
+            {
+                juce::PluginDescription validatedDescription;
+                juce::PluginHostDiagnostics::ScopedCall describe (
+                    "description",
+                    "AudioPluginInstance::fillInPluginDescription", true,
+                    description.name);
+                instance->fillInPluginDescription (validatedDescription);
+
+                // Preserve exactly the identity produced during discovery.
+                // On Windows this may be the module inside the .vst3 bundle;
+                // changing it to the bundle root would change JUCE's stable
+                // identifier and break existing saved setups.
+                validatedDescription.fileOrIdentifier =
+                    description.fileOrIdentifier;
+                validatedDescription.lastFileModTime =
+                    description.lastFileModTime;
+
+                const bool sameIdentity =
+                    validatedDescription.isDuplicateOf (description)
+                    && validatedDescription.pluginFormatName
+                           == description.pluginFormatName;
+                describe.finish (sameIdentity, sameIdentity ? 0 : -1,
+                                 validatedDescription.name);
+
+                if (! sameIdentity)
+                {
+                    setFailure (*result, "host_internal_error", "description",
+                                "validated_identity_changed",
+                                "plugin changed identity during validation");
+                }
+                else
+                    result->addChildElement (
+                        validatedDescription.createXml().release());
+            }
+
             {
                 juce::PluginHostDiagnostics::ScopedCall release (
                     "unload", "AudioProcessor::releaseResources", false,
@@ -419,7 +547,7 @@ private:
                 release.finish (true, 0, description.name);
             }
 
-            return true;
+            return result->getStringAttribute ("status").isEmpty();
         };
 
         bool exercised = false;
@@ -477,9 +605,26 @@ private:
         try
         {
             if (auto* format = findFormat (request.format))
-                result = request.phase == ScanPhase::discovery
-                             ? discover (request, *format)
-                             : validate (request, *format);
+            {
+                switch (request.phase)
+                {
+                    case ScanPhase::discovery:
+                        result = discover (request, *format);
+                        break;
+
+                    case ScanPhase::validation:
+                        result = validate (request, *format);
+                        break;
+
+                    case ScanPhase::vst3Inventory:
+                        result = inventoryVST3 (request, *format);
+                        break;
+
+                    case ScanPhase::vst3ClassValidation:
+                        result = validateVST3Class (request, *format);
+                        break;
+                }
+            }
             else
             {
                 result = makeBaseResult (request);
@@ -703,6 +848,10 @@ public:
             return true;   // incompatibilidade nao e crash do plugin
         }
 
+        if (dynamic_cast<juce::VST3PluginFormatHeadless*> (&format) != nullptr)
+            return findVST3PluginTypesFor (
+                format, result, fileOrIdentifier, discoveryEnvironment);
+
         ScanRequest discovery;
         discovery.phase = ScanPhase::discovery;
         discovery.token = makeScanToken();
@@ -855,6 +1004,185 @@ private:
         int elapsedMs = 0;
         bool workerReaped = true;
     };
+
+    static bool reachedVST3AudioClass (const PhaseAttempt& attempt)
+    {
+        for (const auto& event : attempt.progress.events)
+            if (event != nullptr
+                 && event->getStringAttribute ("stage") == "discovery_class"
+                 && event->getStringAttribute ("call")
+                        == "VST3 audio class selected")
+                return true;
+
+        return false;
+    }
+
+    static bool descriptionBelongsToCandidate (
+        const juce::String& descriptionIdentifier,
+        const juce::String& candidateIdentifier)
+    {
+        if (descriptionIdentifier == candidateIdentifier)
+            return true;
+
+        const juce::File candidate { candidateIdentifier };
+        return candidate.isDirectory()
+            && juce::File (descriptionIdentifier).isAChildOf (candidate);
+    }
+
+    bool findVST3PluginTypesFor (
+        juce::AudioPluginFormat& format,
+        juce::OwnedArray<juce::PluginDescription>& result,
+        const juce::String& fileOrIdentifier,
+        const EnvironmentReport& environment)
+    {
+        ScanRequest inventory;
+        inventory.phase = ScanPhase::vst3Inventory;
+        inventory.token = makeScanToken();
+        inventory.format = format.getName();
+        inventory.identifier = fileOrIdentifier;
+        inventory.environmentXml = environmentToXml (environment)->toString (
+            juce::XmlElement::TextFormat().singleLine());
+
+        auto inventoryAttempt = runPhase (inventory);
+        noteInconclusiveAttempt (inventoryAttempt);
+
+        if (inventoryAttempt.finish == PhaseFinish::cancelled
+             && inventoryAttempt.workerReaped)
+            return true;
+
+        if (! inventoryAttempt.workerReaped
+             || inventoryAttempt.finish != PhaseFinish::result
+             || inventoryAttempt.xml == nullptr
+             || inventoryAttempt.xml->getStringAttribute ("status")
+                    != "inventoried")
+        {
+            auto report = reportForAttempt (
+                inventory, inventoryAttempt, environment, nullptr);
+            reportWriter.appendPlugin (*report);
+            return ! inventoryAttempt.workerReaped
+                || ! deveEntrarNaBlacklistPersistente (
+                    inventoryAttempt.finish);
+        }
+
+        constexpr int maxFactoryClasses = 4096;
+        const int classCount = inventoryAttempt.xml->getIntAttribute (
+            "classCount", -1);
+
+        if (! juce::isPositiveAndBelow (classCount,
+                                        maxFactoryClasses + 1)
+             && classCount != 0)
+        {
+            scanHadInconclusive.store (true);
+            auto report = reportForAttempt (
+                inventory, inventoryAttempt, environment, nullptr);
+            setReportFailure (*report, "host_internal_error", "protocol",
+                              "invalid_vst3_class_count",
+                              "VST3 factory returned an invalid class count");
+            reportWriter.appendPlugin (*report);
+            return true;
+        }
+
+        CandidateValidationAccumulator accumulator { result };
+        int audioClasses = 0;
+
+        for (int classIndex = 0; classIndex < classCount; ++classIndex)
+        {
+            if (shouldExit())
+                return true;
+
+            ScanRequest validation;
+            validation.phase = ScanPhase::vst3ClassValidation;
+            validation.token = makeScanToken();
+            validation.format = format.getName();
+            validation.identifier = fileOrIdentifier;
+            validation.classIndex = classIndex;
+            validation.environmentXml = inventory.environmentXml;
+
+            auto attempt = runPhase (validation);
+            noteInconclusiveAttempt (attempt);
+
+            if (attempt.finish == PhaseFinish::cancelled
+                 && attempt.workerReaped)
+                return true;
+
+            const bool reachedAudioClass = reachedVST3AudioClass (attempt);
+
+            if (reachedAudioClass)
+                ++audioClasses;
+            else if (attempt.finish == PhaseFinish::crash)
+                scanHadInconclusive.store (true);
+
+            if (attempt.workerReaped
+                 && attempt.finish == PhaseFinish::result
+                 && attempt.xml != nullptr
+                 && attempt.xml->getStringAttribute ("status")
+                        == "class_skipped")
+                continue;
+
+            juce::PluginDescription validatedDescription;
+            const bool loaded = attempt.workerReaped
+                && attempt.finish == PhaseFinish::result
+                && attempt.xml != nullptr
+                && attempt.xml->getStringAttribute ("status")
+                       == "loaded_success"
+                && [&]
+                   {
+                       if (const auto* plugin =
+                               attempt.xml->getChildByName ("PLUGIN"))
+                           return validatedDescription.loadFromXml (*plugin)
+                               && descriptionBelongsToCandidate (
+                                      validatedDescription.fileOrIdentifier,
+                                      fileOrIdentifier)
+                               && validatedDescription.pluginFormatName
+                                      == format.getName();
+
+                       return false;
+                   }();
+
+            auto report = reportForAttempt (
+                validation, attempt, environment,
+                loaded ? &validatedDescription : nullptr);
+
+            if (attempt.xml != nullptr
+                 && attempt.xml->getStringAttribute ("status")
+                        == "loaded_success"
+                 && ! loaded)
+            {
+                scanHadInconclusive.store (true);
+                setReportFailure (*report, "host_internal_error", "protocol",
+                                  "invalid_validated_description",
+                                  "validated VST3 class omitted or changed its identity");
+            }
+
+            reportWriter.appendPlugin (*report);
+
+            if (loaded)
+                accumulator.addLoaded (validatedDescription);
+            else
+                accumulator.addFailure (
+                    attempt.finish,
+                    attempt.workerReaped && reachedAudioClass);
+
+            // Depois que um filho nao pode ser colhido, runPhase fecha para as
+            // proximas classes. Pare aqui para nao fabricar centenas de falhas
+            // de transporte; as classes ja aprovadas continuam preservadas.
+            if (! attempt.workerReaped)
+                break;
+        }
+
+        const auto& summary = accumulator.getSummary();
+        juce::Logger::writeToLog (
+            "PLUGIN_SCAN candidate_done format=" + format.getName()
+            + " path=" + fileOrIdentifier
+            + " factory_classes=" + juce::String (classCount)
+            + " audio_classes=" + juce::String (audioClasses)
+            + " validated=" + juce::String (summary.loaded)
+            + " fatal=" + juce::String (summary.fatal)
+            + " retryable_or_skipped="
+            + juce::String (summary.retryableOrSkipped));
+
+        return ! deveEntrarNaBlacklistPersistente (summary);
+    }
 
     void noteInconclusiveAttempt (const PhaseAttempt& attempt)
     {
@@ -1051,6 +1379,10 @@ private:
 
         report->setTagName ("PLUGIN_REPORT");
         report->setAttribute ("elapsedMs", attempt.elapsedMs);
+
+        if (request.classIndex >= 0)
+            report->setAttribute ("classIndex", request.classIndex);
+
         copyEnvironment (*report, environment);
         copyDescription (*report, description);
 

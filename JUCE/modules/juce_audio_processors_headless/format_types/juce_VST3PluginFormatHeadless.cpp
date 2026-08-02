@@ -81,6 +81,72 @@ void VST3PluginFormatHeadless::findAllTypesForFile (OwnedArray<PluginDescription
     }
 }
 
+int VST3PluginFormatHeadless::getNumClassesForFile (const String& fileOrIdentifier)
+{
+    if (! fileMightContainThisPluginType (fileOrIdentifier))
+        return -1;
+
+    int total = 0;
+    bool openedFactory = false;
+
+    for (const auto& file : getLibraryPaths (*this, fileOrIdentifier))
+    {
+        const auto handle = RefCountedDllHandle::getHandle (file);
+
+        if (handle == nullptr)
+            continue;
+
+        const auto factory = handle->getPluginFactory();
+
+        if (factory != nullptr)
+        {
+            openedFactory = true;
+            total += jmax (0, (int) factory->countClasses());
+        }
+    }
+
+    return openedFactory ? total : -1;
+}
+
+void VST3PluginFormatHeadless::findTypeForFileAtClassIndex (
+    OwnedArray<PluginDescription>& results,
+    const String& fileOrIdentifier,
+    int classIndex)
+{
+    if (classIndex < 0 || ! fileMightContainThisPluginType (fileOrIdentifier))
+        return;
+
+    for (const auto& file : getLibraryPaths (*this, fileOrIdentifier))
+    {
+        const auto handle = RefCountedDllHandle::getHandle (file);
+
+        if (handle == nullptr)
+            continue;
+
+        const auto factory = handle->getPluginFactory();
+
+        if (factory == nullptr)
+            continue;
+
+        const int numClasses = jmax (0, (int) factory->countClasses());
+
+        if (classIndex >= numClasses)
+        {
+            classIndex -= numClasses;
+            continue;
+        }
+
+        PluginDescription description;
+
+        if (DescriptionLister::findDescriptionForClass (
+                *factory, File (file), (Steinberg::int32) classIndex,
+                description))
+            results.add (new PluginDescription (description));
+
+        return;
+    }
+}
+
 void VST3PluginFormatHeadless::createARAFactoryAsync (const PluginDescription& description, ARAFactoryCreationCallback callback)
 {
     if (! description.hasARAExtension)

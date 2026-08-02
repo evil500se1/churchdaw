@@ -46,6 +46,45 @@ struct CandidateValidationSummary
     int retryableOrSkipped = 0;
 };
 
+// Mantem as descricoes aprovadas no pai enquanto as demais classes do mesmo
+// shell continuam sendo provadas em filhos descartaveis. Uma queda posterior
+// nunca pode limpar a classe que ja terminou a validacao.
+class CandidateValidationAccumulator
+{
+public:
+    explicit CandidateValidationAccumulator (
+        juce::OwnedArray<juce::PluginDescription>& destinationToUse)
+        : destination (destinationToUse)
+    {
+    }
+
+    void addLoaded (const juce::PluginDescription& description)
+    {
+        destination.add (new juce::PluginDescription (description));
+        ++summary.loaded;
+    }
+
+    void addFailure (PhaseFinish finish, bool crashWasInsidePluginClass = true)
+    {
+        if (crashWasInsidePluginClass
+             && deveEntrarNaBlacklistPersistente (finish))
+            ++summary.fatal;
+        else
+            ++summary.retryableOrSkipped;
+    }
+
+    void addRetryableOrSkipped() { ++summary.retryableOrSkipped; }
+
+    const CandidateValidationSummary& getSummary() const noexcept
+    {
+        return summary;
+    }
+
+private:
+    juce::OwnedArray<juce::PluginDescription>& destination;
+    CandidateValidationSummary summary;
+};
+
 inline bool deveEntrarNaBlacklistPersistente (
     const CandidateValidationSummary& summary)
 {

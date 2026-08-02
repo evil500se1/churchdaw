@@ -55,6 +55,18 @@ public:
     bool isTrivialToScan() const override           { return false; }
 
     void findAllTypesForFile (OwnedArray<PluginDescription>&, const String& fileOrIdentifier) override;
+
+    /** Returns the total number of factory classes without instantiating any
+        component. Hosts which isolate plug-in scanning can use this to launch
+        one disposable process for each class in a VST3 shell. */
+    int getNumClassesForFile (const String& fileOrIdentifier);
+
+    /** Reads the description for exactly one factory class without creating
+        its component. Non-audio classes produce no result. */
+    void findTypeForFileAtClassIndex (OwnedArray<PluginDescription>&,
+                                      const String& fileOrIdentifier,
+                                      int classIndex);
+
     bool fileMightContainThisPluginType (const String& fileOrIdentifier) override;
     String getNameOfPluginFromIdentifier (const String& fileOrIdentifier) override;
     bool pluginNeedsRescanning (const PluginDescription&) override;

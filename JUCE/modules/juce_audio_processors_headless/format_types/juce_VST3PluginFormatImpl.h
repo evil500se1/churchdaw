@@ -962,6 +962,62 @@ struct DescriptionLister
         return tryLoadFast (file, file.getChildFile ("Contents").getChildFile ("moduleinfo.json"));
     }
 
+    static bool findDescriptionForClass (IPluginFactory& factory,
+                                         const File& file,
+                                         Steinberg::int32 classIndex,
+                                         PluginDescription& description)
+    {
+        PClassInfo info{};
+
+        PluginHostDiagnostics::ScopedCall getClassInfo (
+            "discovery_class", "VST3 IPluginFactory::getClassInfo", true,
+            String (classIndex));
+        const auto classInfoResult = factory.getClassInfo (classIndex, &info);
+        getClassInfo.finish (classInfoResult == kResultOk, classInfoResult,
+                             String (classIndex));
+
+        if (classInfoResult != kResultOk
+             || std::strcmp (info.category, kVstAudioEffectClass) != 0)
+            return false;
+
+        const String name (toString (info.name).trim());
+        PluginHostDiagnostics::report (
+            PluginHostDiagnostics::EventKind::info,
+            "discovery_class", "VST3 audio class selected", true,
+            classIndex, false, 0, name);
+
+        PFactoryInfo factoryInfo{};
+        factory.getFactoryInfo (&factoryInfo);
+        const auto companyName = toString (factoryInfo.vendor).trim();
+        std::unique_ptr<PClassInfo2> info2;
+        std::unique_ptr<PClassInfoW> infoW;
+
+        {
+            VSTComSmartPtr<IPluginFactory2> pf2;
+            VSTComSmartPtr<IPluginFactory3> pf3;
+
+            if (pf2.loadFrom (&factory))
+            {
+                info2.reset (new PClassInfo2());
+                pf2->getClassInfo2 (classIndex, info2.get());
+            }
+
+            if (pf3.loadFrom (&factory))
+            {
+                infoW.reset (new PClassInfoW());
+                pf3->getClassInfoUnicode (classIndex, infoW.get());
+            }
+        }
+
+        PluginHostDiagnostics::ScopedCall describe (
+            "discovery_class", "VST3 create PluginDescription", true, name);
+        createPluginDescription (description, file, companyName, name,
+                                 info, info2.get(), infoW.get(), 0, 0);
+        const bool valid = description.uniqueId != 0;
+        describe.finish (valid, valid ? 0 : -1, name);
+        return valid;
+    }
+
     static std::vector<PluginDescription> findDescriptionsSlow (VST3HostContextHeadless& host,
                                                                 IPluginFactory& factory,
                                                                 const File& file)

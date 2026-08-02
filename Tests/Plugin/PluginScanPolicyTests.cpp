@@ -1,7 +1,6 @@
 #include <juce_audio_processors/juce_audio_processors.h>
 
-#include "PluginScanDiagnostics.h"
-#include "PluginScanPolicy.h"
+#include "PluginScanSubprocessV2.h"
 
 #include <initializer_list>
 #include <iostream>
@@ -18,6 +17,66 @@ void expect (bool condition, const char* message)
     ++failures;
     std::cerr << "FAIL: " << message << '\n';
 }
+
+class EmptyScanFormat final : public juce::AudioPluginFormat
+{
+public:
+    juce::String getName() const override { return "VST3"; }
+    void findAllTypesForFile (
+        juce::OwnedArray<juce::PluginDescription>&,
+        const juce::String&) override {}
+    bool fileMightContainThisPluginType (const juce::String&) override
+    {
+        return true;
+    }
+    juce::String getNameOfPluginFromIdentifier (
+        const juce::String& identifier) override
+    {
+        return identifier;
+    }
+    bool pluginNeedsRescanning (const juce::PluginDescription&) override
+    {
+        return true;
+    }
+    bool doesPluginStillExist (const juce::PluginDescription&) override
+    {
+        return true;
+    }
+    bool canScanForPlugins() const override { return true; }
+    bool isTrivialToScan() const override { return false; }
+    juce::StringArray searchPathsForPlugins (
+        const juce::FileSearchPath&, bool, bool) override
+    {
+        return {};
+    }
+    juce::FileSearchPath getDefaultLocationsToSearch() override { return {}; }
+
+private:
+    void createPluginInstance (
+        const juce::PluginDescription&, double, int,
+        PluginCreationCallback callback) override
+    {
+        callback ({}, "not used by this scan policy test");
+    }
+
+    bool requiresUnblockedMessageThreadDuringCreation (
+        const juce::PluginDescription&) const override
+    {
+        return false;
+    }
+};
+
+class SuccessfulEmptyScanner final : public juce::KnownPluginList::CustomScanner
+{
+public:
+    bool findPluginTypesFor (
+        juce::AudioPluginFormat&,
+        juce::OwnedArray<juce::PluginDescription>&,
+        const juce::String&) override
+    {
+        return true;
+    }
+};
 }
 
 int main()
@@ -40,6 +99,21 @@ int main()
              && parsedDiagnostic.getProperty ("status", {})
                     .toString() == "loaded_success",
             "Scanner diagnostic JSON line must be independently parseable");
+
+    ScanRequest classRequest;
+    classRequest.phase = ScanPhase::vst3ClassValidation;
+    classRequest.token = "class-token";
+    classRequest.format = "VST3";
+    classRequest.identifier = "Shell.vst3";
+    classRequest.classIndex = 7;
+    ScanRequest decodedClassRequest;
+    juce::String protocolError;
+    expect (deserialiseRequest (serialiseRequest (classRequest),
+                                decodedClassRequest, protocolError)
+             && decodedClassRequest.phase
+                    == ScanPhase::vst3ClassValidation
+             && decodedClassRequest.classIndex == 7,
+            "VST3 class requests must preserve their isolated class index");
 
     expect (! deveEntrarNaBlacklistPersistente (PhaseFinish::result),
             "A normal validation rejection must remain retryable");
@@ -104,6 +178,32 @@ int main()
             "Any loaded shell class must protect the whole bundle from blacklist");
     expect (! aggregateIsFatal (0, {}),
             "An empty or inconclusive candidate must not be called a crash");
+
+    juce::OwnedArray<juce::PluginDescription> survivingShellClasses;
+    CandidateValidationAccumulator shellAccumulator {
+        survivingShellClasses };
+    juce::PluginDescription validShellClass;
+    validShellClass.name = "Valid class";
+    validShellClass.pluginFormatName = "VST3";
+    validShellClass.fileOrIdentifier = "Shell.vst3";
+    validShellClass.uniqueId = 0x1234;
+    shellAccumulator.addLoaded (validShellClass);
+    shellAccumulator.addFailure (PhaseFinish::crash, true);
+
+    expect (survivingShellClasses.size() == 1
+             && survivingShellClasses[0]->name == "Valid class",
+            "A later crashing shell class must not erase an already validated sibling");
+    expect (! deveEntrarNaBlacklistPersistente (
+                shellAccumulator.getSummary()),
+            "A shell with a validated class must survive a sibling crash");
+
+    juce::OwnedArray<juce::PluginDescription> unknownFactoryClasses;
+    CandidateValidationAccumulator unknownClassAccumulator {
+        unknownFactoryClasses };
+    unknownClassAccumulator.addFailure (PhaseFinish::crash, false);
+    expect (! deveEntrarNaBlacklistPersistente (
+                unknownClassAccumulator.getSummary()),
+            "A crash before identifying an audio class must remain inconclusive");
     expect (precisaRevalidarBlacklistLegada (0)
              && precisaRevalidarBlacklistLegada (1)
              && precisaRevalidarBlacklistLegada (2)
@@ -162,6 +262,49 @@ int main()
             "Apple panner remained blacklisted");
     expect (list.getBlacklistedFiles().contains (kontakt),
             "A third-party failure was incorrectly cleared");
+
+    {
+        const auto staleRoot = juce::File::getSpecialLocation (
+                                   juce::File::tempDirectory)
+                                   .getNonexistentChildFile (
+                                       "churchdaw-stale-shell", ".vst3", false);
+        expect (staleRoot.createDirectory().wasOk(),
+                "Could not create stale VST3 bundle fixture");
+
+        juce::KnownPluginList staleList;
+        juce::PluginDescription stale;
+        stale.name = "Old shell class";
+        stale.pluginFormatName = "VST3";
+        stale.fileOrIdentifier = staleRoot.getChildFile ("Contents")
+                                     .getChildFile ("x86_64-win")
+                                     .getChildFile ("Shell.vst3")
+                                     .getFullPathName();
+        stale.uniqueId = 0x4001;
+        staleList.addType (stale);
+
+        juce::PluginDescription otherFormat = stale;
+        otherFormat.name = "Unrelated format";
+        otherFormat.pluginFormatName = "Other";
+        otherFormat.fileOrIdentifier = staleRoot.getFullPathName();
+        otherFormat.uniqueId = 0x4002;
+        staleList.addType (otherFormat);
+        staleList.setCustomScanner (
+            std::make_unique<SuccessfulEmptyScanner>());
+
+        EmptyScanFormat emptyFormat;
+        juce::OwnedArray<juce::PluginDescription> foundAfterFailure;
+        const bool added = staleList.scanAndAddFile (
+            staleRoot.getFullPathName(), false,
+            foundAfterFailure, emptyFormat);
+        const auto remainingTypes = staleList.getTypes();
+
+        expect (! added && foundAfterFailure.isEmpty(),
+                "The clean failure fixture unexpectedly returned a plugin");
+        expect (remainingTypes.size() == 1
+                 && remainingTypes[0].pluginFormatName == "Other",
+                "A failed normal rescan kept the stale VST3 description or removed another format");
+        staleRoot.deleteRecursively();
+    }
 
     const auto tempDir = juce::File::getSpecialLocation (
                              juce::File::tempDirectory)

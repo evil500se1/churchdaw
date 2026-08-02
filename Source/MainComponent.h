@@ -103,8 +103,10 @@ private:
         // apagar o setup; limpo quando qualquer coisa carrega no slot
         juce::String pendingIdentifier;
         juce::String pendingState;   // base64
+        juce::String loadingIdentifier;   // pedido async ainda nao confirmado
         juce::Array<juce::PluginDescription> choices;
         std::atomic<juce::AudioProcessor*> proc { nullptr };   // para identificar o plugin tocado no MIDI Learn
+        juce::uint64 loadGeneration = 0;   // invalida callbacks async antigos (AUv3 inclusive)
     };
 
     // ---- motor de audio ----
@@ -140,6 +142,15 @@ private:
     juce::StringArray entradasMidiConhecidas;
     juce::AudioPluginFormatManager formatManager;
     juce::KnownPluginList knownPlugins;
+    // IDs da blacklist antiga permanecem indisponiveis enquanto a validacao
+    // isolada ainda nao terminou. Isto fecha a janela entre removeFromBlacklist
+    // e o resultado do subprocesso, inclusive depois de cancelar/fechar o app.
+    juce::StringArray pluginScanQuarantine;
+   #if CHURCHDAW_HOSTS_PLUGINS
+    // O conteudo do dialogo referencia members deste MainComponent. Ownership
+    // explicito garante que ele morra sincronicamente antes desses members.
+    std::unique_ptr<juce::DialogWindow> pluginScannerDialog;
+   #endif
     juce::AudioProcessorGraph graph;
     juce::AudioProcessorPlayer player;
     juce::AudioProcessorGraph::NodeID audioInNode, audioOutNode, midiInNode, masterNode, padNode;
@@ -181,6 +192,11 @@ private:
     juce::ToggleButton inputToggle { "Entrada de audio (guitarra/mic)" };   // agora vive no dialogo Audio/MIDI
     DeviceInfoBar deviceBar;   // chips premium: controlador MIDI + interface de audio
     Slot slots[numSlots];
+    // SafePointer so e invalidado no destrutor da classe-base Component. Alguns
+    // plugins bombeiam mensagens durante a propria destruicao, portanto este
+    // sentinela precisa ser desligado no INICIO de ~MainComponent.
+    std::shared_ptr<std::atomic<bool>> pluginLoadLifetime {
+        std::make_shared<std::atomic<bool>> (true) };
 
     juce::Label masterLabel;
     juce::Slider masterSlider;
@@ -267,6 +283,8 @@ private:
     // adiadas (timbre carregando) so valem se a geracao ainda for a delas —
     // assim a cena abandonada nunca vence a que ele escolheu depois.
     int geracaoDaCena = 0;
+    ChurchDAWLive::ControleDeGravacaoDoSetupDuranteCena controleDeGravacaoDoSetup;
+    int cenaPendenteNoStartup = -1;
     LiveScenePanel liveScenePanel;
     juce::TextButton liveButton { "Live" };
 
@@ -275,7 +293,10 @@ private:
     // tentativa: so o reagendamento interno usa. Uma cena pedida enquanto um
     // timbre carrega se aplica sozinha quando a carga termina, em vez de
     // sumir sem explicacao.
-    ChurchDAWLive::Resultado aplicarCena (int indice, int tentativa = 0);
+    ChurchDAWLive::Resultado aplicarCena (int indice, int tentativa = 0,
+                                          bool paginaDoMotorJaSolicitada = false);
+    void reconciliarCenaAtivaNoStartup (int tentativa = 0);
+    void agendarFimDaSupressaoDeGravacaoDaCena (int geracao);
 
     void renomearCena (int indice, juce::String nome);
     void apagarCena (int indice);
@@ -287,6 +308,14 @@ private:
     bool esquemaDeCenasDesconhecido = false;
     // Nao e const: getUserSettings() do JUCE nao e const.
     juce::File arquivoDeCenas();
+    juce::File pastaDePaginasDeCenas();
+    juce::File arquivoDaPaginaDeCena (const juce::String& estadoId);
+    bool gravarPaginaDeCena (const juce::MemoryBlock& estado,
+                             juce::String& estadoId);
+    bool carregarPaginaDeCena (const juce::String& estadoId,
+                               juce::MemoryBlock& estado);
+    bool assegurarPaginaDaCenaAtiva (TimbresProcessor& live);
+    void removerPaginaDeCenaSeOrfa (const juce::String& estadoId);
 
     bool notaFoiConsumida (juce::MidiInput* source, const juce::MidiMessage& message);
 
@@ -468,9 +497,13 @@ private:
     void changeListenerCallback (juce::ChangeBroadcaster*) override;
     void refreshSlotChoices();
     void slotSelectionChanged (int slotIndex);
-    void loadPlugin (int slotIndex, const juce::PluginDescription& desc, const juce::MemoryBlock* state);
+    void loadPlugin (int slotIndex, const juce::PluginDescription& desc,
+                     const juce::MemoryBlock* state,
+                     bool openEditorAfterLoad = false,
+                     bool saveAfterLoad = false);
     void loadInternalTimbres (int slotIndex, const juce::MemoryBlock* state, int libraryIndex);
     void unloadSlot (int slotIndex);
+    void removeNodeForSlot (int slotIndex, juce::AudioProcessorGraph::NodeID nodeID);
     void openEditorForSlot (int slotIndex);
     void dockNode (juce::AudioProcessorGraph::NodeID nodeID);
     void dockNodeNow (juce::AudioProcessorGraph::NodeID nodeID);
@@ -503,7 +536,9 @@ private:
     bool saveMidiMap();   // true = arquivo realmente gravado
     void restoreMidiMap();
 
-    void rebuildGraphConnections();
+    bool rebuildGraphConnections (
+        int replacementSlot = -1,
+        juce::AudioProcessorGraph::NodeID replacementNode = {});
     void showAudioSettings();
     void showAbout();
     void showLibraries();
@@ -522,7 +557,6 @@ private:
     // Grava o setup pouco depois da ultima mudanca, para um fechamento
     // anormal nao levar embora o que o musico montou.
     void agendarGravacaoDoSetup();
-    int geracaoDaGravacaoDoSetup = 0;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MainComponent)
 };

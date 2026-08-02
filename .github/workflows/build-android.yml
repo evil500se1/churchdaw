@@ -140,7 +140,10 @@ jobs:
           $builtApk = Resolve-Path `
             '.\Builds\Android\app\build\outputs\apk\release_\release\app-release_-release.apk'
           New-Item -ItemType Directory -Force .\dist | Out-Null
-          $publicApk = Join-Path $PWD "dist\ChurchDAW-$versionName.apk"
+          # A ponte de atualizacao aceita somente o nome oficial terminado em
+          # -signed.apk. Publicar outro nome gera um APK valido que o proprio
+          # aplicativo se recusa a instalar.
+          $publicApk = Join-Path $PWD "dist\ChurchDAW-$versionName-signed.apk"
           Copy-Item -LiteralPath $builtApk -Destination $publicApk -Force
 
           $buildTools = Get-ChildItem "$env:ANDROID_HOME\build-tools" -Directory |

@@ -115,6 +115,9 @@ if(CHURCHDAW_BUILD_AUDIO_TESTS AND NOT ANDROID AND NOT IOS)
     juce_add_console_app(ChurchDAWSceneFileWriteProbe
         PRODUCT_NAME "ChurchDAWSceneFileWriteProbe")
 
+    juce_add_console_app(ChurchDAWPluginScanPolicyTests
+        PRODUCT_NAME "ChurchDAWPluginScanPolicyTests")
+
     target_sources(ChurchDAWMasterLimiterTests PRIVATE
         Tests/Audio/StereoLookaheadLimiterTests.cpp)
 
@@ -139,6 +142,9 @@ if(CHURCHDAW_BUILD_AUDIO_TESTS AND NOT ANDROID AND NOT IOS)
     target_sources(ChurchDAWSceneFileWriteProbe PRIVATE
         Tests/Live/SceneFileWriteProbe.cpp)
 
+    target_sources(ChurchDAWPluginScanPolicyTests PRIVATE
+        Tests/Plugin/PluginScanPolicyTests.cpp)
+
     target_include_directories(ChurchDAWMasterLimiterTests PRIVATE Source)
     target_include_directories(ChurchDAWChannelToneTests PRIVATE Source)
     target_include_directories(ChurchDAWMidiMappingSafetyTests PRIVATE Source)
@@ -147,6 +153,7 @@ if(CHURCHDAW_BUILD_AUDIO_TESTS AND NOT ANDROID AND NOT IOS)
     target_include_directories(ChurchDAWLibraryPackPathTests PRIVATE Source)
     target_include_directories(ChurchDAWLiveScenesTests PRIVATE Source)
     target_include_directories(ChurchDAWSceneFileWriteProbe PRIVATE Source)
+    target_include_directories(ChurchDAWPluginScanPolicyTests PRIVATE Source)
     target_compile_definitions(ChurchDAWMasterLimiterTests PRIVATE
         JUCE_WEB_BROWSER=0
         JUCE_PUSH_NOTIFICATIONS=0
@@ -176,6 +183,10 @@ if(CHURCHDAW_BUILD_AUDIO_TESTS AND NOT ANDROID AND NOT IOS)
         JUCE_PUSH_NOTIFICATIONS=0
         JUCE_USE_CURL=0)
     target_compile_definitions(ChurchDAWSceneFileWriteProbe PRIVATE
+        JUCE_WEB_BROWSER=0
+        JUCE_PUSH_NOTIFICATIONS=0
+        JUCE_USE_CURL=0)
+    target_compile_definitions(ChurchDAWPluginScanPolicyTests PRIVATE
         JUCE_WEB_BROWSER=0
         JUCE_PUSH_NOTIFICATIONS=0
         JUCE_USE_CURL=0)
@@ -235,6 +246,12 @@ if(CHURCHDAW_BUILD_AUDIO_TESTS AND NOT ANDROID AND NOT IOS)
         PUBLIC
             juce::juce_recommended_config_flags)
 
+    target_link_libraries(ChurchDAWPluginScanPolicyTests
+        PRIVATE
+            juce::juce_audio_processors
+        PUBLIC
+            juce::juce_recommended_config_flags)
+
     if(MSVC)
         target_compile_options(ChurchDAWMasterLimiterTests PRIVATE /utf-8)
         target_compile_options(ChurchDAWChannelToneTests PRIVATE /utf-8)
@@ -244,6 +261,7 @@ if(CHURCHDAW_BUILD_AUDIO_TESTS AND NOT ANDROID AND NOT IOS)
         target_compile_options(ChurchDAWLibraryPackPathTests PRIVATE /utf-8)
         target_compile_options(ChurchDAWLiveScenesTests PRIVATE /utf-8)
         target_compile_options(ChurchDAWSceneFileWriteProbe PRIVATE /utf-8)
+        target_compile_options(ChurchDAWPluginScanPolicyTests PRIVATE /utf-8)
     endif()
 
     add_test(
@@ -273,6 +291,9 @@ if(CHURCHDAW_BUILD_AUDIO_TESTS AND NOT ANDROID AND NOT IOS)
     add_test(
         NAME ChurchDAWSceneFileWrite
         COMMAND ChurchDAWSceneFileWriteProbe)
+    add_test(
+        NAME ChurchDAWPluginScanPolicy
+        COMMAND ChurchDAWPluginScanPolicyTests)
     set_tests_properties(
         ChurchDAWReverbPitch
         ChurchDAWMasterLimiter
@@ -281,6 +302,7 @@ if(CHURCHDAW_BUILD_AUDIO_TESTS AND NOT ANDROID AND NOT IOS)
         ChurchDAWChannelRotary
         ChurchDAWPadProcessor
         ChurchDAWLibraryPackPath
+        ChurchDAWPluginScanPolicy
         PROPERTIES TIMEOUT 240)
 endif()
 

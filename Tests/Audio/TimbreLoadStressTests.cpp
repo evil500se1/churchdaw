@@ -458,6 +458,42 @@ bool runChannelControlStateProbe()
     if (! currentStateOk)
         return false;
 
+    // Uma pagina de cena que referencia plugin ainda indisponivel nao pode ser
+    // declarada pronta pela metade. O alvo fica pendente para autocura; uma
+    // limpeza/substituicao explicita encerra corretamente essa pendencia.
+    auto missingPluginXml = juce::AudioProcessor::getXmlFromBinary (
+        state.getData(), (int) state.getSize());
+
+    if (missingPluginXml == nullptr)
+        return false;
+
+    forEachXmlChildElementWithTagName (
+        *missingPluginXml, layer, "LAYER")
+        if (layer->getIntAttribute ("index", -1) == 0)
+        {
+            layer->setAttribute (
+                "vstId", "missing-scene-plugin-identifier");
+            layer->setAttribute ("vstState", "");
+            layer->setAttribute ("timbre", "");
+            break;
+        }
+
+    juce::MemoryBlock missingPluginState;
+    juce::AudioProcessor::copyXmlToBinary (
+        *missingPluginXml, missingPluginState);
+    auto pendingScenePage = std::make_unique<TimbresProcessor>();
+    pendingScenePage->setStateInformation (
+        missingPluginState.getData(),
+        (int) missingPluginState.getSize());
+
+    if (! pendingScenePage->hasPendingStateRestore())
+        return false;
+
+    pendingScenePage->clearLayer (0);
+
+    if (pendingScenePage->hasPendingStateRestore())
+        return false;
+
     // Uma LAYER ausente representa canal vazio, nao "deixe os controles do
     // projeto anterior". Suje o canal 2, remova-o do XML e confira o reset
     // substitutivo de volume/ENV/EQ.
@@ -4009,6 +4045,92 @@ bool runPerTimbreRecallProbe()
         && close (processor->getLayerMidEqParam (0)->get(), -3.5f)
         && close (processor->getLayerHighEqParam (0)->get(), 1.75f);
 }
+
+bool runAsyncPluginLoadStateProbe()
+{
+    ChurchDAWPluginLoading::RequestGeneration generation;
+    const auto first = generation.begin();
+
+    if (! generation.isCurrent (first))
+        return false;
+
+    const auto second = generation.begin();
+
+    if (generation.isCurrent (first)
+         || ! generation.isCurrent (second))
+        return false;
+
+    int committedValue = 0;
+
+    if (generation.commitIfCurrent (
+            first, [&committedValue]
+            {
+                committedValue = 1;
+            })
+         || committedValue != 0)
+        return false;
+
+    if (! generation.commitIfCurrent (
+            second, [&committedValue]
+            {
+                committedValue = 2;
+            })
+         || committedValue != 2)
+        return false;
+
+    generation.cancel();
+
+    if (generation.isCurrent (second))
+        return false;
+
+    juce::PluginDescription kontaktAu;
+    kontaktAu.name = "Kontakt 8";
+    kontaktAu.pluginFormatName = "AudioUnit";
+    kontaktAu.manufacturerName = "Native Instruments";
+    kontaktAu.fileOrIdentifier = "AudioUnit:Kontakt";
+    kontaktAu.uniqueId = 101;
+
+    auto kontaktVst = kontaktAu;
+    kontaktVst.pluginFormatName = "VST3";
+    kontaktVst.fileOrIdentifier = "VST3:Kontakt";
+    kontaktVst.uniqueId = 102;
+
+    juce::PluginDescription bigSky;
+    bigSky.name = "BigSky";
+    bigSky.pluginFormatName = "VST3";
+    bigSky.manufacturerName = "Strymon";
+    bigSky.fileOrIdentifier = "VST3:BigSky";
+    bigSky.uniqueId = 103;
+
+    juce::Array<juce::PluginDescription> choices {
+        kontaktAu, bigSky, kontaktVst
+    };
+
+    const auto auLabel = ChurchDAWPluginLoading::displayName (
+        kontaktAu, choices);
+    const auto vstLabel = ChurchDAWPluginLoading::displayName (
+        kontaktVst, choices);
+
+    if (! auLabel.contains ("AudioUnit")
+         || ! auLabel.contains ("Native Instruments")
+         || ! vstLabel.contains ("VST3")
+         || ChurchDAWPluginLoading::displayName (
+                bigSky, choices) != "BigSky")
+        return false;
+
+    const auto selectedIdentifier =
+        kontaktAu.createIdentifierString();
+    choices.move (0, choices.size() - 1);
+
+    const int restoredIndex =
+        ChurchDAWPluginLoading::findChoiceByIdentifier (
+            choices, selectedIdentifier);
+
+    return juce::isPositiveAndBelow (
+               restoredIndex, choices.size())
+        && choices.getReference (restoredIndex)
+               .pluginFormatName == "AudioUnit";
+}
 }
 
 int main (int argc, char* argv[])
@@ -4018,6 +4140,12 @@ int main (int argc, char* argv[])
     if (argc == 2
          && juce::String::fromUTF8 (argv[1]) == "--controls-only")
     {
+        if (! runAsyncPluginLoadStateProbe())
+        {
+            std::cerr << "Geracao assincrona ou identidade/rotulo de plugin falhou\n";
+            return 1;
+        }
+
         if (! runChannelControlStateProbe())
         {
             std::cerr << "Attack/Release/EQ/Rotary falharam no estado salvo ou migrado\n";

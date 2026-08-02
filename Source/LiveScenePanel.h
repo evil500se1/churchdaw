@@ -25,10 +25,10 @@ public:
     //==========================================================================
     // Botao de cena com TOQUE LONGO.
     //
-    // Renomear e apagar nao podem morar num botao proprio: a faixa ja tem onze
-    // alvos e no celular nao sobra largura. O toque longo (ou botao direito no
-    // computador) resolve sem tirar nada da tela — e, principalmente, sem
-    // criar mais um alvo que se pode acertar por engano no escuro.
+    // Renomear continua no toque longo (ou botao direito), porque precisa de
+    // contexto e nao e gesto de palco. LIMPAR agora e visivel para a cena
+    // selecionada, mas ainda pede confirmacao; o toque longo permanece como
+    // atalho para renomear ou apagar sem carregar outra cena.
     //
     // Segurar NAO troca a musica: se o menu abriu, o clique e engolido. Um
     // toque longo que tambem trocasse de cena seria a pior combinacao
@@ -39,6 +39,30 @@ public:
     {
     public:
         std::function<void()> aoSegurar;
+
+        void setSelecionadoComoDestino (bool deveFicarSelecionado)
+        {
+            if (selecionadoComoDestino == deveFicarSelecionado)
+                return;
+
+            selecionadoComoDestino = deveFicarSelecionado;
+            repaint();
+        }
+
+        void paintButton (juce::Graphics& g, bool estaSobre, bool estaPressionado) override
+        {
+            juce::TextButton::paintButton (g, estaSobre, estaPressionado);
+
+            // Vermelho continua reservado para a cena realmente no ar. A
+            // borda ambar significa apenas "este e o destino que estou
+            // preparando" e, portanto, nunca mente que um slot vazio tocou.
+            if (selecionadoComoDestino)
+            {
+                g.setColour (juce::Colour (0xffffc247));
+                g.drawRoundedRectangle (getLocalBounds().toFloat().reduced (1.5f),
+                                        3.5f, 2.0f);
+            }
+        }
 
         void mouseDown (const juce::MouseEvent& e) override
         {
@@ -102,20 +126,29 @@ public:
         }
 
         bool segurou = false;
+        bool selecionadoComoDestino = false;
     };
 
     LiveScenePanel()
     {
+        setTitle ("Cenas ao vivo");
+        setDescription ("Dez cenas para preparar, salvar, carregar e limpar sem interromper o audio.");
+
         for (int i = 0; i < ChurchDAWLive::numeroDeCenas; ++i)
         {
             auto* b = botoes.add (new BotaoDeCena());
             b->setWantsKeyboardFocus (false);   // seta do teclado nao troca musica
+            // O titulo acessivel nunca vira o apelido da musica. Assim a
+            // automacao/leitor de tela continua encontrando "Cena 2" mesmo
+            // depois que o texto visual muda para "Aleluia".
+            b->setTitle ("Cena " + juce::String (i + 1));
             b->onClick = [this, i] { acionar (i); };
             b->aoSegurar = [this, i] { mostrarMenu (i); };
             addAndMakeVisible (b);
         }
 
         gravarBtn.setButtonText ("GRAVAR");
+        gravarBtn.setTitle ("Gravar cena");
         gravarBtn.setWantsKeyboardFocus (false);
         gravarBtn.setClickingTogglesState (true);
         gravarBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff2a2d34));
@@ -124,6 +157,20 @@ public:
         gravarBtn.setColour (juce::TextButton::textColourOnId, juce::Colours::white);
         gravarBtn.onClick = [this] { armarOuDesarmar(); };
         addAndMakeVisible (gravarBtn);
+
+        limparBtn.setButtonText ("LIMPAR");
+        limparBtn.setTitle ("Limpar cena");
+        limparBtn.setWantsKeyboardFocus (false);
+        limparBtn.setClickingTogglesState (true);
+        limparBtn.setTooltip ("Limpar a cena selecionada");
+        limparBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff202329));
+        limparBtn.setColour (juce::TextButton::buttonOnColourId, juce::Colour (0xff6f4a08));
+        limparBtn.setColour (juce::TextButton::textColourOffId,
+                             NordLookAndFeel::dimText().withAlpha (0.90f));
+        limparBtn.setColour (juce::TextButton::textColourOnId, juce::Colours::white);
+        limparBtn.onClick = [this] { armarOuDesarmarLimpeza(); };
+        limparBtn.setEnabled (false);
+        addAndMakeVisible (limparBtn);
 
         // RENOMEAR SEM DIALOGO.
         //
@@ -159,6 +206,20 @@ public:
 
     void atualizar (const ChurchDAWLive::Cena* cenas, int ativa)
     {
+        const int selecionadaAntes = interacao.selecionada;
+        ativaAtual = ativa;
+
+        // A unica transicao preenchida -> vazia e a confirmacao de LIMPAR.
+        // Volta a selecao para a cena que continua no ar (ou para nenhuma), em
+        // vez de deixar uma borda de edicao sobre algo que acabou de ser
+        // apagado deliberadamente.
+        if (juce::isPositiveAndBelow (selecionadaAntes, (int) preenchida.size())
+             && preenchida[(size_t) selecionadaAntes]
+             && ! cenas[selecionadaAntes].preenchida)
+            interacao.cenaFoiApagada (selecionadaAntes, ativa);
+
+        interacao.sincronizarComAtiva (ativa);
+
         for (int i = 0; i < botoes.size(); ++i)
         {
             auto* b = botoes[i];
@@ -178,8 +239,29 @@ public:
             b->setColour (juce::TextButton::textColourOffId,
                           cena.preenchida ? juce::Colours::white
                                           : NordLookAndFeel::dimText().withAlpha (0.55f));
+
+            b->setTooltip (cena.preenchida
+                              ? "Toque para carregar. Segure para renomear ou apagar."
+                              : "Toque para preparar uma nova cena.");
+
+            juce::String descricao = "Cena " + juce::String (i + 1) + ". ";
+
+            if (! cena.preenchida)
+                descricao += "Vazia. Toque para preparar e depois use Salvar.";
+            else
+                descricao += cena.nome.isNotEmpty()
+                               ? "Salva como " + cena.nome + "."
+                               : "Salva sem nome.";
+
+            if (i == ativa)
+                descricao += " Esta e a cena ativa no audio.";
+            else if (i == interacao.selecionada)
+                descricao += " Selecionada como destino; nao esta ativa no audio.";
+
+            b->setDescription (descricao);
         }
 
+        atualizarAcoes();
         repaint();
     }
 
@@ -201,7 +283,10 @@ public:
     void visibilityChanged() override
     {
         if (! isVisible())
+        {
             desarmar();
+            desarmarLimpeza();
+        }
     }
 
     // ARMAR EXPIRA SOZINHO.
@@ -217,10 +302,31 @@ public:
     // Armar e uma intencao de segundos: quem arma vai tocar na cena agora.
     void armarOuDesarmar()
     {
-        if (gravarBtn.getToggleState())
-            startTimer (9000);
-        else
+        if (! gravarBtn.getToggleState())
+        {
             stopTimer();
+
+            repaint();
+            return;
+        }
+
+        // Gravar e limpar sao intencoes mutuamente exclusivas. Nenhum toque
+        // numa cena pode ficar ambiguo entre sobrescrever e apagar.
+        desarmarLimpeza();
+
+        // Fluxo pedido pelo cliente: toque numa cena vazia para prepara-la e,
+        // depois de ajustar os timbres, toque SALVAR. Continua sendo dois
+        // gestos deliberados, mas nao exige descobrir a ordem invertida
+        // GRAVAR -> tocar novamente no mesmo numero.
+        const int destinoNovo = interacao.destinoNovoAoPressionarGravar (true, preenchida);
+
+        if (destinoNovo >= 0)
+        {
+            executarGravacao (destinoNovo, true);
+            return;
+        }
+
+        startTimer (9000);
 
         repaint();
     }
@@ -234,8 +340,29 @@ public:
 
         // Sempre limpa e sempre bump: um aviso deixado para tras reaparecia ao
         // reabrir o painel, contando um erro que ja passou.
-        ++geracaoDoAviso;
-        aviso.clear();
+        limparAviso();
+    }
+
+    void armarOuDesarmarLimpeza()
+    {
+        if (limparBtn.getToggleState())
+        {
+            // Entrar em LIMPAR nunca herda um GRAVAR armado. O proximo toque
+            // escolhe o slot a apagar e nao carrega/troca o audio.
+            desarmar();
+            limparAviso();
+        }
+
+        atualizarAcoes();
+        repaint();
+    }
+
+    void desarmarLimpeza()
+    {
+        if (limparBtn.getToggleState())
+            limparBtn.setToggleState (false, juce::dontSendNotification);
+
+        atualizarAcoes();
         repaint();
     }
 
@@ -253,9 +380,15 @@ public:
         // aparecer (ver avisoDoResultado).
         g.drawText (temAviso
                       ? aviso
-                      : (gravarBtn.getToggleState()
+                      : (limparBtn.getToggleState()
+                          ? juce::String::fromUTF8 ("LIMPAR  \xe2\x80\xa2  toque na cena que deseja apagar")
+                          : gravarBtn.getToggleState()
                           ? juce::String::fromUTF8 ("LIVE MODE  \xe2\x80\xa2  toque numa cena para GRAVAR por cima")
-                          : juce::String::fromUTF8 ("LIVE MODE  \xe2\x80\xa2  toque para trocar de m\xc3\xbasica")),
+                          : destinoNovoSelecionado()
+                              ? juce::String::fromUTF8 ("CENA ")
+                                  + juce::String (interacao.selecionada + 1)
+                                  + juce::String::fromUTF8 (" NOVA  \xe2\x80\xa2  ajuste o som e toque SALVAR")
+                              : juce::String::fromUTF8 ("LIVE MODE  \xe2\x80\xa2  toque para trocar de m\xc3\xbasica")),
                     getLocalBounds().reduced (8, 4).removeFromTop (alturaDoRotulo),
                     juce::Justification::centred);
     }
@@ -264,52 +397,45 @@ public:
     {
         auto area = getLocalBounds().reduced (8, 4);
 
-        // O rotulo so entra se sobrar altura de verdade. Numa faixa curta ele
-        // roubava 14 px que ja faltavam e a conta chegava a dar altura
-        // NEGATIVA — os botoes simplesmente sumiam da tela.
-        alturaDoRotulo = area.getHeight() >= 46 ? 14 : 0;
+        const auto layout = ChurchDAWLive::calcularLayoutDaFaixaDeCenas (
+            area.getWidth(), area.getHeight());
+        alturaDoRotulo = layout.alturaDoRotulo;
         area.removeFromTop (alturaDoRotulo);
 
         if (area.getHeight() <= 0 || area.getWidth() <= 0)
             return;
 
-        // O GRAVAR nunca pode comer a faixa inteira. Numa janela freeform
-        // estreita do Android 16 o minimo fixo de 52 px sobrava zero para as
-        // dez cenas, e o Live Mode aparecia so com o botao de gravar.
-        const int larguraGravar = juce::jlimit (juce::jmin (36, area.getWidth() / 3),
-                                                86,
-                                                area.getWidth() / 6);
+        auto acoes = area.removeFromRight (layout.larguraDasAcoes);
 
-        gravarBtn.setBounds (encolher (area.removeFromRight (larguraGravar)));
-        area.removeFromRight (juce::jmin (6, area.getWidth() / 4));
-
-        // DUAS FILEIRAS quando uma so daria alvo de dedo pequeno demais — mas
-        // SO se houver altura para isso. Dez botoes de 21 px de largura sao
-        // ruins; trocar por quarenta de largura e DEZESSEIS de altura e pior,
-        // e foi o que acontecia na faixa de 52 px do retrato. Pior ainda: num
-        // botao de 16 px o dedo passa dos 10 px de arrasto antes dos 550 ms, o
-        // toque longo morre e o gesto vira clique — tentar renomear TROCAVA a
-        // musica.
-        const bool larguraApertada = (area.getWidth() / botoes.size()) < 44;
-        const bool cabeDuasFileiras = area.getHeight() >= 72;
-        const int porFileira = (larguraApertada && cabeDuasFileiras) ? botoes.size() / 2
-                                                                     : botoes.size();
-        const int fileiras   = juce::jmax (1, botoes.size() / juce::jmax (1, porFileira));
-        const int alturaFileira = juce::jmax (1, area.getHeight() / fileiras);
-
-        for (int f = 0; f < fileiras; ++f)
+        if (layout.acoesEmpilhadas)
         {
-            auto linha = area.removeFromTop (alturaFileira);
-            const int largura = juce::jmax (1, linha.getWidth() / juce::jmax (1, porFileira));
+            const int metade = acoes.getHeight() / 2;
+            gravarBtn.setBounds (encolher (acoes.removeFromTop (metade)));
+            limparBtn.setBounds (encolher (acoes));
+        }
+        else
+        {
+            limparBtn.setBounds (encolher (acoes.removeFromRight (layout.larguraDoLimpar)));
+            gravarBtn.setBounds (encolher (acoes));
+        }
 
-            for (int i = 0; i < porFileira; ++i)
+        area.removeFromRight (layout.espacoEntreCenasEAcoes);
+        atualizarAcoes();
+
+        for (int f = 0; f < layout.fileirasDeCenas; ++f)
+        {
+            auto linha = area.removeFromTop (layout.alturaDaFileira);
+            const int largura = juce::jmax (
+                1, linha.getWidth() / juce::jmax (1, layout.cenasPorFileira));
+
+            for (int i = 0; i < layout.cenasPorFileira; ++i)
             {
-                const int indice = f * porFileira + i;
+                const int indice = f * layout.cenasPorFileira + i;
 
                 if (! juce::isPositiveAndBelow (indice, botoes.size()))
                     break;
 
-                const int w = i == porFileira - 1 ? linha.getWidth() : largura;
+                const int w = i == layout.cenasPorFileira - 1 ? linha.getWidth() : largura;
                 botoes[indice]->setBounds (encolher (linha.removeFromLeft (w)));
             }
         }
@@ -333,16 +459,129 @@ private:
         }
     }
 
-    // Recuo proporcional. O recuo fixo de 6 px virava altura negativa numa
-    // faixa de 20 px, e um Rectangle de altura negativa nao desenha nada.
+    // Recuo so usa a folga ACIMA de 44 px. Reduzir o Rectangle do componente
+    // reduz tambem o hit target; portanto nenhuma margem visual pode transformar
+    // uma celula valida de 44 px em um botao de 40/32 px.
     static juce::Rectangle<int> encolher (juce::Rectangle<int> r)
     {
-        return r.reduced (juce::jmin (2, r.getWidth()  / 6),
-                          juce::jmin (6, r.getHeight() / 6));
+        const int x = juce::jmin (2, juce::jmax (0, (r.getWidth()  - 44) / 2));
+        const int y = juce::jmin (2, juce::jmax (0, (r.getHeight() - 44) / 2));
+        return r.reduced (x, y);
+    }
+
+    bool destinoNovoSelecionado() const
+    {
+        const int indice = interacao.selecionada;
+        return juce::isPositiveAndBelow (indice, (int) preenchida.size())
+            && ! preenchida[(size_t) indice];
+    }
+
+    void atualizarAcessibilidadeDasCenas()
+    {
+        for (int i = 0; i < botoes.size(); ++i)
+        {
+            juce::String descricao = "Cena " + juce::String (i + 1) + ". ";
+
+            if (! preenchida[(size_t) i])
+                descricao += "Vazia. Toque para preparar e depois use Salvar.";
+            else
+                descricao += nomes[(size_t) i].isNotEmpty()
+                               ? "Salva como " + nomes[(size_t) i] + "."
+                               : "Salva sem nome.";
+
+            if (i == ativaAtual)
+                descricao += " Esta e a cena ativa no audio.";
+            else if (i == interacao.selecionada)
+                descricao += " Selecionada como destino; nao esta ativa no audio.";
+
+            botoes[i]->setDescription (descricao);
+        }
+    }
+
+    void atualizarAcoes()
+    {
+        const int selecionada = interacao.selecionada;
+        const bool indiceValido = juce::isPositiveAndBelow (selecionada,
+                                                             (int) preenchida.size());
+        const bool temCenaParaLimpar = indiceValido && preenchida[(size_t) selecionada];
+        bool haAlgumaCenaPreenchida = false;
+
+        for (const bool temCena : preenchida)
+            haAlgumaCenaPreenchida = haAlgumaCenaPreenchida || temCena;
+
+        if (falhaDeGravacaoRecente)
+            gravarBtn.setButtonText (retryExigeToqueNaCena ? "CENA" : "TENTAR");
+        else
+            gravarBtn.setButtonText (indiceValido && ! temCenaParaLimpar ? "SALVAR" : "GRAVAR");
+
+        limparBtn.setEnabled (haAlgumaCenaPreenchida);
+        limparBtn.setButtonText (limparBtn.getToggleState()
+                                   ? (limparBtn.getWidth() < 70 ? "SAIR" : "CANCELAR")
+                                   : (limparBtn.getWidth() < 48 ? "X" : "LIMPAR"));
+
+        gravarBtn.setDescription (gravarBtn.getToggleState()
+                                    ? "Gravacao armada. Toque novamente numa cena para tentar salvar."
+                                    : destinoNovoSelecionado()
+                                        ? "Salvar o som atual na cena vazia selecionada."
+                                        : "Armar gravacao de uma cena.");
+        limparBtn.setDescription (limparBtn.getToggleState()
+                                    ? "Limpeza armada. Toque numa cena preenchida para escolher sem carrega-la."
+                                    : "Escolher uma cena preenchida para apagar sem mudar o audio.");
+
+        setDescription (limparBtn.getToggleState()
+                          ? "Modo de limpeza. O proximo toque escolhe uma cena para apagar sem carrega-la."
+                          : destinoNovoSelecionado()
+                              ? "Nova cena selecionada. Ajuste o som e use Salvar."
+                              : "Dez cenas para preparar, salvar e carregar ao vivo.");
+
+        atualizarAcessibilidadeDasCenas();
+
+        for (int i = 0; i < botoes.size(); ++i)
+            botoes[i]->setSelecionadoComoDestino (i == selecionada && i != ativaAtual);
+    }
+
+    void limparAviso()
+    {
+        ++geracaoDoAviso;
+        aviso.clear();
+        falhaDeGravacaoRecente = false;
+        retryExigeToqueNaCena = false;
+        atualizarAcoes();
+        repaint();
+    }
+
+    void executarGravacao (int indice, bool veioDoBotaoSalvar)
+    {
+        const auto r = onGravarCena != nullptr ? onGravarCena (indice)
+                                               : ChurchDAWLive::Resultado::indisponivel;
+
+        const auto origem = veioDoBotaoSalvar
+                              ? ChurchDAWLive::OrigemDaGravacao::botaoSalvar
+                              : ChurchDAWLive::OrigemDaGravacao::gravarArmadoECena;
+        const bool manterArmado = ChurchDAWLive::manterGravarArmadoParaRetry (r, origem);
+
+        if (! manterArmado)
+            desarmar();
+        else
+            startTimer (9000);   // o retry ganha um prazo novo completo
+
+        falhaDeGravacaoRecente = r != ChurchDAWLive::Resultado::ok;
+        retryExigeToqueNaCena = manterArmado;
+        mostrarAviso (ChurchDAWLive::avisoDaGravacao (r, origem, indice));
+        atualizarAcoes();
+        repaint();
     }
 
     void mostrarMenu (int indice)
     {
+        // Toque longo e um gesto de administracao. Ele sempre cancela as
+        // intencoes perigosas e apenas SELECIONA o slot; nunca carrega o audio.
+        // Isso tambem torna uma cena inativa o alvo do LIMPAR visivel.
+        desarmar();
+        desarmarLimpeza();
+        interacao.selecionarSemAcionar (indice);
+        atualizarAcoes();
+
         if (! juce::isPositiveAndBelow (indice, (int) preenchida.size()) || ! preenchida[indice])
         {
             // Cena vazia nao tem nome para trocar nem conteudo para apagar. Um
@@ -422,23 +661,65 @@ private:
 
     void acionar (int indice)
     {
-        if (gravarBtn.getToggleState())
+        const bool limparArmado = limparBtn.getToggleState();
+        const auto acao = interacao.tocar (
+            indice,
+            juce::isPositiveAndBelow (indice, (int) preenchida.size())
+                && preenchida[(size_t) indice],
+            gravarBtn.getToggleState(),
+            limparArmado);
+
+        atualizarAcoes();
+
+        if (acao == ChurchDAWLive::AcaoDeCena::nenhuma)
         {
-            const auto r = onGravarCena != nullptr ? onGravarCena (indice)
-                                                   : ChurchDAWLive::Resultado::indisponivel;
+            if (limparArmado)
+                mostrarAviso (ChurchDAWLive::avisoDoResultado (
+                    ChurchDAWLive::Resultado::vazia, indice));
 
-            // So desarma se GRAVOU. Desarmar depois de uma gravacao que nao
-            // aconteceu era pior que o bug original: o botao apagava, o musico
-            // lia isso como "gravou" e seguia o culto confiando numa cena que
-            // nao existe — ele so descobriria no domingo seguinte.
-            // desarmar() tambem para o prazo — senao ele dispararia depois e
-            // anunciaria "gravar desarmou sozinho" logo apos uma gravacao que
-            // deu certo.
-            if (r == ChurchDAWLive::Resultado::ok)
-                desarmar();
+            return;
+        }
 
-            mostrarAviso (ChurchDAWLive::avisoDoResultado (r, indice));
-            repaint();
+        if (acao == ChurchDAWLive::AcaoDeCena::apagar)
+        {
+            // A escolha nao chamou onCarregarCena: cenaAtiva e audio seguem
+            // exatamente onde estavam. A confirmacao continua no callback.
+            desarmar();
+            desarmarLimpeza();
+
+            if (onApagarCena != nullptr)
+                onApagarCena (indice);
+            else
+                mostrarAviso (ChurchDAWLive::avisoDoResultado (
+                    ChurchDAWLive::Resultado::indisponivel, indice));
+
+            return;
+        }
+
+        if (acao == ChurchDAWLive::AcaoDeCena::gravar)
+        {
+            executarGravacao (indice, false);
+            return;
+        }
+
+        if (acao == ChurchDAWLive::AcaoDeCena::prepararNova)
+        {
+            const auto r = onCarregarCena != nullptr ? onCarregarCena (indice)
+                                                     : ChurchDAWLive::Resultado::indisponivel;
+
+            if (r == ChurchDAWLive::Resultado::vazia)
+            {
+                // Nao e erro: o slot vazio virou uma pagina nova e o callback
+                // preparou o motor sem timbres. O texto explica o proximo gesto
+                // e a cena anterior continua intacta no banco para voltar depois.
+                limparAviso();
+                atualizarAcoes();
+            }
+            else
+            {
+                mostrarAviso (ChurchDAWLive::avisoDoResultado (r, indice));
+            }
+
             return;
         }
 
@@ -452,6 +733,8 @@ private:
     void mostrarAviso (juce::String texto)
     {
         aviso = std::move (texto);
+        if (aviso.isNotEmpty())
+            setDescription ("Aviso: " + aviso);
         repaint();
 
         if (aviso.isEmpty())
@@ -469,6 +752,9 @@ private:
                     if (self->geracaoDoAviso == minhaGeracao)
                     {
                         self->aviso.clear();
+                        self->falhaDeGravacaoRecente = false;
+                        self->retryExigeToqueNaCena = false;
+                        self->atualizarAcoes();
                         self->repaint();
                     }
             });
@@ -476,13 +762,18 @@ private:
 
     juce::String aviso;
     int geracaoDoAviso = 0;
+    bool falhaDeGravacaoRecente = false;
+    bool retryExigeToqueNaCena = false;
     int alturaDoRotulo = 14;   // 0 numa faixa curta; paint() e resized() usam o MESMO valor
     std::array<bool, ChurchDAWLive::numeroDeCenas> preenchida {};
     std::array<juce::String, ChurchDAWLive::numeroDeCenas> nomes {};
+    ChurchDAWLive::InteracaoDeCenas interacao;
+    int ativaAtual = -1;
     int renomeando = -1;
     juce::TextEditor editorDeNome;
     juce::OwnedArray<BotaoDeCena> botoes;
     juce::TextButton gravarBtn;
+    juce::TextButton limparBtn;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (LiveScenePanel)
 };

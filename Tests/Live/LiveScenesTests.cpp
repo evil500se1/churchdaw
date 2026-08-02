@@ -221,13 +221,14 @@ int main()
         // TODOS os resultados de falha, sem excecao. Esta lista precisa crescer
         // junto com o enum: um valor novo sem mensagem volta a ser exatamente o
         // "nao aconteceu nada" que o enum foi criado para eliminar.
-        for (const auto r : { R::vazia, R::carregando, R::naoGravou, R::indisponivel })
+        for (const auto r : { R::vazia, R::carregando, R::naoGravou,
+                              R::indisponivel, R::paginaInvalida })
             if (ChurchDAWLive::avisoDoResultado (r, 2).isEmpty())
                 return falha ("falha silenciosa: resultado sem explicacao");
 
         // Guarda contra esquecer de atualizar a lista acima: se alguem
         // acrescentar um valor no fim do enum, este contador denuncia.
-        if ((int) R::indisponivel != 4)
+        if ((int) R::paginaInvalida != 5)
             return falha ("o enum Resultado mudou — atualize a lista de avisos deste teste");
 
         if (! ChurchDAWLive::avisoDoResultado (R::vazia, 2).contains ("3"))
@@ -274,6 +275,401 @@ int main()
 
         if (! volta.temGlobais || ! volta.temMaster)
             return falha ("cena gravada agora precisa marcar globais e master na volta");
+    }
+
+    // ------------------------------------------------------------------
+    // 8. Fluxo pedido pelo cliente: uma cena vazia vira DESTINO de edicao,
+    //    nao cena salva e nao gravacao acidental. Preparar o motor vazio e
+    //    responsabilidade do callback do Main; SALVAR continua o segundo gesto.
+    // ------------------------------------------------------------------
+    {
+        using A = ChurchDAWLive::AcaoDeCena;
+
+        std::array<bool, ChurchDAWLive::numeroDeCenas> preenchidas {};
+        preenchidas[0] = true;
+
+        ChurchDAWLive::InteracaoDeCenas interacao;
+        int ativa = 0;   // pertence ao motor; a interacao nao pode muda-la
+
+        interacao.sincronizarComAtiva (ativa);
+
+        if (interacao.selecionada != 0)
+            return falha ("selecao inicial nao acompanhou a cena ativa");
+
+        if (interacao.tocar (1, false, false) != A::prepararNova)
+            return falha ("tocar cena vazia nao preparou uma nova cena");
+
+        if (interacao.selecionada != 1 || ativa != 0 || preenchidas[1])
+            return falha ("selecionar cena vazia alterou a cena no ar ou gravou sozinha");
+
+        if (interacao.destinoNovoAoPressionarGravar (false, preenchidas) != -1)
+            return falha ("cena vazia gravaria sem o segundo gesto em SALVAR");
+
+        if (interacao.destinoNovoAoPressionarGravar (true, preenchidas) != 1)
+            return falha ("SALVAR nao encontrou a cena vazia selecionada");
+
+        preenchidas[1] = true;
+
+        if (interacao.tocar (1, true, false) != A::carregar)
+            return falha ("cena preenchida deixou de carregar com um toque");
+
+        if (interacao.tocar (2, false, true) != A::gravar)
+            return falha ("fluxo antigo GRAVAR e tocar slot deixou de funcionar");
+
+        interacao.cenaFoiApagada (2, ativa);
+
+        if (interacao.selecionada != ativa)
+            return falha ("apagar a selecionada nao devolveu selecao para a cena no ar");
+
+        if (interacao.tocar (-1, false, false) != A::nenhuma
+             || interacao.selecionada != ativa)
+            return falha ("indice invalido corrompeu a selecao de cenas");
+    }
+
+    // ------------------------------------------------------------------
+    // 9. Duas cenas sao independentes no banco e no XML. Gravar ou limpar
+    //    a Cena 2 nao pode contaminar a Cena 1 que o cliente ja salvou.
+    // ------------------------------------------------------------------
+    {
+        std::array<ChurchDAWLive::Cena, ChurchDAWLive::numeroDeCenas> banco {};
+        banco[0] = cenaDeExemplo();
+        banco[0].nome = "Cena 1";
+        banco[0].padTom = 2;
+        banco[0].canais[0].volume = 0.31f;
+        banco[0].estadoDoMotorId = juce::String::repeatedString ("a", 64);
+
+        banco[1] = cenaDeExemplo();
+        banco[1].nome = "Cena 2";
+        banco[1].padTom = 9;
+        banco[1].canais[0].volume = 0.87f;
+        banco[1].estadoDoMotorId = juce::String::repeatedString ("b", 64);
+
+        juce::XmlElement raiz ("LIVESCENES");
+
+        for (int i = 0; i < ChurchDAWLive::numeroDeCenas; ++i)
+            ChurchDAWLive::escreverCena (raiz, banco[(size_t) i], i);
+
+        std::array<ChurchDAWLive::Cena, ChurchDAWLive::numeroDeCenas> volta {};
+        int quantidade = 0;
+
+        for (auto* no : raiz.getChildWithTagNameIterator ("SCENE"))
+        {
+            const int i = no->getIntAttribute ("index", -1);
+
+            if (! juce::isPositiveAndBelow (i, ChurchDAWLive::numeroDeCenas))
+                return falha ("banco serializou indice de cena invalido");
+
+            ChurchDAWLive::lerCena (*no, volta[(size_t) i]);
+            ++quantidade;
+        }
+
+        if (quantidade != ChurchDAWLive::numeroDeCenas)
+            return falha ("banco nao preservou os dez slots de cena");
+
+        if (! volta[0].preenchida || ! volta[1].preenchida
+             || volta[0].nome != "Cena 1" || volta[1].nome != "Cena 2"
+             || volta[0].estadoDoMotorId != banco[0].estadoDoMotorId
+             || volta[1].estadoDoMotorId != banco[1].estadoDoMotorId
+             || volta[0].padTom != 2 || volta[1].padTom != 9
+             || ! perto (volta[0].canais[0].volume, 0.31f)
+             || ! perto (volta[1].canais[0].volume, 0.87f))
+            return falha ("duas cenas se contaminaram na ida e volta do banco");
+
+        const auto cena1Antes = banco[0];
+        banco[1] = ChurchDAWLive::Cena{};
+
+        juce::XmlElement depoisDeLimpar ("LIVESCENES");
+        for (int i = 0; i < ChurchDAWLive::numeroDeCenas; ++i)
+            ChurchDAWLive::escreverCena (depoisDeLimpar, banco[(size_t) i], i);
+
+        auto* cena1Xml = depoisDeLimpar.getChildElement (0);
+        auto* cena2Xml = depoisDeLimpar.getChildElement (1);
+
+        if (cena1Xml == nullptr || cena2Xml == nullptr
+             || cena1Xml->getIntAttribute ("filled", 0) != 1
+             || cena2Xml->getIntAttribute ("filled", 1) != 0
+             || cena2Xml->getNumChildElements() != 0)
+            return falha ("limpar Cena 2 alterou a estrutura de outro slot");
+
+        if (cena1Xml->getChildByName ("ENGINE") == nullptr)
+            return falha ("Cena 1 perdeu a referencia da pagina de audio");
+
+        if (banco[0].nome != cena1Antes.nome
+             || banco[0].padTom != cena1Antes.padTom
+             || ! perto (banco[0].canais[0].volume, cena1Antes.canais[0].volume))
+            return falha ("limpar Cena 2 alterou a Cena 1 em memoria");
+
+        if (! ChurchDAWLive::idDeEstadoDoMotorValido (
+                juce::String::repeatedString ("F", 64))
+             || ChurchDAWLive::idDeEstadoDoMotorValido ("../../setup")
+             || ChurchDAWLive::idDeEstadoDoMotorValido (
+                    juce::String::repeatedString ("g", 64)))
+            return falha ("validacao do ID de pagina aceita caminho/hash invalido");
+    }
+
+    // ------------------------------------------------------------------
+    // 10. LIMPAR escolhe uma cena preenchida sem carrega-la. A cena ativa
+    //     pertence ao motor e nao pode mudar so porque o usuario apontou o
+    //     slot inativo que deseja apagar.
+    // ------------------------------------------------------------------
+    {
+        using A = ChurchDAWLive::AcaoDeCena;
+
+        ChurchDAWLive::InteracaoDeCenas interacao;
+        int ativa = 0;
+        interacao.sincronizarComAtiva (ativa);
+
+        if (interacao.tocar (4, true, false, true) != A::apagar)
+            return falha ("LIMPAR nao escolheu uma cena preenchida inativa");
+
+        if (interacao.selecionada != 4 || ativa != 0)
+            return falha ("escolher cena para limpar mudou a cena no ar");
+
+        if (interacao.tocar (5, false, false, true) != A::nenhuma
+             || interacao.selecionada != 5 || ativa != 0)
+            return falha ("LIMPAR em slot vazio carregou audio ou perdeu a selecao");
+
+        interacao.selecionarSemAcionar (7);
+
+        if (interacao.selecionada != 7 || ativa != 0)
+            return falha ("selecao administrativa acionou a cena inativa");
+    }
+
+    // ------------------------------------------------------------------
+    // 11. Persistencia e transacional: sucesso conserva o novo estado;
+    //     falha devolve slot E cena ativa ao snapshot anterior. Assim a tela
+    //     nunca chama de salva uma cena que so existe ate fechar o app.
+    // ------------------------------------------------------------------
+    {
+        using R = ChurchDAWLive::Resultado;
+
+        auto anterior = cenaDeExemplo();
+        anterior.nome = "Antes";
+        anterior.padTom = 2;
+        ChurchDAWLive::EstadoAntesDePersistirCena snapshot { anterior, 0 };
+
+        auto atual = cenaDeExemplo();
+        atual.nome = "Depois";
+        atual.padTom = 9;
+        int ativa = 1;
+
+        if (ChurchDAWLive::concluirPersistenciaDeCena (
+                true, snapshot, atual, ativa) != R::ok
+             || atual.nome != "Depois" || atual.padTom != 9 || ativa != 1)
+            return falha ("sucesso de persistencia reverteu a cena nova");
+
+        atual.nome = "Nao deve sobreviver";
+        atual.padTom = 11;
+        ativa = 6;
+
+        if (ChurchDAWLive::concluirPersistenciaDeCena (
+                false, snapshot, atual, ativa) != R::naoGravou)
+            return falha ("falha de persistencia foi reportada como sucesso");
+
+        if (atual.nome != "Antes" || atual.padTom != 2 || ativa != 0)
+            return falha ("falha de persistencia nao fez rollback completo");
+    }
+
+    // ------------------------------------------------------------------
+    // 12. Retry coerente nos dois fluxos. No SALVAR cada toque e uma tentativa
+    //     completa; no legado GRAVAR -> cena, uma falha continua armada para o
+    //     proximo toque nao virar apenas um cancelamento silencioso.
+    // ------------------------------------------------------------------
+    {
+        using O = ChurchDAWLive::OrigemDaGravacao;
+        using R = ChurchDAWLive::Resultado;
+
+        for (const auto resultado : { R::vazia, R::carregando, R::naoGravou,
+                                      R::indisponivel, R::paginaInvalida })
+        {
+            if (ChurchDAWLive::manterGravarArmadoParaRetry (
+                    resultado, O::botaoSalvar))
+                return falha ("SALVAR deixou toggle armado e primeiro retry so cancelaria");
+
+            if (! ChurchDAWLive::manterGravarArmadoParaRetry (
+                    resultado, O::gravarArmadoECena))
+                return falha ("fluxo legado perdeu o modo armado depois de falha");
+        }
+
+        if (! ChurchDAWLive::avisoDaGravacao (
+                R::carregando, O::botaoSalvar, 1).containsIgnoreCase ("SALVAR")
+             || ! ChurchDAWLive::avisoDaGravacao (
+                R::carregando, O::gravarArmadoECena, 1).containsIgnoreCase ("CENA")
+             || ! ChurchDAWLive::avisoDaGravacao (
+                R::indisponivel, O::botaoSalvar, 1).containsIgnoreCase ("SALVAR")
+             || ! ChurchDAWLive::avisoDaGravacao (
+                R::indisponivel, O::gravarArmadoECena, 1).containsIgnoreCase ("CENA"))
+            return falha ("aviso de retry manda tocar no controle errado");
+
+        if (ChurchDAWLive::manterGravarArmadoParaRetry (
+                R::ok, O::botaoSalvar)
+             || ChurchDAWLive::manterGravarArmadoParaRetry (
+                R::ok, O::gravarArmadoECena))
+            return falha ("gravacao concluida continuou armada");
+    }
+
+    // ------------------------------------------------------------------
+    // 13. O primeiro pedido preempta uma restauracao antiga; somente a pagina
+    //     que ja foi enviada deve aguardar o proprio carregamento. O mesmo
+    //     helper fixa o contrato simetrico de tamanho entre write e read.
+    // ------------------------------------------------------------------
+    {
+        for (int pagina = 0; pagina <= 1; ++pagina)
+            for (int busy = 0; busy <= 1; ++busy)
+                for (int pending = 0; pending <= 1; ++pending)
+                {
+                    const bool esperado = pagina != 0
+                                       && (busy != 0 || pending != 0);
+
+                    if (ChurchDAWLive::deveAguardarCena (
+                            pagina != 0, busy != 0, pending != 0) != esperado)
+                        return falha ("matriz de preempcao/espera de cena divergiu");
+                }
+
+        const auto maximo = ChurchDAWLive::tamanhoMaximoPaginaDeCena;
+
+        if (ChurchDAWLive::paginaDeCenaTemTamanhoValido (0)
+             || ! ChurchDAWLive::paginaDeCenaTemTamanhoValido (maximo)
+             || ChurchDAWLive::paginaDeCenaTemTamanhoValido (maximo + 1))
+            return falha ("write/read discordam no limite da pagina de cena");
+    }
+
+    // ------------------------------------------------------------------
+    // 14. Startup: o chain global pode estar atrasado depois de uma queda.
+    //     Cena v1 ativa precisa ser aplicada ANTES de a pagina ser capturada;
+    //     senao o chain A sobrescreve silenciosamente a cena B.
+    // ------------------------------------------------------------------
+    {
+        struct EstadoAudivel
+        {
+            float volume = 0.0f;
+            int pad = -1;
+        };
+
+        const EstadoAudivel chainA { 0.18f, 2 };
+        const EstadoAudivel cenaB  { 0.84f, 9 };
+        auto motor = chainA;
+        auto cenaPersistida = cenaB;
+        EstadoAudivel paginaAnexada;
+        bool anexouPagina = false;
+
+        const auto plano = ChurchDAWLive::planejarReconciliacaoNoStartup (
+            true, false);
+
+        if (plano.aplicarPaginaPorSha
+             || ! plano.aplicarCenaAntesDeAnexarPagina
+             || ! plano.anexarPaginaDepoisDeAplicar)
+            return falha ("startup legado nao exigiu aplicar cena antes de anexar SHA");
+
+        if (plano.aplicarCenaAntesDeAnexarPagina)
+            motor = cenaPersistida;
+
+        if (plano.anexarPaginaDepoisDeAplicar)
+        {
+            paginaAnexada = motor;
+            anexouPagina = true;
+        }
+
+        if (! anexouPagina
+             || ! perto (motor.volume, cenaB.volume) || motor.pad != cenaB.pad
+             || ! perto (paginaAnexada.volume, cenaB.volume)
+             || paginaAnexada.pad != cenaB.pad
+             || ! perto (cenaPersistida.volume, cenaB.volume)
+             || cenaPersistida.pad != cenaB.pad)
+            return falha ("startup capturou chain A por cima da cena legada B");
+
+        const auto planoV2 = ChurchDAWLive::planejarReconciliacaoNoStartup (
+            true, true);
+
+        if (! planoV2.aplicarPaginaPorSha
+             || planoV2.aplicarCenaAntesDeAnexarPagina
+             || planoV2.anexarPaginaDepoisDeAplicar)
+            return falha ("startup v2 deixou de escolher a pagina persistida por SHA");
+
+        const auto planoVazio = ChurchDAWLive::planejarReconciliacaoNoStartup (
+            false, false);
+
+        if (planoVazio.aplicarPaginaPorSha
+             || planoVazio.aplicarCenaAntesDeAnexarPagina
+             || planoVazio.anexarPaginaDepoisDeAplicar)
+            return falha ("startup planejou reconciliacao para slot vazio");
+    }
+
+    // ------------------------------------------------------------------
+    // 15. Supressao geracional do autosave pesado durante recall de cena.
+    //     Invalida timer velho, bloqueia callbacks da cena, uma soltura velha
+    //     nao libera a nova, e o primeiro ajuste posterior volta a agendar.
+    // ------------------------------------------------------------------
+    {
+        ChurchDAWLive::ControleDeGravacaoDoSetupDuranteCena controle;
+        int geracaoDaCena = 0;
+
+        const auto timerAnterior = controle.agendarSePermitido (geracaoDaCena);
+
+        if (timerAnterior == 0
+             || ! controle.timerAindaValido (timerAnterior, geracaoDaCena))
+            return falha ("autosave normal nao gerou timer valido");
+
+        geracaoDaCena = 1;
+        controle.iniciarSupressao (geracaoDaCena);
+
+        if (controle.timerAindaValido (timerAnterior, geracaoDaCena))
+            return falha ("inicio da cena nao invalidou timer anterior");
+
+        if (controle.agendarSePermitido (geracaoDaCena) != 0)
+            return falha ("callback produzido pela cena armou autosave");
+
+        geracaoDaCena = 2;
+        controle.iniciarSupressao (geracaoDaCena);
+
+        if (controle.encerrarSupressao (1, geracaoDaCena)
+             || ! controle.estaSuprimida (geracaoDaCena))
+            return falha ("soltura stale da cena A liberou a cena B");
+
+        if (! controle.encerrarSupressao (2, geracaoDaCena)
+             || controle.estaSuprimida (geracaoDaCena))
+            return falha ("geracao corrente nao encerrou a supressao");
+
+        const auto primeiroAjuste =
+            controle.agendarSePermitido (geracaoDaCena);
+
+        if (primeiroAjuste == 0
+             || ! controle.timerAindaValido (primeiroAjuste, geracaoDaCena))
+            return falha ("primeiro ajuste depois da cena nao rearmou autosave");
+    }
+
+    // ------------------------------------------------------------------
+    // 16. Os layouts efetivamente usados por celular retrato/paisagem e
+    //     desktop compacto preservam 44 px em cenas, GRAVAR e LIMPAR. O teste
+    //     recebe a area interna real, depois das margens do MainComponent e do
+    //     painel, para nao validar uma geometria ideal que nunca chega a tela.
+    // ------------------------------------------------------------------
+    {
+        struct Caso { int largura; int altura; const char* nome; };
+        const Caso casos[] {
+            { 288, 90, "telefone 320 dp retrato" },
+            { 328, 90, "telefone 360 dp retrato" },
+            { 692, 44, "telefone 720 dp paisagem curta" },
+            { 914, 46, "desktop compacto 960" }
+        };
+
+        for (const auto& caso : casos)
+        {
+            const auto layout = ChurchDAWLive::calcularLayoutDaFaixaDeCenas (
+                caso.largura, caso.altura);
+
+            if (! layout.suportaAlvosDe44)
+            {
+                std::cerr << "LIVE_SCENES_LAYOUT_FAIL: " << caso.nome
+                          << " cena=" << layout.larguraMinimaDaCena << 'x'
+                          << layout.alturaDaFileira
+                          << " gravar=" << layout.larguraDoGravar << 'x'
+                          << layout.alturaMinimaDaAcao
+                          << " limpar=" << layout.larguraDoLimpar << 'x'
+                          << layout.alturaMinimaDaAcao << '\n';
+                return 1;
+            }
+        }
     }
 
     std::cout << "LIVE_SCENES_OK\n";

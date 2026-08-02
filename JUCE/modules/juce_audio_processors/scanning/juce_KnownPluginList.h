@@ -120,7 +120,13 @@ public:
 
     //==============================================================================
     /** Returns the list of blacklisted files. */
-    const StringArray& getBlacklistedFiles() const;
+    /** Returns a thread-safe snapshot of the blacklisted identifiers. */
+    StringArray getBlacklistedFiles() const;
+
+    /** Thread-safe membership check for code that may run while a background
+        plug-in scan is updating the blacklist. */
+    bool isBlacklisted (const String& pluginID,
+                        bool ignoreCase = false) const;
 
     /** Adds a plugin ID to the black-list. */
     void addToBlacklist (const String& pluginID);
@@ -205,6 +211,13 @@ public:
         /** Called when a scan has finished, to allow clean-up of resources. */
         virtual void scanFinished();
 
+        /** Returns and clears whether the completed scan contained a host-side
+            failure which did not prove the plug-in valid or invalid. Hosts can
+            use this to keep migration quarantine in place after IPC/protocol
+            failures, rather than silently treating the candidate as validated.
+        */
+        virtual bool consumeLastScanWasInconclusive();
+
         /** Returns true if the current scan should be abandoned.
             Any blocking methods should check this value repeatedly and return if
             if becomes true.
@@ -216,6 +229,9 @@ public:
         The KnownPluginList will take ownership of the object passed in.
     */
     void setCustomScanner (std::unique_ptr<CustomScanner> newScanner);
+
+    /** Returns and clears the custom scanner's inconclusive result flag. */
+    bool consumeLastScanWasInconclusive();
 
     //==============================================================================
     /** @cond */
@@ -241,7 +257,8 @@ private:
     Array<PluginDescription> types;
     StringArray blacklist;
     std::unique_ptr<CustomScanner> scanner;
-    CriticalSection scanLock, typesArrayLock;
+    mutable CriticalSection scanLock;
+    CriticalSection typesArrayLock;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (KnownPluginList)
 };

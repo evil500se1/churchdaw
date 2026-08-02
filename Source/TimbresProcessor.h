@@ -73,6 +73,109 @@
 #include <vector>
 
 //==============================================================================
+// Estado pequeno e testavel do carregamento assíncrono de plugins. AUv3 exige
+// que a message thread continue livre durante a instanciação; um ticket por
+// destino permite descartar uma resposta antiga sem jamais retirar antes o
+// plugin que ainda está tocando.
+namespace ChurchDAWPluginLoading
+{
+class RequestGeneration
+{
+public:
+    using Ticket = juce::uint64;
+
+    Ticket begin() noexcept
+    {
+        const std::lock_guard<std::mutex> lock (commitGate);
+        return generation.fetch_add (1, std::memory_order_acq_rel) + 1;
+    }
+
+    void cancel() noexcept
+    {
+        const std::lock_guard<std::mutex> lock (commitGate);
+        generation.fetch_add (1, std::memory_order_acq_rel);
+    }
+
+    bool isCurrent (Ticket ticket) const noexcept
+    {
+        return ticket != 0
+            && generation.load (std::memory_order_acquire) == ticket;
+    }
+
+    template <typename Commit>
+    bool commitIfCurrent (Ticket ticket, Commit&& commit)
+    {
+        // Este gate e deliberadamente NAO recursivo. O lambda de commit deve
+        // conter somente moves/flags locais, nunca codigo de vendor, callbacks
+        // ou bombeamento de mensagens. Assim um begin/cancel reentrante nao
+        // consegue alterar a geracao no meio do swap e tambem nao passa pelo
+        // comportamento recursivo de juce::CriticalSection.
+        const std::lock_guard<std::mutex> lock (commitGate);
+
+        if (! isCurrent (ticket))
+            return false;
+
+        std::forward<Commit> (commit)();
+        return true;
+    }
+
+private:
+    std::mutex commitGate;
+    std::atomic<Ticket> generation { 0 };
+};
+
+inline bool hasDuplicateName (
+    const juce::Array<juce::PluginDescription>& choices,
+    const juce::PluginDescription& candidate)
+{
+    int matches = 0;
+
+    for (const auto& item : choices)
+        if (item.name.trim().equalsIgnoreCase (candidate.name.trim())
+             && ++matches > 1)
+            return true;
+
+    return false;
+}
+
+inline juce::String displayName (
+    const juce::PluginDescription& plugin,
+    const juce::Array<juce::PluginDescription>& choices)
+{
+    auto name = plugin.name.trim();
+
+    if (name.isEmpty())
+        name = "Plugin";
+
+    if (! hasDuplicateName (choices, plugin))
+        return name;
+
+    auto format = plugin.pluginFormatName.trim();
+    auto maker = plugin.manufacturerName.trim();
+
+    if (format.isEmpty())
+        format = "Formato desconhecido";
+
+    if (maker.isEmpty())
+        maker = "Fabricante desconhecido";
+
+    return name + " [" + format + " | " + maker + "]";
+}
+
+inline int findChoiceByIdentifier (
+    const juce::Array<juce::PluginDescription>& choices,
+    const juce::String& identifier)
+{
+    for (int i = 0; i < choices.size(); ++i)
+        if (choices.getReference (i).createIdentifierString()
+             == identifier)
+            return i;
+
+    return -1;
+}
+}
+
+//==============================================================================
 // "Church Live" - instrumento nativo da ChurchDAW.
 //
 // Sampler com 5 canais de timbre em camadas: cada canal carrega um timbre da
@@ -1001,14 +1104,134 @@ public:
     void setExternalMaster (MasterProcessor* m) noexcept    { externalMaster = m; }
     MasterProcessor* getExternalMaster() const noexcept     { return externalMaster; }
 
-    // recursos da DAW para hospedar plugins dentro do canal master
-    void setPluginResources (juce::KnownPluginList* list, juce::AudioPluginFormatManager* fm) noexcept
+    using PluginLoadCompletion =
+        std::function<void (bool, const juce::String&)>;
+
+    enum class HostedPluginLocation
     {
+        insert,
+        instrument
+    };
+
+    using HostedPluginWillRetireCallback =
+        std::function<void (HostedPluginLocation, int,
+                            juce::AudioPluginInstance*)>;
+
+    static void invokePluginLoadCompletionNoThrow (
+        PluginLoadCompletion& completion,
+        bool loaded,
+        const juce::String& error) noexcept
+    {
+        if (completion == nullptr)
+            return;
+
+        try
+        {
+            completion (loaded, error);
+        }
+        catch (...)
+        {
+        }
+    }
+
+    // recursos da DAW para hospedar plugins dentro do canal master
+    void setPluginResources (
+        juce::KnownPluginList* list,
+        juce::AudioPluginFormatManager* fm,
+        const juce::StringArray* quarantine = nullptr) noexcept
+    {
+        if (formatManagerRef != fm)
+        {
+            for (int slot = 0; slot < numInserts; ++slot)
+            {
+                insertPluginLoadGeneration[slot].cancel();
+                insertPluginLoadInFlight[slot].store (
+                    false, std::memory_order_release);
+            }
+
+            for (int layer = 0; layer < numLayers; ++layer)
+            {
+                instrumentPluginLoadGeneration[layer].cancel();
+                instrumentPluginLoadInFlight[layer].store (
+                    false, std::memory_order_release);
+            }
+        }
+
         knownPluginsRef = list;
         formatManagerRef = fm;
+        pluginQuarantineRef = quarantine;
     }
 
     juce::KnownPluginList* getKnownPlugins() const noexcept { return knownPluginsRef; }
+
+    bool isHostedPluginBlocked (const juce::PluginDescription& description) const
+    {
+        const auto& file = description.fileOrIdentifier;
+
+        return (knownPluginsRef != nullptr
+                 && knownPluginsRef->isBlacklisted (file, true))
+            || (pluginQuarantineRef != nullptr
+                 && pluginQuarantineRef->contains (file, true));
+    }
+
+    void setHostedPluginWillRetireCallback (
+        HostedPluginWillRetireCallback callback)
+    {
+        const juce::ScopedLock lock (
+            hostedPluginEditorCallbackLock);
+        hostedPluginWillRetire = std::move (callback);
+    }
+
+    // O destrutor de um editor de vendor pode abrir um loop modal e entregar um
+    // callback AUv3 no meio da propria destruicao. Durante esta janela o
+    // callback de carga fica coalescido no processador ate o teardown externo
+    // terminar, evitando spin no loop modal e troca sob um editor desmontando.
+    void beginHostedPluginEditorTeardown() noexcept
+    {
+        hostedPluginEditorTeardownDepth.fetch_add (
+            1, std::memory_order_acq_rel);
+    }
+
+    void endHostedPluginEditorTeardown() noexcept
+    {
+        const int previous =
+            hostedPluginEditorTeardownDepth.fetch_sub (
+                1, std::memory_order_acq_rel);
+        jassert (previous > 0);
+
+        if (previous == 1)
+            postDeferredHostedPluginFinishes();
+    }
+
+    bool getPendingInsertDescription (
+        int slot, juce::PluginDescription& result)
+    {
+        if (! juce::isPositiveAndBelow (slot, numInserts))
+            return false;
+
+        const juce::ScopedLock lock (getCallbackLock());
+
+        if (! pendingInsertDescriptionValid[slot])
+            return false;
+
+        result = pendingInsertDescriptions[slot];
+        return true;
+    }
+
+    bool getPendingInstrumentDescription (
+        int layer, juce::PluginDescription& result) const
+    {
+        if (! juce::isPositiveAndBelow (layer, numLayers))
+            return false;
+
+        const juce::ScopedLock lock (layerIdentityLock);
+
+        if (! pendingVstDescriptionValid[layer])
+            return false;
+
+        result = pendingVstDescriptions[layer];
+        return true;
+    }
 
     static constexpr int numInserts = 2;
 
@@ -1201,34 +1424,311 @@ public:
             worshipReverb.reset();
     }
 
-    // carrega um plugin de efeito dentro do Church Live (thread de mensagens)
-    bool loadInsert (int slot, const juce::PluginDescription& desc)
+    // Agenda a criação sem bloquear a message thread. O retorno diz apenas se
+    // o pedido foi aceito; sucesso/falha real chega em completion. O insert atual
+    // continua processando até a nova instância estar criada, restaurada e
+    // preparada (swap em duas fases, indispensável para AUv3).
+    bool loadInsert (
+        int slot,
+        const juce::PluginDescription& desc,
+        const juce::MemoryBlock* restoredState = nullptr,
+        PluginLoadCompletion completion = {},
+        bool preservePendingOnFailure = false)
     {
-        if (! juce::isPositiveAndBelow (slot, numInserts) || formatManagerRef == nullptr)
+        if (! juce::isPositiveAndBelow (slot, numInserts)
+             || formatManagerRef == nullptr
+             || isHostedPluginBlocked (desc))
             return false;
 
-        juce::String error;
-        auto instance = formatManagerRef->createPluginInstance (desc, hostSampleRate,
-                                                                juce::jmax (64, lastBlockSize), error);
+        ChurchDAWPluginLoading::RequestGeneration::Ticket ticket = 0;
+
+        try
+        {
+            juce::MemoryBlock stateToRestore;
+
+            if (restoredState != nullptr && restoredState->getSize() > 0)
+                stateToRestore = *restoredState;
+
+            // Termine todas as copias que podem alocar antes de invalidar o
+            // pedido anterior. Depois de begin(), apenas moves/clear entram no
+            // estado compartilhado.
+            auto requestedId = desc.createIdentifierString();
+            auto requestedState = stateToRestore.toBase64Encoding();
+            juce::PluginDescription requestedDescription (desc);
+            ticket = insertPluginLoadGeneration[slot].begin();
+
+            {
+                const juce::ScopedLock callbackGuard (
+                    getCallbackLock());
+                pendingInsertIds[slot] = std::move (requestedId);
+                pendingInsertStates[slot] =
+                    std::move (requestedState);
+                pendingInsertDescriptions[slot] =
+                    std::move (requestedDescription);
+                pendingInsertDescriptionValid[slot] = true;
+                insertPluginLoadInFlight[slot].store (
+                    true, std::memory_order_release);
+
+                if (! preservePendingOnFailure)
+                    insertStateRestorePending[slot].store (
+                        false, std::memory_order_release);
+            }
+
+            juce::WeakReference<TimbresProcessor> weakThis (this);
+            formatManagerRef->createPluginInstanceAsync (
+                desc, hostSampleRate, juce::jmax (64, lastBlockSize),
+                [weakThis, slot, ticket,
+                 preservePendingOnFailure,
+                 stateToRestore = std::move (stateToRestore),
+                 completion = std::move (completion)] (
+                    std::unique_ptr<juce::AudioPluginInstance> instance,
+                    const juce::String& error) mutable
+                {
+                    struct Result
+                    {
+                        std::unique_ptr<juce::AudioPluginInstance> instance;
+                        juce::String error;
+                    };
+
+                    auto result = std::make_shared<Result>();
+                    result->instance = std::move (instance);
+                    result->error = error;
+
+                    auto deliver =
+                        [weakThis, slot, ticket, result,
+                         preservePendingOnFailure,
+                         stateToRestore = std::move (stateToRestore),
+                         completion = std::move (completion)] () mutable
+                    {
+                        if (auto* self = weakThis.get())
+                            self->finishInsertPluginLoad (
+                                slot, ticket,
+                                std::move (result->instance),
+                                result->error, stateToRestore,
+                                std::move (completion),
+                                preservePendingOnFailure);
+                    };
+
+                    if (juce::MessageManager::getInstance()
+                            ->isThisTheMessageThread())
+                        deliver();
+                    else
+                        (void) juce::MessageManager::callAsync (
+                            std::move (deliver));
+                });
+
+            return true;
+        }
+        catch (...)
+        {
+            // O pedido nem chegou ao format manager. Se ele ja havia publicado
+            // uma intencao interativa, volte ao plugin que continua tocando;
+            // restore conserva o alvo para autocura no proximo boot.
+            if (ticket != 0)
+            {
+                const juce::ScopedLock callbackGuard (
+                    getCallbackLock());
+                (void) insertPluginLoadGeneration[slot]
+                    .commitIfCurrent (ticket, [this, slot,
+                                               preservePendingOnFailure]
+                {
+                    insertPluginLoadInFlight[slot].store (
+                        false, std::memory_order_release);
+
+                    if (! preservePendingOnFailure)
+                    {
+                        pendingInsertIds[slot].clear();
+                        pendingInsertStates[slot].clear();
+                        pendingInsertDescriptionValid[slot] = false;
+                        insertStateRestorePending[slot].store (
+                            false, std::memory_order_release);
+                    }
+                });
+            }
+            return false;
+        }
+    }
+
+    void finishInsertPluginLoad (
+        int slot,
+        ChurchDAWPluginLoading::RequestGeneration::Ticket ticket,
+        std::unique_ptr<juce::AudioPluginInstance> instance,
+        const juce::String& creationError,
+        const juce::MemoryBlock& restoredState,
+        PluginLoadCompletion completion,
+        bool preservePendingOnFailure)
+    {
+        jassert (juce::MessageManager::getInstance()
+                    ->isThisTheMessageThread());
+
+        if (! juce::isPositiveAndBelow (slot, numInserts)
+             || ! insertPluginLoadGeneration[slot].isCurrent (ticket))
+            return;
+
+        if (isHostedPluginEditorTeardownActive())
+        {
+            try
+            {
+                struct DeferredResult
+                {
+                    std::unique_ptr<juce::AudioPluginInstance> instance;
+                    juce::String error;
+                    juce::MemoryBlock state;
+                    PluginLoadCompletion completion;
+                };
+
+                auto deferred = std::make_shared<DeferredResult>();
+                deferred->instance = std::move (instance);
+                deferred->error = creationError;
+                deferred->state = restoredState;
+                deferred->completion = std::move (completion);
+                juce::WeakReference<TimbresProcessor> weakThis (this);
+
+                deferHostedPluginFinish (
+                    HostedPluginLocation::insert, slot,
+                    [weakThis, slot, ticket, deferred,
+                     preservePendingOnFailure] () mutable
+                    {
+                        if (auto* self = weakThis.get())
+                            self->finishInsertPluginLoad (
+                                slot, ticket,
+                                std::move (deferred->instance),
+                                deferred->error, deferred->state,
+                                std::move (deferred->completion),
+                                preservePendingOnFailure);
+                    });
+            }
+            catch (...)
+            {
+                // O alvo continua pendente e podera ser restaurado no proximo
+                // boot; nunca troque uma instancia durante teardown de editor.
+            }
+            return;
+        }
+
+        auto failCurrentRequest =
+            [this, slot, ticket, preservePendingOnFailure,
+             &completion] (const juce::String& error) mutable
+        {
+            if (preservePendingOnFailure
+                 && insertStateRestorePending[slot].load (
+                        std::memory_order_acquire))
+            {
+                if (! finishFailedInsertStateRestore (
+                        slot, ticket))
+                    return;
+
+                if (insertPluginLoadGeneration[slot]
+                        .isCurrent (ticket))
+                    invokePluginLoadCompletionNoThrow (
+                        completion, false, error);
+                return;
+            }
+
+            const bool stillCurrent = [&]
+                {
+                    const juce::ScopedLock callbackGuard (
+                        getCallbackLock());
+                    return insertPluginLoadGeneration[slot]
+                        .commitIfCurrent (
+                            ticket,
+                            [this, slot,
+                             preservePending = bool (preservePendingOnFailure)]
+                    {
+                        insertPluginLoadInFlight[slot].store (
+                            false, std::memory_order_release);
+                        insertStateRestorePending[slot].store (
+                            false, std::memory_order_release);
+
+                        if (! preservePending)
+                        {
+                            pendingInsertIds[slot].clear();
+                            pendingInsertStates[slot].clear();
+                            pendingInsertDescriptionValid[slot] = false;
+                        }
+                    });
+                }();
+
+            if (! stillCurrent)
+                return;
+
+            sendChangeMessage();
+            invokePluginLoadCompletionNoThrow (
+                completion, false, error);
+        };
+
+        const auto requestStillAllowed = [this, slot]
+        {
+            juce::PluginDescription pending;
+            return getPendingInsertDescription (slot, pending)
+                && ! isHostedPluginBlocked (pending);
+        };
+
+        if (! requestStillAllowed())
+        {
+            juce::Logger::writeToLog (
+                "PLUGIN: insert bloqueado durante carga assincrona");
+            failCurrentRequest (
+                "Plugin foi colocado em quarentena durante a carga");
+            return;
+        }
 
         if (instance == nullptr)
-            return false;
+        {
+            juce::Logger::writeToLog (
+                "PLUGIN: falha ao criar insert "
+                + juce::String (slot + 1) + ": " + creationError);
+            failCurrentRequest (creationError);
+
+            return;
+        }
+
+        bool temporaryNeedsRelease = true;
+        const juce::ScopeGuard releaseTemporaryOnExit {
+            [this, &instance, &temporaryNeedsRelease]
+        {
+            if (temporaryNeedsRelease)
+                releasePluginResourcesNoThrow (instance.get());
+        } };
 
         try
         {
             instance->prepareToPlay (
                 hostSampleRate,
                 juce::jmax (64, lastBlockSize));
+
+            if (restoredState.getSize() > 0)
+                instance->setStateInformation (
+                    restoredState.getData(),
+                    (int) restoredState.getSize());
         }
         catch (...)
         {
-            releasePluginResourcesNoThrow (
-                instance.get());
-            return false;
+            failCurrentRequest (
+                "Plugin falhou durante prepare/restore");
+
+            return;
         }
 
         std::unique_ptr<juce::AudioPluginInstance> old;
         bool oldWasPrepared = false;
+        notifyHostedPluginWillRetire (
+            HostedPluginLocation::insert, slot,
+            getInsert (slot));
+
+        // Fechar o editor pode bombear mensagens; o scanner pode concluir e
+        // colocar exatamente este ID em quarentena nessa janela.
+        if (! requestStillAllowed())
+        {
+            failCurrentRequest (
+                "Plugin foi colocado em quarentena antes do commit");
+            return;
+        }
+
+        // Fechar o editor pode bombear mensagens e iniciar outro pedido. O
+        // commit atomico e revalidado DEPOIS disso; callback stale nao troca o
+        // grafo nem apaga o pending do pedido mais novo.
+        bool committed = false;
         {
             const bool resumeAfterSwap = ! isSuspended();
 
@@ -1241,44 +1741,80 @@ public:
                     suspendProcessing (false);
             } };
 
-            {
-                const juce::ScopedLock callbackGuard (
-                    getCallbackLock());
-                oldWasPrepared =
-                    insertPrepared[slot].exchange (
-                    false,
-                    std::memory_order_acq_rel);
-                old = std::move (inserts[slot]);
-                inserts[slot] = std::move (instance);
-                insertPrepared[slot].store (
-                    true,
-                    std::memory_order_release);
-                refreshExternalReverbSlot (slot);
+            const juce::ScopedLock callbackGuard (
+                getCallbackLock());
+            committed = insertPluginLoadGeneration[slot]
+                .commitIfCurrent (ticket, [this, slot, &instance,
+                                           &old, &oldWasPrepared,
+                                           &temporaryNeedsRelease]
+                {
+                    oldWasPrepared =
+                        insertPrepared[slot].exchange (
+                        false,
+                        std::memory_order_acq_rel);
+                    old = std::move (inserts[slot]);
+                    inserts[slot] = std::move (instance);
+                    temporaryNeedsRelease = false;
+                    insertPrepared[slot].store (
+                        true,
+                        std::memory_order_release);
+                    pendingInsertIds[slot].clear();
+                    pendingInsertStates[slot].clear();
+                    pendingInsertDescriptionValid[slot] = false;
+                    insertPluginLoadInFlight[slot].store (
+                        false, std::memory_order_release);
+                    insertStateRestorePending[slot].store (
+                        false, std::memory_order_release);
+                });
+        }
 
-                // Reverb como ENVIO exige o plugin 100% molhado: o seco ja vem
-                // do caminho direto do canal. Com MIX no meio, o seco voltaria
-                // dobrado.
-                forceExternalReverbWet (
-                    getReverbSlot());
-            }
+        if (! committed)
+            return;
+
+        try
+        {
+            refreshExternalReverbSlot (slot);
+
+            // Reverb como ENVIO exige o plugin 100% molhado: o seco ja vem do
+            // caminho direto do canal. Com MIX no meio, o seco voltaria dobrado.
+            forceExternalReverbWet (getReverbSlot());
+        }
+        catch (...)
+        {
+            juce::Logger::writeToLog (
+                "PLUGIN: insert instalado; atualizacao do roteamento de reverb falhou");
         }
 
         if (oldWasPrepared)
             releasePluginResourcesNoThrow (old.get());
         old.reset();
 
-        // carga ok: o estado guardado de uma restauracao falhada nao vale mais
-        pendingInsertIds[slot].clear();
-        pendingInsertStates[slot].clear();
-
         sendChangeMessage();
-        return true;
+
+        // releaseResources/destrutor do plugin antigo podem bombear a fila e
+        // iniciar D. C ja foi instalado, mas nao conclui a UI nem toca no
+        // estado persistente de D se deixou de ser o pedido atual.
+        if (insertPluginLoadGeneration[slot].isCurrent (ticket))
+            invokePluginLoadCompletionNoThrow (
+                completion, true, {});
     }
 
     void unloadInsert (int slot)
     {
         if (! juce::isPositiveAndBelow (slot, numInserts))
             return;
+
+        notifyHostedPluginWillRetire (
+            HostedPluginLocation::insert, slot,
+            getInsert (slot));
+
+        // A limpeza explicita deve vencer qualquer pedido entregue por um loop
+        // modal aberto ao destruir o editor; por isso cancela DEPOIS do aviso.
+        insertPluginLoadGeneration[slot].cancel();
+        insertPluginLoadInFlight[slot].store (
+            false, std::memory_order_release);
+        insertStateRestorePending[slot].store (
+            false, std::memory_order_release);
 
         std::unique_ptr<juce::AudioPluginInstance> old;
         bool oldWasPrepared = false;
@@ -1313,8 +1849,13 @@ public:
         old.reset();
 
         // slot esvaziado de proposito: estado pendente de restauracao cai junto
-        pendingInsertIds[slot].clear();
-        pendingInsertStates[slot].clear();
+        {
+            const juce::ScopedLock callbackGuard (
+                getCallbackLock());
+            pendingInsertIds[slot].clear();
+            pendingInsertStates[slot].clear();
+            pendingInsertDescriptionValid[slot] = false;
+        }
 
         sendChangeMessage();
     }
@@ -1380,6 +1921,28 @@ public:
 
     ~TimbresProcessor() override
     {
+        for (auto& generation : insertPluginLoadGeneration)
+            generation.cancel();
+
+        for (auto& generation : instrumentPluginLoadGeneration)
+            generation.cancel();
+
+        // O editor precisa largar AudioProcessorEditor/GenericEditor antes que
+        // qualquer instancia seja liberada. Gerações já canceladas tornam
+        // inofensivo um callback AUv3 entregue por um loop modal do vendor.
+        for (int slot = 0; slot < numInserts; ++slot)
+            notifyHostedPluginWillRetire (
+                HostedPluginLocation::insert, slot,
+                getInsert (slot));
+
+        for (int layer = 0; layer < numLayers; ++layer)
+            notifyHostedPluginWillRetire (
+                HostedPluginLocation::instrument, layer,
+                getLayerInstrument (layer));
+
+        setHostedPluginWillRetireCallback ({});
+        releaseResources();
+
         masterReference.clear();
 
         for (auto& requestAbort : layerLoadAbort)
@@ -1802,15 +2365,50 @@ public:
         if (loadingCount->load() > 0)
             return true;
 
+        // AUv3/AU/VST sao criados assincronamente e nao passam pelo contador
+        // de samples. Uma cena-pagina so pode aplicar os faders finais depois
+        // que esses pedidos terminaram; caso contrario o callback do plugin
+        // restauraria defaults por cima da cena alguns quadros depois.
+        {
+            const juce::ScopedLock callbackLock (getCallbackLock());
+
+            for (int i = 0; i < numInserts; ++i)
+                if (insertPluginLoadInFlight[i].load (
+                        std::memory_order_acquire))
+                    return true;
+        }
+
         {
             const juce::ScopedLock lock (layerIdentityLock);
 
             for (int l = 0; l < numLayers; ++l)
-                if (pendingLayerLabels[l].isNotEmpty())
+                if (pendingLayerLabels[l].isNotEmpty()
+                     || instrumentPluginLoadInFlight[l].load (
+                            std::memory_order_acquire))
                     return true;
         }
 
         return ! entriesScanned;
+    }
+
+    // Diferente de isBusyLoading(): um plugin ausente pode deixar a intencao
+    // de restore guardada para autocura sem haver trabalho em execucao. A
+    // splash nao deve ficar eterna por isso, mas uma troca de CENA precisa
+    // saber que a pagina ainda nao terminou e avisar em vez de declarar
+    // sucesso com metade do som.
+    bool hasPendingStateRestore() const noexcept
+    {
+        for (int i = 0; i < numInserts; ++i)
+            if (insertStateRestorePending[i].load (
+                    std::memory_order_acquire))
+                return true;
+
+        for (int l = 0; l < numLayers; ++l)
+            if (layerStateRestorePending[l].load (
+                    std::memory_order_acquire))
+                return true;
+
+        return false;
     }
 
     // PRESET SHOWROOM: pedido pelo MainComponent quando NAO existe setup salvo
@@ -2439,6 +3037,13 @@ public:
              || familyIndex >= churchOrganFamilyCount)
             return false;
 
+        notifyHostedPluginWillRetire (
+            HostedPluginLocation::instrument, layerIndex,
+            getLayerInstrument (layerIndex));
+        instrumentPluginLoadGeneration[layerIndex].cancel();
+        instrumentPluginLoadInFlight[layerIndex].store (
+            false, std::memory_order_release);
+
         const juce::ScopedLock toneLock (layerToneTransactionLock);
         auto* organ = layers[layerIndex].churchOrgan.get();
 
@@ -2483,6 +3088,7 @@ public:
                 layers[layerIndex].instrumentName.clear();
                 pendingVstIds[layerIndex].clear();
                 pendingVstStates[layerIndex].clear();
+                pendingVstDescriptionValid[layerIndex] = false;
             }
 
             organ->setProcessingSuspended (true);
@@ -2550,6 +3156,7 @@ public:
                 sustainStateUnknown,
                 std::memory_order_release);
 
+            bool supersededByPlugin = false;
             {
                 const juce::ScopedLock identityLock (
                     layerIdentityLock);
@@ -2800,20 +3407,50 @@ public:
                 value);
     }
 
-    // carrega um instrumento VST no canal (thread de mensagens)
-    bool loadInstrumentPlugin (int layerIndex,
-                               const juce::PluginDescription& desc,
-                               bool applyFactoryDefaults = true,
-                               const juce::MemoryBlock* restoredState = nullptr)
+    // Agenda um VST/AU/AUv3 sem esperar sua fábrica na message thread. O canal
+    // atual permanece audível até o callback preparar e validar o substituto.
+    bool loadInstrumentPlugin (
+        int layerIndex,
+        const juce::PluginDescription& desc,
+        bool applyFactoryDefaults = true,
+        const juce::MemoryBlock* restoredState = nullptr,
+        PluginLoadCompletion completion = {})
     {
-        if (! juce::isPositiveAndBelow (layerIndex, numLayers) || formatManagerRef == nullptr)
+        if (! juce::isPositiveAndBelow (layerIndex, numLayers)
+             || formatManagerRef == nullptr
+             || isHostedPluginBlocked (desc))
             return false;
 
-        const juce::ScopedLock toneLock (layerToneTransactionLock);
+        ChurchDAWPluginLoading::RequestGeneration::Ticket ticket = 0;
+
         try
         {
+            juce::MemoryBlock stateToRestore;
+
+            if (restoredState != nullptr && restoredState->getSize() > 0)
+                stateToRestore = *restoredState;
+
+            auto requestedId = desc.createIdentifierString();
+            auto requestedState = stateToRestore.toBase64Encoding();
+            juce::PluginDescription requestedDescription (desc);
+            auto restoreTargetId = requestedId;
+            auto restoreTargetState = requestedState;
+            ticket = instrumentPluginLoadGeneration[layerIndex].begin();
+
             {
                 const juce::ScopedLock lock (layerIdentityLock);
+
+                // Manual e restore ficam serializaveis desde a aceitacao. Sem
+                // isto um autosave durante a fabrica AUv3 lenta gravava o plugin
+                // antigo que ainda estava tocando.
+                pendingVstIds[layerIndex] = std::move (requestedId);
+                pendingVstStates[layerIndex] =
+                    std::move (requestedState);
+                pendingVstDescriptions[layerIndex] =
+                    std::move (requestedDescription);
+                pendingVstDescriptionValid[layerIndex] = true;
+                instrumentPluginLoadInFlight[layerIndex].store (
+                    true, std::memory_order_release);
 
                 if (layerStateRestorePending[layerIndex].load (
                         std::memory_order_acquire))
@@ -2821,51 +3458,256 @@ public:
                     layerStateRestoreTargetTimbre[layerIndex].clear();
                     layerStateRestoreTargetLibrary[layerIndex].clear();
                     layerStateRestoreTargetVstId[layerIndex] =
-                        desc.createIdentifierString();
-
-                    if (applyFactoryDefaults)
-                        layerStateRestoreTargetVstState[layerIndex].clear();
+                        std::move (restoreTargetId);
+                    layerStateRestoreTargetVstState[layerIndex] =
+                        applyFactoryDefaults
+                            ? juce::String()
+                            : std::move (restoreTargetState);
                 }
             }
 
-            juce::String error;
-            auto instance = formatManagerRef->createPluginInstance (
-                desc, hostSampleRate,
-                juce::jmax (64, lastBlockSize), error);
+            juce::WeakReference<TimbresProcessor> weakThis (this);
+            formatManagerRef->createPluginInstanceAsync (
+                desc, hostSampleRate, juce::jmax (64, lastBlockSize),
+                [weakThis, layerIndex, ticket, desc,
+                 applyFactoryDefaults,
+                 stateToRestore = std::move (stateToRestore),
+                 completion = std::move (completion)] (
+                    std::unique_ptr<juce::AudioPluginInstance> instance,
+                    const juce::String& error) mutable
+                {
+                    struct Result
+                    {
+                        std::unique_ptr<juce::AudioPluginInstance> instance;
+                        juce::String error;
+                    };
 
-            if (instance == nullptr)
-                return false;
+                    auto result = std::make_shared<Result>();
+                    result->instance = std::move (instance);
+                    result->error = error;
 
-            // Se qualquer etapa posterior ao prepare falhar (estado de plugin,
-            // reserva do scratch ou swap), finalize a instância temporária.
-            // Destruir um AudioProcessor preparado sem o release pareado deixa
-            // AU/VSTs com threads/recursos nativos órfãos.
-            bool temporaryNeedsRelease = false;
-            const juce::ScopeGuard releaseTemporaryOnFailure {
-                [this, &instance, &temporaryNeedsRelease]
+                    auto deliver =
+                        [weakThis, layerIndex, ticket, desc,
+                         applyFactoryDefaults, result,
+                         stateToRestore = std::move (stateToRestore),
+                         completion = std::move (completion)] () mutable
+                    {
+                        if (auto* self = weakThis.get())
+                            self->finishInstrumentPluginLoad (
+                                layerIndex, ticket, desc,
+                                applyFactoryDefaults,
+                                stateToRestore,
+                                std::move (result->instance),
+                                result->error,
+                                std::move (completion));
+                    };
+
+                    if (juce::MessageManager::getInstance()
+                            ->isThisTheMessageThread())
+                        deliver();
+                    else
+                        (void) juce::MessageManager::callAsync (
+                            std::move (deliver));
+                });
+
+            return true;
+        }
+        catch (...)
+        {
+            if (ticket != 0)
             {
-                if (temporaryNeedsRelease)
-                    releasePluginResourcesNoThrow (
-                        instance.get());
-            } };
+                const bool stillCurrent = [&]
+                {
+                    const juce::ScopedLock lock (layerIdentityLock);
+                    return instrumentPluginLoadGeneration[layerIndex]
+                        .commitIfCurrent (
+                            ticket,
+                            [this, layerIndex, applyFactoryDefaults]
+                    {
+                        instrumentPluginLoadInFlight[layerIndex].store (
+                            false, std::memory_order_release);
+
+                        if (applyFactoryDefaults)
+                        {
+                            pendingVstIds[layerIndex].clear();
+                            pendingVstStates[layerIndex].clear();
+                            pendingVstDescriptionValid[layerIndex] = false;
+                        }
+                    });
+                }();
+
+                if (applyFactoryDefaults && stillCurrent)
+                    completeLayerStateRestore (layerIndex);
+            }
+            return false;
+        }
+    }
+
+    void finishInstrumentPluginLoad (
+        int layerIndex,
+        ChurchDAWPluginLoading::RequestGeneration::Ticket ticket,
+        const juce::PluginDescription& desc,
+        bool applyFactoryDefaults,
+        const juce::MemoryBlock& restoredState,
+        std::unique_ptr<juce::AudioPluginInstance> instance,
+        const juce::String& creationError,
+        PluginLoadCompletion completion)
+    {
+        jassert (juce::MessageManager::getInstance()
+                    ->isThisTheMessageThread());
+
+        if (! juce::isPositiveAndBelow (layerIndex, numLayers)
+             || ! instrumentPluginLoadGeneration[layerIndex]
+                     .isCurrent (ticket))
+            return;
+
+        if (isHostedPluginEditorTeardownActive())
+        {
+            try
+            {
+                struct DeferredResult
+                {
+                    juce::PluginDescription description;
+                    juce::MemoryBlock state;
+                    std::unique_ptr<juce::AudioPluginInstance> instance;
+                    juce::String error;
+                    PluginLoadCompletion completion;
+                };
+
+                auto deferred = std::make_shared<DeferredResult>();
+                deferred->description = desc;
+                deferred->state = restoredState;
+                deferred->instance = std::move (instance);
+                deferred->error = creationError;
+                deferred->completion = std::move (completion);
+                juce::WeakReference<TimbresProcessor> weakThis (this);
+
+                deferHostedPluginFinish (
+                    HostedPluginLocation::instrument, layerIndex,
+                    [weakThis, layerIndex, ticket,
+                     applyFactoryDefaults, deferred] () mutable
+                    {
+                        if (auto* self = weakThis.get())
+                            self->finishInstrumentPluginLoad (
+                                layerIndex, ticket,
+                                deferred->description,
+                                applyFactoryDefaults,
+                                deferred->state,
+                                std::move (deferred->instance),
+                                deferred->error,
+                                std::move (deferred->completion));
+                    });
+            }
+            catch (...)
+            {
+                // A intencao continua persistida; nunca troque a instancia no
+                // meio da destruicao de um editor de vendor.
+            }
+            return;
+        }
+
+        auto failCurrentRequest =
+            [this, layerIndex, ticket, applyFactoryDefaults,
+             &completion] (const juce::String& error) mutable
+        {
+            const bool preservePending = ! applyFactoryDefaults;
+
+            if (preservePending
+                 && layerStateRestorePending[layerIndex].load (
+                        std::memory_order_acquire))
+            {
+                if (! finishFailedInstrumentStateRestore (
+                        layerIndex, ticket))
+                    return;
+
+                if (instrumentPluginLoadGeneration[layerIndex]
+                        .isCurrent (ticket))
+                    invokePluginLoadCompletionNoThrow (
+                        completion, false, error);
+                return;
+            }
+
+            const bool stillCurrent = [&]
+                {
+                    const juce::ScopedLock lock (
+                        layerIdentityLock);
+                    return instrumentPluginLoadGeneration[layerIndex]
+                        .commitIfCurrent (
+                            ticket,
+                            [this, layerIndex, preservePending]
+                    {
+                        instrumentPluginLoadInFlight[layerIndex].store (
+                            false, std::memory_order_release);
+
+                        if (! preservePending)
+                        {
+                            pendingVstIds[layerIndex].clear();
+                            pendingVstStates[layerIndex].clear();
+                            pendingVstDescriptionValid[layerIndex] = false;
+                        }
+                    });
+                }();
+
+            if (! stillCurrent)
+                return;
+
+            if (! preservePending)
+                completeLayerStateRestore (layerIndex);
+
+            sendChangeMessage();
+            invokePluginLoadCompletionNoThrow (
+                completion, false, error);
+        };
+
+        if (isHostedPluginBlocked (desc))
+        {
+            juce::Logger::writeToLog (
+                "PLUGIN: instrumento bloqueado durante carga assincrona "
+                + desc.fileOrIdentifier);
+            failCurrentRequest (
+                "Plugin foi colocado em quarentena durante a carga");
+            return;
+        }
+
+        if (instance == nullptr)
+        {
+            juce::Logger::writeToLog (
+                "PLUGIN: falha ao criar instrumento " + desc.name
+                + ": " + creationError);
+            failCurrentRequest (creationError);
+
+            return;
+        }
+
+        const juce::ScopedLock toneLock (layerToneTransactionLock);
+        // Se qualquer etapa anterior ao commit falhar, finalize a instancia
+        // temporaria. Depois do move, a carga e sucesso e nenhum catch pode
+        // anunciar falha deixando o plugin ja instalado.
+        bool temporaryNeedsRelease = false;
+        const juce::ScopeGuard releaseTemporaryOnFailure {
+            [this, &instance, &temporaryNeedsRelease]
+        {
+            if (temporaryNeedsRelease)
+                releasePluginResourcesNoThrow (instance.get());
+        } };
 
         // DESLIGA os barramentos de saida extras ANTES de preparar. O Kontakt abre
         // com varios pares de saida por padrao: sem isto ele RENDERIZA todos eles a
         // cada bloco e nos jogamos fora tudo menos o primeiro par. Era a maior
         // conta do motor — o mesmo Kontakt sozinho, com 2 canais, roda folgado.
-        if (instance->getBusCount (false) > 1)
-        {
-            auto layout = instance->getBusesLayout();
-
-            for (int b = 1; b < layout.outputBuses.size(); ++b)
-                layout.outputBuses.getReference (b) = juce::AudioChannelSet::disabled();
-
-            instance->setBusesLayout (layout);   // se o plugin recusar, segue como estava
-        }
-
-        bool pluginIsOrgan = false;
         try
         {
+            if (instance->getBusCount (false) > 1)
+            {
+                auto layout = instance->getBusesLayout();
+
+                for (int b = 1; b < layout.outputBuses.size(); ++b)
+                    layout.outputBuses.getReference (b) =
+                        juce::AudioChannelSet::disabled();
+
+                instance->setBusesLayout (layout);
+            }
+
             temporaryNeedsRelease = true;
             instance->prepareToPlay (
                 hostSampleRate, juce::jmax (64, lastBlockSize));
@@ -2874,23 +3716,106 @@ public:
             // de limpar/trocar o canal atual. Base64 corrompido ou plugin que
             // lanca deixa o timbre anterior intacto e o alvo pendente salvo.
             if (! applyFactoryDefaults
-                 && restoredState != nullptr
-                 && restoredState->getSize() > 0)
+                 && restoredState.getSize() > 0)
                 instance->setStateInformation (
-                    restoredState->getData(),
-                    (int) restoredState->getSize());
+                    restoredState.getData(),
+                    (int) restoredState.getSize());
 
-            pluginIsOrgan = looksLikeOrgan (desc.name, {});
         }
         catch (...)
         {
-            return false;
+            failCurrentRequest (
+                "Plugin falhou durante prepare/restore");
+
+            return;
         }
 
-        const auto pluginIdentifier = desc.createIdentifierString();
+        juce::String pluginIdentifier;
+        juce::String pluginName;
+        bool pluginIsOrgan = false;
+        try
+        {
+            pluginIdentifier = desc.createIdentifierString();
+            pluginName = desc.name;
+            pluginIsOrgan = looksLikeOrgan (pluginName, {});
+            rememberOutgoingTimbreTone (layerIndex);
+        }
+        catch (...)
+        {
+            failCurrentRequest (
+                "Plugin falhou antes do commit no canal");
+            return;
+        }
+
+        bool scratchReady = false;
+        {
+            const bool resumeAfterReserve = ! isSuspended();
+
+            if (resumeAfterReserve)
+                suspendProcessing (true);
+            const juce::ScopeGuard restoreProcessing {
+                [this, resumeAfterReserve]
+            {
+                if (resumeAfterReserve)
+                    suspendProcessing (false);
+            } };
+
+            try
+            {
+                reserveInstrumentScratchFor (*instance);
+                scratchReady = true;
+            }
+            catch (...)
+            {
+            }
+        }
+
+        if (! scratchReady)
+        {
+            failCurrentRequest (
+                "Plugin nao conseguiu reservar o buffer do canal");
+            return;
+        }
+
         std::unique_ptr<juce::AudioPluginInstance>
             oldInstrument;
         bool oldInstrumentWasPrepared = false;
+
+        if (! instrumentPluginLoadGeneration[layerIndex]
+                 .isCurrent (ticket))
+            return;
+
+        if (isHostedPluginBlocked (desc))
+        {
+            failCurrentRequest (
+                "Plugin foi colocado em quarentena antes do commit");
+            return;
+        }
+
+        // Retire o timbre nativo antes de fechar o editor antigo. Esse callback
+        // pode bombear mensagens e iniciar outro pedido; depois dele este
+        // resultado antigo apenas revalida o ticket, nunca limpa o pedido novo.
+        clearLayer (layerIndex, true);
+
+        if (! instrumentPluginLoadGeneration[layerIndex]
+                 .isCurrent (ticket))
+            return;
+
+        notifyHostedPluginWillRetire (
+            HostedPluginLocation::instrument, layerIndex,
+            getLayerInstrument (layerIndex));
+
+        // O callback do editor pode reentrar na message thread e concluir um
+        // scan. Nunca limpe o canal atual se o candidato acabou de ser
+        // bloqueado nessa janela.
+        if (isHostedPluginBlocked (desc))
+        {
+            failCurrentRequest (
+                "Plugin foi colocado em quarentena antes do commit");
+            return;
+        }
+
+        bool committed = false;
         {
             const bool resumeAfterSwap = ! isSuspended();
 
@@ -2903,71 +3828,94 @@ public:
                     suspendProcessing (false);
             } };
 
-            // Um AU/VST pode ser carregado depois de prepareToPlay(). Reserve
-            // sua geometria AQUI, com processamento suspenso e antes do swap:
-            // aumentar instrumentBuf no callback criaria heap/bad_alloc na
-            // thread de áudio justamente na primeira nota do plugin.
-            reserveInstrumentScratchFor (*instance);
+            const juce::ScopedLock pluginLock (
+                layerPluginStateLock);
+            const juce::ScopedLock identityLock (
+                layerIdentityLock);
+            committed = instrumentPluginLoadGeneration[layerIndex]
+                .commitIfCurrent (
+                    ticket,
+                    [this, layerIndex, &instance,
+                     &oldInstrument, &oldInstrumentWasPrepared,
+                     &temporaryNeedsRelease, &pluginIdentifier,
+                    &pluginName, pluginIsOrgan]
+                    {
+                        oldInstrumentWasPrepared =
+                            pluginPrepared[layerIndex].exchange (
+                                false, std::memory_order_acq_rel);
+                        oldInstrument = std::move (
+                            layers[layerIndex].instrument);
+                        layers[layerIndex].instrument =
+                            std::move (instance);
+                        temporaryNeedsRelease = false;
+                        pluginPrepared[layerIndex].store (
+                            true, std::memory_order_release);
+                        pluginSustainMirror[layerIndex].store (
+                            sustainStateUnknown,
+                            std::memory_order_release);
+                        pluginPitchCentresPending[layerIndex].store (
+                            true, std::memory_order_release);
 
-            // Clear + swap acontecem dentro da MESMA suspensao: nenhum bloco
-            // vazio escapa entre o timbre nativo e o VST/AU novo.
-            oldInstrumentWasPrepared =
-                pluginPrepared[layerIndex].load (
-                    std::memory_order_acquire);
-            clearLayer (layerIndex, true);
-            {
-                const juce::ScopedLock pluginLock (layerPluginStateLock);
-                oldInstrument = std::move (
-                    layers[layerIndex].instrument);
-                layers[layerIndex].instrument = std::move (instance);
-                temporaryNeedsRelease = false;
-                pluginPrepared[layerIndex].store (
-                    true,
-                    std::memory_order_release);
-                pluginSustainMirror[layerIndex].store (
-                    sustainStateUnknown,
-                    std::memory_order_release);
-                // Inicialização pertence SOMENTE ao plugin recém-instalado.
-                // Pedir centros ao guard global também os entregaria aos outros
-                // canais VST/AU e faria uma nota sustentada saltar de afinação.
-                pluginPitchCentresPending[layerIndex].store (
-                    true,
-                    std::memory_order_release);
-                {
-                    const juce::ScopedLock identityLock (layerIdentityLock);
-                    layers[layerIndex].instrumentId = pluginIdentifier;
-                    layers[layerIndex].instrumentName = desc.name;
-                }
-                setLayerLoaded (layerIndex, true);
-            }
+                        layers[layerIndex].instrumentId.swapWith (
+                            pluginIdentifier);
+                        layers[layerIndex].instrumentName.swapWith (
+                            pluginName);
+                        pendingVstIds[layerIndex].clear();
+                        pendingVstStates[layerIndex].clear();
+                        pendingVstDescriptionValid[layerIndex] = false;
+                        instrumentPluginLoadInFlight[layerIndex].store (
+                            false, std::memory_order_release);
+                        layerStateRestoreTargetTimbre[layerIndex].clear();
+                        layerStateRestoreTargetLibrary[layerIndex].clear();
+                        layerStateRestoreTargetVstId[layerIndex].clear();
+                        layerStateRestoreTargetVstState[layerIndex].clear();
+                        layerStateRestorePending[layerIndex].store (
+                            false, std::memory_order_release);
+
+                        layerCategory[layerIndex].clear();
+                        layerIsOrgan[layerIndex].store (
+                            pluginIsOrgan, std::memory_order_relaxed);
+                        layerNativeFamilyTrim[layerIndex].store (
+                            1.0f, std::memory_order_relaxed);
+                        setLayerLoaded (layerIndex, true);
+                    });
+
+            if (! committed)
+                return;
+
             // Auto EQ por categoria pertence aos packs nativos. Um VST/AU nao
             // pode herdar os coeficientes do piano/pad anterior.
-            layerCategory[layerIndex].clear();
-            if (applyFactoryDefaults)
+            try
             {
-                // VST/AU novo parte em bypass de Rotary: muitos orgaos externos
-                // ja trazem Leslie e dois rotores criariam afinacao instavel.
-                applyFactoryTimbreShape (
-                    layerIndex, desc.name, {}, false);
-                applyRememberedTimbreTone (
-                    layerIndex, desc.name,
-                    pluginToneLibrary (pluginIdentifier));
+                if (applyFactoryDefaults)
+                {
+                    // VST/AU novo parte em bypass de Rotary: muitos orgaos
+                    // externos ja trazem Leslie e dois rotores criariam afinacao
+                    // instavel.
+                    applyFactoryTimbreShape (
+                        layerIndex, desc.name, {}, false);
+                    applyRememberedTimbreTone (
+                        layerIndex, desc.name,
+                        pluginToneLibrary (
+                            desc.createIdentifierString()));
+                }
+                updateLayerEq (layerIndex);
+                manualEqs[layerIndex].syncToTargets (
+                    layers[layerIndex].eqLow != nullptr
+                        ? (float) *layers[layerIndex].eqLow : 0.0f,
+                    layers[layerIndex].eqMid != nullptr
+                        ? (float) *layers[layerIndex].eqMid : 0.0f,
+                    layers[layerIndex].eqHigh != nullptr
+                        ? (float) *layers[layerIndex].eqHigh : 0.0f);
             }
-            updateLayerEq (layerIndex);
-            manualEqs[layerIndex].syncToTargets (
-                layers[layerIndex].eqLow != nullptr
-                    ? (float) *layers[layerIndex].eqLow : 0.0f,
-                layers[layerIndex].eqMid != nullptr
-                    ? (float) *layers[layerIndex].eqMid : 0.0f,
-                layers[layerIndex].eqHigh != nullptr
-                    ? (float) *layers[layerIndex].eqHigh : 0.0f);
-            layerIsOrgan[layerIndex].store (
-                pluginIsOrgan,
-                std::memory_order_relaxed);
-            // VST/AU possui calibracao propria. O trim por familia pertence
-            // exclusivamente aos samples PAD/AMBIENCE nativos.
-            layerNativeFamilyTrim[layerIndex].store (
-                1.0f, std::memory_order_relaxed);
+            catch (...)
+            {
+                // O plugin ja pertence ao grafo. Falha cosmetica/default nao
+                // pode produzir completion=false nem destruir o antigo sem o
+                // release pareado.
+                juce::Logger::writeToLog (
+                    "PLUGIN: instrumento instalado; defaults/EQ nao puderam ser aplicados");
+            }
         }
 
         if (oldInstrumentWasPrepared)
@@ -2975,33 +3923,28 @@ public:
                 oldInstrument.get());
         oldInstrument.reset();
 
-        if (applyFactoryDefaults)
-        {
-            // Selecao interativa conclui aqui. Restore de projeto continua
-            // pendente ate o estado binario do plugin ser aceito com sucesso.
-            {
-                const juce::ScopedLock lock (layerIdentityLock);
-                pendingVstIds[layerIndex].clear();
-                pendingVstStates[layerIndex].clear();
-            }
-            completeLayerStateRestore (layerIndex);
-        }
-
         sendChangeMessage();
-        return true;
-        }
-        catch (...)
-        {
-            // API bool: falha extrema de plugin/alocacao nunca atravessa a
-            // MessageManager. Os ScopeGuards internos restauram a suspensao.
-            return false;
-        }
+
+        if (instrumentPluginLoadGeneration[layerIndex]
+                .isCurrent (ticket))
+            invokePluginLoadCompletionNoThrow (
+                completion, true, {});
     }
 
     void clearInstrumentPlugin (int layerIndex)
     {
         if (! juce::isPositiveAndBelow (layerIndex, numLayers))
             return;
+
+        notifyHostedPluginWillRetire (
+            HostedPluginLocation::instrument, layerIndex,
+            getLayerInstrument (layerIndex));
+
+        // A limpeza explicita vence qualquer pedido entregue enquanto o editor
+        // de vendor fecha e bombeia mensagens.
+        instrumentPluginLoadGeneration[layerIndex].cancel();
+        instrumentPluginLoadInFlight[layerIndex].store (
+            false, std::memory_order_release);
 
         // A API e publica: mesmo um chamador futuro que nao passe antes por
         // clearLayer nao pode deixar SOLO/identidade fantasma do plugin.
@@ -3056,6 +3999,7 @@ public:
             const juce::ScopedLock lock (layerIdentityLock);
             pendingVstIds[layerIndex].clear();
             pendingVstStates[layerIndex].clear();
+            pendingVstDescriptionValid[layerIndex] = false;
         }
 
         if (oldWasPrepared)
@@ -3080,6 +4024,18 @@ public:
     {
         if (! juce::isPositiveAndBelow (layerIndex, numLayers))
             return;
+
+        // Uma escolha nativa substitui também qualquer AU/VST ainda em
+        // criação; o callback antigo será descartado pelo ticket.
+        instrumentPluginLoadGeneration[layerIndex].cancel();
+        instrumentPluginLoadInFlight[layerIndex].store (
+            false, std::memory_order_release);
+        {
+            const juce::ScopedLock lock (layerIdentityLock);
+            pendingVstIds[layerIndex].clear();
+            pendingVstStates[layerIndex].clear();
+            pendingVstDescriptionValid[layerIndex] = false;
+        }
 
         {
             const juce::ScopedLock lock (layerIdentityLock);
@@ -3669,6 +4625,8 @@ public:
             streamer.stream ((int) (&v - voices)).stop();
            #endif
         }
+
+        processorPrepared.store (true, std::memory_order_release);
     }
 
     void releaseResources() override
@@ -3677,6 +4635,9 @@ public:
         // processador. Cada prepareToPlay() encaminhado a AU/VST/insert precisa
         // de um releaseResources() correspondente; o corpo vazio antigo vazava
         // recursos de plugins que dependem desse pareamento.
+        const bool wasProcessorPrepared =
+            processorPrepared.exchange (
+                false, std::memory_order_acq_rel);
         const bool resumeAfterRelease = ! isSuspended();
 
         if (resumeAfterRelease)
@@ -3745,7 +4706,12 @@ public:
 
             refreshExternalReverbSlot (-1);
 
-            stopAllVoices();
+            // Um processor pode ser destruido antes do primeiro prepareToPlay
+            // (scan/teste/erro de rota). Nesse estado SampleStreamer ainda nao
+            // possui maxVoices entradas e stopAllVoices acessaria fora do vetor.
+            // O exchange tambem torna release/destrutor idempotentes.
+            if (wasProcessorPrepared)
+                stopAllVoices();
             pitchBendGuard.reset();
             panicPending.store (
                 false,
@@ -4423,9 +5389,20 @@ public:
     const juce::String getProgramName (int) override            { return {}; }
     void changeProgramName (int, const juce::String&) override  {}
 
+    bool consumeLastStateCaptureHadFailure() noexcept
+    {
+        const juce::ScopedLock captureLock (
+            layerToneTransactionLock);
+        return lastStateCaptureHadFailure.exchange (
+            false, std::memory_order_acq_rel);
+    }
+
     void getStateInformation (juce::MemoryBlock& dest) override
     {
         const juce::ScopedLock toneLock (layerToneTransactionLock);
+        lastStateCaptureHadFailure.store (
+            false, std::memory_order_release);
+        bool stateCaptureHadFailure = false;
 
         // Plugins nao garantem que getStateInformation seja seguro enquanto
         // processBlock roda. Salvar e raro; uma pausa curta e preferivel a
@@ -4469,8 +5446,22 @@ public:
         // ignorados por builds antigos, portanto o arquivo continua retroativo.
         timbreToneMemory.writeToXml (xml);
 
-        for (int i = 0; i < numInserts; ++i)
-            if (inserts[i] != nullptr)
+        {
+            const juce::ScopedLock callbackGuard (
+                getCallbackLock());
+
+            for (int i = 0; i < numInserts; ++i)
+            if (pendingInsertIds[i].isNotEmpty())
+            {
+                // Durante o two-phase o plugin antigo ainda toca, mas a intenção
+                // persistente já é o novo alvo. Assim fechar no meio da criação
+                // não troca silenciosamente o projeto de volta para o antigo.
+                auto* insXml = xml.createNewChildElement ("INSERT");
+                insXml->setAttribute ("slot", i);
+                insXml->setAttribute ("id", pendingInsertIds[i]);
+                insXml->setAttribute ("state", pendingInsertStates[i]);
+            }
+            else if (inserts[i] != nullptr)
             {
                 auto* insXml = xml.createNewChildElement ("INSERT");
                 insXml->setAttribute ("slot", i);
@@ -4484,17 +5475,11 @@ public:
                 catch (...)
                 {
                     mb.reset();
+                    stateCaptureHadFailure = true;
                 }
                 insXml->setAttribute ("state", mb.toBase64Encoding());
             }
-            else if (pendingInsertIds[i].isNotEmpty())
-            {
-                // auto-cura: plugin que falhou no restore nao perde id/estado
-                auto* insXml = xml.createNewChildElement ("INSERT");
-                insXml->setAttribute ("slot", i);
-                insXml->setAttribute ("id", pendingInsertIds[i]);
-                insXml->setAttribute ("state", pendingInsertStates[i]);
-            }
+        }
 
         for (int l = 0; l < numLayers; ++l)
         {
@@ -4551,7 +5536,7 @@ public:
                 && layerIsChurchOrgan[l].load (
                     std::memory_order_acquire);
 
-            if (! restorePending)
+            if (! restorePending && pendingVstId.isEmpty())
             {
                 // Mantem a instancia viva enquanto captura o blob, mas nunca
                 // segura o lock leve de Strings ao executar codigo de terceiro.
@@ -4574,6 +5559,7 @@ public:
                     catch (...)
                     {
                         livePluginState.reset();
+                        stateCaptureHadFailure = true;
                     }
                 }
             }
@@ -4665,21 +5651,26 @@ public:
                     layerXml->setAttribute ("vstState", restoreVstState);
                 }
             }
+            else if (pendingVstId.isNotEmpty())
+            {
+                // Escolha AU/AUv3 aceita, mas ainda em criação: a intenção nova
+                // vence o instrumento antigo que continua audível durante o
+                // two-phase. Falha interativa limpa este pending e o próximo
+                // save volta naturalmente ao plugin antigo.
+                layerXml->setAttribute ("vstId", pendingVstId);
+                layerXml->setAttribute ("vstState", pendingVstState);
+            }
             else if (hasLivePlugin)
             {
                 layerXml->setAttribute ("vstId", livePluginId);
                 layerXml->setAttribute (
                     "vstState", livePluginState.toBase64Encoding());
             }
-            else if (pendingVstId.isNotEmpty())
-            {
-                // auto-cura: VSTi que falhou no restore nao perde id/estado
-                layerXml->setAttribute ("vstId", pendingVstId);
-                layerXml->setAttribute ("vstState", pendingVstState);
-            }
         }
 
         copyXmlToBinary (xml, dest);
+        lastStateCaptureHadFailure.store (
+            stateCaptureHadFailure, std::memory_order_release);
     }
 
     void setStateInformation (const void* data, int size) override
@@ -4708,12 +5699,14 @@ public:
         } };
 
         const juce::XmlElement* restoreLayerXml[numLayers] {};
+        const juce::XmlElement* restoreInsertXml[numInserts] {};
 
         // Descobre TODOS os alvos antes de mudar banco/parametros/inserts. Se
         // um save reentrar durante a restauracao, ele ja enxerga o novo projeto
         // completo (ou canal vazio), nunca identidades do projeto anterior.
         if (currentState)
             for (const auto* child : xml->getChildIterator())
+            {
                 if (child->hasTagName ("LAYER"))
                 {
                     const int layer =
@@ -4723,6 +5716,16 @@ public:
                          && restoreLayerXml[layer] == nullptr)
                         restoreLayerXml[layer] = child;
                 }
+                else if (child->hasTagName ("INSERT"))
+                {
+                    const int slot =
+                        child->getIntAttribute ("slot", -1);
+
+                    if (juce::isPositiveAndBelow (slot, numInserts)
+                         && restoreInsertXml[slot] == nullptr)
+                        restoreInsertXml[slot] = child;
+                }
+            }
 
         {
             // Arma identidades e alvos numa unica secao critica. Um autosave
@@ -4766,7 +5769,26 @@ public:
         {
             cancelLayerLoad (l);
             ++layerLoadGeneration[l];
+            instrumentPluginLoadGeneration[l].cancel();
+            instrumentPluginLoadInFlight[l].store (
+                false, std::memory_order_release);
         }
+
+        for (int slot = 0; slot < numInserts; ++slot)
+        {
+            insertPluginLoadGeneration[slot].cancel();
+            insertPluginLoadInFlight[slot].store (
+                false, std::memory_order_release);
+            insertStateRestorePending[slot].store (
+                false, std::memory_order_release);
+        }
+
+        // Restore e substitutivo tambem nos MASTER FX. A ausencia de <INSERT>
+        // representa slot vazio, nao autorizacao para herdar o efeito do projeto
+        // anterior (inclusive no formato legado TIMBRES).
+        for (int slot = 0; slot < numInserts; ++slot)
+            if (restoreInsertXml[slot] == nullptr)
+                unloadInsert (slot);
 
         // Carregar outro projeto substitui o banco anterior por completo.
         // Estados antigos nao possuem TONE e simplesmente comecam vazios.
@@ -4860,10 +5882,16 @@ public:
         worshipReverb.setPreset (nativeReverbPreset->getIndex());
 
         // estado novo substitui qualquer pendencia de restauracao anterior
-        for (int i = 0; i < numInserts; ++i)
         {
-            pendingInsertIds[i].clear();
-            pendingInsertStates[i].clear();
+            const juce::ScopedLock callbackGuard (
+                getCallbackLock());
+
+            for (int i = 0; i < numInserts; ++i)
+            {
+                pendingInsertIds[i].clear();
+                pendingInsertStates[i].clear();
+                pendingInsertDescriptionValid[i] = false;
+            }
         }
 
         {
@@ -4873,72 +5901,75 @@ public:
             {
                 pendingVstIds[l].clear();
                 pendingVstStates[l].clear();
+                pendingVstDescriptionValid[l] = false;
             }
         }
 
-        for (auto* insXml : xml->getChildIterator())
+        for (int slot = 0; slot < numInserts; ++slot)
         {
-            if (! insXml->hasTagName ("INSERT"))
+            const auto* insXml = restoreInsertXml[slot];
+
+            if (insXml == nullptr)
                 continue;
 
-            const int slot = insXml->getIntAttribute ("slot", -1);
+            insertStateRestorePending[slot].store (
+                true, std::memory_order_release);
 
-            if (! juce::isPositiveAndBelow (slot, numInserts))
-                continue;
+            const auto identifier =
+                insXml->getStringAttribute ("id");
+            const auto encodedState =
+                insXml->getStringAttribute ("state");
 
-            bool restored = false;
+            // O alvo fica serializável durante toda a criação assíncrona. O
+            // commit bem-sucedido limpa estes campos; ausência, base64 ruim ou
+            // falha do vendor preserva a auto-cura para a próxima abertura.
+            {
+                const juce::ScopedLock callbackGuard (
+                    getCallbackLock());
+                pendingInsertIds[slot] = identifier;
+                pendingInsertStates[slot] = encodedState;
+                pendingInsertDescriptionValid[slot] = false;
+            }
+
+            juce::MemoryBlock decodedState;
+            const bool decoded = encodedState.isEmpty()
+                || decodedState.fromBase64Encoding (encodedState);
+            std::unique_ptr<juce::PluginDescription> description;
 
             if (knownPluginsRef != nullptr)
-                if (auto desc = knownPluginsRef->getTypeForIdentifierString (insXml->getStringAttribute ("id")))
-                    if (loadInsert (slot, *desc))
-                    {
-                        juce::MemoryBlock mb;
-                        mb.fromBase64Encoding (insXml->getStringAttribute ("state"));
+                description = knownPluginsRef
+                    ->getTypeForIdentifierString (identifier);
 
-                        const bool resumeAfterInsertState =
-                            ! isSuspended();
+            const bool accepted = decoded
+                && description != nullptr
+                && ! isHostedPluginBlocked (*description)
+                && loadInsert (
+                    slot, *description,
+                    decodedState.getSize() > 0
+                        ? &decodedState : nullptr,
+                    {}, true);
 
-                        if (resumeAfterInsertState)
-                            suspendProcessing (true);
-                        const juce::ScopeGuard restoreProcessing {
-                            [this, resumeAfterInsertState]
-                        {
-                            if (resumeAfterInsertState)
-                                suspendProcessing (false);
-                        } };
-                        {
-                            const juce::ScopedLock callbackGuard (getCallbackLock());
-
-                            if (mb.getSize() > 0 && inserts[slot] != nullptr)
-                                try
-                                {
-                                    inserts[slot]->setStateInformation (
-                                        mb.getData(), (int) mb.getSize());
-                                }
-                                catch (...)
-                                {
-                                    // Estado defeituoso de terceiro nao derruba
-                                    // a restauracao do restante da sessao.
-                                }
-
-                            // Captura DEPOIS do estado: numa futura democao o
-                            // plugin volta ao MIX salvo pelo usuario, nao ao
-                            // default que tinha logo apos ser criado.
-                            captureExternalReverbMix (slot);
-
-                            // O estado binario antigo pode trazer o MIX abaixo
-                            // de 100%; no barramento de envio ele deve ser wet.
-                            forceExternalReverbWet (slot);
-                        }
-
-                        restored = true;
-                    }
-
-            // auto-cura: plugin ausente/falho guarda id+estado pro proximo save
-            if (! restored)
+            if (! accepted)
             {
-                pendingInsertIds[slot] = insXml->getStringAttribute ("id");
-                pendingInsertStates[slot] = insXml->getStringAttribute ("state");
+                // Restore e substitutivo mesmo se o ID sumiu, o state esta
+                // corrompido ou o scanner bloqueou o plugin: nunca deixe o
+                // efeito da pagina anterior tocando sob a nova identidade.
+                unloadInsert (slot);
+
+                const juce::ScopedLock callbackGuard (
+                    getCallbackLock());
+                pendingInsertIds[slot] = identifier;
+                pendingInsertStates[slot] = encodedState;
+                pendingInsertDescriptionValid[slot] =
+                    description != nullptr;
+
+                if (description != nullptr)
+                    pendingInsertDescriptions[slot] = *description;
+
+                insertPluginLoadInFlight[slot].store (
+                    false, std::memory_order_release);
+                insertStateRestorePending[slot].store (
+                    true, std::memory_order_release);
             }
         }
 
@@ -5050,7 +6081,6 @@ public:
 
             if (vstId.isNotEmpty())
             {
-                bool restored = false;
                 const auto savedVstState =
                     layerXml->getStringAttribute ("vstState");
                 juce::MemoryBlock decodedVstState;
@@ -5058,31 +6088,46 @@ public:
                     savedVstState.isEmpty()
                     || decodedVstState.fromBase64Encoding (savedVstState);
 
-                if (decoded && knownPluginsRef != nullptr)
-                    if (auto d = knownPluginsRef->getTypeForIdentifierString (vstId))
-                        if (loadInstrumentPlugin (
-                                l, *d, false,
-                                decodedVstState.getSize() > 0
-                                    ? &decodedVstState : nullptr))
-                        {
-                            // O blob ja foi aceito pela instancia temporaria
-                            // antes do swap; somente agora a transacao termina.
-                            completeLayerStateRestore (l);
-                            {
-                                const juce::ScopedLock lock (
-                                    layerIdentityLock);
-                                pendingVstIds[l].clear();
-                                pendingVstStates[l].clear();
-                            }
-                            restored = true;
-                        }
+                std::unique_ptr<juce::PluginDescription> description;
 
-                // auto-cura: VSTi ausente/falho guarda id+estado pro proximo save
-                if (! restored)
+                if (knownPluginsRef != nullptr)
+                    description = knownPluginsRef
+                        ->getTypeForIdentifierString (vstId);
+
+                const bool accepted = decoded
+                    && description != nullptr
+                    && ! isHostedPluginBlocked (*description)
+                    && loadInstrumentPlugin (
+                        l, *description, false,
+                        decodedVstState.getSize() > 0
+                            ? &decodedVstState : nullptr);
+
+                if (! accepted)
                 {
+                    // Um alvo ausente/bloqueado continua serializavel para
+                    // autocura, mas o audio e sempre o da pagina nova: vazio.
+                    clearLayer (l);
+
+                    if (layers[l].instrument != nullptr)
+                        clearInstrumentPlugin (l);
+
                     const juce::ScopedLock lock (layerIdentityLock);
                     pendingVstIds[l] = vstId;
                     pendingVstStates[l] = savedVstState;
+                    pendingVstDescriptionValid[l] =
+                        description != nullptr;
+
+                    if (description != nullptr)
+                        pendingVstDescriptions[l] = *description;
+
+                    instrumentPluginLoadInFlight[l].store (
+                        false, std::memory_order_release);
+                    layerStateRestoreTargetTimbre[l].clear();
+                    layerStateRestoreTargetLibrary[l].clear();
+                    layerStateRestoreTargetVstId[l] = vstId;
+                    layerStateRestoreTargetVstState[l] = savedVstState;
+                    layerStateRestorePending[l].store (
+                        true, std::memory_order_release);
                 }
             }
             else
@@ -5109,6 +6154,280 @@ public:
     }
 
 private:
+    bool isHostedPluginEditorTeardownActive() const noexcept
+    {
+        return hostedPluginEditorTeardownDepth.load (
+                   std::memory_order_acquire) > 0;
+    }
+
+    void deferHostedPluginFinish (
+        HostedPluginLocation location,
+        int index,
+        std::function<void()> finish)
+    {
+        const juce::ScopedLock lock (
+            hostedPluginDeferredFinishLock);
+
+        if (location == HostedPluginLocation::insert)
+        {
+            if (juce::isPositiveAndBelow (index, numInserts))
+                deferredInsertPluginFinishes[index] =
+                    std::move (finish);
+        }
+        else if (juce::isPositiveAndBelow (index, numLayers))
+        {
+            deferredInstrumentPluginFinishes[index] =
+                std::move (finish);
+        }
+    }
+
+    void postDeferredHostedPluginFinishes() noexcept
+    {
+        std::function<void()> insertFinishes[numInserts];
+        std::function<void()> instrumentFinishes[numLayers];
+
+        {
+            const juce::ScopedLock lock (
+                hostedPluginDeferredFinishLock);
+
+            for (int slot = 0; slot < numInserts; ++slot)
+                insertFinishes[slot].swap (
+                    deferredInsertPluginFinishes[slot]);
+
+            for (int layer = 0; layer < numLayers; ++layer)
+                instrumentFinishes[layer].swap (
+                    deferredInstrumentPluginFinishes[layer]);
+        }
+
+        const auto postOnce = [] (
+            std::function<void()> finish) noexcept
+        {
+            if (! finish)
+                return;
+
+            std::function<void()> fallback;
+
+            try
+            {
+                fallback = finish;
+
+                if (juce::MessageManager::callAsync (
+                        std::move (finish)))
+                    return;
+            }
+            catch (...)
+            {
+            }
+
+            // Se o message loop ja estiver fechando, depth e zero e executar
+            // aqui e mais seguro que perder ownership/completion para sempre.
+            try
+            {
+                if (fallback)
+                    fallback();
+                else if (finish)
+                    finish();
+            }
+            catch (...)
+            {
+            }
+        };
+
+        for (auto& finish : insertFinishes)
+            postOnce (std::move (finish));
+
+        for (auto& finish : instrumentFinishes)
+            postOnce (std::move (finish));
+    }
+
+    void notifyHostedPluginWillRetire (
+        HostedPluginLocation location,
+        int index,
+        juce::AudioPluginInstance* instance) noexcept
+    {
+        if (instance == nullptr)
+            return;
+
+        HostedPluginWillRetireCallback callback;
+
+        try
+        {
+            const juce::ScopedLock lock (
+                hostedPluginEditorCallbackLock);
+            callback = hostedPluginWillRetire;
+        }
+        catch (...)
+        {
+            return;
+        }
+
+        if (callback == nullptr)
+            return;
+
+        try
+        {
+            callback (location, index, instance);
+        }
+        catch (...)
+        {
+            // UI de plugin nunca pode impedir a troca/limpeza do grafo.
+        }
+    }
+
+    bool finishFailedInsertStateRestore (
+        int slot,
+        ChurchDAWPluginLoading::RequestGeneration::Ticket ticket)
+    {
+        if (! juce::isPositiveAndBelow (slot, numInserts)
+             || ! insertPluginLoadGeneration[slot].isCurrent (ticket))
+            return false;
+
+        // O editor guarda uma referencia ao plugin antigo. Feche-o antes de
+        // retirar a instancia, mas revalide o ticket depois: o loop modal do
+        // vendor pode iniciar um pedido mais novo, que sempre deve vencer.
+        notifyHostedPluginWillRetire (
+            HostedPluginLocation::insert, slot,
+            getInsert (slot));
+
+        std::unique_ptr<juce::AudioPluginInstance> old;
+        bool oldWasPrepared = false;
+        bool committed = false;
+        {
+            const bool resumeAfterClear = ! isSuspended();
+
+            if (resumeAfterClear)
+                suspendProcessing (true);
+            const juce::ScopeGuard restoreProcessing {
+                [this, resumeAfterClear]
+            {
+                if (resumeAfterClear)
+                    suspendProcessing (false);
+            } };
+
+            const juce::ScopedLock callbackGuard (
+                getCallbackLock());
+            committed = insertPluginLoadGeneration[slot]
+                .commitIfCurrent (ticket, [this, slot, &old,
+                                           &oldWasPrepared]
+                {
+                    oldWasPrepared = insertPrepared[slot].exchange (
+                        false, std::memory_order_acq_rel);
+                    old = std::move (inserts[slot]);
+                    insertPluginLoadInFlight[slot].store (
+                        false, std::memory_order_release);
+                    insertStateRestorePending[slot].store (
+                        true, std::memory_order_release);
+                    // ID/estado/descricao permanecem como intencao de
+                    // autocura. O pending fica armado para a cena detectar a
+                    // falha e executar timeout/rollback, sem prender a splash.
+                });
+        }
+
+        if (! committed)
+            return false;
+
+        try
+        {
+            refreshExternalReverbSlot (slot);
+            forceExternalReverbWet (getReverbSlot());
+        }
+        catch (...)
+        {
+        }
+
+        if (oldWasPrepared)
+            releasePluginResourcesNoThrow (old.get());
+        old.reset();
+        sendChangeMessage();
+        return true;
+    }
+
+    bool finishFailedInstrumentStateRestore (
+        int layerIndex,
+        ChurchDAWPluginLoading::RequestGeneration::Ticket ticket)
+    {
+        if (! juce::isPositiveAndBelow (layerIndex, numLayers)
+             || ! instrumentPluginLoadGeneration[layerIndex]
+                    .isCurrent (ticket))
+            return false;
+
+        // A pagina pediu uma fonte que terminou em falha. Nao deixe o timbre
+        // da cena anterior tocando sob a identidade nova. A limpeza nativa vem
+        // antes do callback de editor, para um pedido reentrante iniciado ao
+        // fechar a janela nao ser cancelado por este resultado antigo.
+        clearLayer (layerIndex, true);
+
+        if (! instrumentPluginLoadGeneration[layerIndex]
+                .isCurrent (ticket))
+            return false;
+
+        notifyHostedPluginWillRetire (
+            HostedPluginLocation::instrument, layerIndex,
+            getLayerInstrument (layerIndex));
+
+        std::unique_ptr<juce::AudioPluginInstance> old;
+        bool oldWasPrepared = false;
+        bool committed = false;
+        {
+            const bool resumeAfterClear = ! isSuspended();
+
+            if (resumeAfterClear)
+                suspendProcessing (true);
+            const juce::ScopeGuard restoreProcessing {
+                [this, resumeAfterClear]
+            {
+                if (resumeAfterClear)
+                    suspendProcessing (false);
+            } };
+
+            const juce::ScopedLock pluginLock (
+                layerPluginStateLock);
+            const juce::ScopedLock identityLock (
+                layerIdentityLock);
+            committed = instrumentPluginLoadGeneration[layerIndex]
+                .commitIfCurrent (
+                    ticket,
+                    [this, layerIndex, &old, &oldWasPrepared]
+                    {
+                        oldWasPrepared =
+                            pluginPrepared[layerIndex].exchange (
+                                false, std::memory_order_acq_rel);
+                        old = std::move (
+                            layers[layerIndex].instrument);
+                        instNotesOn[layerIndex] = 0;
+                        noteTranspose.clearLayer (layerIndex);
+                        pluginSustainMirror[layerIndex].store (
+                            sustainStateUnknown,
+                            std::memory_order_release);
+                        pluginPitchCentresPending[layerIndex].store (
+                            false, std::memory_order_release);
+                        layers[layerIndex].instrumentId.clear();
+                        layers[layerIndex].instrumentName.clear();
+                        instrumentPluginLoadInFlight[layerIndex].store (
+                            false, std::memory_order_release);
+                        layerStateRestorePending[layerIndex].store (
+                            true, std::memory_order_release);
+                        layerCategory[layerIndex].clear();
+                        layerIsOrgan[layerIndex].store (
+                            false, std::memory_order_relaxed);
+                        layerNativeFamilyTrim[layerIndex].store (
+                            1.0f, std::memory_order_relaxed);
+                        setLayerLoaded (layerIndex, false);
+                        // pendingVstIds/States/Description ficam preservados
+                        // para o proximo scan/boot, sem fingir que ainda carrega.
+                    });
+        }
+
+        if (! committed)
+            return false;
+
+        if (oldWasPrepared)
+            releasePluginResourcesNoThrow (old.get());
+        old.reset();
+        sendChangeMessage();
+        return true;
+    }
+
     void setLayerLoaded (int layerIndex, bool loaded) noexcept
     {
         if (! juce::isPositiveAndBelow (layerIndex, numLayers))
@@ -6474,6 +7793,32 @@ private:
             const bool targetIsOrgan = looksLikeOrgan (label, cat);
             const float targetFamilyTrim =
                 nativeFamilyTrimForCategory (cat);
+            notifyHostedPluginWillRetire (
+                HostedPluginLocation::instrument, layerIndex,
+                getLayerInstrument (layerIndex));
+
+            bool supersededByPlugin = false;
+            {
+                const juce::ScopedLock identityLock (
+                    layerIdentityLock);
+
+                // Destruir o editor antigo pode entregar uma selecao AU/VST
+                // mais nova. Nesse caso ela vence e este decode nativo fica
+                // stale sem apagar sua descricao/pending.
+                if (pendingVstIds[layerIndex].isNotEmpty())
+                {
+                    loadingLabels[layerIndex].clear();
+                    loadingLibs[layerIndex].clear();
+                    supersededByPlugin = true;
+                }
+            }
+
+            if (supersededByPlugin)
+            {
+                sendChangeMessage();
+                return;
+            }
+
             std::unique_ptr<juce::AudioPluginInstance> oldInstrument;
             bool oldInstrumentWasPrepared = false;
             bool retired = false;
@@ -6529,6 +7874,7 @@ private:
                         loadingLibs[layerIndex].clear();
                         pendingVstIds[layerIndex].clear();
                         pendingVstStates[layerIndex].clear();
+                        pendingVstDescriptionValid[layerIndex] = false;
                         layers[layerIndex].instrumentId.clear();
                         layers[layerIndex].instrumentName.clear();
                         layers[layerIndex].timbre = label;
@@ -8894,6 +10240,7 @@ private:
     // Dois teclados no MESMO canal e mesma nota continuam ambiguos (limite do MIDI).
     juce::uint16 keyDown[128] = {};
     double hostSampleRate = 44100.0;
+    std::atomic<bool> processorPrepared { false };
 
     std::atomic<int> uiSelectedLayer { -1 };   // abre sem canal selecionado
     // ATENCAO ao mexer em numLayers: listas escritas a mao ("{-1,-1,...}")
@@ -8947,6 +10294,7 @@ private:
     ChurchDAWChannelTone::ThreeBandEq manualEqs[numLayers];
     ChurchDAWTimbreTone::Store<numLayers> timbreToneMemory;
     std::atomic<int> programmaticToneChangeDepth { 0 };
+    std::atomic<bool> lastStateCaptureHadFailure { false };
     mutable juce::CriticalSection layerToneTransactionLock;
     mutable juce::CriticalSection layerIdentityLock;
     mutable juce::CriticalSection layerPluginStateLock;
@@ -8956,6 +10304,9 @@ private:
                    "A identidade dos canais precisa ser lock-free no callback");
     std::atomic<juce::uint32> loadedLayerMask { 0 };
     std::atomic<bool> layerStateRestorePending[numLayers] {};
+    std::atomic<bool> insertStateRestorePending[numInserts] {};
+    std::atomic<bool> insertPluginLoadInFlight[numInserts] {};
+    std::atomic<bool> instrumentPluginLoadInFlight[numLayers] {};
     juce::String layerStateRestoreTargetTimbre[numLayers];
     juce::String layerStateRestoreTargetLibrary[numLayers];
     juce::String layerStateRestoreTargetVstId[numLayers];
@@ -8999,6 +10350,17 @@ private:
     bool externalReverbOriginalMixValid[numInserts] { false, false };
     juce::KnownPluginList* knownPluginsRef = nullptr;
     juce::AudioPluginFormatManager* formatManagerRef = nullptr;
+    const juce::StringArray* pluginQuarantineRef = nullptr;   // pertence ao MainComponent
+    mutable juce::CriticalSection hostedPluginEditorCallbackLock;
+    mutable juce::CriticalSection hostedPluginDeferredFinishLock;
+    HostedPluginWillRetireCallback hostedPluginWillRetire;
+    std::atomic<int> hostedPluginEditorTeardownDepth { 0 };
+    std::function<void()> deferredInsertPluginFinishes[numInserts];
+    std::function<void()> deferredInstrumentPluginFinishes[numLayers];
+    ChurchDAWPluginLoading::RequestGeneration
+        insertPluginLoadGeneration[numInserts];
+    ChurchDAWPluginLoading::RequestGeneration
+        instrumentPluginLoadGeneration[numLayers];
 
     std::vector<std::vector<std::unique_ptr<Zone>>> retiredZones;   // samples antigos ate as vozes acabarem
 
@@ -9014,6 +10376,10 @@ private:
     std::shared_ptr<std::atomic<bool>> layerLoadAbort[numLayers]; // cancela decode velho por canal
     juce::String pendingVstIds[numLayers], pendingVstStates[numLayers];           // VSTi que falhou no restore (auto-cura no save)
     juce::String pendingInsertIds[numInserts], pendingInsertStates[numInserts];   // idem para os INSERTs
+    juce::PluginDescription pendingVstDescriptions[numLayers];
+    juce::PluginDescription pendingInsertDescriptions[numInserts];
+    bool pendingVstDescriptionValid[numLayers] {};
+    bool pendingInsertDescriptionValid[numInserts] {};
     bool showroomPending = false;   // primeira execucao: carregar setup de fabrica pos-scan
     // Compartilhado com os tickets dos workers: mesmo se callAsync falhar ou o
     // processador morrer antes do callback, cada pedido decrementa exatamente
@@ -10021,6 +11387,11 @@ public:
             closedCallback();
     }
 
+    juce::AudioPluginInstance* getPluginInstance() noexcept
+    {
+        return &plugin;
+    }
+
 private:
     juce::AudioPluginInstance& plugin;
     std::function<void()> closedCallback;
@@ -10129,6 +11500,11 @@ public:
 
     void mouseUp (const juce::MouseEvent&) override   { dragging = false; }
 
+    juce::AudioPluginInstance* getPluginInstance() noexcept
+    {
+        return &plugin;
+    }
+
 private:
     void fitToEditor()
     {
@@ -10167,6 +11543,9 @@ public:
 
         if (auto* m = proc.getExternalMaster())
             m->addChangeListener (this);
+
+        if (auto* plugins = proc.getKnownPlugins())
+            plugins->addChangeListener (this);
 
         title.setText ("CHURCH LIVE", juce::dontSendNotification);
         title.setFont (juce::Font (juce::FontOptions (16.0f)).boldened());
@@ -10323,9 +11702,11 @@ public:
             // o menu padrao do JUCE nao tem busca; com centenas de timbres isso
             // virava rolagem infinita — clicar no combo abre o seletor com busca
             s.combo.onShowPopup = [this, l] { openPickerFor (l); };
-            s.combo.onChange = [this, l]
+            s.combo.onChange =
+                [this, l, lifetime = editorCallbackLifetime]
             {
-                if (updatingCombos)
+                if (! lifetime->load (std::memory_order_acquire)
+                     || updatingCombos)
                     return;
 
                 selectStrip (l);
@@ -10363,20 +11744,47 @@ public:
                 }
                 else if (id >= vstBaseId && id - vstBaseId < instrumentsCache.size())
                 {
-                    // VSTi externo (Kontakt) no canal
-                    if (proc.loadInstrumentPlugin (
-                            l, instrumentsCache.getReference (
-                                   id - vstBaseId)))
+                    // AUv3 e alguns Audio Units concluem em outro ciclo da
+                    // message thread. Só abra o editor e altere os controles
+                    // depois do commit real; até lá o instrumento anterior toca.
+                    auto safe =
+                        juce::Component::SafePointer<TimbresEditor> (
+                            this);
+                    std::weak_ptr<std::atomic<bool>> lifetime (
+                        editorCallbackLifetime);
+                    const bool accepted = proc.loadInstrumentPlugin (
+                        l,
+                        instrumentsCache.getReference (id - vstBaseId),
+                        true, nullptr,
+                        [safe, lifetime, l] (
+                            bool loaded, const juce::String&)
+                        {
+                            const auto alive = lifetime.lock();
+
+                            if (alive == nullptr
+                                 || ! alive->load (
+                                     std::memory_order_acquire))
+                                return;
+
+                            if (auto* editor = safe.getComponent())
+                            {
+                                if (loaded)
+                                {
+                                    *editor->proc.layers[l].on = true;
+                                    *editor->proc.layers[l].mute = false;
+                                    *editor->proc.layers[l].solo = false;
+                                    editor->openLayerPlugin (l);
+                                }
+                                else
+                                {
+                                    // O canal anterior permaneceu intacto.
+                                    editor->refreshFromProcessor();
+                                }
+                            }
+                        });
+
+                    if (! accepted)
                     {
-                        *proc.layers[l].on = true;
-                        *proc.layers[l].mute = false;
-                        *proc.layers[l].solo = false;
-                        openLayerPlugin (l);
-                    }
-                    else
-                    {
-                        // O canal anterior permaneceu intacto. Reposiciona o
-                        // seletor na verdade do motor e nao abre janela nula.
                         refreshFromProcessor();
                     }
                 }
@@ -10846,27 +12254,25 @@ public:
         fxTitle.setColour (juce::Label::textColourId, NordLookAndFeel::dimText());   // subtitulo, nao marca
         addAndMakeVisible (fxTitle);
 
-        if (auto* kl = proc.getKnownPlugins())
-            for (const auto& d : kl->getTypes())
-            {
-                if (! d.isInstrument)
-                    effectsCache.add (d);
-                else
-                    instrumentsCache.add (d);   // Kontakt e outros VSTi para os canais
-            }
+        rebuildPluginCaches();
 
         for (int i = 0; i < TimbresProcessor::numInserts; ++i)
         {
             insertCombos[i].addItem ("Sem efeito", 1);
 
             for (int e = 0; e < effectsCache.size(); ++e)
-                insertCombos[i].addItem (effectsCache.getReference (e).name, e + 2);
+                insertCombos[i].addItem (
+                    ChurchDAWPluginLoading::displayName (
+                        effectsCache.getReference (e), effectsCache),
+                    e + 2);
 
             insertCombos[i].setTextWhenNothingSelected ("Sem efeito");
             insertCombos[i].setWantsKeyboardFocus (false);   // setas do PC nao trocam o efeito
-            insertCombos[i].onChange = [this, i]
+            insertCombos[i].onChange =
+                [this, i, lifetime = editorCallbackLifetime]
             {
-                if (updatingCombos)
+                if (! lifetime->load (std::memory_order_acquire)
+                     || updatingCombos)
                     return;
 
                 insertWindows[i].reset();   // fecha o editor embutido antes de trocar
@@ -10898,19 +12304,65 @@ public:
         populateCombos();
         refreshFromProcessor();
         setSize (960, 622);
+
+        auto safe = juce::Component::SafePointer<TimbresEditor> (
+            this);
+        std::weak_ptr<std::atomic<bool>> lifetime (
+            editorCallbackLifetime);
+        proc.setHostedPluginWillRetireCallback (
+            [safe, lifetime] (
+                TimbresProcessor::HostedPluginLocation location,
+                int index,
+                juce::AudioPluginInstance* instance)
+            {
+                const auto alive = lifetime.lock();
+
+                if (alive == nullptr
+                     || ! alive->load (std::memory_order_acquire))
+                    return;
+
+                if (auto* editor = safe.getComponent())
+                    editor->closeHostedPluginEditorBeforeRetire (
+                        location, index, instance);
+            });
     }
 
     ~TimbresEditor() override
     {
-        churchOrganOverlay.reset();
+        // SafePointer continua resolvendo durante o corpo do destrutor. Feche a
+        // porta das completions primeiro e bloqueie commits AUv3 enquanto os
+        // editores de vendor (que podem bombear mensagens) sao desmontados.
+        editorCallbackLifetime->store (
+            false, std::memory_order_release);
 
-        for (auto& w : layerPluginWindows)
-            w.reset();
-
+        // Listeners podem ter callbacks ja enfileirados. Desconecte todas as
+        // fontes antes de resetar qualquer editor de vendor, cujo destrutor pode
+        // bombear a fila de mensagens e reentrar neste objeto em teardown.
         if (auto* m = proc.getExternalMaster())
             m->removeChangeListener (this);
 
+        if (auto* plugins = proc.getKnownPlugins())
+            plugins->removeChangeListener (this);
+
         proc.removeChangeListener (this);
+
+        proc.beginHostedPluginEditorTeardown();
+        {
+            const juce::ScopeGuard finishEditorTeardown { [this]
+            {
+                proc.endHostedPluginEditorTeardown();
+            } };
+
+            proc.setHostedPluginWillRetireCallback ({});
+
+            for (auto& w : insertWindows)
+                w.reset();
+
+            for (auto& w : layerPluginWindows)
+                w.reset();
+        }
+
+        churchOrganOverlay.reset();
     }
 
     bool isMobileMasterPageActive() const noexcept
@@ -13467,6 +14919,13 @@ private:
 
     void changeListenerCallback (juce::ChangeBroadcaster* source) override
     {
+        if (auto* plugins = proc.getKnownPlugins();
+            plugins != nullptr && source == plugins)
+        {
+            refreshPluginCatalogPreservingSelection();
+            return;
+        }
+
         if (auto* m = proc.getExternalMaster(); m != nullptr && source == m)
         {
             syncingMaster = true;
@@ -13537,6 +14996,47 @@ private:
         }
     }
 
+    void closeHostedPluginEditorBeforeRetire (
+        TimbresProcessor::HostedPluginLocation location,
+        int index,
+        juce::AudioPluginInstance* instance)
+    {
+        if (instance == nullptr)
+            return;
+
+        const bool matches =
+            location == TimbresProcessor::HostedPluginLocation::insert
+                ? juce::isPositiveAndBelow (
+                      index, TimbresProcessor::numInserts)
+                    && insertWindows[index] != nullptr
+                    && insertWindows[index]->getPluginInstance()
+                           == instance
+                : juce::isPositiveAndBelow (
+                      index, TimbresProcessor::numLayers)
+                    && layerPluginWindows[index] != nullptr
+                    && layerPluginWindows[index]->getPluginInstance()
+                           == instance;
+
+        if (! matches)
+            return;
+
+        // AudioProcessorEditor::~AudioProcessorEditor de alguns vendors abre
+        // um loop modal. Adie qualquer completion AUv3 entregue nesse intervalo
+        // ate a referencia ao plugin ter desaparecido por completo.
+        auto* processor = &proc;
+        processor->beginHostedPluginEditorTeardown();
+        const juce::ScopeGuard finishEditorTeardown { [processor]
+        {
+            processor->endHostedPluginEditorTeardown();
+        } };
+
+        if (location
+             == TimbresProcessor::HostedPluginLocation::insert)
+            insertWindows[index].reset();
+        else
+            layerPluginWindows[index].reset();
+    }
+
     // abre o editor do plugin do MASTER FX EMBUTIDO (card "nativo" dentro do
     // Church Live, arrastavel) — nada de janela separada do sistema
     void openInsertEmbedded (int i)
@@ -13553,11 +15053,20 @@ private:
         if (auto* p = proc.getInsert (i))
         {
             auto safe = juce::Component::SafePointer<TimbresEditor> (this);
+            std::weak_ptr<std::atomic<bool>> lifetime (
+                editorCallbackLifetime);
 
-            insertWindows[i] = std::make_unique<InsertEditorCard> (*p, [safe, i]
+            insertWindows[i] = std::make_unique<InsertEditorCard> (*p, [safe, lifetime, i]
             {
-                juce::MessageManager::callAsync ([safe, i]
+                juce::MessageManager::callAsync ([safe, lifetime, i]
                 {
+                    const auto alive = lifetime.lock();
+
+                    if (alive == nullptr
+                         || ! alive->load (
+                             std::memory_order_acquire))
+                        return;
+
                     if (auto* ed = safe.getComponent())
                         ed->insertWindows[i].reset();
                 });
@@ -13594,11 +15103,20 @@ private:
         if (auto* p = proc.getLayerInstrument (l))
         {
             auto safe = juce::Component::SafePointer<TimbresEditor> (this);
+            std::weak_ptr<std::atomic<bool>> lifetime (
+                editorCallbackLifetime);
 
-            layerPluginWindows[l] = std::make_unique<InsertPluginWindow> (*p, [safe, l]
+            layerPluginWindows[l] = std::make_unique<InsertPluginWindow> (*p, [safe, lifetime, l]
             {
-                juce::MessageManager::callAsync ([safe, l]
+                juce::MessageManager::callAsync ([safe, lifetime, l]
                 {
+                    const auto alive = lifetime.lock();
+
+                    if (alive == nullptr
+                         || ! alive->load (
+                             std::memory_order_acquire))
+                        return;
+
                     if (auto* ed = safe.getComponent())
                         ed->layerPluginWindows[l].reset();
                 });
@@ -13786,6 +15304,164 @@ public:
         return "OUTROS";
     }
 
+    void rebuildPluginCaches()
+    {
+        effectsCache.clearQuick();
+        instrumentsCache.clearQuick();
+
+        const auto addUnique = [] (
+            juce::Array<juce::PluginDescription>& destination,
+            const juce::PluginDescription& description)
+        {
+            const auto identifier =
+                description.createIdentifierString();
+
+            for (const auto& existing : destination)
+                if (existing.createIdentifierString() == identifier)
+                    return;
+
+            destination.add (description);
+        };
+
+        if (auto* list = proc.getKnownPlugins())
+            for (const auto& description : list->getTypes())
+                if (! proc.isHostedPluginBlocked (description))
+                    addUnique (description.isInstrument
+                                   ? instrumentsCache
+                                   : effectsCache,
+                               description);
+
+        // Uma atualização do scanner não pode transformar em "vazio" um
+        // plugin que já está tocando. Preserve sua descrição mesmo se a lista
+        // conhecida estiver, naquele instante, sendo reconstruída.
+        for (int slot = 0; slot < TimbresProcessor::numInserts; ++slot)
+        {
+            if (auto* plugin = proc.getInsert (slot))
+                addUnique (effectsCache,
+                           plugin->getPluginDescription());
+
+            juce::PluginDescription pending;
+            if (proc.getPendingInsertDescription (slot, pending)
+                 && ! proc.isHostedPluginBlocked (pending))
+                addUnique (effectsCache, pending);
+        }
+
+        for (int layer = 0;
+             layer < TimbresProcessor::numLayers;
+             ++layer)
+        {
+            if (auto* plugin = proc.getLayerInstrument (layer))
+                addUnique (instrumentsCache,
+                           plugin->getPluginDescription());
+
+            juce::PluginDescription pending;
+            if (proc.getPendingInstrumentDescription (layer, pending)
+                 && ! proc.isHostedPluginBlocked (pending))
+                addUnique (instrumentsCache, pending);
+        }
+    }
+
+    static int findPluginChoice (
+        const juce::Array<juce::PluginDescription>& choices,
+        const juce::String& identifier)
+    {
+        return ChurchDAWPluginLoading::findChoiceByIdentifier (
+            choices, identifier);
+    }
+
+    void refreshPluginCatalogPreservingSelection()
+    {
+        juce::String selectedInsertIds[
+            TimbresProcessor::numInserts];
+        juce::String selectedInstrumentIds[
+            TimbresProcessor::numLayers];
+
+        for (int slot = 0;
+             slot < TimbresProcessor::numInserts;
+             ++slot)
+        {
+            const int oldIndex =
+                insertCombos[slot].getSelectedId() - 2;
+
+            if (juce::isPositiveAndBelow (
+                    oldIndex, effectsCache.size()))
+                selectedInsertIds[slot] =
+                    effectsCache.getReference (oldIndex)
+                        .createIdentifierString();
+            else if (auto* plugin = proc.getInsert (slot))
+                selectedInsertIds[slot] =
+                    plugin->getPluginDescription()
+                        .createIdentifierString();
+        }
+
+        for (int layer = 0;
+             layer < TimbresProcessor::numLayers;
+             ++layer)
+        {
+            const int oldIndex =
+                strips[layer].combo.getSelectedId() - vstBaseId;
+
+            if (juce::isPositiveAndBelow (
+                    oldIndex, instrumentsCache.size()))
+                selectedInstrumentIds[layer] =
+                    instrumentsCache.getReference (oldIndex)
+                        .createIdentifierString();
+            else if (auto* plugin =
+                         proc.getLayerInstrument (layer))
+                selectedInstrumentIds[layer] =
+                    plugin->getPluginDescription()
+                        .createIdentifierString();
+        }
+
+        const bool wasUpdating = updatingCombos;
+        updatingCombos = true;
+        rebuildPluginCaches();
+
+        for (int slot = 0;
+             slot < TimbresProcessor::numInserts;
+             ++slot)
+        {
+            auto& combo = insertCombos[slot];
+            combo.clear (juce::dontSendNotification);
+            combo.addItem ("Sem efeito", 1);
+
+            for (int i = 0; i < effectsCache.size(); ++i)
+                combo.addItem (
+                    ChurchDAWPluginLoading::displayName (
+                        effectsCache.getReference (i),
+                        effectsCache),
+                    i + 2);
+
+            const int selected = findPluginChoice (
+                effectsCache, selectedInsertIds[slot]);
+            combo.setSelectedId (
+                selected >= 0 ? selected + 2 : 1,
+                juce::dontSendNotification);
+        }
+
+        // Reconstrói também o picker dos canais. Depois restaura cada AU/VST
+        // pela identidade estável, nunca pelo índice que mudou com o scan.
+        populateCombos();
+
+        for (int layer = 0;
+             layer < TimbresProcessor::numLayers;
+             ++layer)
+        {
+            const int selected = findPluginChoice (
+                instrumentsCache,
+                selectedInstrumentIds[layer]);
+
+            if (selected >= 0)
+                strips[layer].combo.setSelectedId (
+                    vstBaseId + selected,
+                    juce::dontSendNotification);
+        }
+
+        updatingCombos = wasUpdating;
+        resized();
+        repaint();
+    }
+
     void populateCombos()
     {
         const auto& entries = proc.getEntriesNonBlocking();
@@ -13840,11 +15516,21 @@ public:
         // VSTi externos (Kontakt etc.) primeiro - "de fora"
         for (int i = 0; i < instrumentsCache.size(); ++i)
         {
-            const auto& name = instrumentsCache.getReference (i).name;
+            const auto& plugin = instrumentsCache.getReference (i);
+            const auto name = ChurchDAWPluginLoading::displayName (
+                plugin, instrumentsCache);
+            auto detail = plugin.pluginFormatName.trim();
+
+            if (plugin.manufacturerName.trim().isNotEmpty())
+                detail += juce::String::fromUTF8 (" \xc2\xb7 ")
+                       + plugin.manufacturerName.trim();
+
             pickerItems.add ({ vstBaseId + i, name, juce::String ("PLUGINS / KONTAKT"),
-                               (int) TimbreGlyph::resolveKind (true, name, {}),
+                               (int) TimbreGlyph::resolveKind (true, plugin.name, {}),
                                juce::String ("PLUGINS"),
-                               juce::String::fromUTF8 ("Plugin externo \xc2\xb7 VST/Kontakt") });
+                               detail.isNotEmpty()
+                                   ? detail
+                                   : juce::String ("Plugin externo") });
         }
 
         // agrupa por BIBLIOTECA -> CATEGORIA (escolha timbre de qualquer lib)
@@ -13969,13 +15655,30 @@ public:
                 || isChurchOrgan;
             int selected = 1;
             bool loadedHiddenSampleOrgan = false;
+            juce::PluginDescription pendingInstrument;
+            const bool hasPendingInstrument =
+                proc.getPendingInstrumentDescription (
+                    l, pendingInstrument);
 
             // plugin do canal morreu por fora (restore de estado, troca
             // interna): a janela dele nao pode sobreviver ao instance
             if (proc.getLayerInstrument (l) == nullptr)
                 layerPluginWindows[l].reset();
 
-            if (isChurchOrgan)
+            if (hasPendingInstrument)
+            {
+                const auto pendingId =
+                    pendingInstrument.createIdentifierString();
+
+                for (int i = 0; i < instrumentsCache.size(); ++i)
+                    if (instrumentsCache.getReference (i)
+                            .createIdentifierString() == pendingId)
+                    {
+                        selected = vstBaseId + i;
+                        break;
+                    }
+            }
+            else if (isChurchOrgan)
             {
                 selected = organBaseId
                          + static_cast<int> (
@@ -14111,8 +15814,22 @@ public:
         for (int i = 0; i < TimbresProcessor::numInserts; ++i)
         {
             int selected = 1;
+            juce::PluginDescription pendingInsert;
 
-            if (auto* p = proc.getInsert (i))
+            if (proc.getPendingInsertDescription (i, pendingInsert))
+            {
+                const auto id =
+                    pendingInsert.createIdentifierString();
+
+                for (int e = 0; e < effectsCache.size(); ++e)
+                    if (effectsCache.getReference (e)
+                            .createIdentifierString() == id)
+                    {
+                        selected = e + 2;
+                        break;
+                    }
+            }
+            else if (auto* p = proc.getInsert (i))
             {
                 const auto id = p->getPluginDescription().createIdentifierString();
 
@@ -14324,6 +16041,8 @@ public:
     std::unique_ptr<InsertEditorCard> insertWindows[TimbresProcessor::numInserts];   // editores EMBUTIDOS (estilo nativo)
     bool updatingCombos = false;
     bool syncingMaster = false;
+    std::shared_ptr<std::atomic<bool>> editorCallbackLifetime =
+        std::make_shared<std::atomic<bool>> (true);
     bool desktopToneEditMode = false;
     juce::ComboBox reverbTypeCombo;   // Church Reverb ou BigSky externo
     juce::Rectangle<int> fxDivider;   // linha que separa MASTER FX do bloco de saida

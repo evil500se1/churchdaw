@@ -293,6 +293,165 @@ MainComponent::MainComponent()
     if (auto xml = appProperties.getUserSettings()->getXmlValue ("pluginList"))
         knownPlugins.recreateFromXml (*xml);
 
+    auto* pluginSettings = appProperties.getUserSettings();
+    const auto deadMansPedal = pluginSettings->getFile()
+                                   .getSiblingFile ("PluginsComProblema.txt");
+
+    // Versoes antigas entregavam Audio Units de infraestrutura da Apple ao
+    // scanner. Esses IDs sao falsos positivos deterministas e podem sair ja.
+    const int migratedBlacklist =
+        ChurchDAWPluginScan::removerAudioUnitsDeSistemaDaBlacklist (knownPlugins);
+    const int migratedDeadMansResult =
+        ChurchDAWPluginScan::removerAudioUnitsDeSistemaDoDeadMansPedal (deadMansPedal);
+    const bool policyDeadMansWriteOk = migratedDeadMansResult >= 0;
+    const int migratedDeadMans = juce::jmax (0, migratedDeadMansResult);
+
+    if (migratedBlacklist > 0)
+    {
+        if (auto migratedXml = knownPlugins.createXml())
+            pluginSettings->setValue ("pluginList", migratedXml.get());
+    }
+
+    // A blacklist v1 misturava crash real com arquitetura, licenca e falha do
+    // host. NAO a libera no startup: um tipo crashante salvo continuaria no
+    // combo antes do scan. Apenas guarda backup/marker; a remocao acontece
+    // dentro do dialogo imediatamente antes da revalidacao isolada.
+    constexpr int blacklistSemanticsVersion = 2;
+    int legacyBlacklistCount = 0;
+    int legacyDeadMansCount = 0;
+
+    pluginScanQuarantine.addLines (
+        pluginSettings->getValue ("pluginBlacklistMigrationQuarantine"));
+
+    // O dead-man nao e apenas legado: o JUCE grava nele o candidato ANTES de
+    // chama-lo. Se o app/OS cair no meio de um scan v2, esse ID precisa entrar
+    // na barreira ja neste boot, antes de restoreChainState tentar instancia-lo.
+    juce::StringArray startupDeadMans;
+    bool startupDeadMansReadOk = ! deadMansPedal.existsAsFile();
+
+    if (deadMansPedal.existsAsFile())
+        if (auto input = deadMansPedal.createInputStream())
+        {
+            startupDeadMans.addLines (input->readEntireStreamAsString());
+            startupDeadMansReadOk = true;
+        }
+    startupDeadMans.removeEmptyStrings();
+
+    for (int i = startupDeadMans.size(); --i >= 0;)
+        if (ChurchDAWPluginScan::ehAudioUnitDeSistema (
+                startupDeadMans[i]))
+            startupDeadMans.remove (i);
+
+    startupDeadMans.removeDuplicates (true);
+
+    for (const auto& identifier : startupDeadMans)
+        knownPlugins.addToBlacklist (identifier);
+
+    pluginScanQuarantine.addArray (startupDeadMans);
+
+    if (! startupDeadMans.isEmpty()
+         || ! startupDeadMansReadOk
+         || ! policyDeadMansWriteOk)
+    {
+        const bool crashBackupReady = startupDeadMans.isEmpty()
+            || deadMansPedal.getSiblingFile (
+                   "PluginsComProblema-crash-backup.txt")
+                   .replaceWithText (
+                       startupDeadMans.joinIntoString ("\n"), true, true);
+
+        pluginScanQuarantine.removeEmptyStrings();
+        pluginScanQuarantine.removeDuplicates (true);
+        pluginSettings->setValue (
+            "pluginBlacklistMigrationQuarantine",
+            pluginScanQuarantine.joinIntoString ("\n"));
+        pluginSettings->setValue (
+            "pluginBlacklistMigrationPending", true);
+        pluginSettings->setValue (
+            "pluginBlacklistMigrationBackupsReady",
+            crashBackupReady && startupDeadMansReadOk
+                && policyDeadMansWriteOk);
+
+        if (auto blockedXml = knownPlugins.createXml())
+            pluginSettings->setValue ("pluginList", blockedXml.get());
+
+        juce::Logger::writeToLog (
+            "PLUGIN_SCAN startup_dead_man_quarantined count="
+            + juce::String (startupDeadMans.size())
+            + " read_ok=" + juce::String (startupDeadMansReadOk ? 1 : 0));
+    }
+
+    if (ChurchDAWPluginScan::precisaRevalidarBlacklistLegada (
+            pluginSettings->getIntValue ("pluginBlacklistSemanticsVersion", 0)))
+    {
+        const auto legacyBlacklist = knownPlugins.getBlacklistedFiles();
+        legacyBlacklistCount = legacyBlacklist.size();
+        pluginScanQuarantine.addArray (legacyBlacklist);
+
+        auto legacyDeadMans = startupDeadMans;
+        legacyDeadMansCount = legacyDeadMans.size();
+        pluginScanQuarantine.addArray (legacyDeadMans);
+        pluginScanQuarantine.removeEmptyStrings();
+        pluginScanQuarantine.removeDuplicates (true);
+
+        // Itens de infraestrutura Apple ja foram classificados por politica e
+        // nao precisam entrar na quarentena de terceiros. Se a regravacao do
+        // dead-man falhou, entretanto, a migracao inteira permanece bloqueada.
+        for (int i = pluginScanQuarantine.size(); --i >= 0;)
+            if (ChurchDAWPluginScan::ehAudioUnitDeSistema (
+                    pluginScanQuarantine[i]))
+                pluginScanQuarantine.remove (i);
+
+        bool backupsReady = policyDeadMansWriteOk
+                         && startupDeadMansReadOk;
+
+        if (! pluginScanQuarantine.isEmpty())
+        {
+            const auto disabledBackup = pluginSettings->getFile()
+                .getSiblingFile ("PluginsDesativados-v1-backup.txt");
+            backupsReady = disabledBackup.replaceWithText (
+                               pluginScanQuarantine.joinIntoString ("\n"),
+                               true, true)
+                        && backupsReady;
+
+            if (! legacyDeadMans.isEmpty())
+                backupsReady = deadMansPedal
+                    .getSiblingFile ("PluginsComProblema-v1-backup.txt")
+                    .replaceWithText (legacyDeadMans.joinIntoString ("\n"),
+                                      true, true)
+                            && backupsReady;
+        }
+
+        const bool needsRetry = ! pluginScanQuarantine.isEmpty()
+                             || ! policyDeadMansWriteOk;
+        pluginSettings->setValue ("pluginBlacklistMigrationQuarantine",
+                                  pluginScanQuarantine.joinIntoString ("\n"));
+        pluginSettings->setValue ("pluginBlacklistMigrationPending", needsRetry);
+        pluginSettings->setValue ("pluginBlacklistMigrationBackupsReady",
+                                  backupsReady);
+
+        if (! needsRetry)
+            pluginSettings->setValue ("pluginBlacklistSemanticsVersion",
+                                      blacklistSemanticsVersion);
+
+        if (needsRetry && ! backupsReady)
+            juce::Logger::writeToLog (
+                "PLUGIN_SCAN legacy_migration_blocked reason=backup_or_dead_man_write_failed");
+    }
+
+    pluginScanQuarantine.removeEmptyStrings();
+    pluginScanQuarantine.removeDuplicates (true);
+
+    pluginSettings->saveIfNeeded();
+
+    if (legacyBlacklistCount > 0 || legacyDeadMansCount > 0
+         || migratedBlacklist > 0 || migratedDeadMans > 0)
+        juce::Logger::writeToLog (
+            "PLUGIN_SCAN legacy_blacklist_pending retry="
+            + juce::String (legacyBlacklistCount)
+            + " legacy_dead_mans=" + juce::String (legacyDeadMansCount)
+            + " policy_blacklist=" + juce::String (migratedBlacklist)
+            + " policy_dead_mans=" + juce::String (migratedDeadMans));
+
     knownPlugins.addChangeListener (this);
    #endif
     // No celular o formatManager fica sem formato nenhum de proposito. O resto
@@ -1186,6 +1345,17 @@ MainComponent::MainComponent()
     restoreChainState();
     rebuildGraphConnections();
 
+    // O XML so informa qual pagina estava ativa; ele nao prova que a pagina
+    // correspondente chegou ao motor neste processo. Reconcilia depois que o
+    // construtor terminou e deixa o painel sem destaque ate o SHA ser aplicado.
+    if (cenaPendenteNoStartup >= 0)
+        juce::MessageManager::callAsync (
+            [safe = juce::Component::SafePointer<MainComponent> (this)]
+            {
+                if (auto* self = safe.getComponent())
+                    self->reconciliarCenaAtivaNoStartup();
+            });
+
     setSize (1280, 720);
     suppressAudioStateSave = false;
 
@@ -1210,6 +1380,16 @@ MainComponent::MainComponent()
 
 MainComponent::~MainComponent()
 {
+    pluginLoadLifetime->store (false);
+
+   #if CHURCHDAW_HOSTS_PLUGINS
+    // PluginListHolder guarda referencias para formatManager, knownPlugins,
+    // appProperties e pluginScanQuarantine. launchAsync() normalmente o apaga
+    // depois de encerrar o modal; durante o shutdown precisamos destrui-lo
+    // AGORA, antes que qualquer uma dessas referencias deixe de existir.
+    pluginScannerDialog.reset();
+   #endif
+
     // PRIMEIRA COISA A MORRER: o aviso de mudanca de dispositivos MIDI.
     //
     // O callback dele reposta um refreshMidiInputs() via callAsync com
@@ -2531,24 +2711,45 @@ void MainComponent::changeListenerCallback (juce::ChangeBroadcaster* source)
 
 void MainComponent::agendarGravacaoDoSetup()
 {
+    // setStateInformation() e os callbacks assíncronos dos plugins disparam o
+    // mesmo ChangeBroadcaster usado por um fader manual. Durante uma troca de
+    // cena, salvar aqui gravaria uma pagina pela metade como setup global.
+    const auto token = controleDeGravacaoDoSetup.agendarSePermitido (
+        geracaoDaCena);
+
+    if (token == 0)
+        return;
+
     // Uma geracao por pedido: se chegarem dez mudancas seguidas, so a
     // ultima grava. Component::SafePointer cobre o app fechando no meio.
-    const auto geracao = ++geracaoDaGravacaoDoSetup;
-
     juce::Timer::callAfterDelay (
         2000,
+        [safe = juce::Component::SafePointer<MainComponent> (this), token]
+        {
+            if (auto* self = safe.getComponent())
+                if (self->controleDeGravacaoDoSetup.timerAindaValido (
+                        token, self->geracaoDaCena))
+                    self->saveChainState();
+        });
+}
+
+void MainComponent::agendarFimDaSupressaoDeGravacaoDaCena (int geracao)
+{
+    // ChangeBroadcaster entrega notificacoes de forma assíncrona. Soltar no
+    // proximo giro deixa passar primeiro as que ja estavam na fila, sem engolir
+    // o primeiro ajuste manual feito depois de a cena aparecer pronta.
+    juce::MessageManager::callAsync (
         [safe = juce::Component::SafePointer<MainComponent> (this), geracao]
         {
             if (auto* self = safe.getComponent())
-                if (self->geracaoDaGravacaoDoSetup == geracao)
-                    self->saveChainState();
+                (void) self->controleDeGravacaoDoSetup.encerrarSupressao (
+                    geracao, self->geracaoDaCena);
         });
 }
 
 void MainComponent::refreshSlotChoices()
 {
     const auto types = knownPlugins.getTypes();
-
     for (int i = 0; i < numSlots; ++i)
     {
         auto& s = slots[i];
@@ -2565,20 +2766,36 @@ void MainComponent::refreshSlotChoices()
         const bool wantInstrument = (i == 0);
 
         for (const auto& d : types)
-            if (d.isInstrument == wantInstrument)
+            if (d.isInstrument == wantInstrument
+                && ! knownPlugins.isBlacklisted (d.fileOrIdentifier, true)
+                && ! pluginScanQuarantine.contains (d.fileOrIdentifier, true))
                 s.choices.add (d);
 
         for (int c = 0; c < s.choices.size(); ++c)
-            s.box.addItem (s.choices.getReference (c).name, c + 2);
+        {
+            const auto& choice = s.choices.getReference (c);
+            juce::String label = choice.name;
+
+            if (choice.pluginFormatName.isNotEmpty())
+                label += " \xC2\xB7 " + choice.pluginFormatName;
+
+            if (choice.manufacturerName.isNotEmpty())
+                label += " \xC2\xB7 " + choice.manufacturerName;
+
+            s.box.addItem (label, c + 2);
+        }
 
         // qualquer instrumento interno (inclusive setups antigos) usa a entrada unica
-        bool matchedInternal = s.pluginIdentifier.startsWith ("internal:timbres");
+        const auto identifierToShow = s.loadingIdentifier.isNotEmpty()
+                                      ? s.loadingIdentifier
+                                      : s.pluginIdentifier;
+        bool matchedInternal = identifierToShow.startsWith ("internal:timbres");
 
         if (matchedInternal)
             s.box.setSelectedId (timbresComboId, juce::dontSendNotification);
-        else if (s.pluginIdentifier.isNotEmpty())
+        else if (identifierToShow.isNotEmpty())
             for (int c = 0; c < s.choices.size(); ++c)
-                if (s.choices.getReference (c).createIdentifierString() == s.pluginIdentifier)
+                if (s.choices.getReference (c).createIdentifierString() == identifierToShow)
                     s.box.setSelectedId (c + 2, juce::dontSendNotification);
     }
 }
@@ -2601,7 +2818,11 @@ void MainComponent::slotSelectionChanged (int slotIndex)
     if (id == timbresComboId)
     {
         if (s.nodeID.uid != 0 && s.pluginIdentifier.startsWith ("internal:timbres"))
+        {
+            ++s.loadGeneration;
+            s.loadingIdentifier.clear();
             return;   // ja carregado
+        }
 
         loadInternalTimbres (slotIndex, nullptr, 0);
         saveChainState();
@@ -2615,7 +2836,11 @@ void MainComponent::slotSelectionChanged (int slotIndex)
     const auto& desc = s.choices.getReference (id - 2);
 
     if (s.nodeID.uid != 0 && desc.createIdentifierString() == s.pluginIdentifier)
+    {
+        ++s.loadGeneration;
+        s.loadingIdentifier.clear();
         return;   // ja carregado
+    }
 
     // rescan na mesma sessao: se o escolhido e o proprio plugin pendente,
     // restaura o estado preservado em vez de carregar com defaults
@@ -2627,80 +2852,391 @@ void MainComponent::slotSelectionChanged (int slotIndex)
         && pendingBlock.fromBase64Encoding (s.pendingState))
         stateToUse = &pendingBlock;
 
-    loadPlugin (slotIndex, desc, stateToUse);
-    saveChainState();
-
-    if (s.nodeID.uid != 0)
-        openEditorForSlot (slotIndex);
+    // AUv3 exige criacao assincrona. A troca so e confirmada quando a nova
+    // instancia existe; ate la o plugin anterior continua tocando.
+    loadPlugin (slotIndex, desc, stateToUse, true, true);
 }
 
-void MainComponent::loadPlugin (int slotIndex, const juce::PluginDescription& desc, const juce::MemoryBlock* state)
+void MainComponent::loadPlugin (int slotIndex,
+                                const juce::PluginDescription& desc,
+                                const juce::MemoryBlock* state,
+                                bool openEditorAfterLoad,
+                                bool saveAfterLoad)
 {
-    unloadSlot (slotIndex);
+    auto& s = slots[slotIndex];
+    const auto requestedIdentifier = desc.createIdentifierString();
 
-    juce::String error;
-    auto instance = formatManager.createPluginInstance (desc, getCurrentSampleRate(), getCurrentBlockSize(), error);
-
-    if (instance == nullptr)
+    if (knownPlugins.isBlacklisted (desc.fileOrIdentifier, true)
+         || pluginScanQuarantine.contains (desc.fileOrIdentifier, true))
     {
-        juce::AlertWindow::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
-                                                "Erro ao carregar plugin",
-                                                desc.name + ":\n" + error);
-        // combo sem selecao (0), nao "(vazio)" (1): assim escolher "(vazio)"
-        // depois dispara o onChange e o usuario consegue limpar a pendencia
-        slots[slotIndex].box.setSelectedId (0, juce::dontSendNotification);
-        slots[slotIndex].pluginIdentifier.clear();
-        // falha de carga nao apaga o salvo: guarda pro autosave re-emitir.
-        // Retentativa pelo combo chega com state == nullptr — nesse caso o
-        // pendingState ja preservado (mesmo id) NAO pode ser sobrescrito.
-        // E se a pendencia atual e de OUTRO plugin COM estado (A falhou no
-        // restore, usuario tentou B que tambem falhou), a pendencia de A e a
-        // que tem valor: nada carregou, entao ela continua valendo — instalar
-        // B vazio por cima destruiria o setup de A no proximo autosave
-        const auto failedId = desc.createIdentifierString();
-
-        if (state != nullptr && state->getSize() > 0)
-        {
-            slots[slotIndex].pendingState = state->toBase64Encoding();
-            slots[slotIndex].pendingIdentifier = failedId;
-        }
-        else if (slots[slotIndex].pendingIdentifier == failedId
-                  || slots[slotIndex].pendingState.isEmpty())
-        {
-            slots[slotIndex].pendingIdentifier = failedId;   // sem pendencia valiosa em risco
-        }
-
+        juce::Logger::writeToLog (
+            "PLUGIN LOAD: pedido bloqueado por quarentena "
+            + desc.fileOrIdentifier);
         return;
     }
 
-    if (state != nullptr && state->getSize() > 0)
-        instance->setStateInformation (state->getData(), (int) state->getSize());
+    const auto generation = ++s.loadGeneration;
+    const bool hadProcessorAtRequest = s.nodeID.uid != 0;
+    s.loadingIdentifier = requestedIdentifier;
 
-    auto node = graph.addNode (std::move (instance));
+    juce::MemoryBlock stateCopy;
+    const bool hasState = state != nullptr && state->getSize() > 0;
 
-    auto& s = slots[slotIndex];
-    s.nodeID = node->nodeID;
-    s.pluginIdentifier = desc.createIdentifierString();
-    s.pendingIdentifier.clear();   // carregou de verdade: pendente nao vale mais
-    s.pendingState.clear();
-    s.openButton.setEnabled (true);
-    s.proc.store (node->getProcessor());
-    node->getProcessor()->addListener (this);   // para o MIDI Learn detectar o controle tocado
+    if (hasState)
+        stateCopy = *state;
 
-    for (int c = 0; c < s.choices.size(); ++c)
-        if (s.choices.getReference (c).createIdentifierString() == s.pluginIdentifier)
-            s.box.setSelectedId (c + 2, juce::dontSendNotification);
+    // Sem plugin ativo, o setup salvo continua reemitindo esta solicitacao
+    // mesmo se o aplicativo for fechado enquanto o AUv3 ainda esta abrindo.
+    // Uma pendencia anterior COM estado so e substituida depois do sucesso.
+    if (! hadProcessorAtRequest
+        && (hasState || s.pendingIdentifier == requestedIdentifier
+                     || s.pendingState.isEmpty()))
+    {
+        s.pendingIdentifier = requestedIdentifier;
 
-    rebuildGraphConnections();
+        if (hasState)
+            s.pendingState = stateCopy.toBase64Encoding();
+
+        s.pluginIdentifier.clear();
+    }
+
+    const auto lifetime = pluginLoadLifetime;
+    const auto safe = juce::Component::SafePointer<MainComponent> (this);
+
+    formatManager.createPluginInstanceAsync (
+        desc, getCurrentSampleRate(), getCurrentBlockSize(),
+        [safe, lifetime, slotIndex, desc, requestedIdentifier, generation,
+         stateCopy = std::move (stateCopy), hasState,
+         openEditorAfterLoad, saveAfterLoad]
+        (std::unique_ptr<juce::AudioPluginInstance> instance, const juce::String& error) mutable
+        {
+            if (! lifetime->load())
+                return;
+
+            auto* self = safe.getComponent();
+            if (self == nullptr || slotIndex < 0 || slotIndex >= numSlots)
+                return;
+
+            auto& slot = self->slots[slotIndex];
+            if (slot.loadGeneration != generation)
+                return;
+
+            const auto restoreCurrentSelection = [&slot]
+            {
+                if (slot.pluginIdentifier.startsWith ("internal:timbres"))
+                {
+                    slot.box.setSelectedId (timbresComboId, juce::dontSendNotification);
+                    return;
+                }
+
+                for (int c = 0; c < slot.choices.size(); ++c)
+                    if (slot.choices.getReference (c).createIdentifierString()
+                        == slot.pluginIdentifier)
+                    {
+                        slot.box.setSelectedId (c + 2, juce::dontSendNotification);
+                        return;
+                    }
+
+                // 0 e intencional: escolher "(vazio)" ainda dispara onChange.
+                slot.box.setSelectedId (0, juce::dontSendNotification);
+            };
+
+            const auto pluginWasBlocked = [self, &desc]
+            {
+                return self->knownPlugins.isBlacklisted (
+                           desc.fileOrIdentifier, true)
+                    || self->pluginScanQuarantine.contains (
+                           desc.fileOrIdentifier, true);
+            };
+
+            const auto rejectBlockedCandidate = [&]
+            {
+                slot.loadingIdentifier.clear();
+                restoreCurrentSelection();
+                juce::Logger::writeToLog (
+                    "PLUGIN LOAD: candidato entrou em quarentena durante carga "
+                    + desc.fileOrIdentifier);
+            };
+
+            if (pluginWasBlocked())
+            {
+                rejectBlockedCandidate();
+                return;
+            }
+
+            if (instance == nullptr)
+            {
+                slot.loadingIdentifier.clear();
+
+                if (slot.nodeID.uid == 0)
+                {
+                    slot.pluginIdentifier.clear();
+
+                    if (hasState)
+                    {
+                        slot.pendingIdentifier = requestedIdentifier;
+                        slot.pendingState = stateCopy.toBase64Encoding();
+                    }
+                    else if (slot.pendingIdentifier == requestedIdentifier
+                              || slot.pendingState.isEmpty())
+                    {
+                        slot.pendingIdentifier = requestedIdentifier;
+                    }
+                }
+
+                restoreCurrentSelection();
+                juce::Logger::writeToLog ("PLUGIN LOAD: " + desc.name + ": " + error);
+
+                if (openEditorAfterLoad || saveAfterLoad)
+                    juce::AlertWindow::showMessageBoxAsync (
+                        juce::MessageBoxIconType::WarningIcon,
+                        "Erro ao carregar plugin",
+                        desc.name + ":\n" + error);
+
+                if (saveAfterLoad)
+                    self->saveChainState();
+
+                return;
+            }
+
+            if (hasState)
+            {
+                try
+                {
+                    instance->setStateInformation (stateCopy.getData(), (int) stateCopy.getSize());
+                }
+                catch (...)
+                {
+                    if (! lifetime->load() || safe.getComponent() == nullptr)
+                        return;
+
+                    if (slot.loadGeneration != generation)
+                        return;
+
+                    slot.loadingIdentifier.clear();
+                    restoreCurrentSelection();
+                    const auto stateError = desc.name
+                        + ": o plugin rejeitou o estado salvo; o plugin anterior foi preservado.";
+                    juce::Logger::writeToLog ("PLUGIN LOAD: " + stateError);
+
+                    if (openEditorAfterLoad || saveAfterLoad)
+                        juce::AlertWindow::showMessageBoxAsync (
+                            juce::MessageBoxIconType::WarningIcon,
+                            "Erro ao restaurar plugin",
+                            stateError);
+
+                    if (saveAfterLoad)
+                        self->saveChainState();
+
+                    return;
+                }
+            }
+
+            if (! lifetime->load()
+                || safe.getComponent() == nullptr
+                || slot.loadGeneration != generation)
+                return;
+
+            const auto inputChannels = instance->getTotalNumInputChannels();
+            const auto outputChannels = instance->getTotalNumOutputChannels();
+            juce::String incompatibleReason;
+
+            if (desc.isInstrument != (slotIndex == 0))
+            {
+                incompatibleReason = slotIndex == 0
+                    ? "o plugin foi identificado como efeito, nao instrumento"
+                    : "o plugin foi identificado como instrumento, nao efeito";
+            }
+            else if (slotIndex == 0)
+            {
+                if (outputChannels <= 0)
+                    incompatibleReason = "o instrumento nao oferece saida de audio";
+                else if (! instance->acceptsMidi())
+                    incompatibleReason = "o instrumento nao aceita MIDI";
+            }
+            else if (inputChannels <= 0 || outputChannels <= 0)
+            {
+                incompatibleReason = "o efeito precisa oferecer entrada e saida de audio";
+            }
+
+            // Os getters acima sao codigo virtual de terceiros. Um AU pode
+            // bombear a message thread; nunca publica o resultado de um pedido
+            // que ficou obsoleto enquanto consultavamos sua configuracao.
+            if (! lifetime->load() || safe.getComponent() == nullptr
+                || slot.loadGeneration != generation)
+                return;
+
+            if (incompatibleReason.isNotEmpty())
+            {
+                slot.loadingIdentifier.clear();
+                restoreCurrentSelection();
+                const auto routingError = desc.name + ": " + incompatibleReason
+                    + "; o conteudo anterior do slot foi preservado.";
+                juce::Logger::writeToLog ("PLUGIN LOAD: " + routingError);
+
+                if (openEditorAfterLoad || saveAfterLoad)
+                    juce::AlertWindow::showMessageBoxAsync (
+                        juce::MessageBoxIconType::WarningIcon,
+                        "Plugin incompativel com o slot",
+                        routingError);
+
+                if (saveAfterLoad)
+                    self->saveChainState();
+
+                return;
+            }
+
+            if (pluginWasBlocked())
+            {
+                rejectBlockedCandidate();
+                return;
+            }
+
+            // Primeiro prova que o novo processador entra no grafo; somente
+            // depois remove o anterior. Assim uma falha nao silencia o culto.
+            auto newNode = self->graph.addNode (std::move (instance));
+
+            if (! lifetime->load() || safe.getComponent() == nullptr)
+                return;
+
+            if (slot.loadGeneration != generation)
+            {
+                if (newNode != nullptr)
+                {
+                    self->graph.removeNode (newNode->nodeID);
+                    self->rebuildGraphConnections();
+                }
+
+                return;
+            }
+
+            if (newNode == nullptr)
+            {
+                slot.loadingIdentifier.clear();
+                restoreCurrentSelection();
+                const auto graphError = desc.name
+                    + ": nao foi possivel inserir o plugin no grafo de audio.";
+                juce::Logger::writeToLog ("PLUGIN LOAD: " + graphError);
+
+                if (openEditorAfterLoad || saveAfterLoad)
+                    juce::AlertWindow::showMessageBoxAsync (
+                        juce::MessageBoxIconType::WarningIcon,
+                        "Erro ao carregar plugin",
+                        graphError);
+
+                if (saveAfterLoad)
+                    self->saveChainState();
+
+                return;
+            }
+
+            const auto oldNodeID = slot.nodeID;
+
+            // Prova o candidato usando uma visao local do slot. O estado
+            // publicado continua apontando para o plugin antigo enquanto o
+            // grafo transacional valida todas as bordas.
+            if (! self->rebuildGraphConnections (slotIndex, newNode->nodeID))
+            {
+                if (! lifetime->load() || safe.getComponent() == nullptr)
+                    return;
+
+                if (slot.loadGeneration != generation)
+                {
+                    self->rebuildGraphConnections();
+                    self->graph.removeNode (newNode->nodeID);
+                    return;
+                }
+
+                const bool previousRouteOk = self->rebuildGraphConnections();
+                self->graph.removeNode (newNode->nodeID);
+
+                if (! lifetime->load() || safe.getComponent() == nullptr
+                    || slot.loadGeneration != generation)
+                    return;
+
+                slot.loadingIdentifier.clear();
+                restoreCurrentSelection();
+                const auto graphError = desc.name
+                    + ": a configuracao de canais nao pode ser ligada ao mixer; "
+                    + (previousRouteOk
+                        ? "o plugin anterior foi preservado."
+                        : "o plugin anterior continua selecionado, mas a rota de audio "
+                          "tambem precisa ser revisada.");
+                juce::Logger::writeToLog (
+                    "PLUGIN LOAD: " + graphError
+                    + " previous_route_ok=" + juce::String (previousRouteOk ? 1 : 0));
+
+                if (openEditorAfterLoad || saveAfterLoad)
+                    juce::AlertWindow::showMessageBoxAsync (
+                        juce::MessageBoxIconType::WarningIcon,
+                        "Erro ao rotear plugin",
+                        graphError);
+
+                if (saveAfterLoad)
+                    self->saveChainState();
+
+                return;
+            }
+
+            if (! lifetime->load() || safe.getComponent() == nullptr)
+                return;
+
+            if (slot.loadGeneration != generation)
+            {
+                self->rebuildGraphConnections();
+                self->graph.removeNode (newNode->nodeID);
+                return;
+            }
+
+            if (pluginWasBlocked())
+            {
+                self->rebuildGraphConnections();
+                self->graph.removeNode (newNode->nodeID);
+                rejectBlockedCandidate();
+                return;
+            }
+
+            slot.nodeID = newNode->nodeID;
+            slot.proc.store (newNode->getProcessor());
+            slot.pluginIdentifier = requestedIdentifier;
+            slot.pendingIdentifier.clear();
+            slot.pendingState.clear();
+            slot.loadingIdentifier.clear();
+            slot.openButton.setEnabled (true);
+            newNode->getProcessor()->addListener (self);
+
+            for (int c = 0; c < slot.choices.size(); ++c)
+                if (slot.choices.getReference (c).createIdentifierString()
+                    == slot.pluginIdentifier)
+                    slot.box.setSelectedId (c + 2, juce::dontSendNotification);
+
+            if (oldNodeID.uid != 0)
+                self->removeNodeForSlot (slotIndex, oldNodeID);
+
+            // Destrutores de plugins de terceiros podem bombear a message
+            // thread. Se houve outra escolha durante o fechamento do antigo,
+            // a nova geracao ja assumiu o slot e nao deve ser sobrescrita.
+            if (! lifetime->load() || safe.getComponent() == nullptr
+                || slot.loadGeneration != generation)
+                return;
+
+            if (saveAfterLoad)
+                self->saveChainState();
+
+            if (openEditorAfterLoad)
+                self->openEditorForSlot (slotIndex);
+        });
 }
 
 void MainComponent::loadInternalTimbres (int slotIndex, const juce::MemoryBlock* state, int libraryIndex)
 {
     unloadSlot (slotIndex);
+    const auto loadGeneration = slots[slotIndex].loadGeneration;
 
     auto instance = std::make_unique<TimbresProcessor>();
     instance->setExternalMaster (masterProcessor);                    // master grandao dentro do Church Live
-    instance->setPluginResources (&knownPlugins, &formatManager);     // plugins hospedados no canal master
+    instance->setPluginResources (&knownPlugins, &formatManager,
+                                  &pluginScanQuarantine);     // plugins hospedados no canal master
 
     if (libraryIndex == 1)
         instance->setLibraryRoot (TimbresProcessor::redkeysSamplesFolder());
@@ -2713,6 +3249,16 @@ void MainComponent::loadInternalTimbres (int slotIndex, const juce::MemoryBlock*
         instance->setStateInformation (state->getData(), (int) state->getSize());
 
     auto node = graph.addNode (std::move (instance));
+
+    if (node == nullptr)
+        return;
+
+    if (slots[slotIndex].loadGeneration != loadGeneration)
+    {
+        graph.removeNode (node->nodeID);
+        rebuildGraphConnections();
+        return;
+    }
 
     auto& s = slots[slotIndex];
     s.nodeID = node->nodeID;
@@ -2741,37 +3287,47 @@ void MainComponent::loadInternalTimbres (int slotIndex, const juce::MemoryBlock*
 void MainComponent::unloadSlot (int slotIndex)
 {
     auto& s = slots[slotIndex];
+    ++s.loadGeneration;   // cancela qualquer AUv3 que ainda esteja abrindo
+    s.loadingIdentifier.clear();
+    s.openButton.setEnabled (false);
+    const auto nodeToRemove = s.nodeID;
 
-    if (s.nodeID.uid != 0)
+    // Desanexa o slot ANTES de destruir editores. Plugins reais podem bombear
+    // a fila de mensagens ao fechar; uma escolha reentrante passa a pertencer
+    // a uma nova geracao e nunca pode ser removida por este unload antigo.
+    s.nodeID = {};
+    s.proc.store (nullptr);
+
+    if (nodeToRemove.uid != 0)
+        removeNodeForSlot (slotIndex, nodeToRemove);
+
+    rebuildGraphConnections();
+}
+
+void MainComponent::removeNodeForSlot (int slotIndex,
+                                       juce::AudioProcessorGraph::NodeID nodeID)
+{
+    if (nodeID.uid == 0)
+        return;
+
+    if (auto node = graph.getNodeForId (nodeID))
     {
-        if (dockedNodeID == s.nodeID)
-            undockEditor();
+        node->getProcessor()->removeListener (this);
 
-        closeWindowForNode (s.nodeID);
-
-        if (auto* node = graph.getNodeForId (s.nodeID))
+        if (auto* live = dynamic_cast<TimbresProcessor*> (node->getProcessor()))
         {
-            node->getProcessor()->removeListener (this);
+            live->removeChangeListener (this);
 
-            // par do addChangeListener em loadInternalTimbres: sem isto o
-            // broadcaster ficaria com um ponteiro para este componente
-            if (auto* live = dynamic_cast<TimbresProcessor*> (node->getProcessor()))
-                live->removeChangeListener (this);
-
-            // o card Audio/MIDI segura um attachment pro parametro de velocity
-            // do Church Live; remover o no com o card aberto deixaria o
-            // attachment apontando pra memoria morta
-            if (audioPanel != nullptr && dynamic_cast<TimbresProcessor*> (node->getProcessor()) != nullptr)
+            if (slotIndex == 0 && audioPanel != nullptr)
                 audioPanel.reset();
         }
-
-        s.proc.store (nullptr);
-        graph.removeNode (s.nodeID);
-        s.nodeID = {};
-        rebuildGraphConnections();
     }
 
-    s.openButton.setEnabled (false);
+    if (dockedNodeID == nodeID)
+        undockEditor();
+
+    closeWindowForNode (nodeID);
+    graph.removeNode (nodeID);
 }
 
 void MainComponent::openEditorForSlot (int slotIndex)
@@ -4674,10 +5230,39 @@ ChurchDAWLive::Resultado MainComponent::capturarCena (int indice)
     // depois o resetLayerParametersToDefaults do restore passa por cima e o
     // motor vira outra coisa. A cena ficaria calada e errada — e teria
     // sobrescrito a anterior, que nao volta. Melhor recusar e avisar.
-    if (live->isBusyLoading())
+    if (live->isBusyLoading() || live->hasPendingStateRestore())
         return ChurchDAWLive::Resultado::carregando;
 
+    juce::MemoryBlock paginaDoMotor;
+
+    try
+    {
+        live->getStateInformation (paginaDoMotor);
+
+        if (live->consumeLastStateCaptureHadFailure())
+        {
+            paginaDoMotor.reset();
+            juce::Logger::writeToLog (
+                "LIVE: cena " + juce::String (indice + 1)
+                + " NAO gravada; estado de plugin incompleto");
+            return ChurchDAWLive::Resultado::naoGravou;
+        }
+    }
+    catch (...)
+    {
+        (void) live->consumeLastStateCaptureHadFailure();
+        paginaDoMotor.reset();
+    }
+
+    juce::String novoEstadoId;
+
+    if (! gravarPaginaDeCena (paginaDoMotor, novoEstadoId))
+        return ChurchDAWLive::Resultado::naoGravou;
+
+    const ChurchDAWLive::EstadoAntesDePersistirCena antes { cenas[indice], cenaAtiva };
     auto& cena = cenas[indice];
+    const auto estadoIdAnterior = cena.estadoDoMotorId;
+    cena.estadoDoMotorId = novoEstadoId;
 
     // SOLO NAO ENTRA NA CENA — ele vira mute.
     //
@@ -4752,18 +5337,24 @@ ChurchDAWLive::Resultado MainComponent::capturarCena (int indice)
     // cena existe so nesta sessao e some ao fechar. Dizer "ok" aqui desarmaria
     // o GRAVAR e deixaria o musico confiando numa cena que nao vai estar la no
     // domingo — a mesma confianca falsa que ja custou caro no mapa de notas.
-    if (! salvarCenas())
+    const auto resultado = ChurchDAWLive::concluirPersistenciaDeCena (
+        salvarCenas(), antes, cena, cenaAtiva);
+
+    if (resultado != ChurchDAWLive::Resultado::ok)
     {
+        removerPaginaDeCenaSeOrfa (novoEstadoId);
         juce::Logger::writeToLog ("LIVE: cena " + juce::String (indice + 1)
-                                    + " capturada, mas NAO gravada no disco");
-        return ChurchDAWLive::Resultado::naoGravou;
+                                    + " NAO gravada; memoria e cena ativa restauradas");
+        return resultado;
     }
 
+    removerPaginaDeCenaSeOrfa (estadoIdAnterior);
     juce::Logger::writeToLog ("LIVE: cena " + juce::String (indice + 1) + " gravada");
     return ChurchDAWLive::Resultado::ok;
 }
 
-ChurchDAWLive::Resultado MainComponent::aplicarCena (int indice, int tentativa)
+ChurchDAWLive::Resultado MainComponent::aplicarCena (
+    int indice, int tentativa, bool paginaDoMotorJaSolicitada)
 {
     if (! juce::isPositiveAndBelow (indice, ChurchDAWLive::numeroDeCenas))
         return ChurchDAWLive::Resultado::indisponivel;
@@ -4773,30 +5364,36 @@ ChurchDAWLive::Resultado MainComponent::aplicarCena (int indice, int tentativa)
     // valer tambem quando a cena entra de primeira: senao uma cadeia velha
     // ainda pendente aplicaria a cena abandonada por cima desta.
     if (tentativa == 0)
+    {
         ++geracaoDaCena;
 
-    const auto& cena = cenas[indice];
+        // Um toque do musico preempta tambem a reconciliacao ainda pendente do
+        // startup. A partir daqui esta geracao e a unica dona do recall.
+        cenaPendenteNoStartup = -1;
+        controleDeGravacaoDoSetup.iniciarSupressao (geracaoDaCena);
+    }
 
-    if (! cena.preenchida)
-        return ChurchDAWLive::Resultado::vazia;
+    const int geracaoDaRequisicao = geracaoDaCena;
 
     auto* live = getChurchLive();
 
     if (live == nullptr)
+    {
+        agendarFimDaSupressaoDeGravacaoDaCena (geracaoDaRequisicao);
         return ChurchDAWLive::Resultado::indisponivel;
+    }
 
-    // NAO APLICAR NO MEIO DE UM CARREGAMENTO.
-    //
-    // Um restore de timbre que termine depois passa por
-    // resetLayerParametersToDefaults e apagaria a cena que acabou de entrar —
-    // o musico veria a cena "voltar sozinha" segundos depois.
-    if (live->isBusyLoading())
+    const auto& cena = cenas[indice];
+
+    const auto safeThis = juce::Component::SafePointer<MainComponent> (this);
+    const auto reagendar = [this, safeThis, indice, tentativa] (
+                               bool paginaJaSolicitada)
     {
         // Adiar sem retomar era um beco: o musico tocava a cena, nada
-        // acontecia, e nada mais aconteceria nunca. Um timbre entra em menos
-        // de 2 s, entao reagendamos por ~3 s e desistimos — desistir calado
-        // depois do aviso na tela e melhor do que insistir para sempre.
-        constexpr int maximoDeTentativas = 12;
+        // acontecia, e nada mais aconteceria nunca. Uma pagina com Kontakt/AU
+        // pode levar bem mais que um sample nativo; 30 s mantem o pedido vivo
+        // sem criar um retry infinito se o vendor nao responder.
+        constexpr int maximoDeTentativas = 120;
 
         // GERACAO: so a ULTIMA cena pedida pode vencer.
         //
@@ -4814,15 +5411,19 @@ ChurchDAWLive::Resultado MainComponent::aplicarCena (int indice, int tentativa)
         if (tentativa < maximoDeTentativas)
         {
             juce::Timer::callAfterDelay (250,
-                [ref = juce::Component::SafePointer<MainComponent> (this),
-                 indice, tentativa, minhaGeracao]
+                [ref = safeThis,
+                 indice, tentativa, minhaGeracao, paginaJaSolicitada]
                 {
                     auto* self = ref.getComponent();
 
                     if (self == nullptr || self->geracaoDaCena != minhaGeracao)
                         return;   // o musico ja pediu outra cena
 
-                    if (self->aplicarCena (indice, tentativa + 1) == ChurchDAWLive::Resultado::ok)
+                    const auto resultado = self->aplicarCena (
+                        indice, tentativa + 1, paginaJaSolicitada);
+
+                    if (resultado == ChurchDAWLive::Resultado::ok
+                         || resultado == ChurchDAWLive::Resultado::vazia)
                         self->liveScenePanel.atualizar (self->cenas, self->cenaAtiva);
                 });
         }
@@ -4831,14 +5432,209 @@ ChurchDAWLive::Resultado MainComponent::aplicarCena (int indice, int tentativa)
             juce::Logger::writeToLog ("LIVE: cena " + juce::String (indice + 1)
                                         + " desistiu, timbre ainda carregando");
 
-            // Desistir calado era voltar ao problema que o Resultado veio
-            // resolver: o aviso de "carregando" dura 2,6 s e as tentativas
-            // 3 s, entao a desistencia caia num silencio total.
             liveScenePanel.avisar (juce::String::fromUTF8 (
                 "TIMBRE DEMOROU \xe2\x80\x94 TOQUE NA CENA DE NOVO"));
+
+            // A pagina alvo pode ter substituido parte do motor antes de um
+            // plugin travar. Recarregar a cena que continuou marcada como
+            // ativa evita deixar UI=A e audio=hibrido de A/B.
+            const int anterior = cenaAtiva;
+            bool rollbackSolicitado = false;
+
+            if (juce::isPositiveAndBelow (anterior,
+                                          ChurchDAWLive::numeroDeCenas)
+                 && anterior != indice && cenas[anterior].preenchida)
+            {
+                rollbackSolicitado = true;
+                juce::MessageManager::callAsync (
+                    [ref = safeThis, anterior,
+                     geracaoEsperada = minhaGeracao]
+                    {
+                        if (auto* self = ref.getComponent())
+                        {
+                            if (self->geracaoDaCena != geracaoEsperada)
+                                return;
+
+                            const auto r = self->aplicarCena (anterior);
+
+                            if (r == ChurchDAWLive::Resultado::ok
+                                 || r == ChurchDAWLive::Resultado::vazia)
+                                self->liveScenePanel.atualizar (
+                                    self->cenas, self->cenaAtiva);
+                        }
+                    });
+            }
+            else if (! juce::isPositiveAndBelow (
+                         anterior, ChurchDAWLive::numeroDeCenas))
+            {
+                cenaAtiva = -1;
+                liveScenePanel.atualizar (cenas, cenaAtiva);
+            }
+
+            if (! rollbackSolicitado)
+                agendarFimDaSupressaoDeGravacaoDaCena (minhaGeracao);
         }
 
         return ChurchDAWLive::Resultado::carregando;
+    };
+
+    // Um callback atrasado de timbre/plugin restauraria defaults por cima da
+    // cena. Espere antes de tocar nos controles; o snapshot desta propria cena
+    // e enviado uma unica vez e depois esta mesma guarda espera o commit.
+    if (ChurchDAWLive::deveAguardarCena (
+            paginaDoMotorJaSolicitada,
+            live->isBusyLoading(),
+            live->hasPendingStateRestore()))
+        return reagendar (true);
+
+    // Cena v1 nao tinha pagina de audio. Antes de sair dela, captura o motor
+    // que esta no ar; abrir a Cena 2 nunca apaga a unica copia da Cena 1.
+    if (! paginaDoMotorJaSolicitada && indice != cenaAtiva)
+    {
+        // Uma cena legada/corrompida ainda sem pagina precisa ser capturada
+        // antes da troca. Se o motor esta transitorio, esperar e obrigatorio;
+        // capturar agora gravaria metade da requisicao anterior como verdade.
+        bool ativaPrecisaCaptura = false;
+
+        if (juce::isPositiveAndBelow (cenaAtiva,
+                                      ChurchDAWLive::numeroDeCenas)
+             && cenas[cenaAtiva].preenchida)
+        {
+            juce::MemoryBlock paginaAtiva;
+            ativaPrecisaCaptura = ! carregarPaginaDeCena (
+                cenas[cenaAtiva].estadoDoMotorId, paginaAtiva);
+        }
+
+        if (ativaPrecisaCaptura
+             && (live->isBusyLoading() || live->hasPendingStateRestore()))
+            return reagendar (false);
+
+        if (! assegurarPaginaDaCenaAtiva (*live))
+        {
+            agendarFimDaSupressaoDeGravacaoDaCena (geracaoDaRequisicao);
+            return ChurchDAWLive::Resultado::naoGravou;
+        }
+    }
+
+    if (! cena.preenchida)
+    {
+        // Grava primeiro que nenhuma cena salva esta no ar. Se o disco recusar,
+        // o motor permanece intacto. A pagina anterior ja tem snapshot proprio.
+        const int ativaAntes = cenaAtiva;
+        cenaAtiva = -1;
+
+        if (! salvarCenas())
+        {
+            cenaAtiva = ativaAntes;
+            agendarFimDaSupressaoDeGravacaoDaCena (geracaoDaRequisicao);
+            return ChurchDAWLive::Resultado::naoGravou;
+        }
+
+        live->panic();
+
+        for (int slot = 0; slot < TimbresProcessor::numInserts; ++slot)
+            live->unloadInsert (slot);
+
+        for (int l = 0; l < TimbresProcessor::numLayers; ++l)
+        {
+            live->clearLayer (l);
+
+            if (live->getLayerInstrument (l) != nullptr)
+                live->clearInstrumentPlugin (l);
+
+            if (auto* on = live->getLayerOnParam (l))
+                on->setValueNotifyingHost (0.0f);
+
+            if (auto* mute = live->getLayerMuteParam (l))
+                *mute = false;
+
+            if (auto* solo = live->getLayerSoloParam (l))
+                *solo = false;
+        }
+
+        // Pagina nova nao herda os controles globais da musica anterior.
+        // Como nao ha canal carregado, neutralizar agora nao produz salto de
+        // audio e entrega ao cliente um ponto de partida realmente novo.
+        const ChurchDAWLive::Cena paginaNova;
+
+        if (auto* p = live->getVolumeGeralParam())
+            *p = paginaNova.volumeGeral;
+
+        if (auto* p = live->getTransposeGeralParam())
+            *p = paginaNova.transposeGeral;
+
+        if (auto* p = live->getRetornoDeReverbParam())
+            *p = paginaNova.retornoDeReverb;
+
+        if (padProcessor != nullptr)
+        {
+            padProcessor->setKey (-1);
+            padProcessor->setGain (paginaNova.padVolume);
+            padProcessor->setCutoff (paginaNova.padCorte);
+        }
+
+        if (masterProcessor != nullptr)
+        {
+            masterProcessor->setMasterDb (paginaNova.masterDb);
+            masterSlider.setValue (paginaNova.masterDb,
+                                   juce::dontSendNotification);
+        }
+
+        agendarFimDaSupressaoDeGravacaoDaCena (geracaoDaRequisicao);
+        juce::Logger::writeToLog (
+            "LIVE: cena " + juce::String (indice + 1)
+            + " preparada como pagina vazia");
+        return ChurchDAWLive::Resultado::vazia;
+    }
+
+    if (! paginaDoMotorJaSolicitada
+         && ChurchDAWLive::idDeEstadoDoMotorValido (cena.estadoDoMotorId))
+    {
+        juce::MemoryBlock pagina;
+
+        if (! carregarPaginaDeCena (cena.estadoDoMotorId, pagina))
+        {
+            agendarFimDaSupressaoDeGravacaoDaCena (geracaoDaRequisicao);
+            return ChurchDAWLive::Resultado::paginaInvalida;
+        }
+
+        live->panic();
+
+        try
+        {
+            live->setStateInformation (pagina.getData(), (int) pagina.getSize());
+        }
+        catch (...)
+        {
+            const int anterior = cenaAtiva;
+            const int geracaoEsperada = geracaoDaCena;
+            bool rollbackSolicitado = false;
+
+            if (juce::isPositiveAndBelow (anterior,
+                                          ChurchDAWLive::numeroDeCenas)
+                 && anterior != indice && cenas[anterior].preenchida)
+            {
+                rollbackSolicitado = true;
+                juce::MessageManager::callAsync (
+                    [safe = juce::Component::SafePointer<MainComponent> (this),
+                     anterior, geracaoEsperada]
+                    {
+                        if (auto* self = safe.getComponent())
+                            if (self->geracaoDaCena == geracaoEsperada)
+                                (void) self->aplicarCena (anterior);
+                    });
+            }
+
+            if (! rollbackSolicitado)
+                agendarFimDaSupressaoDeGravacaoDaCena (geracaoEsperada);
+
+            return ChurchDAWLive::Resultado::paginaInvalida;
+        }
+
+        paginaDoMotorJaSolicitada = true;
+
+        if (live->isBusyLoading() || live->hasPendingStateRestore())
+            return reagendar (true);
     }
 
     // PASSO 1 — Pad primeiro: e o unico item que pode precisar ler do disco,
@@ -4956,13 +5752,52 @@ ChurchDAWLive::Resultado MainComponent::aplicarCena (int indice, int tentativa)
     // Message thread: mesma regra do clearMapButton e do handleAsyncUpdate.
     ccPickup.clear();
 
+    const int ativaAntes = cenaAtiva;
     cenaAtiva = indice;
 
     // UMA fonte de verdade para a cena corrente: o mesmo XML que guarda as 10.
     // Guardar o indice numa chave separada ja custou um bug — a chave era
     // escrita aqui e ninguem a lia, entao ao reabrir o app nenhuma cena
     // aparecia acesa mesmo depois de uma noite inteira tocando numa delas.
-    salvarCenas();
+    if (! salvarCenas())
+    {
+        cenaAtiva = ativaAntes;
+        liveScenePanel.atualizar (cenas, cenaAtiva);
+        bool rollbackSolicitado = false;
+
+        if (juce::isPositiveAndBelow (ativaAntes,
+                                      ChurchDAWLive::numeroDeCenas)
+             && ativaAntes != indice && cenas[ativaAntes].preenchida)
+        {
+            rollbackSolicitado = true;
+            juce::MessageManager::callAsync (
+                [safe = juce::Component::SafePointer<MainComponent> (this),
+                 ativaAntes,
+                 geracaoEsperada = geracaoDaCena]
+                {
+                    if (auto* self = safe.getComponent())
+                    {
+                        if (self->geracaoDaCena != geracaoEsperada)
+                            return;
+
+                        const auto r = self->aplicarCena (ativaAntes);
+
+                        if (r == ChurchDAWLive::Resultado::ok
+                             || r == ChurchDAWLive::Resultado::vazia)
+                            self->liveScenePanel.atualizar (
+                                self->cenas, self->cenaAtiva);
+                    }
+                });
+        }
+
+        if (! rollbackSolicitado)
+            agendarFimDaSupressaoDeGravacaoDaCena (geracaoDaRequisicao);
+
+        juce::Logger::writeToLog (
+            "LIVE: cena " + juce::String (indice + 1)
+            + " aplicada, mas indice ativo NAO foi gravado; rollback solicitado");
+        return ChurchDAWLive::Resultado::naoGravou;
+    }
 
     // NAO agendar a gravacao do setup aqui. Ja tentei, e o remedio era muito
     // pior que a doenca.
@@ -4982,6 +5817,7 @@ ChurchDAWLive::Resultado MainComponent::aplicarCena (int indice, int tentativa)
     if (padPanel != nullptr)
         padPanel->refreshState();
 
+    agendarFimDaSupressaoDeGravacaoDaCena (geracaoDaRequisicao);
     juce::Logger::writeToLog ("LIVE: cena " + juce::String (indice + 1) + " aplicada");
     return ChurchDAWLive::Resultado::ok;
 }
@@ -4995,16 +5831,18 @@ void MainComponent::renomearCena (int indice, juce::String nome)
     // Limite curto de proposito: o botao tem a largura de um dedo. Um nome que
     // nao cabe vira reticencias e deixa de servir para achar a musica, que e a
     // unica razao de existir o nome.
+    const ChurchDAWLive::EstadoAntesDePersistirCena antes { cenas[indice], cenaAtiva };
     cenas[indice].nome = nome.trim().substring (0, 18);
 
-    const bool gravou = salvarCenas();
+    const auto resultado = ChurchDAWLive::concluirPersistenciaDeCena (
+        salvarCenas(), antes, cenas[indice], cenaAtiva);
     liveScenePanel.atualizar (cenas, cenaAtiva);
 
     // Mesma regra do capturarCena: renomear que nao chegou ao disco volta ao
     // nome antigo no proximo arranque, e o musico so descobre no domingo.
-    if (! gravou)
+    if (resultado != ChurchDAWLive::Resultado::ok)
         liveScenePanel.avisar (
-            ChurchDAWLive::avisoDoResultado (ChurchDAWLive::Resultado::naoGravou, indice));
+            ChurchDAWLive::avisoDoResultado (resultado, indice));
 }
 
 void MainComponent::apagarCena (int indice)
@@ -5028,28 +5866,43 @@ void MainComponent::apagarCena (int indice)
             + juce::String::fromUTF8 ("\" ser\xc3\xa1 apagada. Isso n\xc3\xa3o tem como desfazer."),
         "Apagar", "Cancelar", this,
         juce::ModalCallbackFunction::create (
-            [this, indice] (int resultado)
+            [safe = juce::Component::SafePointer<MainComponent> (this),
+             indice] (int resultado)
             {
-                if (resultado != 1)
+                auto* self = safe.getComponent();
+
+                if (resultado != 1 || self == nullptr)
                     return;
 
-                cenas[indice] = ChurchDAWLive::Cena{};   // volta a ser slot vazio
+                const ChurchDAWLive::EstadoAntesDePersistirCena antes {
+                    self->cenas[indice], self->cenaAtiva
+                };
+                const auto paginaAnterior =
+                    self->cenas[indice].estadoDoMotorId;
+                self->cenas[indice] = ChurchDAWLive::Cena{};   // volta a ser slot vazio
 
                 // A cena apagada nao pode continuar acesa como "tocando".
-                if (cenaAtiva == indice)
-                    cenaAtiva = -1;
+                if (self->cenaAtiva == indice)
+                    self->cenaAtiva = -1;
 
-                const bool gravou = salvarCenas();
-                liveScenePanel.atualizar (cenas, cenaAtiva);
+                const auto persistencia = ChurchDAWLive::concluirPersistenciaDeCena (
+                    self->salvarCenas(), antes,
+                    self->cenas[indice], self->cenaAtiva);
+                const bool gravou = persistencia == ChurchDAWLive::Resultado::ok;
+                self->liveScenePanel.atualizar (self->cenas, self->cenaAtiva);
+
+                if (gravou)
+                    self->removerPaginaDeCenaSeOrfa (paginaAnterior);
 
                 // Apagar que nao foi ao disco e pior que gravar que nao foi: a
                 // cena some da tela e VOLTA INTEIRA no proximo arranque.
                 if (! gravou)
-                    liveScenePanel.avisar (
-                        ChurchDAWLive::avisoDoResultado (ChurchDAWLive::Resultado::naoGravou, indice));
+                    self->liveScenePanel.avisar (
+                        ChurchDAWLive::avisoDoResultado (persistencia, indice));
 
                 juce::Logger::writeToLog ("LIVE: cena " + juce::String (indice + 1)
-                                            + (gravou ? " apagada" : " apagada SO na sessao"));
+                                            + (gravou ? " apagada"
+                                                      : " NAO apagada; memoria restaurada"));
             }));
 }
 
@@ -5131,6 +5984,163 @@ juce::File MainComponent::arquivoDeCenas()
     return appProperties.getUserSettings()->getFile().getSiblingFile ("live-scenes.xml");
 }
 
+juce::File MainComponent::pastaDePaginasDeCenas()
+{
+    return arquivoDeCenas().getSiblingFile ("live-scene-pages");
+}
+
+juce::File MainComponent::arquivoDaPaginaDeCena (const juce::String& estadoId)
+{
+    if (! ChurchDAWLive::idDeEstadoDoMotorValido (estadoId))
+        return {};
+
+    return pastaDePaginasDeCenas().getChildFile (
+        estadoId.toLowerCase() + ".churchscene");
+}
+
+bool MainComponent::gravarPaginaDeCena (const juce::MemoryBlock& estado,
+                                        juce::String& estadoId)
+{
+    estadoId.clear();
+
+    if (! ChurchDAWLive::paginaDeCenaTemTamanhoValido (
+            static_cast<std::uint64_t> (estado.getSize())))
+        return false;
+
+    estadoId = juce::SHA256 (estado).toHexString().toLowerCase();
+    auto destino = arquivoDaPaginaDeCena (estadoId);
+
+    if (destino == juce::File{})
+        return false;
+
+    auto pasta = destino.getParentDirectory();
+
+    if (pasta.createDirectory().failed())
+        return false;
+
+    // Conteudo enderecado pelo hash: duas cenas identicas compartilham o
+    // mesmo arquivo. Antes de reutilizar, confirma que nao existe um arquivo
+    // truncado com o nome certo deixado por disco/queda antiga.
+    if (destino.existsAsFile())
+    {
+        juce::MemoryBlock existente;
+
+        if (destino.loadFileAsData (existente)
+             && ! existente.isEmpty()
+             && juce::SHA256 (existente).toHexString().equalsIgnoreCase (estadoId))
+            return true;
+    }
+
+    juce::TemporaryFile temp (destino);
+    const bool gravou = temp.getFile().replaceWithData (
+                            estado.getData(), estado.getSize())
+                     && temp.overwriteTargetFileWithTemporary();
+
+    if (! gravou)
+    {
+        estadoId.clear();
+        juce::Logger::writeToLog (
+            "LIVE: FALHA ao gravar pagina de cena " + destino.getFullPathName());
+    }
+
+    return gravou;
+}
+
+bool MainComponent::carregarPaginaDeCena (const juce::String& estadoId,
+                                          juce::MemoryBlock& estado)
+{
+    estado.reset();
+    const auto arquivo = arquivoDaPaginaDeCena (estadoId);
+    const auto tamanho = arquivo == juce::File{} ? 0 : arquivo.getSize();
+
+    if (arquivo == juce::File{}
+         || ! arquivo.existsAsFile()
+         || ! ChurchDAWLive::paginaDeCenaTemTamanhoValido (
+                static_cast<std::uint64_t> (juce::jmax<juce::int64> (0, tamanho)))
+         || ! arquivo.loadFileAsData (estado)
+         || estado.isEmpty())
+        return false;
+
+    if (! juce::SHA256 (estado).toHexString().equalsIgnoreCase (estadoId))
+    {
+        estado.reset();
+        juce::Logger::writeToLog (
+            "LIVE: pagina de cena com SHA-256 invalido " + arquivo.getFileName());
+        return false;
+    }
+
+    return true;
+}
+
+void MainComponent::removerPaginaDeCenaSeOrfa (const juce::String& estadoId)
+{
+    if (! ChurchDAWLive::idDeEstadoDoMotorValido (estadoId))
+        return;
+
+    for (const auto& cena : cenas)
+        if (cena.estadoDoMotorId.equalsIgnoreCase (estadoId))
+            return;
+
+    const auto arquivo = arquivoDaPaginaDeCena (estadoId);
+
+    if (arquivo.existsAsFile() && ! arquivo.deleteFile())
+        juce::Logger::writeToLog (
+            "LIVE: pagina orfa nao pôde ser removida " + arquivo.getFileName());
+}
+
+bool MainComponent::assegurarPaginaDaCenaAtiva (TimbresProcessor& live)
+{
+    if (! juce::isPositiveAndBelow (cenaAtiva, ChurchDAWLive::numeroDeCenas)
+         || ! cenas[cenaAtiva].preenchida)
+        return true;
+
+    auto& ativa = cenas[cenaAtiva];
+    juce::MemoryBlock existente;
+
+    if (carregarPaginaDeCena (ativa.estadoDoMotorId, existente))
+        return true;
+
+    juce::MemoryBlock estado;
+
+    try
+    {
+        live.getStateInformation (estado);
+
+        if (live.consumeLastStateCaptureHadFailure())
+        {
+            juce::Logger::writeToLog (
+                "LIVE: pagina da cena ativa NAO capturada; estado de plugin incompleto");
+            return false;
+        }
+    }
+    catch (...)
+    {
+        (void) live.consumeLastStateCaptureHadFailure();
+        estado.reset();
+    }
+
+    juce::String novoId;
+
+    if (! gravarPaginaDeCena (estado, novoId))
+        return false;
+
+    const auto idAnterior = ativa.estadoDoMotorId;
+    const auto antes = ativa;
+    ativa.estadoDoMotorId = novoId;
+
+    if (! salvarCenas())
+    {
+        ativa = antes;
+        removerPaginaDeCenaSeOrfa (novoId);
+        return false;
+    }
+
+    removerPaginaDeCenaSeOrfa (idAnterior);
+    juce::Logger::writeToLog (
+        "LIVE: cena ativa legada ganhou pagina de audio " + novoId.substring (0, 12));
+    return true;
+}
+
 bool MainComponent::salvarCenas()
 {
     // Mesma trava do mapa de notas: arquivo de uma versao futura nao se
@@ -5143,7 +6153,7 @@ bool MainComponent::salvarCenas()
     }
 
     juce::XmlElement xml ("LIVESCENES");
-    xml.setAttribute ("schema", 1);
+    xml.setAttribute ("schema", 2);   // v2 referencia paginas de audio por SHA-256
     xml.setAttribute ("active", cenaAtiva);
 
     for (int i = 0; i < ChurchDAWLive::numeroDeCenas; ++i)
@@ -5207,7 +6217,7 @@ void MainComponent::restaurarCenas()
     if (xml == nullptr || ! xml->hasTagName ("LIVESCENES"))
         return;
 
-    if (xml->getIntAttribute ("schema", 1) > 1)
+    if (xml->getIntAttribute ("schema", 1) > 2)
     {
         // Igual ao mapa de notas: nao le E nao grava. Sem isto, o primeiro
         // toque de GRAVAR reescreveria no formato velho o arquivo que uma
@@ -5255,6 +6265,116 @@ void MainComponent::restaurarCenas()
         {
             juce::Logger::writeToLog ("LIVE: migracao adiada, as cenas continuam no setup");
         }
+    }
+
+    // O indice do XML e apenas a INTENCAO persistida. Marcar a cena agora
+    // deixaria UI=A enquanto o restoreChainState ainda entrega o audio de B.
+    // A pagina pelo SHA sera aplicada depois do graph/catalogo ficarem prontos;
+    // ate la nenhuma cena aparece como ativa.
+    if (juce::isPositiveAndBelow (cenaAtiva, ChurchDAWLive::numeroDeCenas)
+         && cenas[cenaAtiva].preenchida)
+    {
+        cenaPendenteNoStartup = cenaAtiva;
+        cenaAtiva = -1;
+    }
+}
+
+void MainComponent::reconciliarCenaAtivaNoStartup (int tentativa)
+{
+    if (! juce::isPositiveAndBelow (cenaPendenteNoStartup,
+                                    ChurchDAWLive::numeroDeCenas))
+        return;
+
+    constexpr int maximoDeTentativas = 120;   // 30 s, igual ao recall normal
+    const int indice = cenaPendenteNoStartup;
+    auto* live = getChurchLive();
+    const auto plano = ChurchDAWLive::planejarReconciliacaoNoStartup (
+        cenas[indice].preenchida,
+        ChurchDAWLive::idDeEstadoDoMotorValido (
+            cenas[indice].estadoDoMotorId));
+
+    // isBusyLoading cobre o scan do catalogo, a fila de samples e criacoes
+    // AU/VST em voo. hasPendingStateRestore nao entra aqui: um plugin ausente
+    // pode ficar pendente indefinidamente, e a pagina da cena e justamente a
+    // nova fonte de verdade que deve substituir essa intencao antiga.
+    if (live == nullptr || live->isBusyLoading()
+         || (plano.aplicarCenaAntesDeAnexarPagina
+              && live->hasPendingStateRestore()))
+    {
+        if (tentativa < maximoDeTentativas)
+        {
+            juce::Timer::callAfterDelay (
+                250,
+                [safe = juce::Component::SafePointer<MainComponent> (this),
+                 indice, tentativa]
+                {
+                    if (auto* self = safe.getComponent())
+                        if (self->cenaPendenteNoStartup == indice)
+                            self->reconciliarCenaAtivaNoStartup (tentativa + 1);
+                });
+            return;
+        }
+
+        cenaPendenteNoStartup = -1;
+        liveScenePanel.atualizar (cenas, cenaAtiva);
+        liveScenePanel.avisar (ChurchDAWLive::avisoDoResultado (
+            ChurchDAWLive::Resultado::indisponivel, indice));
+        juce::Logger::writeToLog (
+            "LIVE: cena ativa do startup nao reconciliada; motor/catalogo indisponivel");
+        return;
+    }
+
+    // Limpa antes de chamar aplicarCena: um toque manual que preemptar qualquer
+    // retry nao pode ser vencido depois pela intencao antiga do startup.
+    cenaPendenteNoStartup = -1;
+    const auto resultado = aplicarCena (indice);
+
+    // Uma carga pode comecar entre a consulta acima e a aplicacao legada. Nesse
+    // caso conserva a intencao sem acender a UI. O novo aplicarCena incrementa
+    // a geracao e preempta a cadeia interna anterior antes de tentar de novo.
+    if (plano.aplicarCenaAntesDeAnexarPagina
+         && resultado == ChurchDAWLive::Resultado::carregando
+         && tentativa < maximoDeTentativas)
+    {
+        cenaPendenteNoStartup = indice;
+        juce::Timer::callAfterDelay (
+            250,
+            [safe = juce::Component::SafePointer<MainComponent> (this),
+             indice, tentativa]
+            {
+                if (auto* self = safe.getComponent())
+                    if (self->cenaPendenteNoStartup == indice)
+                        self->reconciliarCenaAtivaNoStartup (tentativa + 1);
+            });
+        return;
+    }
+
+    if (resultado == ChurchDAWLive::Resultado::ok
+         && plano.anexarPaginaDepoisDeAplicar
+         && ! assegurarPaginaDaCenaAtiva (*live))
+    {
+        // aplicarCena persistiu a intencao ativa antes da captura. Conserve-a
+        // no disco para o proximo startup tentar novamente, mas nao afirme na
+        // UI desta sessao que a pagina incompleta foi reconciliada.
+        cenaAtiva = -1;
+        liveScenePanel.atualizar (cenas, cenaAtiva);
+        liveScenePanel.avisar (ChurchDAWLive::avisoDoResultado (
+            ChurchDAWLive::Resultado::naoGravou, indice));
+        return;
+    }
+
+    if (resultado == ChurchDAWLive::Resultado::ok
+         || resultado == ChurchDAWLive::Resultado::vazia)
+    {
+        liveScenePanel.atualizar (cenas, cenaAtiva);
+    }
+    else if (resultado != ChurchDAWLive::Resultado::carregando
+              || plano.aplicarCenaAntesDeAnexarPagina)
+    {
+        // aplicarCena so marca cenaAtiva depois de carregar/verificar a pagina e
+        // persistir o indice. Portanto SHA ausente/corrompido permanece apagado.
+        liveScenePanel.atualizar (cenas, cenaAtiva);
+        liveScenePanel.avisar (ChurchDAWLive::avisoDoResultado (resultado, indice));
     }
 }
 
@@ -5697,58 +6817,211 @@ void MainComponent::restoreMidiMap()
 }
 
 //==============================================================================
-void MainComponent::rebuildGraphConnections()
+bool MainComponent::rebuildGraphConnections (
+    int replacementSlot,
+    juce::AudioProcessorGraph::NodeID replacementNode)
 {
-    for (const auto& c : graph.getConnections())
-        graph.removeConnection (c);
+    const auto previousConnections = graph.getConnections();
+
+    for (const auto& c : previousConnections)
+        graph.removeConnection (c, juce::AudioProcessorGraph::UpdateKind::none);
+
+    bool requiredConnectionsOk = true;
+
+    const auto addAudioConnection =
+        [this, &requiredConnectionsOk] (juce::AudioProcessorGraph::NodeID source,
+                                        int sourceChannel,
+                                        juce::AudioProcessorGraph::NodeID destination,
+                                        int destinationChannel,
+                                        const juce::String& label,
+                                        bool required)
+        {
+            const bool added = graph.addConnection (
+                { { source, sourceChannel }, { destination, destinationChannel } },
+                juce::AudioProcessorGraph::UpdateKind::none);
+
+            if (! added)
+            {
+                juce::Logger::writeToLog (
+                    "AUDIO_GRAPH connection_failed edge=" + label
+                    + " source_channel=" + juce::String (sourceChannel)
+                    + " destination_channel=" + juce::String (destinationChannel)
+                    + " required=" + juce::String (required ? 1 : 0));
+
+                if (required)
+                    requiredConnectionsOk = false;
+            }
+
+            return added;
+        };
+
+    const auto connectAudio =
+        [this, &addAudioConnection, &requiredConnectionsOk]
+        (juce::AudioProcessorGraph::NodeID source,
+         juce::AudioProcessorGraph::NodeID destination,
+         const juce::String& label,
+         bool required)
+        {
+            juce::AudioProcessorGraph::Node::Ptr sourceNode (
+                graph.getNodeForId (source));
+            juce::AudioProcessorGraph::Node::Ptr destinationNode (
+                graph.getNodeForId (destination));
+
+            if (sourceNode == nullptr || destinationNode == nullptr)
+            {
+                juce::Logger::writeToLog (
+                    "AUDIO_GRAPH node_missing edge=" + label
+                    + " required=" + juce::String (required ? 1 : 0));
+
+                if (required)
+                    requiredConnectionsOk = false;
+
+                return false;
+            }
+
+            const int sourceChannels =
+                sourceNode->getProcessor()->getTotalNumOutputChannels();
+            const int destinationChannels =
+                destinationNode->getProcessor()->getTotalNumInputChannels();
+
+            if (sourceChannels <= 0 || destinationChannels <= 0)
+            {
+                juce::Logger::writeToLog (
+                    "AUDIO_GRAPH incompatible_io edge=" + label
+                    + " outputs=" + juce::String (sourceChannels)
+                    + " inputs=" + juce::String (destinationChannels)
+                    + " required=" + juce::String (required ? 1 : 0));
+
+                if (required)
+                    requiredConnectionsOk = false;
+
+                return false;
+            }
+
+            bool connected = true;
+
+            if (sourceChannels == 1)
+            {
+                connected &= addAudioConnection (source, 0, destination, 0,
+                                                 label, required);
+
+                if (destinationChannels >= 2)
+                    connected &= addAudioConnection (source, 0, destination, 1,
+                                                     label, required);
+            }
+            else if (destinationChannels == 1)
+            {
+                connected &= addAudioConnection (source, 0, destination, 0,
+                                                 label, required);
+                connected &= addAudioConnection (source, 1, destination, 0,
+                                                 label, required);
+            }
+            else
+            {
+                connected &= addAudioConnection (source, 0, destination, 0,
+                                                 label, required);
+                connected &= addAudioConnection (source, 1, destination, 1,
+                                                 label, required);
+            }
+
+            return connected;
+        };
 
     juce::Array<juce::AudioProcessorGraph::NodeID> fxChain;
 
-    for (int i = 1; i < numSlots; ++i)
-        if (slots[i].nodeID.uid != 0)
-            fxChain.add (slots[i].nodeID);
+    const auto nodeForSlot =
+        [this, replacementSlot, replacementNode] (int slotIndex)
+        {
+            return slotIndex == replacementSlot ? replacementNode
+                                                : slots[slotIndex].nodeID;
+        };
 
-    const auto instrument = slots[0].nodeID;
+    for (int i = 1; i < numSlots; ++i)
+        if (const auto nodeID = nodeForSlot (i); nodeID.uid != 0)
+            fxChain.add (nodeID);
+
+    const auto instrument = nodeForSlot (0);
     const auto midiCh = juce::AudioProcessorGraph::midiChannelIndex;
 
     // fontes que alimentam o comeco da cadeia de efeitos
-    juce::Array<juce::AudioProcessorGraph::NodeID> sources;
-
-    if (instrument.uid != 0)
-        sources.add (instrument);
-
-    if (inputToggle.getToggleState())
-        sources.add (audioInNode);
-
     const auto firstDest = fxChain.isEmpty() ? masterNode : fxChain.getFirst();
 
-    for (const auto& src : sources)
-        for (int ch = 0; ch < 2; ++ch)
-            graph.addConnection ({ { src, ch }, { firstDest, ch } });
+    if (instrument.uid != 0)
+        connectAudio (instrument, firstDest, "instrument_to_chain", true);
+
+    if (inputToggle.getToggleState())
+    {
+        juce::AudioProcessorGraph::Node::Ptr inputNode (
+            graph.getNodeForId (audioInNode));
+        const bool inputIsAvailable = inputNode != nullptr
+            && inputNode->getProcessor()->getTotalNumOutputChannels() > 0;
+        connectAudio (audioInNode, firstDest, "device_input_to_chain",
+                      inputIsAvailable);
+    }
 
     for (int k = 0; k + 1 < fxChain.size(); ++k)
-        for (int ch = 0; ch < 2; ++ch)
-            graph.addConnection ({ { fxChain[k], ch }, { fxChain[k + 1], ch } });
+        connectAudio (fxChain[k], fxChain[k + 1], "effect_to_effect", true);
 
     if (! fxChain.isEmpty())
-        for (int ch = 0; ch < 2; ++ch)
-            graph.addConnection ({ { fxChain.getLast(), ch }, { masterNode, ch } });
+        connectAudio (fxChain.getLast(), masterNode, "effect_to_master", true);
 
     // pad continuo soma direto no master (passa pelo volume/medidor do master)
     if (padNode.uid != 0)
-        for (int ch = 0; ch < 2; ++ch)
-            graph.addConnection ({ { padNode, ch }, { masterNode, ch } });
+        connectAudio (padNode, masterNode, "pad_to_master", true);
 
     // master sempre alimenta a saida
-    for (int ch = 0; ch < 2; ++ch)
-        graph.addConnection ({ { masterNode, ch }, { audioOutNode, ch } });
+    juce::AudioProcessorGraph::Node::Ptr outputNode (
+        graph.getNodeForId (audioOutNode));
+    const bool outputIsAvailable = outputNode != nullptr
+        && outputNode->getProcessor()->getTotalNumInputChannels() > 0;
+    connectAudio (masterNode, audioOutNode, "master_to_device_output",
+                  outputIsAvailable);
 
     // MIDI vai para o instrumento e tambem para os efeitos (controle externo)
     if (instrument.uid != 0)
-        graph.addConnection ({ { midiInNode, midiCh }, { instrument, midiCh } });
+    {
+        if (! graph.addConnection (
+                { { midiInNode, midiCh }, { instrument, midiCh } },
+                juce::AudioProcessorGraph::UpdateKind::none))
+        {
+            requiredConnectionsOk = false;
+            juce::Logger::writeToLog (
+                "AUDIO_GRAPH connection_failed edge=midi_to_instrument required=1");
+        }
+    }
 
     for (const auto& fx : fxChain)
-        graph.addConnection ({ { midiInNode, midiCh }, { fx, midiCh } });
+        if (juce::AudioProcessorGraph::Node::Ptr node (graph.getNodeForId (fx));
+            node != nullptr && node->getProcessor()->acceptsMidi())
+        {
+            if (! graph.addConnection (
+                    { { midiInNode, midiCh }, { fx, midiCh } },
+                    juce::AudioProcessorGraph::UpdateKind::none))
+                juce::Logger::writeToLog (
+                    "AUDIO_GRAPH connection_failed edge=midi_to_effect required=0");
+        }
+
+    if (! requiredConnectionsOk)
+    {
+        for (const auto& c : graph.getConnections())
+            graph.removeConnection (c, juce::AudioProcessorGraph::UpdateKind::none);
+
+        bool restored = true;
+
+        for (const auto& c : previousConnections)
+            restored &= graph.addConnection (
+                c, juce::AudioProcessorGraph::UpdateKind::none);
+
+        juce::Logger::writeToLog (
+            "AUDIO_GRAPH transaction_rollback restored="
+            + juce::String (restored ? 1 : 0));
+    }
+
+    // Uma unica troca atomica do plano de renderizacao: durante toda a
+    // montagem (ou rollback) a thread de audio continua usando o grafo antigo.
+    graph.rebuild();
+
+    return requiredConnectionsOk;
 }
 
 //==============================================================================
@@ -6604,8 +7877,16 @@ float MainComponent::getLoadingProgress() const
 struct PluginListHolder final : public juce::Component,
                                 private juce::Timer
 {
+    struct PendingScan
+    {
+        juce::AudioPluginFormat* format = nullptr;
+        juce::StringArray identifiers;
+        bool explicitIdentifiers = false;
+    };
+
     PluginListHolder (juce::AudioPluginFormatManager& fm, juce::KnownPluginList& kl,
-                      const juce::File& deadMansPedal, juce::PropertiesFile* props)
+                      const juce::File& deadMansPedal, juce::PropertiesFile* props,
+                      juce::StringArray& quarantine)
         // O 5o argumento (allowPluginsWhichRequireAsynchronousInstantiation)
         // NAO e so sobre AUv3: com ele em "false" o PluginListComponent usa
         // numThreads = 0 (juce_PluginListComponent.cpp:446) e a varredura roda
@@ -6613,7 +7894,9 @@ struct PluginListHolder final : public juce::Component,
         // problematico segurava a interface inteira pelos 90 s do prazo — app
         // "Nao Responde", barra parada e botao Cancelar inclicavel. Era o
         // "travou no Korg Vox" e o "AUVectorPanner a 0%" dos clientes.
-        : formats (fm), list (fm, kl, deadMansPedal, props, true)
+        : formats (fm), knownPlugins (kl), deadMansPedalFile (deadMansPedal),
+          propertiesToUse (props), persistentQuarantine (quarantine),
+          list (fm, kl, deadMansPedal, props, true)
     {
         // Uma thread so: os plugins ja sao abertos num processo separado, e
         // varias threads abrindo plugins ao mesmo tempo e receita de conflito.
@@ -6622,6 +7905,7 @@ struct PluginListHolder final : public juce::Component,
         list.setNumberOfThreadsForScanning (1);
 
         list.setOptionsButtonText (juce::String::fromUTF8 ("Op\xc3\xa7\xc3\xb5" "es..."));
+        list.getOptionsButton().onClick = [this] { showOptionsMenu(); };
         addAndMakeVisible (list);
 
         scanButton.setButtonText ("Escanear " + formatosDaPlataforma());
@@ -6633,8 +7917,259 @@ struct PluginListHolder final : public juce::Component,
         setSize (880, 470);
     }
 
+    ~PluginListHolder() override
+    {
+        // Fechar o dialogo/app durante uma prova nao pode abrir uma janela em
+        // que o ID acabou de sair da blacklist mas ainda nao foi validado.
+        if (revalidationBatchActive)
+        {
+            persistentQuarantine.addArray (revalidationTargets);
+            normaliseQuarantine();
+            // O ThreadPool de `list` so e cancelado na destruicao dos membros,
+            // depois deste corpo. Persista a barreira agora, mas nao percorra
+            // KnownPluginList enquanto o worker ainda pode altera-la.
+            if (! persistQuarantineState (false))
+                juce::Logger::writeToLog (
+                    "PLUGIN_SCAN quarantine_persist_failed during=holder_shutdown");
+        }
+    }
+
+    void showOptionsMenu()
+    {
+        juce::PopupMenu menu;
+        menu.addItem ("Limpar lista de plugins", [this] { knownPlugins.clear(); });
+        menu.addItem ("Remover plugins selecionados", [this]
+        {
+            list.removeSelectedPlugins();
+        });
+
+        auto disabledIds = persistentQuarantine;
+        disabledIds.addArray (knownPlugins.getBlacklistedFiles());
+        disabledIds.removeEmptyStrings();
+        disabledIds.removeDuplicates (true);
+        const int disabledCount = disabledIds.size();
+        menu.addItem (
+            "Revalidar desativados (" + juce::String (disabledCount) + ")",
+            disabledCount > 0 || deadMansPedalFile.existsAsFile(),
+            false,
+            [this] { revalidateDisabledPlugins(); });
+
+        menu.addSeparator();
+
+        for (auto* format : formats.getFormats())
+            if (format != nullptr && format->canScanForPlugins())
+                menu.addItem ("Escanear " + format->getName(), [this, format]
+                {
+                    scanSingleFormat (*format);
+                });
+
+        menu.showMenuAsync (
+            juce::PopupMenu::Options()
+                .withDeletionCheck (*this)
+                .withTargetComponent (list.getOptionsButton()));
+    }
+
+    bool revalidateDisabledPlugins (const juce::StringArray& quarantined = {})
+    {
+        if (list.isScanning() || ! filaDeFormatos.isEmpty())
+        {
+            juce::Logger::writeToLog (
+                "PLUGIN_SCAN revalidate_ignored reason=batch_in_progress");
+            return false;
+        }
+
+        auto disabled = persistentQuarantine;
+        disabled.addArray (quarantined);
+        disabled.addArray (knownPlugins.getBlacklistedFiles());
+        disabled.removeEmptyStrings();
+        disabled.removeDuplicates (true);
+
+        // Infraestrutura Apple nunca foi um plugin selecionavel. Retira esses
+        // falsos positivos definitivamente; todos os demais IDs continuam no
+        // lote explicito abaixo, inclusive VST3 fora do caminho padrao.
+        for (int i = disabled.size(); --i >= 0;)
+            if (ChurchDAWPluginScan::ehAudioUnitDeSistema (disabled[i]))
+            {
+                knownPlugins.removeFromBlacklist (disabled[i]);
+                persistentQuarantine.removeString (disabled[i], true);
+                disabled.remove (i);
+            }
+
+        normaliseQuarantine();
+
+        if (! disabled.isEmpty())
+        {
+            const auto backup = propertiesToUse != nullptr
+                ? propertiesToUse->getFile().getSiblingFile (
+                      "PluginsDesativados-antes-da-revalidacao.txt")
+                : juce::File{};
+
+            if (backup == juce::File{}
+                 || ! backup.replaceWithText (disabled.joinIntoString ("\n"),
+                                               true, true))
+            {
+                const auto message =
+                    "Nao foi possivel criar a copia de seguranca da lista "
+                    "de plugins desativados. Nenhum plugin foi liberado.";
+                juce::Logger::writeToLog (
+                    "PLUGIN_SCAN revalidate_failed reason=backup_write");
+                juce::AlertWindow::showMessageBoxAsync (
+                    juce::MessageBoxIconType::WarningIcon,
+                    "Nao foi possivel revalidar", message);
+                return false;
+            }
+
+            // A quarentena e gravada ANTES de apagar blacklist/descricoes.
+            // Assim, fechar ou cair a qualquer instante continua bloqueando os
+            // IDs antigos no editor e na restauracao dos canais.
+            persistentQuarantine.addArray (disabled);
+            normaliseQuarantine();
+            propertiesToUse->setValue (
+                "pluginBlacklistMigrationBackupsReady", true);
+        }
+
+        // NENHUM ID sai do dead-man/blacklist antes de a barreira duravel
+        // existir. Backup legivel nao substitui isto: o startup importa a
+        // quarentena e o dead-man, nao um arquivo administrativo de backup.
+        if (! persistQuarantineState())
+        {
+            const auto message =
+                "Nao foi possivel gravar a quarentena de plugins. "
+                "Nenhum plugin foi liberado; verifique o espaco e as "
+                "permissoes da pasta de configuracao.";
+            juce::Logger::writeToLog (
+                "PLUGIN_SCAN revalidate_failed reason=quarantine_persist");
+            juce::AlertWindow::showMessageBoxAsync (
+                juce::MessageBoxIconType::WarningIcon,
+                "Nao foi possivel revalidar", message);
+            return false;
+        }
+
+        if (deadMansPedalFile.existsAsFile()
+             && ! deadMansPedalFile.deleteFile()
+             && ! deadMansPedalFile.replaceWithText ({}, true, true))
+        {
+            const auto message =
+                "Nao foi possivel limpar o arquivo de seguranca do scanner:\n"
+                + deadMansPedalFile.getFullPathName();
+            juce::Logger::writeToLog ("PLUGIN_SCAN revalidate_failed " + message);
+            juce::AlertWindow::showMessageBoxAsync (
+                juce::MessageBoxIconType::WarningIcon,
+                "Nao foi possivel revalidar",
+                message);
+            return false;
+        }
+
+        if (disabled.isEmpty())
+        {
+            juce::Logger::writeToLog (
+                "PLUGIN_SCAN user_revalidate_disabled count=0");
+
+            if (onBatchFinished != nullptr)
+            {
+                auto callback = std::move (onBatchFinished);
+                callback (true);
+            }
+
+            return true;
+        }
+
+        // Remove descricoes antigas antes de liberar a blacklist. Sem isto um
+        // plugin v1 ficava selecionavel durante a prova e uma falha limpa
+        // (arquitetura/licenca) deixava a descricao velha parecendo validada.
+        const auto typesBeforeRevalidation = knownPlugins.getTypes();
+
+        for (const auto& description : typesBeforeRevalidation)
+            if (disabled.contains (description.fileOrIdentifier, true))
+                knownPlugins.removeType (description);
+
+        for (const auto& identifier : disabled)
+            knownPlugins.removeFromBlacklist (identifier);
+
+        juce::Logger::writeToLog (
+            "PLUGIN_SCAN user_revalidate_disabled count="
+            + juce::String (disabled.size()));
+
+        filaDeFormatos.clearQuick();
+        revalidationTargets = disabled;
+        unresolvedTargets.clear();
+        activeScanIdentifiers.clear();
+        revalidationBatchActive = true;
+        juce::StringArray assigned;
+
+        for (auto* format : formats.getFormats())
+        {
+            if (format == nullptr || ! format->canScanForPlugins())
+                continue;
+
+            for (const auto& identifier : disabled)
+            {
+                if (assigned.contains (identifier, true))
+                    continue;
+
+                bool knownFormat = false;
+
+                for (const auto& description : typesBeforeRevalidation)
+                    if (description.fileOrIdentifier.equalsIgnoreCase (identifier)
+                         && description.pluginFormatName.equalsIgnoreCase (
+                                format->getName()))
+                    {
+                        knownFormat = true;
+                        break;
+                    }
+
+                if (knownFormat || format->fileMightContainThisPluginType (identifier))
+                {
+                    // Um pedido por ID. O CustomScanner agrega apenas um bool
+                    // inconclusivo por scan; agrupar dez VST3 faria uma falha
+                    // de IPC de UM manter Kontakt/BigSky validos em quarentena.
+                    // Isolando, o residual e exatamente o candidato que nao
+                    // conseguiu concluir a prova.
+                    filaDeFormatos.add ({ format, { identifier }, true });
+                    assigned.add (identifier);
+                }
+            }
+        }
+
+        juce::StringArray unmatched;
+
+        for (const auto& identifier : disabled)
+            if (! assigned.contains (identifier, true))
+                unmatched.add (identifier);
+
+        if (! unmatched.isEmpty())
+        {
+            unresolvedTargets.addArray (unmatched);
+            juce::Logger::writeToLog (
+                "PLUGIN_SCAN quarantine_unmatched count="
+                + juce::String (unmatched.size())
+                + " ids=" + unmatched.joinIntoString (" | "));
+        }
+
+        scanButton.setEnabled (false);
+        dispararProximoFormato();
+        return true;
+    }
+
+    void scanSingleFormat (juce::AudioPluginFormat& format)
+    {
+        if (list.isScanning() || ! filaDeFormatos.isEmpty())
+            return;
+
+        revalidationTargets.clear();
+        unresolvedTargets.clear();
+        activeScanIdentifiers.clear();
+        revalidationBatchActive = false;
+        filaDeFormatos.add ({ &format, {}, false });
+        scanButton.setEnabled (false);
+        dispararProximoFormato();
+    }
+
     void scanNow()
     {
+        if (list.isScanning() || ! filaDeFormatos.isEmpty())
+            return;
+
         // UM FORMATO DE CADA VEZ.
         //
         // PluginListComponent::scanFor faz "currentScanner = Scanner::make
@@ -6654,38 +8189,217 @@ struct PluginListHolder final : public juce::Component,
         // ser procurado. AU primeiro garante que o formato nativo do
         // sistema entre na lista mesmo se o VST3 der trabalho depois.
         filaDeFormatos.clearQuick();
+        revalidationTargets.clear();
+        unresolvedTargets.clear();
+        activeScanIdentifiers.clear();
+        revalidationBatchActive = false;
+        scanButton.setEnabled (false);
 
         for (auto* format : formats.getFormats())
             if (format != nullptr && format->getName().containsIgnoreCase ("AudioUnit"))
-                filaDeFormatos.add (format);
+                filaDeFormatos.add ({ format, {}, false });
 
         for (auto* format : formats.getFormats())
             if (format != nullptr && ! format->getName().containsIgnoreCase ("AudioUnit"))
-                filaDeFormatos.add (format);
+                filaDeFormatos.add ({ format, {}, false });
 
         dispararProximoFormato();
     }
 
     void dispararProximoFormato()
     {
-        if (filaDeFormatos.isEmpty())
+        while (! filaDeFormatos.isEmpty())
         {
-            stopTimer();
+            auto request = filaDeFormatos.removeAndReturn (0);
+            auto* format = request.format;
+
+            if (format == nullptr)
+                continue;
+
+            if (request.explicitIdentifiers)
+            {
+                if (request.identifiers.isEmpty())
+                    continue;
+
+                juce::Logger::writeToLog (
+                    "PLUGIN_SCAN explicit_revalidation format="
+                    + format->getName()
+                    + " count=" + juce::String (request.identifiers.size()));
+                activeScanIdentifiers = request.identifiers;
+                list.scanFor (*format, request.identifiers);
+            }
+            else
+            {
+                activeScanIdentifiers.clear();
+
+           #if JUCE_MAC
+                if (format->getName().containsIgnoreCase ("AudioUnit"))
+                {
+                    const auto allIdentifiers = format->searchPathsForPlugins (
+                        format->getDefaultLocationsToSearch(), true, true);
+                    const auto hostable =
+                        ChurchDAWPluginScan::filtrarAudioUnitsHospedaveis (
+                            allIdentifiers);
+
+                    juce::Logger::writeToLog (
+                        "PLUGIN_SCAN audio_units discovered="
+                        + juce::String (allIdentifiers.size())
+                        + " hostable=" + juce::String (hostable.size())
+                        + " policy_skipped="
+                        + juce::String (allIdentifiers.size() - hostable.size()));
+
+                    // Lista explicita impede que os itens de politica cheguem ao
+                    // PluginDirectoryScanner e virem blacklist/failedFiles.
+                    if (hostable.isEmpty())
+                        continue;
+
+                    list.scanFor (*format, hostable);
+                }
+                else
+           #endif
+                {
+                    list.scanFor (*format);
+                }
+            }
+
+            startTimer (400);
             return;
         }
 
-        auto* format = filaDeFormatos.removeAndReturn (0);
-
-        if (format != nullptr)
-            list.scanFor (*format);
-
-        startTimer (400);
+        concluirLote (true);
     }
 
     void timerCallback() override
     {
         if (! list.isScanning())
+        {
+            const bool wasCancelled = list.consumeLastScanWasCancelled();
+            const bool wasInconclusive =
+                list.consumeLastScanWasInconclusive();
+
+            if (wasInconclusive)
+            {
+                if (revalidationBatchActive)
+                    unresolvedTargets.addArray (activeScanIdentifiers);
+
+                juce::Logger::writeToLog (
+                    "PLUGIN_SCAN scan_inconclusive retry_count="
+                    + juce::String (activeScanIdentifiers.size()));
+            }
+
+            activeScanIdentifiers.clear();
+
+            if (wasCancelled)
+            {
+                filaDeFormatos.clearQuick();
+                juce::Logger::writeToLog (
+                    "PLUGIN_SCAN batch_cancelled remaining_formats_discarded");
+                concluirLote (false);
+                return;
+            }
+
             dispararProximoFormato();
+        }
+    }
+
+    void concluirLote (bool completed)
+    {
+        stopTimer();
+        scanButton.setEnabled (true);
+
+        bool allRevalidationTargetsResolved = completed;
+
+        if (revalidationBatchActive)
+        {
+            const auto quarantineDuravelAnterior = revalidationTargets;
+            auto remaining = unresolvedTargets;
+
+            if (! completed)
+                remaining.addArray (revalidationTargets);
+
+            // Crash/timeout voltaram para a blacklist pelo CustomScanner e
+            // tambem precisam continuar na barreira do editor/restauracao.
+            const auto blacklisted = knownPlugins.getBlacklistedFiles();
+            for (const auto& identifier : revalidationTargets)
+                if (blacklisted.contains (identifier, true))
+                    remaining.addIfNotAlreadyThere (identifier);
+
+            remaining.removeEmptyStrings();
+            remaining.removeDuplicates (true);
+
+            for (const auto& identifier : revalidationTargets)
+                persistentQuarantine.removeString (identifier, true);
+
+            persistentQuarantine.addArray (remaining);
+            normaliseQuarantine();
+            const bool persistiu = persistQuarantineState();
+            allRevalidationTargetsResolved = persistiu && remaining.isEmpty();
+
+            if (! persistiu)
+            {
+                // O arquivo em disco ainda contem a barreira completa gravada
+                // antes do lote. Reponha o mesmo estado tambem na memoria,
+                // senao um save posterior poderia publicar uma liberacao que
+                // esta rodada nao conseguiu tornar duravel.
+                persistentQuarantine.addArray (quarantineDuravelAnterior);
+                normaliseQuarantine();
+                (void) persistQuarantineState (false);
+                juce::Logger::writeToLog (
+                    "PLUGIN_SCAN quarantine_persist_failed during=batch_finish");
+                juce::AlertWindow::showMessageBoxAsync (
+                    juce::MessageBoxIconType::WarningIcon,
+                    "Plugins continuam protegidos",
+                    "A validacao terminou, mas o resultado nao pode ser "
+                    "gravado. Os plugins permanecem desativados para nao "
+                    "serem liberados sem seguranca.");
+            }
+        }
+
+        revalidationTargets.clear();
+        unresolvedTargets.clear();
+        activeScanIdentifiers.clear();
+        revalidationBatchActive = false;
+
+        if (onBatchFinished != nullptr)
+        {
+            auto callback = std::move (onBatchFinished);
+            callback (allRevalidationTargetsResolved);
+        }
+    }
+
+    void normaliseQuarantine()
+    {
+        persistentQuarantine.removeEmptyStrings();
+        persistentQuarantine.removeDuplicates (true);
+
+        for (int i = persistentQuarantine.size(); --i >= 0;)
+            if (ChurchDAWPluginScan::ehAudioUnitDeSistema (
+                    persistentQuarantine[i]))
+                persistentQuarantine.remove (i);
+    }
+
+    bool persistQuarantineState (bool includeKnownPluginList = true)
+    {
+        normaliseQuarantine();
+
+        if (propertiesToUse == nullptr)
+            return false;
+
+        propertiesToUse->setValue (
+            "pluginBlacklistMigrationQuarantine",
+            persistentQuarantine.joinIntoString ("\n"));
+        propertiesToUse->setValue (
+            "pluginBlacklistMigrationPending",
+            ! persistentQuarantine.isEmpty());
+
+        if (persistentQuarantine.isEmpty())
+            propertiesToUse->setValue ("pluginBlacklistSemanticsVersion", 2);
+
+        if (includeKnownPluginList)
+            if (auto xml = knownPlugins.createXml())
+                propertiesToUse->setValue ("pluginList", xml.get());
+
+        return propertiesToUse->saveIfNeeded();
     }
 
     static juce::String formatosDaPlataforma()
@@ -6707,20 +8421,36 @@ struct PluginListHolder final : public juce::Component,
     }
 
     juce::AudioPluginFormatManager& formats;
+    juce::KnownPluginList& knownPlugins;
+    juce::File deadMansPedalFile;
+    juce::PropertiesFile* propertiesToUse = nullptr;
+    juce::StringArray& persistentQuarantine;
     juce::PluginListComponent list;
     juce::TextButton scanButton;
-    juce::Array<juce::AudioPluginFormat*> filaDeFormatos;
+    juce::Array<PendingScan> filaDeFormatos;
+    juce::StringArray revalidationTargets;
+    juce::StringArray unresolvedTargets;
+    juce::StringArray activeScanIdentifiers;
+    bool revalidationBatchActive = false;
+    std::function<void(bool completed)> onBatchFinished;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (PluginListHolder)
 };
 
 void MainComponent::showPluginScanner()
 {
+    if (auto* dialog = pluginScannerDialog.get())
+    {
+        dialog->toFront (true);
+        return;
+    }
+
     const auto deadMansPedal = appProperties.getUserSettings()->getFile()
                                    .getSiblingFile ("PluginsComProblema.txt");
 
     auto* holder = new PluginListHolder (formatManager, knownPlugins, deadMansPedal,
-                                         appProperties.getUserSettings());
+                                         appProperties.getUserSettings(),
+                                         pluginScanQuarantine);
 
     juce::DialogWindow::LaunchOptions o;
     o.content.setOwned (holder);
@@ -6731,10 +8461,89 @@ void MainComponent::showPluginScanner()
     o.dialogBackgroundColour = NordLookAndFeel::background();
     o.useNativeTitleBar = false;   // barra de titulo desenhada pelo JUCE = escura
     o.resizable = true;
-    o.launchAsync();
+    // launchAsync() usa deleteWhenDismissed=true e deixa a vida do holder nas
+    // maos do ModalComponentManager. Aqui o Main e o dono: o X apenas encerra
+    // o modal, o callback apaga a janela, e o destrutor pode apaga-la de forma
+    // sincrona antes das referencias que o holder usa.
+    pluginScannerDialog.reset (o.create());
+    pluginScannerDialog->enterModalState (
+        true,
+        juce::ModalCallbackFunction::create (
+            [safe = juce::Component::SafePointer<MainComponent> (this),
+             lifetime = pluginLoadLifetime] (int)
+            {
+                if (! lifetime->load())
+                    return;
 
-    // primeira vez: ja dispara o escaneamento de VST3
-    if (knownPlugins.getNumTypes() == 0)
+                if (auto* self = safe.getComponent())
+                    self->pluginScannerDialog.reset();
+            }),
+        false);
+
+    const bool needsBlacklistRevalidation =
+        appProperties.getUserSettings()->getBoolValue (
+            "pluginBlacklistMigrationPending", false);
+    const bool migrationBackupsReady =
+        appProperties.getUserSettings()->getBoolValue (
+            "pluginBlacklistMigrationBackupsReady", false);
+
+    if (needsBlacklistRevalidation && migrationBackupsReady)
+    {
+        // O construtor do PluginListComponent acabou de importar o dead-man
+        // para KnownPluginList. Persiste a uniao ANTES de remover qualquer ID,
+        // para sobreviver ate a fechamento/crash durante a revalidacao.
+        pluginScanQuarantine.addArray (knownPlugins.getBlacklistedFiles());
+        pluginScanQuarantine.removeEmptyStrings();
+        pluginScanQuarantine.removeDuplicates (true);
+        appProperties.getUserSettings()->setValue (
+            "pluginBlacklistMigrationQuarantine",
+            pluginScanQuarantine.joinIntoString ("\n"));
+        appProperties.getUserSettings()->saveIfNeeded();
+
+        holder->onBatchFinished =
+            [safe = juce::Component::SafePointer<MainComponent> (this)] (bool completed)
+            {
+                if (auto* self = safe.getComponent())
+                {
+                    auto* settings = self->appProperties.getUserSettings();
+
+                    settings->setValue (
+                        "pluginBlacklistMigrationQuarantine",
+                        self->pluginScanQuarantine.joinIntoString ("\n"));
+                    settings->setValue (
+                        "pluginBlacklistMigrationPending",
+                        ! self->pluginScanQuarantine.isEmpty());
+
+                    if (completed && self->pluginScanQuarantine.isEmpty())
+                        settings->setValue ("pluginBlacklistSemanticsVersion", 2);
+
+                    if (auto xml = self->knownPlugins.createXml())
+                        settings->setValue ("pluginList", xml.get());
+
+                    settings->saveIfNeeded();
+                    self->refreshSlotChoices();
+                }
+            };
+
+        if (! holder->revalidateDisabledPlugins (pluginScanQuarantine))
+            holder->onBatchFinished = nullptr;
+    }
+    else if (needsBlacklistRevalidation)
+    {
+        juce::Logger::writeToLog (
+            "PLUGIN_SCAN legacy_revalidation_blocked reason=backup_not_ready");
+        juce::AlertWindow::showMessageBoxAsync (
+            juce::MessageBoxIconType::WarningIcon,
+            "Plugins desativados protegidos",
+            "O ChurchDAW nao conseguiu criar a copia de seguranca da lista "
+            "antiga. Os plugins continuam desativados e nenhuma lista foi "
+            "apagada. Verifique o acesso a pasta de configuracao e tente "
+            "abrir Plugins novamente.");
+    }
+
+    // Primeira vez ou migracao v1 -> v2: ja dispara AU + VST3. O scanner
+    // isolado recoloca somente crash/timeout reais na blacklist.
+    if (! needsBlacklistRevalidation && knownPlugins.getNumTypes() == 0)
         holder->scanNow();
 }
 #else
@@ -7032,6 +8841,7 @@ bool MainComponent::saveChainState()
             {
                 juce::MemoryBlock mb;
                 auto* processor = node->getProcessor();
+                auto* live = dynamic_cast<TimbresProcessor*> (processor);
                 const bool wasSuspended = processor->isSuspended();
                 bool captured = false;
 
@@ -7045,25 +8855,28 @@ bool MainComponent::saveChainState()
 
                 try
                 {
-                    if (dynamic_cast<TimbresProcessor*> (processor) != nullptr)
+                    if (live != nullptr)
                     {
                         // TimbresProcessor serializa internamente troca de
                         // timbre + ENV/EQ + identidade. Nao inverta a ordem
                         // desse lock com callbackLock durante autosave.
                         processor->getStateInformation (mb);
+                        captured = ! live->consumeLastStateCaptureHadFailure();
                     }
                     else
                     {
                         const juce::ScopedLock lock (
                             processor->getCallbackLock());
                         processor->getStateInformation (mb);
+                        captured = true;
                     }
-                    captured = true;
                 }
                 catch (...)
                 {
                     // Um plugin defeituoso nao pode impedir o restante da cadeia
                     // de ser salvo nem deixar o audio permanentemente suspenso.
+                    if (live != nullptr)
+                        (void) live->consumeLastStateCaptureHadFailure();
                 }
 
                 processor->suspendProcessing (wasSuspended);
@@ -7192,7 +9005,12 @@ void MainComponent::restoreChainState()
             continue;
         }
 
-        if (auto desc = knownPlugins.getTypeForIdentifierString (id))
+        if (auto desc = knownPlugins.getTypeForIdentifierString (id);
+            desc != nullptr
+            && ! knownPlugins.isBlacklisted (
+                desc->fileOrIdentifier, true)
+            && ! pluginScanQuarantine.contains (
+                desc->fileOrIdentifier, true))
         {
             juce::MemoryBlock state;
             state.fromBase64Encoding (slotXml->getStringAttribute ("state"));

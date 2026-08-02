@@ -2,6 +2,7 @@
 
 #include <juce_audio_processors/juce_audio_processors.h>
 #include "PluginScanDiagnostics.h"
+#include "PluginScanPolicy.h"
 
 #include <condition_variable>
 #include <mutex>
@@ -12,7 +13,7 @@
 //
 // Cada candidato passa por dois processos descartaveis:
 //   1. discovery: bundle/componente -> factory -> PluginDescription(s)
-//   2. validation: uma descricao -> create -> initialize -> activate -> editor
+//   2. validation: uma descricao -> create -> initialize -> activate
 //                  -> release -> unload
 //
 // A separacao e importante para shells VST3: se uma classe do bundle quebrar,
@@ -401,47 +402,14 @@ private:
                 return false;
             }
 
-            bool hasEditor = false;
-
-            {
-                juce::PluginHostDiagnostics::ScopedCall query (
-                    "createEditor", "AudioProcessor::hasEditor", false,
-                    description.name);
-                hasEditor = instance->hasEditor();
-                query.finish (true, hasEditor ? 1 : 0,
-                              hasEditor ? "editor advertised"
-                                        : "no editor advertised");
-            }
-
-            if (hasEditor)
-            {
-                juce::PluginHostDiagnostics::ScopedCall createEditor (
-                    "createEditor", "AudioProcessor::createEditorAndMakeActive",
-                    true, description.name);
-                std::unique_ptr<juce::AudioProcessorEditor> editor (
-                    instance->createEditorAndMakeActive());
-                createEditor.finish (editor != nullptr,
-                                     editor != nullptr ? 0 : -1,
-                                     editor != nullptr
-                                         ? "editor created"
-                                         : "hasEditor=true but createEditor returned null");
-
-                if (editor == nullptr)
-                {
-                    setFailureFromLastEvent (*result, "plugin_internal_error",
-                                             "createEditor", "editor_null",
-                                             "plugin advertised an editor but returned null");
-                    return false;
-                }
-
-                {
-                    juce::PluginHostDiagnostics::ScopedCall destroyEditor (
-                        "unload", "AudioProcessorEditor destructor", false,
-                        description.name);
-                    editor.reset();
-                    destroyEditor.finish (true, 0, description.name);
-                }
-            }
+            // Scanner valida o caminho de AUDIO, nao a janela grafica. Criar a
+            // GUI durante a descoberta causa falsos negativos em plugins que
+            // precisam de uma janela ativa, autorizacao/licenca ou AUv3 fora do
+            // processo. A interface sera criada sob demanda pelo host, que ja
+            // possui GenericAudioProcessorEditor como fallback.
+            const bool hasEditor = instance->hasEditor();
+            result->setAttribute ("editorAdvertised", hasEditor);
+            result->setAttribute ("editorValidation", "deferred_until_open");
 
             {
                 juce::PluginHostDiagnostics::ScopedCall release (
@@ -679,27 +647,6 @@ private:
 };
 
 //==============================================================================
-inline bool ehAudioUnitDeSistema (const juce::String& fileOrIdentifier)
-{
-    if (! fileOrIdentifier.startsWithIgnoreCase ("AudioUnit:")
-         || ! fileOrIdentifier.endsWithIgnoreCase (",appl"))
-        return false;
-
-    for (const auto* category : { "AudioUnit:Mixers/", "AudioUnit:Panners/" })
-        if (fileOrIdentifier.startsWithIgnoreCase (category))
-            return true;
-
-    // Componentes Apple que abrem rede, fala ou arquivos e nao sao efeitos
-    // musicais do ChurchDAW. EQ/dynamics/limiter da Apple ficam permitidos.
-    for (const auto* subtype : { "aufx,rvb2,", "augn,ttsp,", "augn,nrcv,",
-                                 "augn,nsnd,", "augn,sspl,", "augn,afpl," })
-        if (fileOrIdentifier.containsIgnoreCase (subtype))
-            return true;
-
-    return false;
-}
-
-//==============================================================================
 class ChurchDAWPluginScanner final : public juce::KnownPluginList::CustomScanner
 {
 public:
@@ -721,7 +668,10 @@ public:
             reportWriter.appendPlugin (*report);
             juce::Logger::writeToLog (
                 "PLUGIN_SCAN skip_system_component path=" + fileOrIdentifier);
-            return false;
+            // Defesa adicional. O fluxo normal filtra antes de construir o
+            // PluginDirectoryScanner; true evita uma blacklist persistente se
+            // algum chamador futuro entregar este identificador diretamente.
+            return true;
         }
 
         const auto discoveryEnvironment = getEnvironment (fileOrIdentifier, nullptr);
@@ -732,7 +682,7 @@ public:
                 format.getName(), fileOrIdentifier, nullptr,
                 discoveryEnvironment);
             reportWriter.appendPlugin (*report);
-            return false;
+            return true;   // incompatibilidade nao e crash do plugin
         }
 
         ScanRequest discovery;
@@ -745,6 +695,7 @@ public:
                 juce::XmlElement::TextFormat().singleLine());
 
         auto discoveryAttempt = runPhase (discovery);
+        noteInconclusiveAttempt (discoveryAttempt);
 
         if (discoveryAttempt.finish == PhaseFinish::cancelled)
             return true;
@@ -756,24 +707,26 @@ public:
             auto report = reportForAttempt (discovery, discoveryAttempt,
                                             discoveryEnvironment, nullptr);
             reportWriter.appendPlugin (*report);
-            return false;
+            return ! deveEntrarNaBlacklistPersistente (discoveryAttempt.finish);
         }
 
         auto* descriptions = discoveryAttempt.xml->getChildByName ("DESCRIPTIONS");
 
         if (descriptions == nullptr)
         {
+            scanHadInconclusive.store (true);
             auto report = reportForAttempt (discovery, discoveryAttempt,
                                             discoveryEnvironment, nullptr);
             setReportFailure (*report, "host_internal_error", "protocol",
                               "missing_descriptions",
                               "discovery result omitted DESCRIPTIONS");
             reportWriter.appendPlugin (*report);
-            return false;
+            return true;
         }
 
         int discovered = 0;
         int validated = 0;
+        bool fatalPluginFailure = false;
 
         for (const auto* item : descriptions->getChildIterator())
         {
@@ -783,7 +736,10 @@ public:
             juce::PluginDescription description;
 
             if (! description.loadFromXml (*item))
+            {
+                scanHadInconclusive.store (true);
                 continue;
+            }
 
             ++discovered;
             const auto environment = getEnvironment (fileOrIdentifier,
@@ -809,9 +765,13 @@ public:
                 juce::XmlElement::TextFormat().singleLine());
 
             auto validationAttempt = runPhase (validation);
+            noteInconclusiveAttempt (validationAttempt);
 
             if (validationAttempt.finish == PhaseFinish::cancelled)
                 return true;
+
+            fatalPluginFailure = fatalPluginFailure
+                || deveEntrarNaBlacklistPersistente (validationAttempt.finish);
 
             auto report = reportForAttempt (validation, validationAttempt,
                                             environment, &description);
@@ -830,10 +790,11 @@ public:
             + " discovered=" + juce::String (discovered)
             + " validated=" + juce::String (validated));
 
-        // false faz o JUCE bloquear somente o bundle no qual nenhuma classe
-        // sobreviveu. Em shells, qualquer classe valida preserva o bundle e as
-        // classes defeituosas continuam documentadas no JSONL.
-        return validated > 0;
+        // false significa exclusivamente crash/timeout sem nenhuma classe
+        // sobrevivente. Falha de arquitetura, protocolo, licenca ou carga fica
+        // no JSONL/failedFiles e pode ser tentada de novo sem limpar blacklist.
+        // Em shells, qualquer classe valida preserva o bundle inteiro.
+        return validated > 0 || ! fatalPluginFailure;
     }
 
     void scanFinished() override
@@ -844,16 +805,13 @@ public:
             + " report=" + reportWriter.getFile().getFullPathName());
     }
 
-private:
-    enum class PhaseFinish
+    bool consumeLastScanWasInconclusive() override
     {
-        result,
-        crash,
-        timeout,
-        cancelled,
-        launchFailed,
-        sendFailed
-    };
+        return scanHadInconclusive.exchange (false);
+    }
+
+private:
+    using PhaseFinish = ChurchDAWPluginScan::PhaseFinish;
 
     struct PhaseAttempt
     {
@@ -863,6 +821,19 @@ private:
         juce::String stack;
         int elapsedMs = 0;
     };
+
+    void noteInconclusiveAttempt (const PhaseAttempt& attempt)
+    {
+        const bool transportFailure = attempt.finish == PhaseFinish::launchFailed
+                                   || attempt.finish == PhaseFinish::sendFailed;
+        const bool protocolFailure = attempt.finish == PhaseFinish::result
+                                  && (attempt.xml == nullptr
+                                      || attempt.xml->getStringAttribute ("status")
+                                             == "host_internal_error");
+
+        if (transportFailure || protocolFailure)
+            scanHadInconclusive.store (true);
+    }
 
     static int timeoutForPluginMs()
     {
@@ -1139,6 +1110,7 @@ private:
     ReportWriter reportWriter;
     std::map<juce::String, EnvironmentReport> environmentCache;
     juce::String currentFormat;
+    std::atomic<bool> scanHadInconclusive { false };
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (ChurchDAWPluginScanner)
 };

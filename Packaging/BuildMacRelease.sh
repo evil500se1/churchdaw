@@ -28,6 +28,8 @@ NOTARY_PROFILE=""
 APPLE_ID=""
 TEAM_ID=""
 OUTPUT_DIR=""
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+ENTITLEMENTS="$SCRIPT_DIR/ChurchDAW.entitlements"
 
 while getopts "b:i:n:t:o:h" opt; do
     case "$opt" in
@@ -91,11 +93,27 @@ esac
 #--------------------------------------------------------------------- assinar
 if [ -n "$IDENTITY" ]; then
     echo "== assinando o app =="
+    if [ ! -s "$ENTITLEMENTS" ]; then
+        echo "erro: entitlements ausente ou vazio: $ENTITLEMENTS" >&2
+        exit 1
+    fi
+    plutil -lint "$ENTITLEMENTS" >/dev/null
     # --deep e desaconselhado pela Apple, mas o bundle do JUCE nao tem
     # frameworks aninhados; assinar o bundle inteiro basta.
     codesign --force --options runtime --timestamp \
+             --entitlements "$ENTITLEMENTS" \
              --sign "$IDENTITY" "$APP"
     codesign --verify --deep --strict --verbose=2 "$APP"
+
+    SIGNED_ENTITLEMENTS="$STAGE/signed-entitlements.plist"
+    codesign -d --entitlements :- "$APP" >"$SIGNED_ENTITLEMENTS" 2>/dev/null
+    plutil -lint "$SIGNED_ENTITLEMENTS" >/dev/null
+    if [ "$(/usr/libexec/PlistBuddy -c \
+             'Print :com.apple.security.cs.disable-library-validation' \
+             "$SIGNED_ENTITLEMENTS" 2>/dev/null || true)" != "true" ]; then
+        echo "erro: assinatura sem com.apple.security.cs.disable-library-validation=true" >&2
+        exit 1
+    fi
 else
     echo "== SEM assinatura (build de teste) =="
 fi

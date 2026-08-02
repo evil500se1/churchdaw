@@ -2,32 +2,131 @@
 
 #include <juce_core/juce_core.h>
 
+#include <array>
+#include <cstdint>
+
 //==============================================================================
 // LIVE MODE — 10 cenas para trocar de musica no culto.
 //
 // Pedido de cliente (01/08/2026): "uns 10 programas pelo menos para salvar
 // cenas".
 //
-// A DECISAO CENTRAL: a cena guarda ESTADO, nunca manda recarregar sample.
-//
-// Isso nao e limitacao, e o desenho certo. Sao 14 canais: o jeito de
-// trabalhar e deixar os dois pianos carregados em canais diferentes e a cena
-// ligar um e desligar o outro. Ligar/desligar canal e mudar volume sao
-// escritas de parametro — instantaneas, e com a rampa do pos-fader elas nem
-// cortam a cauda. Recarregar sample e a UNICA operacao lenta do app, e entre
-// duas musicas o tecladista tem uns quatro segundos com o pastor falando: se
-// a troca de cena pudesse recarregar timbre, uma cena errada silenciaria o
-// culto sem chance de desfazer.
-//
-// A cena guarda tambem o RoTULO do timbre de cada canal, mas so para o painel
-// poder avisar "esta cena foi gravada com Grand Piano no canal 1; hoje esta
-// Rhodes". Avisar e diferente de trocar.
+// Cada cena nova e uma PAGINA completa: guarda mixer/Pad/Master aqui e aponta
+// para um snapshot separado do motor (timbres nativos, Kontakt/AU/VST e seus
+// estados). O arquivo grande fica fora deste XML para que trocar a cena ativa
+// continue gravando apenas poucos KB, sem reescrever estados de plugin no meio
+// do culto. Cenas antigas sem snapshot continuam compativeis como cenas de
+// mixer; ao sair delas pela primeira vez, o Main captura a pagina que esta no
+// ar antes de carregar outra.
 //==============================================================================
 namespace ChurchDAWLive
 {
 
 inline constexpr int numeroDeCenas = 10;
 inline constexpr int numeroDeCanais = 14;
+inline constexpr std::uint64_t tamanhoMaximoPaginaDeCena =
+    256ull * 1024ull * 1024ull;
+
+inline bool paginaDeCenaTemTamanhoValido (std::uint64_t bytes) noexcept
+{
+    return bytes > 0 && bytes <= tamanhoMaximoPaginaDeCena;
+}
+
+// Uma requisicao nova precisa chegar a setStateInformation/clearLayer para
+// invalidar as geracoes da requisicao anterior. So esperamos depois que a
+// pagina desta propria cena ja foi enviada ao motor.
+inline bool deveAguardarCena (bool paginaJaSolicitada,
+                              bool motorCarregando,
+                              bool restauracaoPendente) noexcept
+{
+    return paginaJaSolicitada && (motorCarregando || restauracaoPendente);
+}
+
+// O startup tem duas fontes persistidas que podem divergir depois de uma queda:
+// o setup global e a cena que estava ativa. Para uma cena v2, a pagina pelo SHA
+// e a fonte de verdade. Para uma cena v1, os valores da PROPRIA cena precisam
+// ser aplicados antes de anexar ao slot uma pagina capturada do motor. Capturar
+// primeiro transformaria o setup global A na cena B e apagaria B para sempre.
+struct PlanoDeReconciliacaoNoStartup
+{
+    bool aplicarPaginaPorSha = false;
+    bool aplicarCenaAntesDeAnexarPagina = false;
+    bool anexarPaginaDepoisDeAplicar = false;
+};
+
+inline PlanoDeReconciliacaoNoStartup planejarReconciliacaoNoStartup (
+    bool cenaPreenchida, bool temShaValido) noexcept
+{
+    if (! cenaPreenchida)
+        return {};
+
+    if (temShaValido)
+        return { true, false, false };
+
+    return { false, true, true };
+}
+
+// Maquina geracional pura usada para impedir que os ChangeBroadcasters
+// produzidos por setStateInformation() armem o autosave pesado do setup. O
+// token zero significa "nao agendou"; tokens reais nunca usam zero.
+struct ControleDeGravacaoDoSetupDuranteCena
+{
+    using GeracaoDeGravacao = std::uint64_t;
+
+    GeracaoDeGravacao agendarSePermitido (int geracaoAtualDaCena) noexcept
+    {
+        if (estaSuprimida (geracaoAtualDaCena))
+            return 0;
+
+        return avancarGeracaoDaGravacao();
+    }
+
+    void iniciarSupressao (int geracaoAtualDaCena) noexcept
+    {
+        geracaoDaCenaSuprimida = geracaoAtualDaCena;
+
+        // Invalida inclusive um timer armado antes de a troca comecar.
+        (void) avancarGeracaoDaGravacao();
+    }
+
+    bool encerrarSupressao (int geracaoEsperada,
+                            int geracaoAtualDaCena) noexcept
+    {
+        // Uma soltura atrasada da cena A nunca pode liberar a cena B.
+        if (geracaoAtualDaCena != geracaoEsperada
+             || geracaoDaCenaSuprimida != geracaoEsperada)
+            return false;
+
+        geracaoDaCenaSuprimida = -1;
+        return true;
+    }
+
+    bool estaSuprimida (int geracaoAtualDaCena) const noexcept
+    {
+        return geracaoDaCenaSuprimida == geracaoAtualDaCena;
+    }
+
+    bool timerAindaValido (GeracaoDeGravacao token,
+                           int geracaoAtualDaCena) const noexcept
+    {
+        return token != 0
+            && token == geracaoDaGravacao
+            && ! estaSuprimida (geracaoAtualDaCena);
+    }
+
+private:
+    GeracaoDeGravacao avancarGeracaoDaGravacao() noexcept
+    {
+        // uint64_t tem wrap definido. Reserva zero para o retorno "bloqueado".
+        if (++geracaoDaGravacao == 0)
+            ++geracaoDaGravacao;
+
+        return geracaoDaGravacao;
+    }
+
+    GeracaoDeGravacao geracaoDaGravacao = 0;
+    int geracaoDaCenaSuprimida = -1;
+};
 
 // O painel divide as cenas em duas fileiras quando a tela e estreita. Com um
 // numero impar sobraria um botao SEM bounds — invisivel e ainda assim
@@ -65,6 +164,11 @@ struct Cena
     juce::String nome;
     juce::String gravadaEm;      // ISO-8601, para o musico saber qual e a nova
 
+    // SHA-256 hexadecimal do arquivo binario em live-scene-pages/. Guardar so
+    // o ID torna o XML pequeno e impede caminho injetado por arquivo corrompido.
+    // Vazio = cena legada, apenas mixer.
+    juce::String estadoDoMotorId;
+
     CanalDaCena canais[numeroDeCanais];
 
     // Globais do Church Live.
@@ -89,6 +193,188 @@ struct Cena
     float padVolume = 0.9f;
     float padCorte = 1.0f;
 };
+
+inline bool idDeEstadoDoMotorValido (const juce::String& id)
+{
+    if (id.length() != 64)
+        return false;
+
+    for (auto c : id)
+        if (! ((c >= '0' && c <= '9')
+                || (c >= 'a' && c <= 'f')
+                || (c >= 'A' && c <= 'F')))
+            return false;
+
+    return true;
+}
+
+//==============================================================================
+// Estado puro da interacao do painel.
+//
+// A cena ATIVA pertence ao motor/MainComponent: e o som que esta no ar. Este
+// estado guarda somente a cena SELECIONADA no painel. Separar os dois permite
+// preparar um slot vazio sem apagar, trocar ou fingir que aquele slot esta
+// tocando. Tambem deixa a regra de seguranca verificavel sem uma janela JUCE:
+// tocar num slot vazio apenas o prepara; gravar continua exigindo outro gesto.
+//==============================================================================
+enum class AcaoDeCena
+{
+    nenhuma,
+    carregar,
+    prepararNova,
+    gravar,
+    apagar
+};
+
+struct InteracaoDeCenas
+{
+    int selecionada = -1;
+
+    void sincronizarComAtiva (int ativa)
+    {
+        if (! juce::isPositiveAndBelow (selecionada, numeroDeCenas))
+            selecionada = juce::isPositiveAndBelow (ativa, numeroDeCenas) ? ativa : -1;
+    }
+
+    AcaoDeCena tocar (int indice,
+                      bool preenchida,
+                      bool gravarArmado,
+                      bool limparArmado = false)
+    {
+        if (! juce::isPositiveAndBelow (indice, numeroDeCenas))
+            return AcaoDeCena::nenhuma;
+
+        selecionada = indice;
+
+        // LIMPAR e um modo de escolha, nao uma carga disfarçada. Assim o
+        // musico consegue apontar uma cena preenchida que NAO esta no ar sem
+        // mudar o audio apenas para poder apaga-la.
+        if (limparArmado)
+            return preenchida ? AcaoDeCena::apagar : AcaoDeCena::nenhuma;
+
+        if (gravarArmado)
+            return AcaoDeCena::gravar;
+
+        return preenchida ? AcaoDeCena::carregar : AcaoDeCena::prepararNova;
+    }
+
+    int destinoNovoAoPressionarGravar (
+        bool gravarFicouArmado,
+        const std::array<bool, numeroDeCenas>& preenchidas) const
+    {
+        if (! gravarFicouArmado
+             || ! juce::isPositiveAndBelow (selecionada, numeroDeCenas)
+             || preenchidas[(size_t) selecionada])
+            return -1;
+
+        return selecionada;
+    }
+
+    void selecionarSemAcionar (int indice)
+    {
+        if (juce::isPositiveAndBelow (indice, numeroDeCenas))
+            selecionada = indice;
+    }
+
+    void cenaFoiApagada (int indice, int ativa)
+    {
+        if (selecionada == indice)
+            selecionada = juce::isPositiveAndBelow (ativa, numeroDeCenas) ? ativa : -1;
+    }
+};
+
+//==============================================================================
+// Geometria pura da faixa de cenas.
+//
+// O layout real passa por aqui e o teste tambem. Isso impede que um comentario
+// prometa 44 px enquanto margens, rotulo e duas fileiras deixam o Component
+// clicavel com 30 px no aparelho. As dimensoes recebidas ja sao as da area
+// interna do painel (depois da margem decorativa externa).
+//==============================================================================
+struct LayoutDaFaixaDeCenas
+{
+    int alturaDoRotulo = 0;
+    int larguraDasAcoes = 0;
+    int espacoEntreCenasEAcoes = 0;
+    int fileirasDeCenas = 1;
+    int cenasPorFileira = numeroDeCenas;
+    int alturaDaFileira = 0;
+    int larguraMinimaDaCena = 0;
+    int larguraDoLimpar = 0;
+    int larguraDoGravar = 0;
+    int alturaMinimaDaAcao = 0;
+    bool acoesEmpilhadas = false;
+    bool suportaAlvosDe44 = false;
+};
+
+inline LayoutDaFaixaDeCenas calcularLayoutDaFaixaDeCenas (int largura, int altura)
+{
+    LayoutDaFaixaDeCenas r;
+    largura = juce::jmax (0, largura);
+    altura = juce::jmax (0, altura);
+
+    if (largura == 0 || altura == 0)
+        return r;
+
+    r.espacoEntreCenasEAcoes = juce::jmin (6, largura / 4);
+
+    // Uma fileira exige 10 * 44 para as cenas e 2 * 44 para as acoes. Quando
+    // essa largura nao existe mas ha 88 px de altura, fazemos 5+5 e empilhamos
+    // as duas acoes. E a configuracao usada no retrato de 320/360 dp.
+    const int larguraMinimaEmUmaFileira = numeroDeCenas * 44 + 2 * 44
+                                        + r.espacoEntreCenasEAcoes;
+    const bool precisaDeDuas = largura < larguraMinimaEmUmaFileira;
+    const bool cabemDuas = altura >= 2 * 44;
+
+    r.fileirasDeCenas = precisaDeDuas && cabemDuas ? 2 : 1;
+    r.cenasPorFileira = numeroDeCenas / r.fileirasDeCenas;
+    r.acoesEmpilhadas = r.fileirasDeCenas == 2;
+
+    const int larguraMinimaDasAcoes = r.acoesEmpilhadas ? 44 : 2 * 44;
+    const int larguraMaximaDasAcoes = juce::jmax (
+        0, largura - r.espacoEntreCenasEAcoes - r.cenasPorFileira * 44);
+
+    if (larguraMaximaDasAcoes >= larguraMinimaDasAcoes)
+        r.larguraDasAcoes = juce::jlimit (
+            larguraMinimaDasAcoes,
+            juce::jmin (154, larguraMaximaDasAcoes),
+            largura / 4);
+    else
+        r.larguraDasAcoes = juce::jmin (largura, juce::jmax (1, largura / 4));
+
+    // Rotulo so ocupa espaco quando, depois dele, TODOS os alvos continuam
+    // com 44 px. Em faixas curtas a instrucao continua nos tooltips e na
+    // descricao acessivel, sem roubar o alvo do dedo.
+    const int sobraParaRotulo = altura - r.fileirasDeCenas * 44;
+    r.alturaDoRotulo = sobraParaRotulo >= 10 ? juce::jmin (14, sobraParaRotulo) : 0;
+
+    const int alturaDasAcoesECenas = altura - r.alturaDoRotulo;
+    r.alturaDaFileira = alturaDasAcoesECenas / r.fileirasDeCenas;
+    r.alturaMinimaDaAcao = r.acoesEmpilhadas ? alturaDasAcoesECenas / 2
+                                              : alturaDasAcoesECenas;
+
+    const int larguraDasCenas = juce::jmax (
+        0, largura - r.larguraDasAcoes - r.espacoEntreCenasEAcoes);
+    r.larguraMinimaDaCena = larguraDasCenas / r.cenasPorFileira;
+
+    if (r.acoesEmpilhadas)
+    {
+        r.larguraDoLimpar = r.larguraDasAcoes;
+        r.larguraDoGravar = r.larguraDasAcoes;
+    }
+    else
+    {
+        r.larguraDoLimpar = r.larguraDasAcoes / 2;
+        r.larguraDoGravar = r.larguraDasAcoes - r.larguraDoLimpar;
+    }
+
+    r.suportaAlvosDe44 = r.alturaDaFileira >= 44
+                      && r.alturaMinimaDaAcao >= 44
+                      && r.larguraMinimaDaCena >= 44
+                      && r.larguraDoLimpar >= 44
+                      && r.larguraDoGravar >= 44;
+    return r;
+}
 
 //==============================================================================
 // Serializacao.
@@ -117,6 +403,12 @@ inline void escreverCena (juce::XmlElement& pai, const Cena& cena, int indice)
 
     c->setAttribute ("name", cena.nome);
     c->setAttribute ("savedAt", cena.gravadaEm);
+
+    if (idDeEstadoDoMotorValido (cena.estadoDoMotorId))
+    {
+        auto* engine = c->createNewChildElement ("ENGINE");
+        engine->setAttribute ("sha256", cena.estadoDoMotorId.toLowerCase());
+    }
 
     auto* g = c->createNewChildElement ("LIVE");
     g->setAttribute ("gain", (double) cena.volumeGeral);
@@ -151,6 +443,14 @@ inline void lerCena (const juce::XmlElement& c, Cena& cena)
     cena.preenchida = c.getIntAttribute ("filled", cena.preenchida ? 1 : 0) != 0;
     cena.nome       = c.getStringAttribute ("name", cena.nome);
     cena.gravadaEm  = c.getStringAttribute ("savedAt", cena.gravadaEm);
+
+    if (auto* engine = c.getChildByName ("ENGINE"))
+    {
+        const auto id = engine->getStringAttribute ("sha256").trim();
+
+        if (idDeEstadoDoMotorValido (id))
+            cena.estadoDoMotorId = id.toLowerCase();
+    }
 
     if (auto* g = c.getChildByName ("LIVE"))
     {
@@ -205,8 +505,49 @@ enum class Resultado
     vazia,          // slot nunca gravado — carregar nao faz nada de proposito
     carregando,     // ha timbre entrando; a aplicacao se reagenda sozinha
     naoGravou,      // capturou na memoria mas o disco recusou
-    indisponivel    // motor ainda nao existe (so na largada do app)
+    indisponivel,   // motor ainda nao existe (so na largada do app)
+    paginaInvalida  // snapshot da pagina ausente, truncado ou com hash errado
 };
+
+// Snapshot minimo para uma alteracao que so pode existir se chegar ao disco.
+// O chamador muda a cena em memoria, tenta a escrita atomica e entrega o
+// resultado aqui. Falha restaura TANTO o slot quanto a referencia da cena no
+// ar; assim a tela nunca confirma um estado que desaparecera no proximo boot.
+struct EstadoAntesDePersistirCena
+{
+    Cena cena;
+    int ativa = -1;
+};
+
+inline Resultado concluirPersistenciaDeCena (bool persistiu,
+                                              const EstadoAntesDePersistirCena& antes,
+                                              Cena& cenaAtual,
+                                              int& ativaAtual)
+{
+    if (persistiu)
+        return Resultado::ok;
+
+    cenaAtual = antes.cena;
+    ativaAtual = antes.ativa;
+    return Resultado::naoGravou;
+}
+
+enum class OrigemDaGravacao
+{
+    botaoSalvar,
+    gravarArmadoECena
+};
+
+inline bool manterGravarArmadoParaRetry (Resultado resultado,
+                                         OrigemDaGravacao origem)
+{
+    // No fluxo SALVAR o proprio botao e o disparo. Ele volta ao repouso para
+    // que o proximo toque seja inequivocamente outra tentativa. No fluxo
+    // legado GRAVAR -> cena, uma falha mantem o modo armado e renova o prazo;
+    // caso contrario o primeiro retry apenas desligaria o toggle, sem gravar.
+    return origem == OrigemDaGravacao::gravarArmadoECena
+        && resultado != Resultado::ok;
+}
 
 inline juce::String avisoDoResultado (Resultado r, int indice)
 {
@@ -219,10 +560,30 @@ inline juce::String avisoDoResultado (Resultado r, int indice)
         case Resultado::carregando:   return juce::String::fromUTF8 ("CARREGANDO TIMBRE\xe2\x80\xa6 J\xc3\x81 VAI");
         case Resultado::naoGravou:    return juce::String::fromUTF8 ("N\xc3\x83O GRAVOU NO DISCO");
         case Resultado::indisponivel: return juce::String::fromUTF8 ("MOTOR AINDA INICIANDO");
+        case Resultado::paginaInvalida:
+            return "CENA " + juce::String (indice + 1)
+                 + " — PAGINA DE SOM AUSENTE OU DANIFICADA";
         case Resultado::ok:           break;
     }
 
     return {};
+}
+
+inline juce::String avisoDaGravacao (Resultado resultado,
+                                     OrigemDaGravacao origem,
+                                     int indice)
+{
+    if (resultado == Resultado::carregando)
+        return origem == OrigemDaGravacao::botaoSalvar
+                 ? juce::String::fromUTF8 ("CARREGANDO TIMBRE\xe2\x80\xa6 TOQUE SALVAR DE NOVO")
+                 : juce::String::fromUTF8 ("CARREGANDO TIMBRE\xe2\x80\xa6 TOQUE A CENA DE NOVO");
+
+    if (resultado == Resultado::indisponivel)
+        return origem == OrigemDaGravacao::botaoSalvar
+                 ? juce::String::fromUTF8 ("MOTOR INICIANDO\xe2\x80\xa6 TOQUE SALVAR DE NOVO")
+                 : juce::String::fromUTF8 ("MOTOR INICIANDO\xe2\x80\xa6 TOQUE A CENA DE NOVO");
+
+    return avisoDoResultado (resultado, indice);
 }
 
 //==============================================================================

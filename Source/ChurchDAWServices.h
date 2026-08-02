@@ -34,8 +34,8 @@
 //==============================================================================
 namespace ChurchDAWServices
 {
-    inline constexpr int currentVersionCode = 12;
-    inline constexpr const char* currentVersionName = "1.5.6";
+    inline constexpr int currentVersionCode = 13;
+    inline constexpr const char* currentVersionName = "1.5.7";
     inline constexpr const char* packageId = "com.churchdaw.app";
     inline constexpr const char* updatePolicyUrl =
         "https://churchdaw.com/app/android/update-policy-v2.json";
@@ -51,7 +51,7 @@ namespace ChurchDAWServices
     // morto e, no gate obrigatorio, o cliente ficava preso — foi o que
     // aconteceu em 31/07/2026.
     inline constexpr const char* defaultPlayStoreUrl =
-        "https://churchdaw.com/app/android/ChurchDAW-1.5.6-signed.apk";
+        "https://churchdaw.com/app/android/ChurchDAW-1.5.7-signed.apk";
     inline constexpr int maximumUpdatePolicyBytes = 32 * 1024;
     inline constexpr int maximumSignedPolicyPayloadBytes = 24 * 1024;
     inline constexpr int maximumVersionNameCharacters = 48;

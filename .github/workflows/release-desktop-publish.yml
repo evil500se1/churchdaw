@@ -1,0 +1,595 @@
+name: Publicar release comercial desktop
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Tag imutavel no formato vMAJOR.MINOR.PATCH
+        required: true
+        type: string
+      expected_commit_sha:
+        description: Commit de 40 hex apontado pela tag e pelos dois builders
+        required: true
+        type: string
+      windows_run_id:
+        description: Run ID aprovado de Release comercial Windows
+        required: true
+        type: string
+      macos_run_id:
+        description: Run ID aprovado de Release comercial macOS
+        required: true
+        type: string
+      expected_previous_policy_sha256:
+        description: SHA-256 atual de update-policy-v1.json antes da promocao
+        required: true
+        type: string
+      update_message:
+        description: Mensagem curta mostrada no atualizador
+        required: true
+        type: string
+      confirmation:
+        description: Confirme a promocao comercial conjunta
+        required: true
+        type: choice
+        default: CANCEL
+        options:
+          - CANCEL
+          - PUBLISH
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: desktop-production-publish
+  cancel-in-progress: false
+
+jobs:
+  verify-provenance:
+    if: inputs.confirmation == 'PUBLISH'
+    name: Provar tag, runs e artefatos exatos
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      windows_artifact_id: ${{ steps.provenance.outputs.windows_artifact_id }}
+      windows_artifact_digest: ${{ steps.provenance.outputs.windows_artifact_digest }}
+      windows_artifact_size: ${{ steps.provenance.outputs.windows_artifact_size }}
+      macos_artifact_id: ${{ steps.provenance.outputs.macos_artifact_id }}
+      macos_artifact_digest: ${{ steps.provenance.outputs.macos_artifact_digest }}
+      macos_artifact_size: ${{ steps.provenance.outputs.macos_artifact_size }}
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      EXPECTED_COMMIT: ${{ inputs.expected_commit_sha }}
+      WINDOWS_RUN_ID: ${{ inputs.windows_run_id }}
+      MACOS_RUN_ID: ${{ inputs.macos_run_id }}
+
+    steps:
+      - name: Baixar somente o codigo confiavel do publicador
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validar proveniencia sem confiar em nomes soltos
+        id: provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+            || { echo "Tag invalida" >&2; exit 1; }
+          [[ "$EXPECTED_COMMIT" =~ ^[0-9a-fA-F]{40}$ ]] \
+            || { echo "Commit esperado invalido" >&2; exit 1; }
+          [[ "$WINDOWS_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$MACOS_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ -n "$GH_TOKEN" ]]
+          [[ "$GITHUB_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+
+          expected_commit="$(printf '%s' "$EXPECTED_COMMIT" | tr 'A-F' 'a-f')"
+          head_commit="$(git rev-parse --verify HEAD)"
+          [[ "$head_commit" == "$expected_commit" ]] \
+            || { echo "Publicador nao esta no commit esperado" >&2; exit 1; }
+          [[ "$GITHUB_SHA" == "$expected_commit" ]] \
+            || { echo "GITHUB_SHA nao e o commit esperado" >&2; exit 1; }
+          [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]] \
+            || { echo "Checkout do publicador nao esta limpo" >&2; exit 1; }
+
+          default_branch="$(gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "repos/$GITHUB_REPOSITORY" --jq '.default_branch')"
+          [[ "$default_branch" =~ ^[A-Za-z0-9._/-]+$ ]]
+          [[ "$GITHUB_REF" == "refs/heads/$default_branch" ]] \
+            || { echo "Despache o publicador pelo branch default protegido" >&2; exit 1; }
+
+          local_tag_object="$(git rev-parse --verify "refs/tags/$RELEASE_TAG")"
+          local_tag_commit="$(git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}")"
+          [[ "$local_tag_object" =~ ^[0-9a-fA-F]{40}$ ]]
+          [[ "$local_tag_commit" == "$expected_commit" ]] \
+            || { echo "Tag local nao aponta para o commit esperado" >&2; exit 1; }
+
+          remote_row="$(gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" \
+            --jq '[.ref, .object.type, .object.sha] | @tsv')"
+          IFS=$'\t' read -r remote_ref remote_type remote_sha <<<"$remote_row"
+          [[ "$remote_ref" == "refs/tags/$RELEASE_TAG" ]]
+          [[ "$remote_sha" == "$local_tag_object" ]] \
+            || { echo "Objeto bruto remoto da tag mudou" >&2; exit 1; }
+
+          seen=""
+          depth=0
+          while [[ "$remote_type" == 'tag' ]]; do
+            (( depth < 8 )) || { echo "Cadeia de tags profunda" >&2; exit 1; }
+            [[ " $seen " != *" $remote_sha "* ]] \
+              || { echo "Ciclo na cadeia de tags" >&2; exit 1; }
+            seen="$seen $remote_sha"
+            remote_row="$(gh api \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "repos/$GITHUB_REPOSITORY/git/tags/$remote_sha" \
+              --jq '[.object.type, .object.sha] | @tsv')"
+            IFS=$'\t' read -r remote_type remote_sha <<<"$remote_row"
+            [[ "$remote_sha" =~ ^[0-9a-fA-F]{40}$ ]]
+            (( depth += 1 ))
+          done
+          [[ "$remote_type" == 'commit' && "$remote_sha" == "$expected_commit" ]] \
+            || { echo "Tag remota nao termina no commit esperado" >&2; exit 1; }
+
+          verify_archive() {
+            local artifact_id="$1"
+            local expected_digest="$2"
+            local expected_size="$3"
+            local label="$4"
+            local headers archive location actual_digest actual_size
+
+            headers="$(mktemp "$RUNNER_TEMP/churchdaw-artifact-headers.XXXXXX")"
+            archive="$(mktemp "$RUNNER_TEMP/churchdaw-artifact-archive.XXXXXX")"
+            curl --disable --silent --show-error --fail \
+              --proto '=https' --tlsv1.2 --max-redirs 0 \
+              --connect-timeout 30 --max-time 900 \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header 'Accept: application/vnd.github+json' \
+              --header 'X-GitHub-Api-Version: 2022-11-28' \
+              --dump-header "$headers" --output /dev/null \
+              "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id/zip"
+            location="$(python3 - "$headers" <<'PY'
+          import pathlib, sys
+          values = []
+          for line in pathlib.Path(sys.argv[1]).read_text(
+                  encoding="iso-8859-1").splitlines():
+              if line.lower().startswith("location:"):
+                  values.append(line.split(":", 1)[1].strip())
+          if len(values) != 1:
+              raise SystemExit("redirect unico do artifact nao encontrado")
+          print(values[0])
+          PY
+            )"
+            python3 - "$location" <<'PY'
+          import sys
+          from urllib.parse import urlsplit
+          value = urlsplit(sys.argv[1])
+          host = (value.hostname or "").lower()
+          allowed = (
+              host.endswith(".blob.core.windows.net") or
+              host.endswith(".actions.githubusercontent.com")
+          )
+          if (value.scheme != "https" or not allowed or value.username or
+                  value.password or not value.path or not value.query):
+              raise SystemExit("redirect assinado do artifact fora do host permitido")
+          PY
+            curl --disable --silent --show-error --fail \
+              --proto '=https' --tlsv1.2 --max-redirs 0 \
+              --connect-timeout 30 --max-time 900 \
+              --output "$archive" "$location"
+            actual_digest="sha256:$(sha256sum "$archive" | awk '{ print $1 }')"
+            actual_size="$(stat -c '%s' "$archive")"
+            [[ "$actual_digest" == "$expected_digest" ]] \
+              || { echo "Digest do ZIP $label diverge" >&2; exit 1; }
+            [[ "$actual_size" == "$expected_size" ]] \
+              || { echo "Tamanho do ZIP $label diverge" >&2; exit 1; }
+            rm -f "$headers" "$archive"
+          }
+
+          verify_run() {
+            local prefix="$1"
+            local run_id="$2"
+            local workflow_path="$3"
+            local artifact_name="$4"
+            local run_row
+            local actual_id status conclusion event head_sha head_branch path attempt
+
+            run_row="$(gh api \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" \
+              --jq '[.id, .status, .conclusion, .event, .head_sha, .head_branch, .path, .run_attempt] | @tsv')"
+            IFS=$'\t' read -r actual_id status conclusion event head_sha \
+              head_branch path attempt <<<"$run_row"
+            [[ "$actual_id" == "$run_id" ]]
+            [[ "$status" == 'completed' && "$conclusion" == 'success' ]]
+            [[ "$event" == 'workflow_dispatch' ]]
+            [[ "$head_sha" == "$expected_commit" ]]
+            [[ "$head_branch" == "$RELEASE_TAG" ]]
+            [[ "$path" == "$workflow_path" ]]
+            [[ "$attempt" =~ ^[1-9][0-9]*$ ]]
+
+            artifact_json="$(gh api \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/artifacts?per_page=100")"
+            artifact_row="$(python3 -c '
+          import json, re, sys
+          expected = sys.argv[1]
+          data = json.load(sys.stdin)
+          if not isinstance(data.get("total_count"), int) or data["total_count"] > 100:
+              raise SystemExit("artifact count invalido ou paginacao necessaria")
+          found = [item for item in data.get("artifacts", []) if item.get("name") == expected]
+          if len(found) != 1:
+              raise SystemExit(f"esperava um artifact {expected!r}; encontrei {len(found)}")
+          item = found[0]
+          artifact_id = item.get("id")
+          digest = item.get("digest")
+          size = item.get("size_in_bytes")
+          if (not isinstance(artifact_id, int) or artifact_id < 1 or
+                  item.get("expired") is not False or
+                  not isinstance(size, int) or size < 1 or
+                  not isinstance(digest, str) or
+                  not re.fullmatch(r"sha256:[0-9a-fA-F]{64}", digest)):
+              raise SystemExit("metadados do artifact invalidos/expirados")
+          print(f"{artifact_id}\t{digest.lower()}\t{size}")
+          ' "$artifact_name" <<<"$artifact_json")"
+            IFS=$'\t' read -r artifact_id artifact_digest artifact_size \
+              <<<"$artifact_row"
+            verify_archive "$artifact_id" "$artifact_digest" \
+              "$artifact_size" "$prefix"
+            printf '%s_artifact_id=%s\n' "$prefix" "$artifact_id" \
+              >>"$GITHUB_OUTPUT"
+            printf '%s_artifact_digest=%s\n' "$prefix" "$artifact_digest" \
+              >>"$GITHUB_OUTPUT"
+            printf '%s_artifact_size=%s\n' "$prefix" "$artifact_size" \
+              >>"$GITHUB_OUTPUT"
+          }
+
+          verify_run windows "$WINDOWS_RUN_ID" \
+            '.github/workflows/release-windows.yml' \
+            "ChurchDAW-Windows-$RELEASE_TAG-signed"
+          verify_run macos "$MACOS_RUN_ID" \
+            '.github/workflows/release-mac.yml' \
+            "ChurchDAW-macOS-$RELEASE_TAG-notarized"
+
+  verify-windows:
+    needs: verify-provenance
+    name: Revalidar candidato Windows
+    runs-on: windows-2022
+    timeout-minutes: 30
+    outputs:
+      installer_sha256: ${{ steps.verify.outputs.installer_sha256 }}
+      installer_bytes: ${{ steps.verify.outputs.installer_bytes }}
+      manifest_sha256: ${{ steps.verify.outputs.manifest_sha256 }}
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      EXPECTED_COMMIT: ${{ inputs.expected_commit_sha }}
+      WINDOWS_RUN_ID: ${{ inputs.windows_run_id }}
+      WINDOWS_EXPECTED_PUBLISHER: ${{ vars.WINDOWS_EXPECTED_PUBLISHER }}
+      WINDOWS_EXPECTED_THUMBPRINT: ${{ vars.WINDOWS_EXPECTED_THUMBPRINT }}
+
+    steps:
+      - name: Baixar codigo confiavel dos verificadores
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Baixar artefato do run exato
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.verify-provenance.outputs.windows_artifact_id }}
+          path: candidate-windows
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.windows_run_id }}
+
+      - name: Verificar manifest, hashes, PE e Authenticode
+        id: verify
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          .\Packaging\VerifyWindowsReleaseArtifact.ps1 `
+            -ArtifactRoot .\candidate-windows `
+            -ReleaseTag $env:RELEASE_TAG `
+            -SourceCommit $env:EXPECTED_COMMIT `
+            -ExpectedPublisher $env:WINDOWS_EXPECTED_PUBLISHER `
+            -ExpectedThumbprint $env:WINDOWS_EXPECTED_THUMBPRINT `
+            -MetadataOutput .\verification-windows.json `
+            -GitHubOutput $env:GITHUB_OUTPUT
+
+      - name: Preservar prova Windows
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ChurchDAW-publisher-Windows-proof-${{ github.run_id }}
+          path: |
+            verification-windows.json
+            ${{ runner.temp }}/churchdaw-publisher-windows-authenticode.log
+          if-no-files-found: warn
+          retention-days: 90
+
+  verify-macos:
+    needs: verify-provenance
+    name: Revalidar candidato macOS
+    runs-on: macos-14
+    timeout-minutes: 30
+    outputs:
+      installer_sha256: ${{ steps.verify.outputs.installer_sha256 }}
+      installer_bytes: ${{ steps.verify.outputs.installer_bytes }}
+      manifest_sha256: ${{ steps.verify.outputs.manifest_sha256 }}
+      certificate_sha256: ${{ steps.verify.outputs.certificate_sha256 }}
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      EXPECTED_COMMIT: ${{ inputs.expected_commit_sha }}
+      MACOS_RUN_ID: ${{ inputs.macos_run_id }}
+      MACOS_EXPECTED_TEAM_ID: ${{ vars.MACOS_EXPECTED_TEAM_ID }}
+      MACOS_EXPECTED_CERTIFICATE_SHA256: ${{ vars.MACOS_EXPECTED_CERTIFICATE_SHA256 }}
+
+    steps:
+      - name: Baixar codigo confiavel dos verificadores
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Baixar artefato do run exato
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.verify-provenance.outputs.macos_artifact_id }}
+          path: candidate-macos
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.macos_run_id }}
+
+      - name: Verificar notarizacao, Gatekeeper, bundle e slices
+        id: verify
+        run: |
+          set -Eeuo pipefail
+          bash Packaging/VerifyMacReleaseArtifact.sh \
+            candidate-macos \
+            "$RELEASE_TAG" \
+            "$EXPECTED_COMMIT" \
+            "$MACOS_EXPECTED_TEAM_ID" \
+            "$MACOS_EXPECTED_CERTIFICATE_SHA256" \
+            verification-macos.json \
+            "$GITHUB_OUTPUT" \
+            verification-macos-logs
+
+      - name: Preservar prova macOS
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ChurchDAW-publisher-macOS-proof-${{ github.run_id }}
+          path: |
+            verification-macos.json
+            verification-macos-logs/
+          if-no-files-found: warn
+          retention-days: 90
+
+  compose-and-publish:
+    needs:
+      - verify-provenance
+      - verify-windows
+      - verify-macos
+    name: Promover artefatos e policy por ultimo
+    runs-on: windows-2022
+    timeout-minutes: 90
+    environment: desktop-production
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      EXPECTED_COMMIT: ${{ inputs.expected_commit_sha }}
+      WINDOWS_RUN_ID: ${{ inputs.windows_run_id }}
+      MACOS_RUN_ID: ${{ inputs.macos_run_id }}
+      EXPECTED_PREVIOUS_POLICY_SHA256: ${{ inputs.expected_previous_policy_sha256 }}
+      UPDATE_MESSAGE: ${{ inputs.update_message }}
+      POLICY_SERIAL: ${{ vars.DESKTOP_POLICY_SERIAL }}
+      MINIMUM_VERSION_CODE: ${{ vars.DESKTOP_MINIMUM_VERSION_CODE }}
+      FTPS_PORT: ${{ vars.HOSTGATOR_FTPS_PORT }}
+      REMOTE_ROOT_DIRECTORY: ${{ vars.HOSTGATOR_REMOTE_ROOT }}
+      REMOTE_DESKTOP_DIRECTORY: ${{ vars.HOSTGATOR_DESKTOP_REMOTE_DIR }}
+      PUBLIC_SITE_URL: ${{ vars.PUBLIC_SITE_URL }}
+      PUBLIC_DESKTOP_BASE_URL: ${{ vars.PUBLIC_DESKTOP_BASE_URL }}
+      WINDOWS_EXPECTED_PUBLISHER: ${{ vars.WINDOWS_EXPECTED_PUBLISHER }}
+      WINDOWS_EXPECTED_THUMBPRINT: ${{ vars.WINDOWS_EXPECTED_THUMBPRINT }}
+      WINDOWS_VERIFIED_SHA256: ${{ needs.verify-windows.outputs.installer_sha256 }}
+      WINDOWS_VERIFIED_BYTES: ${{ needs.verify-windows.outputs.installer_bytes }}
+      WINDOWS_MANIFEST_SHA256: ${{ needs.verify-windows.outputs.manifest_sha256 }}
+      MACOS_VERIFIED_SHA256: ${{ needs.verify-macos.outputs.installer_sha256 }}
+      MACOS_VERIFIED_BYTES: ${{ needs.verify-macos.outputs.installer_bytes }}
+      MACOS_MANIFEST_SHA256: ${{ needs.verify-macos.outputs.manifest_sha256 }}
+      WINDOWS_ARTIFACT_ID: ${{ needs.verify-provenance.outputs.windows_artifact_id }}
+      WINDOWS_ARTIFACT_DIGEST: ${{ needs.verify-provenance.outputs.windows_artifact_digest }}
+      WINDOWS_ARTIFACT_SIZE: ${{ needs.verify-provenance.outputs.windows_artifact_size }}
+      MACOS_ARTIFACT_ID: ${{ needs.verify-provenance.outputs.macos_artifact_id }}
+      MACOS_ARTIFACT_DIGEST: ${{ needs.verify-provenance.outputs.macos_artifact_digest }}
+      MACOS_ARTIFACT_SIZE: ${{ needs.verify-provenance.outputs.macos_artifact_size }}
+
+    steps:
+      - name: Reservar janela segura de promocao e rollback
+        shell: pwsh
+        run: |
+          $started = [DateTimeOffset]::UtcNow.ToString(
+            'o',
+            [Globalization.CultureInfo]::InvariantCulture)
+          "PUBLISH_JOB_STARTED_AT_UTC=$started" >> $env:GITHUB_ENV
+
+      - name: Baixar codigo confiavel do publicador
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Baixar candidato Windows exato
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.verify-provenance.outputs.windows_artifact_id }}
+          path: candidate-windows
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.windows_run_id }}
+
+      - name: Baixar candidato macOS exato
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.verify-provenance.outputs.macos_artifact_id }}
+          path: candidate-macos
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.macos_run_id }}
+
+      - name: Restaurar segredos somente em arquivos temporarios
+        id: credentials
+        shell: pwsh
+        env:
+          HOSTGATOR_FTPS_HOST: ${{ secrets.HOSTGATOR_FTPS_HOST }}
+          HOSTGATOR_FTPS_USERNAME: ${{ secrets.HOSTGATOR_FTPS_USERNAME }}
+          HOSTGATOR_FTPS_PASSWORD: ${{ secrets.HOSTGATOR_FTPS_PASSWORD }}
+          DESKTOP_UPDATE_PRIVATE_KEY_BASE64: ${{ secrets.DESKTOP_UPDATE_PRIVATE_KEY_BASE64 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($name in @(
+            'HOSTGATOR_FTPS_HOST',
+            'HOSTGATOR_FTPS_USERNAME',
+            'HOSTGATOR_FTPS_PASSWORD',
+            'DESKTOP_UPDATE_PRIVATE_KEY_BASE64'
+          )) {
+            $value = [Environment]::GetEnvironmentVariable($name)
+            if ([string]::IsNullOrWhiteSpace($value) -or
+                $value.IndexOfAny([char[]] "`0`r`n") -ge 0) {
+              throw "Secret obrigatorio ausente ou invalido: $name"
+            }
+          }
+          if ($env:HOSTGATOR_FTPS_HOST -notmatch '^[A-Za-z0-9.-]+$') {
+            throw 'HOSTGATOR_FTPS_HOST invalido'
+          }
+          foreach ($credential in @(
+            $env:HOSTGATOR_FTPS_USERNAME,
+            $env:HOSTGATOR_FTPS_PASSWORD
+          )) {
+            if ($credential -notmatch '^[A-Za-z0-9@._%+=,:;-]{1,512}$') {
+              throw 'Credencial FTPS contem caractere inseguro para netrc'
+            }
+          }
+
+          $privateKey = Join-Path $env:RUNNER_TEMP `
+            'churchdaw-desktop-policy-private.pem'
+          $netrc = Join-Path $env:RUNNER_TEMP 'churchdaw-hostgator.netrc'
+          foreach ($path in @($privateKey, $netrc)) {
+            if (Test-Path -LiteralPath $path) {
+              throw "Arquivo temporario ja existe: $path"
+            }
+          }
+
+          $keyBytes = [Convert]::FromBase64String(
+            $env:DESKTOP_UPDATE_PRIVATE_KEY_BASE64)
+          $keyText = [Text.Encoding]::ASCII.GetString($keyBytes)
+          if ($keyBytes.Length -lt 1024 -or
+              $keyText -notmatch '-----BEGIN (?:RSA )?PRIVATE KEY-----') {
+            throw 'Chave privada da policy tem formato inesperado'
+          }
+          [IO.File]::WriteAllBytes($privateKey, $keyBytes)
+
+          $netrcText = "machine $($env:HOSTGATOR_FTPS_HOST)`n" +
+            "login $($env:HOSTGATOR_FTPS_USERNAME)`n" +
+            "password $($env:HOSTGATOR_FTPS_PASSWORD)`n"
+          [IO.File]::WriteAllText(
+            $netrc,
+            $netrcText,
+            [Text.UTF8Encoding]::new($false))
+          & icacls.exe $privateKey /inheritance:r /grant:r "$env:USERNAME`:(R,W)" | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'Falha ao restringir ACL da chave' }
+          & icacls.exe $netrc /inheritance:r /grant:r "$env:USERNAME`:(R,W)" | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'Falha ao restringir ACL do netrc' }
+
+          "private_key=$privateKey" >> $env:GITHUB_OUTPUT
+          "netrc=$netrc" >> $env:GITHUB_OUTPUT
+
+      - name: Promover Setup e DMG, site e policy compartilhada por ultimo
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HOSTGATOR_FTPS_HOST: ${{ secrets.HOSTGATOR_FTPS_HOST }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($name in @(
+            'POLICY_SERIAL', 'MINIMUM_VERSION_CODE', 'FTPS_PORT',
+            'REMOTE_ROOT_DIRECTORY', 'REMOTE_DESKTOP_DIRECTORY',
+            'PUBLIC_SITE_URL', 'PUBLIC_DESKTOP_BASE_URL',
+            'HOSTGATOR_FTPS_HOST', 'WINDOWS_EXPECTED_PUBLISHER',
+            'WINDOWS_EXPECTED_THUMBPRINT',
+            'WINDOWS_VERIFIED_SHA256', 'WINDOWS_VERIFIED_BYTES',
+            'MACOS_VERIFIED_SHA256', 'MACOS_VERIFIED_BYTES',
+            'WINDOWS_MANIFEST_SHA256', 'MACOS_MANIFEST_SHA256',
+            'WINDOWS_ARTIFACT_ID', 'WINDOWS_ARTIFACT_DIGEST',
+            'WINDOWS_ARTIFACT_SIZE', 'MACOS_ARTIFACT_ID',
+            'MACOS_ARTIFACT_DIGEST', 'MACOS_ARTIFACT_SIZE'
+          )) {
+            if ([string]::IsNullOrWhiteSpace(
+                [Environment]::GetEnvironmentVariable($name))) {
+              throw "Variable protegida ausente: $name"
+            }
+          }
+
+          .\Packaging\PublishDesktopRelease.ps1 `
+            -WindowsArtifactRoot .\candidate-windows `
+            -MacArtifactRoot .\candidate-macos `
+            -ReleaseTag $env:RELEASE_TAG `
+            -SourceCommit $env:EXPECTED_COMMIT `
+            -WindowsRunId ([long] $env:WINDOWS_RUN_ID) `
+            -MacRunId ([long] $env:MACOS_RUN_ID) `
+            -WindowsArtifactId ([long] $env:WINDOWS_ARTIFACT_ID) `
+            -WindowsArtifactDigest $env:WINDOWS_ARTIFACT_DIGEST `
+            -WindowsArtifactArchiveBytes ([long] $env:WINDOWS_ARTIFACT_SIZE) `
+            -MacArtifactId ([long] $env:MACOS_ARTIFACT_ID) `
+            -MacArtifactDigest $env:MACOS_ARTIFACT_DIGEST `
+            -MacArtifactArchiveBytes ([long] $env:MACOS_ARTIFACT_SIZE) `
+            -ExpectedPreviousPolicySha256 $env:EXPECTED_PREVIOUS_POLICY_SHA256 `
+            -PolicySerial ([int] $env:POLICY_SERIAL) `
+            -MinimumVersionCode ([int] $env:MINIMUM_VERSION_CODE) `
+            -UpdateMessage $env:UPDATE_MESSAGE `
+            -PrivateKey '${{ steps.credentials.outputs.private_key }}' `
+            -ExpectedWindowsPublisher $env:WINDOWS_EXPECTED_PUBLISHER `
+            -ExpectedWindowsThumbprint $env:WINDOWS_EXPECTED_THUMBPRINT `
+            -FtpsHost $env:HOSTGATOR_FTPS_HOST `
+            -FtpsPort ([int] $env:FTPS_PORT) `
+            -NetrcPath '${{ steps.credentials.outputs.netrc }}' `
+            -RemoteRootDirectory $env:REMOTE_ROOT_DIRECTORY `
+            -RemoteDesktopDirectory $env:REMOTE_DESKTOP_DIRECTORY `
+            -PublicSiteUrl $env:PUBLIC_SITE_URL `
+            -PublicDesktopBaseUrl $env:PUBLIC_DESKTOP_BASE_URL `
+            -SiteIndex .\Packaging\SiteProduction\index.html `
+            -AuditOutputDirectory .\desktop-promotion-audit `
+            -VerifiedWindowsSha256 $env:WINDOWS_VERIFIED_SHA256 `
+            -VerifiedWindowsBytes ([long] $env:WINDOWS_VERIFIED_BYTES) `
+            -VerifiedMacSha256 $env:MACOS_VERIFIED_SHA256 `
+            -VerifiedMacBytes ([long] $env:MACOS_VERIFIED_BYTES) `
+            -VerifiedWindowsManifestSha256 $env:WINDOWS_MANIFEST_SHA256 `
+            -VerifiedMacManifestSha256 $env:MACOS_MANIFEST_SHA256
+
+      - name: Remover credenciais temporarias
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($path in @(
+            (Join-Path $env:RUNNER_TEMP 'churchdaw-desktop-policy-private.pem'),
+            (Join-Path $env:RUNNER_TEMP 'churchdaw-hostgator.netrc')
+          )) {
+            if (Test-Path -LiteralPath $path -PathType Leaf) {
+              Remove-Item -LiteralPath $path -Force
+            }
+          }
+
+      - name: Preservar auditoria da promocao
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ChurchDAW-desktop-promotion-audit-${{ github.run_id }}-${{ github.run_attempt }}
+          path: desktop-promotion-audit/
+          if-no-files-found: warn
+          retention-days: 90

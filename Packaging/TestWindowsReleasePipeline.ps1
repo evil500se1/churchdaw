@@ -41,6 +41,23 @@ function Assert-Throws {
     if (-not $threw) { throw $Message }
 }
 
+function Assert-ThrowsMessage {
+    param(
+        [scriptblock] $Body,
+        [string] $ExpectedMessage,
+        [string] $Message
+    )
+
+    try { & $Body | Out-Null }
+    catch {
+        if ($_.Exception.Message -cne $ExpectedMessage) {
+            throw ("$Message; erro inesperado: $($_.Exception.Message)")
+        }
+        return
+    }
+    throw $Message
+}
+
 $knownThumbprint = '00112233445566778899AABBCCDDEEFF00112233'
 
 Test-Case 'normaliza thumbprint com separadores' {
@@ -159,6 +176,58 @@ Test-Case 'excecao sem instalador recusa artefato presente' {
     } 'excecao policy-only aceitou instalador'
 }
 
+Test-Case 'rollback comercial pode omitir instaladores explicitamente' {
+    $kind = Assert-ChurchDAWDesktopPolicyArtifactSet `
+        -ReleaseMode Commercial `
+        -LatestVersionCode 10507 `
+        -MinimumVersionCode 10400 `
+        -WindowsInstallerBytes 0 `
+        -MacInstallerBytes 0 `
+        -AllowRollbackPolicyWithoutInstaller
+    Assert-True ($kind -eq 'rollback-policy-only') `
+        'classificacao de rollback inesperada'
+}
+
+Test-Case 'rollback sem instalador recusa artefato presente' {
+    Assert-Throws {
+        Assert-ChurchDAWDesktopPolicyArtifactSet `
+            -ReleaseMode Commercial `
+            -LatestVersionCode 10507 `
+            -MinimumVersionCode 10400 `
+            -WindowsInstallerBytes 123 `
+            -MacInstallerBytes 0 `
+            -AllowRollbackPolicyWithoutInstaller
+    } 'rollback policy-only aceitou instalador'
+}
+
+Test-Case 'excecoes de policy sem instalador sao mutuamente exclusivas' {
+    Assert-Throws {
+        Assert-ChurchDAWDesktopPolicyArtifactSet `
+            -ReleaseMode Commercial `
+            -LatestVersionCode 10400 `
+            -MinimumVersionCode 10400 `
+            -WindowsInstallerBytes 0 `
+            -MacInstallerBytes 0 `
+            -AllowCurrentVersionPolicyWithoutInstaller `
+            -AllowRollbackPolicyWithoutInstaller
+    } 'duas excecoes policy-only foram aceitas juntas'
+}
+
+Test-Case 'rollback nao pode usar excecao current-version policy-only' {
+    Assert-ThrowsMessage {
+        & (Join-Path $PSScriptRoot 'SignDesktopUpdatePolicy.ps1') `
+            -PolicySerial 8 `
+            -LatestVersionCode 10507 `
+            -MinimumVersionCode 10507 `
+            -LatestVersionName 1.5.7 `
+            -UpdateMessage rollback `
+            -Mode rollback `
+            -RevokesPolicySerial 7 `
+            -AllowCurrentVersionPolicyWithoutInstaller
+    } '-AllowCurrentVersionPolicyWithoutInstaller exige -Mode normal' `
+        'rollback aceitou a excecao errada de policy-only'
+}
+
 Test-Case 'argumentos signtool verify sao fail-closed' {
     $arguments = @(Get-ChurchDAWSignToolVerifyArguments `
         (Join-Path $env:WINDIR 'System32\notepad.exe'))
@@ -274,6 +343,8 @@ Test-Case 'todos os scripts PowerShell do pipeline fazem parse' {
         'SignDesktopInstaller.ps1',
         'SignDesktopUpdatePolicy.ps1',
         'BuildDesktopRelease.ps1',
+        'VerifyWindowsReleaseArtifact.ps1',
+        'PublishDesktopRelease.ps1',
         'TestWindowsReleasePipeline.ps1'
     )) {
         $tokens = $null
@@ -286,6 +357,33 @@ Test-Case 'todos os scripts PowerShell do pipeline fazem parse' {
             throw "$name possui $($errors.Count) erros de parse"
         }
     }
+}
+
+Test-Case 'publisher limita rede dentro da janela de rollback' {
+    $publisher = [IO.File]::ReadAllText(
+        (Join-Path $PSScriptRoot 'PublishDesktopRelease.ps1'))
+    Assert-True (-not $publisher.Contains("'--retry'")) `
+        'publisher reintroduziu retry interno do curl'
+    Assert-True ($publisher.Contains(
+        '$tagDeadline = [DateTimeOffset]::UtcNow.AddSeconds(30)')) `
+        'deadline total da revalidacao da tag ausente'
+    Assert-True ($publisher.Contains(
+        '$elapsed.TotalMinutes -ge 20.0')) `
+        'gate pre-mutacao nao reserva 70 minutos do job'
+}
+
+Test-Case 'publisher revalida tag antes da policy e dos RNTOs' {
+    $publisher = [IO.File]::ReadAllText(
+        (Join-Path $PSScriptRoot 'PublishDesktopRelease.ps1'))
+    Assert-True ([regex]::IsMatch(
+        $publisher,
+        'Assert-RemoteReleaseTag\s+\$policyPromotionAttempted = \$true')) `
+        'tag nao e revalidada imediatamente antes da tentativa de policy'
+    $renameGates = [regex]::Matches(
+        $publisher,
+        '-BeforeRename\s+\{\s*Assert-RemoteReleaseTag\s*\}')
+    Assert-True ($renameGates.Count -eq 2) `
+        'site e policy nao possuem exatamente dois gates pre-RNTO'
 }
 
 Write-Host ''

@@ -48,6 +48,7 @@ param(
     [string[]] $ExpectedWindowsSignerThumbprints = @(),
     [switch] $AllowUnsignedWindowsInstallerForTest,
     [switch] $AllowCurrentVersionPolicyWithoutInstaller,
+    [switch] $AllowRollbackPolicyWithoutInstaller,
     [string] $WindowsVerificationLogPath = '',
 
     [ValidateSet('normal', 'rollback')]
@@ -242,16 +243,6 @@ if ([string]::IsNullOrWhiteSpace($Output)) {
         'DesktopHosting\app\desktop\update-policy-v1.json'
 }
 
-if (-not (Test-Path -LiteralPath $openssl -PathType Leaf)) {
-    throw "OpenSSL nao encontrado: $openssl"
-}
-if (-not (Test-Path -LiteralPath $PrivateKey -PathType Leaf)) {
-    throw "Chave privada nao encontrada: $PrivateKey"
-}
-if (-not (Test-Path -LiteralPath $publicKey -PathType Leaf)) {
-    throw "Chave publica nao encontrada: $publicKey"
-}
-
 if ($PolicySerial -lt 1 -or $LatestVersionCode -lt 1 -or
     $MinimumVersionCode -lt 1 -or $LatestVersionCode -lt $MinimumVersionCode) {
     throw 'Serial ou faixa de versoes invalida'
@@ -262,8 +253,24 @@ if ($Mode -eq 'rollback' -and $RevokesPolicySerial -lt 1) {
 if ($Mode -eq 'normal' -and $RevokesPolicySerial -ne 0) {
     throw 'Politica normal nao revoga outro serial'
 }
+if ($AllowCurrentVersionPolicyWithoutInstaller -and $Mode -ne 'normal') {
+    throw '-AllowCurrentVersionPolicyWithoutInstaller exige -Mode normal'
+}
+if ($AllowRollbackPolicyWithoutInstaller -and $Mode -ne 'rollback') {
+    throw '-AllowRollbackPolicyWithoutInstaller exige -Mode rollback'
+}
 if ($UpdateMessage.IndexOfAny([char[]] "`0`r`n") -ge 0) {
     throw 'A mensagem nao pode conter NUL nem quebras de linha'
+}
+
+if (-not (Test-Path -LiteralPath $openssl -PathType Leaf)) {
+    throw "OpenSSL nao encontrado: $openssl"
+}
+if (-not (Test-Path -LiteralPath $PrivateKey -PathType Leaf)) {
+    throw "Chave privada nao encontrada: $PrivateKey"
+}
+if (-not (Test-Path -LiteralPath $publicKey -PathType Leaf)) {
+    throw "Chave publica nao encontrada: $publicKey"
 }
 
 $windows = Resolve-Installer -Path $WindowsInstaller -Url $WindowsInstallerUrl `
@@ -282,7 +289,9 @@ $artifactSet = Assert-ChurchDAWDesktopPolicyArtifactSet `
     -WindowsInstallerBytes $windows.Bytes `
     -MacInstallerBytes $mac.Bytes `
     -AllowCurrentVersionPolicyWithoutInstaller:(
-        $AllowCurrentVersionPolicyWithoutInstaller)
+        $AllowCurrentVersionPolicyWithoutInstaller) `
+    -AllowRollbackPolicyWithoutInstaller:(
+        $AllowRollbackPolicyWithoutInstaller)
 
 if ($artifactSet -eq 'test-policy-only') {
     Write-Warning ('Politica de teste sem instalador: ela so vai AVISAR, ' +
@@ -291,6 +300,10 @@ if ($artifactSet -eq 'test-policy-only') {
 elseif ($artifactSet -eq 'current-version-policy-only') {
     Write-Host ('Politica comercial da versao corrente: nenhum instalador ' +
                 'foi anunciado.')
+}
+elseif ($artifactSet -eq 'rollback-policy-only') {
+    Write-Host ('Rollback comercial sem instalador: somente a policy ' +
+                'autenticada desativa a atualizacao revogada.')
 }
 if ($ReleaseMode -eq 'Commercial' -and
     $AllowUnsignedWindowsInstallerForTest) {
@@ -409,8 +422,12 @@ try {
                 throw ("Rollback deve revogar exatamente o serial anterior " +
                        "($($previous.PolicySerial))")
             }
-            if ([long] $MinimumVersionCode -ge $previous.MinimumVersionCode) {
-                throw ("Rollback deve reduzir minimum_version_code abaixo de " +
+            if ([long] $LatestVersionCode -ge $previous.LatestVersionCode) {
+                throw ("Rollback deve reduzir latest_version_code abaixo de " +
+                       "$($previous.LatestVersionCode)")
+            }
+            if ([long] $MinimumVersionCode -gt $previous.MinimumVersionCode) {
+                throw ("Rollback nao pode aumentar minimum_version_code acima de " +
                        "$($previous.MinimumVersionCode)")
             }
         }

@@ -1,11 +1,11 @@
 {
   "schema_version": 1,
   "package_id": "com.churchdaw.app",
-  "latest_version_code": 13,
-  "minimum_version_code": 13,
-  "latest_version_name": "1.6.2-test",
+  "latest_version_code": 14,
+  "minimum_version_code": 14,
+  "latest_version_name": "1.6.3-test",
   "update_message": "A politica deve bloquear mesmo quando o catalogo abaixo for rejeitado.",
-  "play_store_url": "https://churchdaw.com/app/android/ChurchDAW-1.6.2-test.apk",
+  "play_store_url": "https://churchdaw.com/app/android/ChurchDAW-1.6.3-test-signed.apk",
   "libraries": [
     {
       "id": "../catalogo-invalido",

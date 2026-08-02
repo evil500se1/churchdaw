@@ -193,9 +193,13 @@ jobs:
           $item = Get-Item -LiteralPath $publicApk
           $sha256 = (Get-FileHash -LiteralPath $publicApk -Algorithm SHA256).Hash
           $certLine = $signerOutput | Where-Object {
-            $_ -like 'Signer #1 certificate SHA-256 digest:*'
+            $_ -match '(?:Signer #\d+|V2 Signer): certificate SHA-256 digest:'
           } | Select-Object -First 1
-          $certSha256 = if ($certLine) { ($certLine -split ':', 2)[1].Trim() } else { '' }
+          if (-not $certLine -or
+              $certLine -notmatch 'certificate SHA-256 digest:\s*([0-9a-fA-F]{64})') {
+            throw 'SHA-256 do certificado de assinatura nao encontrado'
+          }
+          $certSha256 = $Matches[1].ToUpperInvariant()
 
           [ordered]@{
             package_id = 'com.churchdaw.app'

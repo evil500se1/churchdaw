@@ -1,5 +1,6 @@
 #include <juce_audio_processors/juce_audio_processors.h>
 
+#include "PluginScanDiagnostics.h"
 #include "PluginScanPolicy.h"
 
 #include <initializer_list>
@@ -22,6 +23,23 @@ void expect (bool condition, const char* message)
 int main()
 {
     using namespace ChurchDAWPluginScan;
+
+    juce::DynamicObject::Ptr diagnosticRecord (new juce::DynamicObject());
+    diagnosticRecord->setProperty ("recordType", "plugin");
+    diagnosticRecord->setProperty ("status", "loaded_success");
+    const auto diagnosticLine = serialiseDiagnosticJsonLine (
+        diagnosticRecord.get());
+    const auto diagnosticPayload = diagnosticLine.dropLastCharacters (1);
+    juce::var parsedDiagnostic;
+    const auto diagnosticParse = juce::JSON::parse (diagnosticPayload,
+                                                     parsedDiagnostic);
+    expect (diagnosticLine.endsWithChar ('\n')
+             && ! diagnosticPayload.containsAnyOf ("\r\n"),
+            "Scanner diagnostics must emit exactly one JSON object per line");
+    expect (diagnosticParse.wasOk()
+             && parsedDiagnostic.getProperty ("status", {})
+                    .toString() == "loaded_success",
+            "Scanner diagnostic JSON line must be independently parseable");
 
     expect (! deveEntrarNaBlacklistPersistente (PhaseFinish::result),
             "A normal validation rejection must remain retryable");

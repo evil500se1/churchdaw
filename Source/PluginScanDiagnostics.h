@@ -25,6 +25,11 @@ namespace ChurchDAWPluginScan
 
 inline constexpr int protocolVersion = 2;
 
+inline juce::String serialiseDiagnosticJsonLine (const juce::var& value)
+{
+    return juce::JSON::toString (value, true) + "\n";
+}
+
 enum class ScanPhase : int
 {
     discovery = 1,
@@ -678,7 +683,7 @@ private:
     {
         // JSON Lines exige exatamente um objeto por linha; pretty-print criaria
         // registros de varias linhas e quebraria ferramentas de suporte.
-        const auto line = juce::JSON::toString (value, false) + "\n";
+        const auto line = serialiseDiagnosticJsonLine (value);
         const std::lock_guard<std::mutex> lock (fileMutex);
         reportFile.appendText (line, false, false, "\n");
     }

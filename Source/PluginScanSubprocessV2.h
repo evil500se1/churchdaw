@@ -534,7 +534,8 @@ public:
     ~ScannerSuperprocess() override
     {
         // O pipe deve parar antes dos mutexes/strings desta classe morrerem.
-        killWorkerProcess();
+        if (! terminationAttempted)
+            stopAndReap();
     }
 
     ScannerSuperprocess()
@@ -563,6 +564,21 @@ public:
 
     bool wasLaunched() const noexcept { return launched; }
     using juce::ChildProcessCoordinator::sendMessageToWorker;
+
+    bool stopAndReap()
+    {
+        if (terminationAttempted)
+            return terminationSucceeded;
+
+        terminationAttempted = true;
+        terminationSucceeded = killWorkerProcessAndWait (500, 2000);
+
+        if (! terminationSucceeded)
+            juce::Logger::writeToLog (
+                "PLUGIN_SCAN child_reap_failed after forced termination");
+
+        return terminationSucceeded;
+    }
 
     Response getResponse()
     {
@@ -642,6 +658,8 @@ private:
     bool launched = false;
     bool lost = false;
     bool gotResult = false;
+    bool terminationAttempted = false;
+    bool terminationSucceeded = false;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (ScannerSuperprocess)
 };
@@ -697,17 +715,20 @@ public:
         auto discoveryAttempt = runPhase (discovery);
         noteInconclusiveAttempt (discoveryAttempt);
 
-        if (discoveryAttempt.finish == PhaseFinish::cancelled)
+        if (discoveryAttempt.finish == PhaseFinish::cancelled
+             && discoveryAttempt.workerReaped)
             return true;
 
-        if (discoveryAttempt.finish != PhaseFinish::result
+        if (! discoveryAttempt.workerReaped
+             || discoveryAttempt.finish != PhaseFinish::result
              || discoveryAttempt.xml == nullptr
              || discoveryAttempt.xml->getStringAttribute ("status") != "discovered")
         {
             auto report = reportForAttempt (discovery, discoveryAttempt,
                                             discoveryEnvironment, nullptr);
             reportWriter.appendPlugin (*report);
-            return ! deveEntrarNaBlacklistPersistente (discoveryAttempt.finish);
+            return ! discoveryAttempt.workerReaped
+                || ! deveEntrarNaBlacklistPersistente (discoveryAttempt.finish);
         }
 
         auto* descriptions = discoveryAttempt.xml->getChildByName ("DESCRIPTIONS");
@@ -769,7 +790,8 @@ public:
             auto validationAttempt = runPhase (validation);
             noteInconclusiveAttempt (validationAttempt);
 
-            if (validationAttempt.finish == PhaseFinish::cancelled)
+            if (validationAttempt.finish == PhaseFinish::cancelled
+                 && validationAttempt.workerReaped)
                 return true;
 
             auto report = reportForAttempt (validation, validationAttempt,
@@ -782,7 +804,8 @@ public:
                 ++validated;
                 ++validationSummary.loaded;
             }
-            else if (deveEntrarNaBlacklistPersistente (
+            else if (validationAttempt.workerReaped
+                     && deveEntrarNaBlacklistPersistente (
                          validationAttempt.finish))
                 ++validationSummary.fatal;
             else
@@ -830,6 +853,7 @@ private:
         ScannerSuperprocess::Progress progress;
         juce::String stack;
         int elapsedMs = 0;
+        bool workerReaped = true;
     };
 
     void noteInconclusiveAttempt (const PhaseAttempt& attempt)
@@ -841,7 +865,7 @@ private:
                                       || attempt.xml->getStringAttribute ("status")
                                              == "host_internal_error");
 
-        if (inconclusiveFinish || protocolFailure)
+        if (inconclusiveFinish || protocolFailure || ! attempt.workerReaped)
             scanHadInconclusive.store (true);
     }
 
@@ -856,12 +880,24 @@ private:
     PhaseAttempt runPhase (const ScanRequest& request)
     {
         const auto started = juce::Time::getMillisecondCounterHiRes();
-        ScannerSuperprocess process;
         PhaseAttempt attempt;
+
+        if (childReapFailed.load())
+        {
+            attempt.workerReaped = false;
+            return attempt;
+        }
+
+        ScannerSuperprocess process;
 
         if (! process.wasLaunched())
         {
             attempt.finish = PhaseFinish::launchFailed;
+            attempt.workerReaped = process.stopAndReap();
+
+            if (! attempt.workerReaped)
+                childReapFailed.store (true);
+
             return attempt;
         }
 
@@ -870,6 +906,11 @@ private:
         if (! process.sendMessageToWorker (block))
         {
             attempt.finish = PhaseFinish::sendFailed;
+            attempt.workerReaped = process.stopAndReap();
+
+            if (! attempt.workerReaped)
+                childReapFailed.store (true);
+
             return attempt;
         }
 
@@ -914,6 +955,11 @@ private:
 
         if (attempt.finish == PhaseFinish::crash)
             attempt.stack = readCrashStack (request.token);
+
+        attempt.workerReaped = process.stopAndReap();
+
+        if (! attempt.workerReaped)
+            childReapFailed.store (true);
 
         return attempt;
     }
@@ -1060,6 +1106,11 @@ private:
                 break;
         }
 
+        if (! attempt.workerReaped)
+            setReportFailure (*report, "host_internal_error", "worker_shutdown",
+                              "child_reap_failed",
+                              "scanner child could not be terminated and reaped");
+
         appendProgress (*report, attempt.progress);
 
         juce::Logger::writeToLog (
@@ -1121,6 +1172,7 @@ private:
     std::map<juce::String, EnvironmentReport> environmentCache;
     juce::String currentFormat;
     std::atomic<bool> scanHadInconclusive { false };
+    std::atomic<bool> childReapFailed { false };
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (ChurchDAWPluginScanner)
 };

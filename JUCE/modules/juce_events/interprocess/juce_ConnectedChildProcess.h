@@ -158,8 +158,8 @@ public:
     ChildProcessCoordinator();
 
     /** Destructor.
-        Note that the destructor calls killWorkerProcess(), but doesn't wait for
-        the child process to finish terminating.
+        The destructor calls killWorkerProcess(), which performs a bounded wait
+        for the child process to terminate.
     */
     virtual ~ChildProcessCoordinator();
 
@@ -195,10 +195,29 @@ public:
         return launchWorkerProcess (executableToLaunch, commandLineUniqueID, timeoutMs, streamFlags);
     }
 
-    /** Sends a kill message to the worker, and disconnects from it.
-        Note that this won't wait for it to terminate.
+    /** Sends a kill message to the worker, disconnects from it, and performs a
+        bounded wait for it to terminate.
+
+        Prefer killWorkerProcessAndWait() when the caller needs to observe a
+        failure to terminate the worker.
     */
     void killWorkerProcess();
+
+    /** Stops the worker and confirms that the operating system has observed its
+        termination.
+
+        The worker first receives the normal shutdown message and is allowed up
+        to gracefulShutdownTimeoutMs to exit. If it is still running, it is
+        forcibly killed and this method waits for up to forcedKillTimeoutMs for
+        the process to be collected.
+
+        Returns true when there was no worker, or when the worker is confirmed
+        to have terminated. Returns false if the forced kill or the final wait
+        fails. In that case the process handle is retained, and a later call to
+        launchWorkerProcess() will fail rather than starting another worker.
+    */
+    bool killWorkerProcessAndWait (int gracefulShutdownTimeoutMs = 500,
+                                   int forcedKillTimeoutMs = 2000);
 
     [[deprecated ("Replaced by killWorkerProcess.")]]
     void killSlaveProcess() { killWorkerProcess(); }

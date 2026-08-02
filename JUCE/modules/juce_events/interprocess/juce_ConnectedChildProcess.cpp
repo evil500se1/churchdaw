@@ -166,7 +166,8 @@ bool ChildProcessCoordinator::sendMessageToWorker (const MemoryBlock& mb)
 bool ChildProcessCoordinator::launchWorkerProcess (const File& executable, const String& commandLineUniqueID,
                                                    int timeoutMs, int streamFlags)
 {
-    killWorkerProcess();
+    if (! killWorkerProcessAndWait())
+        return false;
 
     auto pipeName = "p" + String::toHexString (Random().nextInt64());
 
@@ -199,12 +200,22 @@ bool ChildProcessCoordinator::launchWorkerProcess (const File& executable, const
         }
 
         connection.reset();
+
+        // A process that started but never connected is still our
+        // responsibility. Do not leave it behind after a launch failure.
+        killWorkerProcessAndWait();
     }
 
     return false;
 }
 
 void ChildProcessCoordinator::killWorkerProcess()
+{
+    ignoreUnused (killWorkerProcessAndWait());
+}
+
+bool ChildProcessCoordinator::killWorkerProcessAndWait (int gracefulShutdownTimeoutMs,
+                                                        int forcedKillTimeoutMs)
 {
     if (connection != nullptr)
     {
@@ -213,7 +224,27 @@ void ChildProcessCoordinator::killWorkerProcess()
         connection.reset();
     }
 
+    if (childProcess == nullptr)
+        return true;
+
+    const auto process = childProcess;
+    const auto gracefulWait = jmax (0, gracefulShutdownTimeoutMs);
+    const auto forcedWait = jmax (0, forcedKillTimeoutMs);
+
+    if (! process->waitForProcessToFinish (gracefulWait))
+    {
+        // kill() may race with a process that exited immediately after the
+        // graceful wait. Treat that race as success only after isRunning()
+        // confirms the exit; otherwise preserve the handle and fail closed.
+        if (! process->kill() && process->isRunning())
+            return false;
+
+        if (! process->waitForProcessToFinish (forcedWait))
+            return false;
+    }
+
     childProcess.reset();
+    return true;
 }
 
 //==============================================================================

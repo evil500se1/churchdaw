@@ -107,6 +107,9 @@ if(CHURCHDAW_BUILD_AUDIO_TESTS AND NOT ANDROID AND NOT IOS)
     juce_add_console_app(ChurchDAWPluginScanPolicyTests
         PRODUCT_NAME "ChurchDAWPluginScanPolicyTests")
 
+    juce_add_console_app(ChurchDAWChildProcessReapTests
+        PRODUCT_NAME "ChurchDAWChildProcessReapTests")
+
     add_executable(ChurchDAWAndroidStageLayoutTests
         Tests/UI/AndroidStageLayoutTests.cpp)
 
@@ -136,6 +139,9 @@ if(CHURCHDAW_BUILD_AUDIO_TESTS AND NOT ANDROID AND NOT IOS)
 
     target_sources(ChurchDAWPluginScanPolicyTests PRIVATE
         Tests/Plugin/PluginScanPolicyTests.cpp)
+
+    target_sources(ChurchDAWChildProcessReapTests PRIVATE
+        Tests/Plugin/ConnectedChildProcessReapTests.cpp)
 
     target_include_directories(ChurchDAWMasterLimiterTests PRIVATE Source)
     target_include_directories(ChurchDAWChannelToneTests PRIVATE Source)
@@ -180,6 +186,10 @@ if(CHURCHDAW_BUILD_AUDIO_TESTS AND NOT ANDROID AND NOT IOS)
         JUCE_PUSH_NOTIFICATIONS=0
         JUCE_USE_CURL=0)
     target_compile_definitions(ChurchDAWPluginScanPolicyTests PRIVATE
+        JUCE_WEB_BROWSER=0
+        JUCE_PUSH_NOTIFICATIONS=0
+        JUCE_USE_CURL=0)
+    target_compile_definitions(ChurchDAWChildProcessReapTests PRIVATE
         JUCE_WEB_BROWSER=0
         JUCE_PUSH_NOTIFICATIONS=0
         JUCE_USE_CURL=0)
@@ -245,6 +255,12 @@ if(CHURCHDAW_BUILD_AUDIO_TESTS AND NOT ANDROID AND NOT IOS)
         PUBLIC
             juce::juce_recommended_config_flags)
 
+    target_link_libraries(ChurchDAWChildProcessReapTests
+        PRIVATE
+            juce::juce_events
+        PUBLIC
+            juce::juce_recommended_config_flags)
+
     if(APPLE)
         # Prova real do protocolo V2 no macOS. O mesmo executavel funciona como
         # coordenador e como processo filho descartavel, carrega apenas o
@@ -294,6 +310,7 @@ if(CHURCHDAW_BUILD_AUDIO_TESTS AND NOT ANDROID AND NOT IOS)
         target_compile_options(ChurchDAWLiveScenesTests PRIVATE /utf-8)
         target_compile_options(ChurchDAWSceneFileWriteProbe PRIVATE /utf-8)
         target_compile_options(ChurchDAWPluginScanPolicyTests PRIVATE /utf-8)
+        target_compile_options(ChurchDAWChildProcessReapTests PRIVATE /utf-8)
         target_compile_options(ChurchDAWAndroidStageLayoutTests PRIVATE /utf-8)
     endif()
 
@@ -328,6 +345,9 @@ if(CHURCHDAW_BUILD_AUDIO_TESTS AND NOT ANDROID AND NOT IOS)
         NAME ChurchDAWPluginScanPolicy
         COMMAND ChurchDAWPluginScanPolicyTests)
     add_test(
+        NAME ChurchDAWChildProcessReap
+        COMMAND ChurchDAWChildProcessReapTests)
+    add_test(
         NAME ChurchDAWAndroidStageLayout
         COMMAND ChurchDAWAndroidStageLayoutTests)
     set_tests_properties(
@@ -339,6 +359,7 @@ if(CHURCHDAW_BUILD_AUDIO_TESTS AND NOT ANDROID AND NOT IOS)
         ChurchDAWPadProcessor
         ChurchDAWLibraryPackPath
         ChurchDAWPluginScanPolicy
+        ChurchDAWChildProcessReap
         ChurchDAWAndroidStageLayout
         PROPERTIES TIMEOUT 240)
 endif()

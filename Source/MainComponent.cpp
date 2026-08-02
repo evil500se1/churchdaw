@@ -6056,7 +6056,7 @@ bool MainComponent::carregarPaginaDeCena (const juce::String& estadoId,
     if (arquivo == juce::File{}
          || ! arquivo.existsAsFile()
          || ! ChurchDAWLive::paginaDeCenaTemTamanhoValido (
-                static_cast<std::uint64_t> (juce::jmax<juce::int64> (0, tamanho)))
+                static_cast<std::uint64_t> (tamanho > 0 ? tamanho : juce::int64{}))
          || ! arquivo.loadFileAsData (estado)
          || estado.isEmpty())
         return false;

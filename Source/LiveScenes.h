@@ -188,6 +188,16 @@ struct Cena
     bool  temMaster = false;
     float masterDb = 0.0f;
 
+    // Estes dois controles pertencem ao MasterProcessor externo, portanto nao
+    // entram na pagina binaria do TimbresProcessor. As flags individuais
+    // preservam cenas v2 antigas que tinham <MASTER db="...">, mas ainda nao
+    // conheciam Auto EQ nem Punch/Peso: atributo ausente continua significando
+    // "nao mexe" em vez de aplicar silenciosamente um default novo.
+    bool  temMasterAutoEq = false;
+    bool  masterAutoEq = false;
+    bool  temMasterPunch = false;
+    bool  masterPunch = true;
+
     // Pad Continuo: o que mais muda de uma musica para a outra.
     int   padTom = -1;           // -1 = desligado
     float padVolume = 0.9f;
@@ -410,13 +420,31 @@ inline void escreverCena (juce::XmlElement& pai, const Cena& cena, int indice)
         engine->setAttribute ("sha256", cena.estadoDoMotorId.toLowerCase());
     }
 
-    auto* g = c->createNewChildElement ("LIVE");
-    g->setAttribute ("gain", (double) cena.volumeGeral);
-    g->setAttribute ("gtransp", cena.transposeGeral);
-    g->setAttribute ("rvbreturn", (double) cena.retornoDeReverb);
+    // Nao materialize blocos que a cena legada nunca teve. Salvar o banco ao
+    // renomear outro slot ou trocar a cena ativa precisa conservar
+    // temGlobais/temMaster falsos; recapturar deliberadamente esta propria cena
+    // e que a converte para o formato completo. Caso contrario uma simples
+    // escrita do banco faria a proxima carga aplicar defaults que nunca fizeram
+    // parte daquela musica.
+    if (cena.temGlobais)
+    {
+        auto* g = c->createNewChildElement ("LIVE");
+        g->setAttribute ("gain", (double) cena.volumeGeral);
+        g->setAttribute ("gtransp", cena.transposeGeral);
+        g->setAttribute ("rvbreturn", (double) cena.retornoDeReverb);
+    }
 
-    auto* m = c->createNewChildElement ("MASTER");
-    m->setAttribute ("db", (double) cena.masterDb);
+    if (cena.temMaster)
+    {
+        auto* m = c->createNewChildElement ("MASTER");
+        m->setAttribute ("db", (double) cena.masterDb);
+
+        if (cena.temMasterAutoEq)
+            m->setAttribute ("autoEq", cena.masterAutoEq ? 1 : 0);
+
+        if (cena.temMasterPunch)
+            m->setAttribute ("punch", cena.masterPunch ? 1 : 0);
+    }
 
     auto* p = c->createNewChildElement ("PAD");
     p->setAttribute ("key", cena.padTom);
@@ -464,6 +492,18 @@ inline void lerCena (const juce::XmlElement& c, Cena& cena)
     {
         cena.temMaster = true;
         cena.masterDb  = (float) m->getDoubleAttribute ("db", (double) cena.masterDb);
+
+        if (m->hasAttribute ("autoEq"))
+        {
+            cena.temMasterAutoEq = true;
+            cena.masterAutoEq = m->getBoolAttribute ("autoEq", cena.masterAutoEq);
+        }
+
+        if (m->hasAttribute ("punch"))
+        {
+            cena.temMasterPunch = true;
+            cena.masterPunch = m->getBoolAttribute ("punch", cena.masterPunch);
+        }
     }
 
     if (auto* p = c.getChildByName ("PAD"))
@@ -508,6 +548,26 @@ enum class Resultado
     indisponivel,   // motor ainda nao existe (so na largada do app)
     paginaInvalida  // snapshot da pagina ausente, truncado ou com hash errado
 };
+
+inline bool precisaAvisarResultadoTerminal (Resultado resultado) noexcept
+{
+    // carregando ainda possui uma cadeia de retry; ok/vazia ja sao estados
+    // explicados pela propria interface. Todo o resto terminou e precisa chegar
+    // ao musico, inclusive a falha de persistir o indice ativo no fim do recall.
+    return resultado != Resultado::ok
+        && resultado != Resultado::vazia
+        && resultado != Resultado::carregando;
+}
+
+inline bool deveBloquearGravacaoAposArquivoIlegivel (
+    bool arquivoPrincipalIlegivel,
+    bool recuperouBancoLegadoValido) noexcept
+{
+    // Sem um banco valido para migrar, abrir dez slots vazios e permitir a
+    // proxima gravacao destruiria o arquivo original. O bloqueio so pode ser
+    // levantado quando uma copia legada valida realmente foi recuperada.
+    return arquivoPrincipalIlegivel && ! recuperouBancoLegadoValido;
+}
 
 // Snapshot minimo para uma alteracao que so pode existir se chegar ao disco.
 // O chamador muda a cena em memoria, tenta a escrita atomica e entrega o

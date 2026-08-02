@@ -15324,8 +15324,13 @@ private:
         {
             syncingMaster = true;
             masterDbSlider.setValue (m->getMasterDb(), juce::dontSendNotification);
+            masterAutoEqBtn.setToggleState (m->getAutoEq(),
+                                            juce::dontSendNotification);
+            masterPunchBtn.setToggleState (m->getPunch(),
+                                           juce::dontSendNotification);
             syncingMaster = false;
             refreshMasterDbColour();
+            refreshMasterUtilityLabels();
             return;
         }
 

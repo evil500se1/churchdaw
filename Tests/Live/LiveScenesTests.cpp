@@ -30,10 +30,16 @@ ChurchDAWLive::Cena cenaDeExemplo()
     c.nome = "Santo Espirito";
     c.gravadaEm = "2026-08-01T03:00:00.000-03:00";
 
+    c.temGlobais = true;
     c.volumeGeral = 1.2f;
     c.transposeGeral = -3;
     c.retornoDeReverb = 0.55f;
+    c.temMaster = true;
     c.masterDb = -4.5f;
+    c.temMasterAutoEq = true;
+    c.masterAutoEq = true;
+    c.temMasterPunch = true;
+    c.masterPunch = false;
 
     c.padTom = 7;
     c.padVolume = 1.35f;
@@ -86,7 +92,11 @@ int main()
              || ! perto (lida.retornoDeReverb, original.retornoDeReverb))
             return falha ("globais do Church Live nao sobreviveram");
 
-        if (! perto (lida.masterDb, original.masterDb))
+        if (! lida.temMaster || ! perto (lida.masterDb, original.masterDb)
+             || ! lida.temMasterAutoEq
+             || lida.masterAutoEq != original.masterAutoEq
+             || ! lida.temMasterPunch
+             || lida.masterPunch != original.masterPunch)
             return falha ("master nao sobreviveu");
 
         if (lida.padTom != original.padTom
@@ -275,6 +285,35 @@ int main()
 
         if (! volta.temGlobais || ! volta.temMaster)
             return falha ("cena gravada agora precisa marcar globais e master na volta");
+
+        // Um roundtrip de cena legada nao pode inventar os blocos que estavam
+        // ausentes. Isso seria uma migracao de semantica, nao de formato.
+        juce::XmlElement raizLegada ("LIVESCENES");
+        ChurchDAWLive::escreverCena (raizLegada, cena, 0);
+        auto* voltaLegadaXml = raizLegada.getChildByName ("SCENE");
+
+        if (voltaLegadaXml == nullptr
+             || voltaLegadaXml->getChildByName ("LIVE") != nullptr
+             || voltaLegadaXml->getChildByName ("MASTER") != nullptr)
+            return falha ("roundtrip legado inventou LIVE/MASTER ausentes");
+
+        ChurchDAWLive::Cena voltaLegada;
+        ChurchDAWLive::lerCena (*voltaLegadaXml, voltaLegada);
+
+        if (voltaLegada.temGlobais || voltaLegada.temMaster)
+            return falha ("flags temGlobais/temMaster mudaram no roundtrip legado");
+
+        // MASTER antigo tinha apenas db. Ele continua aplicando o fader, mas
+        // nao ganha por acidente defaults de Auto EQ/Punch.
+        juce::XmlElement masterAntigo ("SCENE");
+        masterAntigo.setAttribute ("filled", 1);
+        masterAntigo.createNewChildElement ("MASTER")->setAttribute ("db", -8.0);
+        ChurchDAWLive::Cena masterLido;
+        ChurchDAWLive::lerCena (masterAntigo, masterLido);
+
+        if (! masterLido.temMaster || masterLido.temMasterAutoEq
+             || masterLido.temMasterPunch)
+            return falha ("MASTER antigo inventou Auto EQ/Punch");
     }
 
     // ------------------------------------------------------------------
@@ -670,6 +709,29 @@ int main()
                 return 1;
             }
         }
+    }
+
+    // ------------------------------------------------------------------
+    // 17. Arquivo principal ilegivel bloqueia escrita ate existir um banco
+    //     legado realmente valido; e todo resultado terminal de retry precisa
+    //     chegar a tela.
+    // ------------------------------------------------------------------
+    {
+        if (! ChurchDAWLive::deveBloquearGravacaoAposArquivoIlegivel (true, false)
+             || ChurchDAWLive::deveBloquearGravacaoAposArquivoIlegivel (true, true)
+             || ChurchDAWLive::deveBloquearGravacaoAposArquivoIlegivel (false, false))
+            return falha ("politica de protecao do XML ilegivel ficou permissiva");
+
+        using R = ChurchDAWLive::Resultado;
+
+        for (const auto terminal : { R::naoGravou, R::indisponivel,
+                                     R::paginaInvalida })
+            if (! ChurchDAWLive::precisaAvisarResultadoTerminal (terminal))
+                return falha ("falha terminal de cena ficou sem aviso");
+
+        for (const auto naoTerminal : { R::ok, R::vazia, R::carregando })
+            if (ChurchDAWLive::precisaAvisarResultadoTerminal (naoTerminal))
+                return falha ("resultado nao terminal virou aviso duplicado");
     }
 
     std::cout << "LIVE_SCENES_OK\n";

@@ -964,7 +964,23 @@ MainComponent::MainComponent()
         // morrendo e o setup NAO esta sendo gravado".
         const bool ccsFalhou   = ! ccsOk   && ! esquemaDeCCsDesconhecido;
         const bool notasFalhou = ! notasOk && ! esquemaDeNotasDesconhecido;
-        const bool cenasFalhou = ! cenasOk && ! esquemaDeCenasDesconhecido;
+        bool arquivoDeCenasIlegivel = false;
+
+        if (! cenasOk && esquemaDeCenasDesconhecido)
+        {
+            const auto arquivo = arquivoDeCenas();
+            auto xml = juce::parseXML (arquivo);
+            arquivoDeCenasIlegivel = arquivo.existsAsFile()
+                                  && (xml == nullptr
+                                       || ! xml->hasTagName ("LIVESCENES"));
+        }
+
+        // Versao futura e recusa deliberada; arquivo danificado e falha real.
+        // Ambos usam a mesma trava contra overwrite, mas so o primeiro pode
+        // manter o indicador verde sem mentir ao musico.
+        const bool cenasFalhou = ! cenasOk
+                              && (! esquemaDeCenasDesconhecido
+                                   || arquivoDeCenasIlegivel);
 
         const bool tudoOk = setupOk && audioOk
                               && ! ccsFalhou && ! notasFalhou && ! cenasFalhou;
@@ -5320,6 +5336,10 @@ ChurchDAWLive::Resultado MainComponent::capturarCena (int indice)
     {
         cena.masterDb = masterProcessor->getMasterDb();
         cena.temMaster = true;
+        cena.masterAutoEq = masterProcessor->getAutoEq();
+        cena.temMasterAutoEq = true;
+        cena.masterPunch = masterProcessor->getPunch();
+        cena.temMasterPunch = true;
     }
 
     if (padProcessor != nullptr)
@@ -5431,6 +5451,16 @@ ChurchDAWLive::Resultado MainComponent::aplicarCena (
                     if (resultado == ChurchDAWLive::Resultado::ok
                          || resultado == ChurchDAWLive::Resultado::vazia)
                         self->liveScenePanel.atualizar (self->cenas, self->cenaAtiva);
+                    else if (ChurchDAWLive::precisaAvisarResultadoTerminal (resultado))
+                    {
+                        // Um retry que termina na escrita do indice ativo pode
+                        // falhar depois de o primeiro toque ja ter voltado ao
+                        // event loop. Sem este ramo havia log/rollback, mas a
+                        // faixa ficava muda e o musico acreditava que salvou.
+                        self->liveScenePanel.atualizar (self->cenas, self->cenaAtiva);
+                        self->liveScenePanel.avisar (
+                            ChurchDAWLive::avisoDoResultado (resultado, indice));
+                    }
                 });
         }
         else
@@ -5582,9 +5612,20 @@ ChurchDAWLive::Resultado MainComponent::aplicarCena (
         if (masterProcessor != nullptr)
         {
             masterProcessor->setMasterDb (paginaNova.masterDb);
+            masterProcessor->setAutoEq (paginaNova.masterAutoEq);
+            masterProcessor->setPunch (paginaNova.masterPunch);
             masterSlider.setValue (paginaNova.masterDb,
                                    juce::dontSendNotification);
         }
+
+        // A pagina vazia tambem move Pad/Master por baixo dos controles MIDI.
+        // Ela precisa do mesmo refresh/rearme de uma cena preenchida; sem isto
+        // o card do Pad mostrava o tom anterior e o primeiro CC saltava direto
+        // para a posicao fisica antiga.
+        ccPickup.clear();
+
+        if (padPanel != nullptr)
+            padPanel->refreshState();
 
         agendarFimDaSupressaoDeGravacaoDaCena (geracaoDaRequisicao);
         juce::Logger::writeToLog (
@@ -5742,6 +5783,12 @@ ChurchDAWLive::Resultado MainComponent::aplicarCena (
 
         masterProcessor->setMasterDb (cena.masterDb);
         masterSlider.setValue (cena.masterDb, juce::dontSendNotification);
+
+        if (cena.temMasterAutoEq)
+            masterProcessor->setAutoEq (cena.masterAutoEq);
+
+        if (cena.temMasterPunch)
+            masterProcessor->setPunch (cena.masterPunch);
     }
 
     // PASSO 8 — REARMAR O SOFT-TAKEOVER.
@@ -5964,24 +6011,43 @@ void MainComponent::guardarCopiaDeArquivoIlegivel (const juce::File& arquivo,
 void MainComponent::avisarSobreArquivosDeVersaoFutura()
 {
     juce::StringArray perdidos;
+    bool cenasIlegiveis = false;
+
+    if (esquemaDeCenasDesconhecido)
+    {
+        const auto arquivo = arquivoDeCenas();
+        auto xml = juce::parseXML (arquivo);
+        cenasIlegiveis = arquivo.existsAsFile()
+                      && (xml == nullptr || ! xml->hasTagName ("LIVESCENES"));
+    }
 
     if (esquemaDeCCsDesconhecido)   perdidos.add ("os mapeamentos de knobs/faders");
     if (esquemaDeNotasDesconhecido) perdidos.add ("os mapeamentos de teclas");
-    if (esquemaDeCenasDesconhecido) perdidos.add ("as 10 cenas do Live Mode");
+    if (esquemaDeCenasDesconhecido)
+        perdidos.add (cenasIlegiveis
+                        ? "as 10 cenas do Live Mode (arquivo danificado)"
+                        : "as 10 cenas do Live Mode");
 
     if (perdidos.isEmpty())
         return;
 
     juce::AlertWindow::showMessageBoxAsync (
         juce::MessageBoxIconType::WarningIcon,
-        juce::String::fromUTF8 ("Arquivo de uma vers\xc3\xa3o mais nova"),
+        cenasIlegiveis
+            ? juce::String::fromUTF8 ("Arquivo de cenas protegido")
+            : juce::String::fromUTF8 ("Arquivo de uma vers\xc3\xa3o mais nova"),
         juce::String::fromUTF8 ("Esta vers\xc3\xa3o do ChurchDAW n\xc3\xa3o consegue ler ")
             + perdidos.joinIntoString (", ")
-            + juce::String::fromUTF8 (
-                ".\n\nEles foram gravados por uma vers\xc3\xa3o mais recente. Nada foi "
-                "apagado — o app apenas n\xc3\xa3o vai us\xc3\xa1-los nem grav\xc3\xa1-los, "
-                "para n\xc3\xa3o destruir o que est\xc3\xa1 l\xc3\xa1.\n\n"
-                "Atualize o ChurchDAW para voltar a us\xc3\xa1-los."),
+            + (cenasIlegiveis
+                ? juce::String::fromUTF8 (
+                    ".\n\nO arquivo original foi preservado e o ChurchDAW bloqueou novas "
+                    "grava\xc3\xa7\xc3\xb5" "es de cenas para n\xc3\xa3o substitu\xc3\xad-lo por um banco vazio. "
+                    "Guarde o original e, se existir, a c\xc3\xb3pia .corrompido para recupera\xc3\xa7\xc3\xa3o.")
+                : juce::String::fromUTF8 (
+                    ".\n\nEles foram gravados por uma vers\xc3\xa3o mais recente. Nada foi "
+                    "apagado — o app apenas n\xc3\xa3o vai us\xc3\xa1-los nem grav\xc3\xa1-los, "
+                    "para n\xc3\xa3o destruir o que est\xc3\xa1 l\xc3\xa1.\n\n"
+                    "Atualize o ChurchDAW para voltar a us\xc3\xa1-los.")),
         "Entendi");
 }
 
@@ -6149,12 +6215,12 @@ bool MainComponent::assegurarPaginaDaCenaAtiva (TimbresProcessor& live)
 
 bool MainComponent::salvarCenas()
 {
-    // Mesma trava do mapa de notas: arquivo de uma versao futura nao se
-    // sobrescreve com as regras de hoje.
+    // Mesma trava do mapa de notas: arquivo de uma versao futura ou ilegivel
+    // nao se sobrescreve com as regras de hoje.
     if (esquemaDeCenasDesconhecido)
     {
         juce::Logger::writeToLog ("LIVE: gravacao ignorada, o arquivo de cenas em disco "
-                                  "e de uma versao mais nova");
+                                  "e de uma versao mais nova ou esta ilegivel");
         return false;
     }
 
@@ -6191,6 +6257,9 @@ void MainComponent::restaurarCenas()
 {
     const auto arquivo = arquivoDeCenas();
     auto xml = juce::parseXML (arquivo);
+    const bool arquivoPrincipalIlegivel =
+        arquivo.existsAsFile()
+        && (xml == nullptr || ! xml->hasTagName ("LIVESCENES"));
 
     // ARQUIVO ILEGIVEL NAO PODE PARECER "NUNCA EXISTIU".
     //
@@ -6200,7 +6269,7 @@ void MainComponent::restaurarCenas()
     // arquivo — as cenas do cliente sumiriam de vez, sem uma linha de log.
     // Guardar a evidencia de lado custa nada e ainda deixa uma copia para
     // recuperar a mao.
-    if (arquivo.existsAsFile() && (xml == nullptr || ! xml->hasTagName ("LIVESCENES")))
+    if (arquivoPrincipalIlegivel)
     {
         guardarCopiaDeArquivoIlegivel (arquivo, "LIVE (cenas)");
         xml = nullptr;
@@ -6215,13 +6284,29 @@ void MainComponent::restaurarCenas()
     if (xml == nullptr)
     {
         xml = appProperties.getUserSettings()->getXmlValue ("liveScenes");
-        veioDoFormatoAntigo = xml != nullptr;
+        veioDoFormatoAntigo = xml != nullptr && xml->hasTagName ("LIVESCENES");
+
+        if (! veioDoFormatoAntigo)
+            xml = nullptr;
     }
 
     // Sem arquivo e sem chave = setup antigo, sem cenas. Abre com 10 slots
     // vazios e zero efeito no audio — nenhuma cena e aplicada na largada.
     if (xml == nullptr || ! xml->hasTagName ("LIVESCENES"))
+    {
+        if (ChurchDAWLive::deveBloquearGravacaoAposArquivoIlegivel (
+                arquivoPrincipalIlegivel, veioDoFormatoAntigo))
+        {
+            // Reutiliza a trava persistente ja consultada por salvarCenas(). O
+            // arquivo original permanece intacto e o botao Salvar reporta a
+            // recusa, em vez de substituir as cenas por um banco vazio.
+            esquemaDeCenasDesconhecido = true;
+            juce::Logger::writeToLog (
+                "LIVE: arquivo de cenas ILEGIVEL; gravacao bloqueada para preservar o original");
+        }
+
         return;
+    }
 
     if (xml->getIntAttribute ("schema", 1) > 2)
     {

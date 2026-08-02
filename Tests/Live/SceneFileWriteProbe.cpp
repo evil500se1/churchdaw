@@ -187,6 +187,37 @@ int main()
         }
     }
 
+    // ------------------------------------------------------------------
+    // XML principal corrompido nunca pode virar um banco vazio. A politica
+    // usada por restaurarCenas()/salvarCenas() mantem o arquivo intocado ate
+    // que exista um banco legado valido para migrar.
+    // ------------------------------------------------------------------
+    {
+        const auto corrompido = pasta.getChildFile ("live-scenes-corrompido.xml");
+        const juce::String conteudoOriginal = "<LIVESCENES><SCENE index=\"0\"";
+
+        if (! corrompido.replaceWithText (conteudoOriginal))
+            return falha ("nao consegui montar XML corrompido");
+
+        const auto xml = juce::parseXML (corrompido);
+        const bool ilegivel = xml == nullptr || ! xml->hasTagName ("LIVESCENES");
+        const bool bloqueado = ChurchDAWLive::deveBloquearGravacaoAposArquivoIlegivel (
+            ilegivel, false);
+
+        if (! bloqueado)
+        {
+            juce::XmlElement bancoVazio ("LIVESCENES");
+            bancoVazio.writeTo (corrompido);
+        }
+
+        if (corrompido.loadFileAsString() != conteudoOriginal)
+            return falha ("XML corrompido foi sobrescrito por banco vazio");
+
+        if (ChurchDAWLive::deveBloquearGravacaoAposArquivoIlegivel (
+                ilegivel, true))
+            return falha ("banco legado valido nao liberou migracao protegida");
+    }
+
     pasta.deleteRecursively();
 
     std::cout << "SCENE_FILE_OK\n";

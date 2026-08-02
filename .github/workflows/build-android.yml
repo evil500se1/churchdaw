@@ -2,8 +2,8 @@ name: Release Android APK
 
 on:
   push:
-    branches:
-      - agent/release-mac-android-site-1.5.6
+    tags:
+      - "v*"
   workflow_dispatch:
 
 permissions:
@@ -17,24 +17,26 @@ jobs:
   build-android-release:
     runs-on: windows-2022
     timeout-minutes: 90
+    environment: android-production
     env:
       CHURCHDAW_UPLOAD_STORE_PASSWORD: ${{ secrets.ANDROID_UPLOAD_STORE_PASSWORD }}
       CHURCHDAW_UPLOAD_KEY_ALIAS: ${{ secrets.ANDROID_UPLOAD_KEY_ALIAS }}
       CHURCHDAW_UPLOAD_KEY_PASSWORD: ${{ secrets.ANDROID_UPLOAD_KEY_PASSWORD }}
+      CHURCHDAW_EXPECTED_SIGNING_CERT_SHA256: ${{ vars.ANDROID_EXPECTED_CERTIFICATE_SHA256 }}
       GRADLE_OPTS: -Xmx4096m -Dfile.encoding=UTF-8
 
     steps:
       - name: Baixar codigo
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Configurar Java 21
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@d7793b545071e98d581d3bf084a51c3213318a07 # v4
         with:
           distribution: temurin
           java-version: "21"
 
       - name: Configurar cache do Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4
 
       - name: Instalar Android SDK e NDK exigidos pelo JUCE
         shell: pwsh
@@ -201,6 +203,20 @@ jobs:
           }
           $certSha256 = $Matches[1].ToUpperInvariant()
 
+          $expectedCertSha256 =
+            ($env:CHURCHDAW_EXPECTED_SIGNING_CERT_SHA256 -replace '\s', '').ToUpperInvariant()
+          if ($expectedCertSha256 -notmatch '^[0-9A-F]{64}$') {
+            throw 'ANDROID_EXPECTED_CERTIFICATE_SHA256 ausente ou invalido'
+          }
+          if ($certSha256 -cne $expectedCertSha256) {
+            throw "Certificado APK inesperado: $certSha256"
+          }
+
+          if ('${{ github.ref_type }}' -eq 'tag' -and
+              '${{ github.ref_name }}' -cne "v$versionName") {
+            throw "Tag ${{ github.ref_name }} difere da versao Android v$versionName"
+          }
+
           [ordered]@{
             package_id = 'com.churchdaw.app'
             version_name = $versionName
@@ -222,7 +238,7 @@ jobs:
           "version=$versionName" >> $env:GITHUB_OUTPUT
 
       - name: Publicar APK Release assinado
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ChurchDAW-Android-${{ steps.metadata.outputs.version }}-Release
           path: dist/
@@ -231,7 +247,7 @@ jobs:
 
       - name: Publicar relatorio do lint em caso de falha
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ChurchDAW-Android-lint-failure
           path: Builds/Android/app/build/reports/

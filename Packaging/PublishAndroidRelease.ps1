@@ -1436,14 +1436,23 @@ try {
 
     foreach ($fixed in @(
         @($RemoteAndroidDirectory, 'manifest.json', $previousManifestPath,
-          $ExpectedPreviousManifestSha256),
+          $ExpectedPreviousManifestSha256, 'Packaging/AndroidHosting/app/android/manifest.json'),
         @($RemoteAndroidDirectory, 'update-policy.json', $previousLegacyPath,
-          $ExpectedPreviousLegacyPolicySha256),
+          $ExpectedPreviousLegacyPolicySha256, 'Packaging/AndroidHosting/app/android/update-policy.json'),
         @($RemoteAndroidDirectory, 'update-policy-v2.json', $previousPolicyPath,
-          $ExpectedPreviousPolicySha256),
+          $ExpectedPreviousPolicySha256, 'Packaging/AndroidHosting/app/android/update-policy-v2.json'),
         @($RemoteRootDirectory, 'index.html', $previousSitePath,
-          $ExpectedPreviousSiteSha256)
+          $ExpectedPreviousSiteSha256, 'Packaging/SiteProduction/index.html')
     )) {
+        if (-not (Test-FtpsFileExists $fixed[0] $fixed[1])) {
+            $seedPath = $fixed[4]
+            if ($seedPath -and (Test-Path -LiteralPath $seedPath -PathType Leaf)) {
+                $seedRecord = Get-FileRecord $seedPath
+                if ($seedRecord.sha256 -eq ([string] $fixed[3]).ToLowerInvariant()) {
+                    Upload-FtpsFile $seedPath $fixed[0] $fixed[1]
+                }
+            }
+        }
         if (-not (Test-FtpsFileExists $fixed[0] $fixed[1])) {
             $currentListed = (Get-FtpsNames $fixed[0]) -join ', '
             throw "Arquivo remoto anterior ausente: $($fixed[1]) em $($fixed[0]). Listados: [$currentListed]"

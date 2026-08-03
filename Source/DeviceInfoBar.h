@@ -31,12 +31,33 @@ public:
         }
     }
 
+    // Tag de transporte (USB / BLE) no chip MIDI — opcional.
+    void setControllerTransport (const juce::String& transportTag)
+    {
+        if (controllerTransport != transportTag)
+        {
+            controllerTransport = transportTag;
+            updateTooltip();
+            repaint();
+        }
+    }
+
     void setInterfaceName (const juce::String& name, bool connected)
     {
         if (interfaceName != name || ifaceOn != connected)
         {
             interfaceName = name;
             ifaceOn = connected;
+            updateTooltip();
+            repaint();
+        }
+    }
+
+    void setInterfaceTransport (const juce::String& transportTag)
+    {
+        if (interfaceTransport != transportTag)
+        {
+            interfaceTransport = transportTag;
             updateTooltip();
             repaint();
         }
@@ -80,6 +101,9 @@ public:
 
         juce::String keyboardTag (compact ? "MIDI" : "TECLADO");
 
+        if (controllerTransport.isNotEmpty())
+            keyboardTag = controllerTransport + " " + keyboardTag;
+
         if (mappingCount > 0)
             keyboardTag << "  " << juce::String::charToString ((juce::juce_wchar) 0x2022)
                         << "  " << mappingCount << (mappingCount == 1 ? " MAPA" : " MAPAS");
@@ -111,8 +135,12 @@ public:
 
         area.removeFromLeft (gap);
 
+        juce::String audioTag (juce::String::fromUTF8 ("\xc3\x81UDIO")); // ÁUDIO
+        if (interfaceTransport.isNotEmpty())
+            audioTag = interfaceTransport + " " + audioTag;
+
         drawChip (g, area.toFloat(),
-                  juce::String::fromUTF8 ("\xc3\x81UDIO"),   // ÁUDIO
+                  audioTag,
                   interfaceName.isNotEmpty() ? interfaceName : juce::String ("Nenhum"),
                   ifaceOn, Glyph::speaker, false);
     }
@@ -200,12 +228,18 @@ private:
 
     void updateTooltip()
     {
-        setTooltip (juce::String ("TECLADO: ")
-                    + (controller.isNotEmpty() ? controller : juce::String ("Nenhum"))
-                    + "\n"
-                    + juce::String::fromUTF8 ("\xc3\x81UDIO: ")
-                    + (interfaceName.isNotEmpty() ? interfaceName
-                                                  : juce::String ("Nenhum")));
+        juce::String midiLine = juce::String ("TECLADO");
+        if (controllerTransport.isNotEmpty())
+            midiLine << " (" << controllerTransport << ")";
+        midiLine << ": " << (controller.isNotEmpty() ? controller : juce::String ("Nenhum"));
+
+        juce::String audioLine = juce::String::fromUTF8 ("\xc3\x81UDIO");
+        if (interfaceTransport.isNotEmpty())
+            audioLine << " (" << interfaceTransport << ")";
+        audioLine << ": " << (interfaceName.isNotEmpty() ? interfaceName
+                                                         : juce::String ("Nenhum"));
+
+        setTooltip (midiLine + "\n" + audioLine);
     }
 
     static void drawKeysIcon (juce::Graphics& g, juce::Rectangle<float> r)
@@ -237,6 +271,7 @@ private:
     }
 
     juce::String controller, interfaceName;
+    juce::String controllerTransport, interfaceTransport;
     bool ctrlOn = false, ifaceOn = false;
     bool compact = false, midiActivity = false;
     int mappingCount = 0;

@@ -1436,8 +1436,31 @@ namespace ChurchDAWServices
 
         const LibraryPack* starterPack() const
         {
+            // Culto offline primeiro: pack leve (Pad) permite tocar sem baixar
+            // o Church Live de ~12 GB e sem Wi-Fi no domingo.
+            auto isOfflineCulto = [] (const LibraryPack& pack)
+            {
+                return pack.id.equalsIgnoreCase ("pad-continuo")
+                    || pack.id.equalsIgnoreCase ("culto-offline")
+                    || pack.id.equalsIgnoreCase ("culto-offline-v1");
+            };
+
+            for (const auto& pack : libraries)
+                if (pack.included && pack.canDownload() && isOfflineCulto (pack))
+                    return &pack;
+
+            for (const auto& pack : libraries)
+                if (pack.included && pack.featured && pack.canDownload()
+                     && ! pack.id.equalsIgnoreCase ("church-live"))
+                    return &pack;
+
             for (const auto& pack : libraries)
                 if (pack.included && pack.featured)
+                    return &pack;
+
+            for (const auto& pack : libraries)
+                if (pack.included && pack.canDownload()
+                     && ! pack.id.equalsIgnoreCase ("church-live"))
                     return &pack;
 
             for (const auto& pack : libraries)

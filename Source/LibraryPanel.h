@@ -2,6 +2,7 @@
 
 #include <juce_gui_extra/juce_gui_extra.h>
 #include "ChurchDAWServices.h"
+#include "AndroidCultoConnectivity.h"
 #include "NordLookAndFeel.h"
 
 class LibraryCatalogPanel;
@@ -174,7 +175,9 @@ public:
         auto titleArea = area.removeFromTop (dense ? 22 : compact ? 27 : 35);
         g.setColour (juce::Colours::white);
         g.setFont (juce::Font (juce::FontOptions (dense ? 15.0f : compact ? 17.0f : 19.0f)).boldened());
-        g.drawFittedText (pack.name, titleArea, juce::Justification::centredLeft, 1, 0.8f);
+        g.drawFittedText (
+            ChurchDAWAndroidCulto::displayNameForPack (pack.id, pack.name),
+            titleArea, juce::Justification::centredLeft, 1, 0.8f);
 
         juce::String meta;
 
@@ -197,7 +200,8 @@ public:
         g.setFont (juce::Font (juce::FontOptions (dense ? 10.5f : compact ? 12.0f : 12.5f)));
         const auto bodyText = installing ? installText
                             : lastError.isNotEmpty() ? lastError
-                                                   : pack.description;
+                            : ChurchDAWAndroidCulto::descriptionHintForPack (
+                                  pack.id, pack.description);
         g.drawFittedText (bodyText, area, juce::Justification::topLeft,
                           compact ? 2 : 3, 0.8f);
 

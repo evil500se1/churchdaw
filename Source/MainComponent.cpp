@@ -5,6 +5,10 @@
 #include "AboutPanel.h"
 #include "LibraryPanel.h"
 #include "MidiMappingSafety.h"
+#include "AndroidCultoConnectivity.h"
+#if JUCE_ANDROID
+ #include "AndroidAudioMidiCenter.h"
+#endif
 #include "UiProfiler.h"
 #include "BinaryData.h"
 
@@ -552,10 +556,9 @@ MainComponent::MainComponent()
     //
     // A lista de getAvailableBufferSizes() comeca no tamanho NATIVO da rajada
     // (256 aqui = 5,3 ms) e sobe de rajada em rajada. Escolhemos a primeira que
-    // chega a ~8 ms em vez da menor de todas: 5,3 ms nao e audivelmente melhor
-    // que 10,7 ms para quem toca teclado, e o dobro de folga importa porque este
-    // app le samples do disco enquanto toca -- falha de audio incomoda MUITO
-    // mais que 5 ms de atraso. Quem quiser apertar mais muda no painel.
+    // chega a ~12 ms: 5–8 ms nao e audivelmente melhor no teclado de culto, e
+    // a folga importa porque o app le samples do disco enquanto toca -- xrun
+    // incomoda MUITO mais que 4 ms de atraso. Quem quiser apertar usa Rapida.
     // So vale como PADRAO DE PRIMEIRA ABERTURA. Se ja existe buffer salvo, e
     // escolha do usuario e nao se mexe -- alem disso o reforco logo abaixo
     // (o que existe por causa dos drivers ASIO teimosos) reaplica o valor salvo
@@ -569,7 +572,7 @@ MainComponent::MainComponent()
         int chosen = 0;
 
         for (const auto s : sizes)
-            if (((double) s / rate) * 1000.0 >= 8.0)
+            if (((double) s / rate) * 1000.0 >= 12.0)
             {
                 chosen = s;
                 break;
@@ -704,11 +707,9 @@ MainComponent::MainComponent()
         int wantedBuffer = appProperties.getUserSettings()->getIntValue ("bufferSize", 0);
 
        #if JUCE_ANDROID || JUCE_IOS
-        // Comeca no menor tamanho OFERECIDO pelo aparelho que entrega pelo
-        // menos 8 ms de prazo. No TANK3 sao dois bursts/512 frames; em um
-        // aparelho de burst 192 podem ser 384. Nao force um numero que o driver
-        // nao oferece. O Android observa xruns reais no timer e sobe em passos
-        // somente quando o aparelho precisar.
+        // Piso fluido pro culto: >= 12 ms no menor tamanho OFERECIDO pelo
+        // aparelho. Em TANK3 costuma cair em 512–768. Nao forca numero que o
+        // driver nao lista. O tuner sobe em silencio se houver xrun.
         int preferredMobileBuffer = 0;
 
         if (auto* mobileDevice = deviceManager.getCurrentAudioDevice())
@@ -719,7 +720,7 @@ MainComponent::MainComponent()
                                     : 48000.0;
 
             for (const int candidate : available)
-                if (((double) candidate / rate) * 1000.0 >= 8.0)
+                if (((double) candidate / rate) * 1000.0 >= 12.0)
                 {
                     preferredMobileBuffer = candidate;
                     break;
@@ -732,14 +733,14 @@ MainComponent::MainComponent()
         if (preferredMobileBuffer > 0)
         {
            #if JUCE_ANDROID
-            // A versao anterior gravava 1024 como se fosse escolha do cliente.
-            // Migra uma vez para o novo perfil adaptativo; depois respeita o
-            // valor estabilizado/salvo, sujeito apenas ao piso seguro.
+            // Schema 2: sobe o piso de 8 ms -> 12 ms e reaplica uma vez em
+            // aparelhos que ficaram em buffer baixo com muitos xruns.
             auto* settings = appProperties.getUserSettings();
-            if (settings->getIntValue ("androidAdaptiveBufferSchema", 0) < 1)
+            if (settings->getIntValue ("androidAdaptiveBufferSchema", 0) < 2)
             {
                 wantedBuffer = preferredMobileBuffer;
-                settings->setValue ("androidAdaptiveBufferSchema", 1);
+                settings->setValue ("androidAdaptiveBufferSchema", 2);
+                settings->setValue ("bufferSize", preferredMobileBuffer);
             }
            #endif
 
@@ -837,6 +838,7 @@ MainComponent::MainComponent()
     // ---- cabecalho ----
     addAndMakeVisible (audioSettingsButton);
     audioSettingsButton.setButtonText (juce::String::fromUTF8 ("\xc3\x81udio / MIDI"));   // Áudio / MIDI
+    audioSettingsButton.setActiveSupplier ([this] { return audioPanel != nullptr; });
     audioSettingsButton.onClick = [this] { showAudioSettings(); };
 
     addAndMakeVisible (librariesButton);
@@ -1702,23 +1704,14 @@ void MainComponent::paint (juce::Graphics& g)
                     juce::Justification::centred, false);
     }
 
-    // ---- cartoes ----
+    // ---- cartoes (vidro premium compartilhado) ----
     auto drawCard = [&g] (juce::Rectangle<int> r)
     {
         if (r.isEmpty())
             return;
 
-        auto card = r.toFloat();
-        g.setColour (juce::Colours::black.withAlpha (0.35f));
-        g.fillRoundedRectangle (card.translated (0.0f, 2.0f), 9.0f);
-        g.setColour (NordLookAndFeel::panel());
-        g.fillRoundedRectangle (card, 9.0f);
-        g.setColour (NordLookAndFeel::panelOutline());
-        g.drawRoundedRectangle (card, 9.0f, 1.0f);
-
-        auto accent = card.reduced (12.0f, 0.0f).removeFromTop (9.0f).withTrimmedTop (6.0f);
-        g.setColour (NordLookAndFeel::nordRed());
-        g.fillRoundedRectangle (accent, 1.5f);
+        NordLookAndFeel::drawGlassCard (g, r.toFloat(), NordLookAndFeel::radiusCard,
+                                        false, NordLookAndFeel::nordRed(), false, false);
     };
 
     for (int i = 0; i < numSlots; ++i)
@@ -2227,10 +2220,10 @@ void MainComponent::resized()
         headerControls.removeFromLeft (layoutBrandWidth);
         headerControls.removeFromRight (8);
 
-        for (auto* button : { &instrumentsButton, &liveButton, &mapButton,
-                              &clearMapButton, &saveButton, &padButton,
-                              &scanButton, &librariesButton,
-                              &audioSettingsButton })
+        for (juce::Button* button : std::initializer_list<juce::Button*> { &instrumentsButton, &liveButton, &mapButton,
+                                                                            &clearMapButton, &saveButton, &padButton,
+                                                                            &scanButton, &librariesButton,
+                                                                            &audioSettingsButton })
             button->setBounds ({});
 
         auto layoutNavigation = [&] (juce::Rectangle<int> row)
@@ -2618,6 +2611,15 @@ void MainComponent::resized()
         layoutDockHolder();
     }
 
+   #if JUCE_ANDROID
+    // Central Áudio/MIDI full-screen: acompanha rotação, freeform e safe area.
+    if (audioPanel != nullptr)
+    {
+        audioPanel->setBounds (getLocalBounds());
+        audioPanel->toFront (false);
+    }
+   #endif
+
     // card do Pad Continuo: centrado, um pouco abaixo do meio (flutua no mixer)
     if (padPanel != nullptr)
     {
@@ -2694,6 +2696,30 @@ void MainComponent::changeListenerCallback (juce::ChangeBroadcaster* source)
         // que deve ser restaurado quando voltar.
         if (audioDialogOpen)
             updateAndroidPreferredUsbSetupFromCurrent();
+       #endif
+
+       #if ! JUCE_ANDROID && ! JUCE_IOS
+        // Diagnostico de travamento ao trocar de driver no desktop (ASIO4ALL em
+        // especial): snapshot logo apos a troca. Se o processo morrer DURANTE a
+        // abertura, esta linha nao chega a ser escrita -- nesse caso a ultima
+        // linha do log e o snapshot PRE-selecao do timer do painel (AUDIO_DIALOG),
+        // e so entre as duas se fecha o ponto exato da queda. Leitura only, nao
+        // muda nada no comportamento.
+        {
+            const auto setup = deviceManager.getAudioDeviceSetup();
+            const auto* type = deviceManager.getCurrentDeviceTypeObject();
+            const auto* dev = deviceManager.getCurrentAudioDevice();
+            juce::Logger::writeToLog (
+                "AUDIO_CHANGE type=\""
+                + (type != nullptr ? type->getTypeName() : juce::String())
+                + "\" output=\"" + setup.outputDeviceName
+                + "\" input=\"" + setup.inputDeviceName
+                + "\" inChannels=" + juce::String (setup.inputChannels.countNumberOfSetBits())
+                + " buffer=" + juce::String (setup.bufferSize)
+                + " rate=" + juce::String (setup.sampleRate, 0)
+                + (dev != nullptr ? juce::String (" open=yes \"") + dev->getName() + "\""
+                                   : juce::String (" open=NO")));
+        }
        #endif
 
         // so grava enquanto o dialogo de audio esta aberto: um fallback de driver
@@ -3855,7 +3881,52 @@ void MainComponent::handleIncomingMidiMessage (juce::MidiInput* source,
 
     // Tudo que nao foi consumido segue para o motor. Este repasse substitui o
     // registro direto do player como callback de MIDI.
-    player.getMidiMessageCollector().addMessageToQueue (message);
+    //
+    // Roteamento 2 teclados: se o dispositivo esta amarrado a um canal do
+    // Church Live (piano vs pad), reescreve o canal MIDI da mensagem antes de
+    // enfileirar — teclados USB quase sempre mandam tudo no canal 1.
+    juce::MidiMessage routed = message;
+    if (source != nullptr)
+        if (auto* live = getChurchLive())
+        {
+            const int forced = live->getForcedMidiChannelForDevice (
+                source->getIdentifier());
+            if (forced >= 1 && forced <= 16
+                 && routed.getChannel() != forced
+                 && (routed.isNoteOnOrOff() || routed.isAftertouch()
+                      || routed.isPitchWheel()
+                      || (routed.isController()
+                           && routed.getControllerNumber() != 64
+                           && routed.getControllerNumber() != 120
+                           && routed.getControllerNumber() != 121
+                           && routed.getControllerNumber() != 123)))
+            {
+                // Reconstroi com o canal forçado (API JUCE: withChannel).
+                if (routed.isNoteOn())
+                    routed = juce::MidiMessage::noteOn (
+                        forced, routed.getNoteNumber(), routed.getVelocity());
+                else if (routed.isNoteOff())
+                    routed = juce::MidiMessage::noteOff (
+                        forced, routed.getNoteNumber(),
+                        routed.getVelocity());
+                else if (routed.isAftertouch())
+                    routed = juce::MidiMessage::aftertouchChange (
+                        forced, routed.getNoteNumber(),
+                        routed.getAfterTouchValue());
+                else if (routed.isChannelPressure())
+                    routed = juce::MidiMessage::channelPressureChange (
+                        forced, routed.getChannelPressureValue());
+                else if (routed.isPitchWheel())
+                    routed = juce::MidiMessage::pitchWheel (
+                        forced, routed.getPitchWheelValue());
+                else if (routed.isController())
+                    routed = juce::MidiMessage::controllerEvent (
+                        forced, routed.getControllerNumber(),
+                        routed.getControllerValue());
+            }
+        }
+
+    player.getMidiMessageCollector().addMessageToQueue (routed);
 }
 
 // Chave completa da nota (aparelho + canal + numero). So e montada depois que
@@ -4415,22 +4486,30 @@ void MainComponent::timerCallback()
 {
     CHURCHDAW_UI_SCOPE ("MainComponent::timerCallback");
     CHURCHDAW_UI_LAP_BEGIN();
-    // Os plugins do MASTER FX vivem DENTRO do Church Live e podem ser carregados
-    // por varios caminhos (restaurar setup, escolher no combo). Em vez de espalhar
-    // addListener por cada caminho, uma varredura por segundo garante que todos
-    // avisem quando um controle e tocado — sem isso o MIDI Learn nao ve o BigSky.
-    // addListener e idempotente, entao repetir nao custa nada.
-    for (int i = 0; i < numSlots; ++i)
-        if (auto* timbres = dynamic_cast<TimbresProcessor*> (slots[i].proc.load()))
-            for (int ins = 0; ins < TimbresProcessor::numInserts; ++ins)
-                if (auto* fx = timbres->getInsert (ins))
-                    fx->addListener (this);
-
-    CHURCHDAW_UI_LAP ("timer:listeners");
 
     // Subiu para antes do bloco de MIDI: a lista de entradas agora e cacheada
     // por tempo (ver midiInputsCached) e precisa do relogio aqui em cima.
     const auto nowMs = juce::Time::getMillisecondCounter();
+
+    // MASTER FX listeners: addListener e idempotente. No Android a cada 1 s
+    // competia com o audio; 3 s basta pro MIDI Learn sem jank.
+    static juce::uint32 lastInsertListenerScanMs = 0;
+   #if JUCE_ANDROID || JUCE_IOS
+    constexpr juce::uint32 insertScanPeriodMs = 3000;
+   #else
+    constexpr juce::uint32 insertScanPeriodMs = 1000;
+   #endif
+    if (nowMs - lastInsertListenerScanMs >= insertScanPeriodMs)
+    {
+        lastInsertListenerScanMs = nowMs;
+        for (int i = 0; i < numSlots; ++i)
+            if (auto* timbres = dynamic_cast<TimbresProcessor*> (slots[i].proc.load()))
+                for (int ins = 0; ins < TimbresProcessor::numInserts; ++ins)
+                    if (auto* fx = timbres->getInsert (ins))
+                        fx->addListener (this);
+    }
+
+    CHURCHDAW_UI_LAP ("timer:listeners");
 
     // A porta DAW tem de ficar FORA da entrada MIDI comum. O estado de audio
     // salvo e o proprio dialogo Audio/MIDI podem reabilita-la sem querer — e ai
@@ -4466,16 +4545,11 @@ void MainComponent::timerCallback()
 
     CHURCHDAW_UI_LAP ("timer:android-audio-topology");
 
-    // Tuner conservador de latencia. Ele roda na message thread, nunca no
-    // callback de audio, ignora um xrun isolado e apenas AUMENTA o buffer.
-    // Assim a primeira resposta continua em ~10,7 ms/48 kHz, mas um aparelho
-    // lento se autocorrige em passos ate 1024 em vez de ficar estalando.
-    // 10 s e UMA leitura de xrun por ciclo (era 5 s com duas): o
-    // getXRunCount consulta o stream Oboe e disputa lock com o callback —
-    // este bloco media 47 ms na message thread (timer:android-buffer),
-    // o maior ofensor de jank conhecido. O tuner continua reagindo, so
-    // que em ate 10 s.
-    if (nowMs - androidLastBufferTuneMs >= 10000)
+    // Tuner de fluidez: roda na message thread, so AUMENTA buffer quando ha
+    // xrun real. 1 xrun/8 s ja sobe um degrau (antes 2/10 s e teto 1024) —
+    // culto multi-camada + streaming de samples precisa de folga. Teto 2048
+    // se o driver oferecer. getXRunCount e caro (lock Oboe): UMA leitura/ciclo.
+    if (nowMs - androidLastBufferTuneMs >= 8000)
     {
         const int currentXRuns = deviceManager.getXRunCount();
         const int newXRuns = currentXRuns >= androidLastXRunCount
@@ -4483,14 +4557,14 @@ void MainComponent::timerCallback()
                                 : currentXRuns;
         bool bufferChanged = false;
 
-        if (newXRuns >= 2)
+        if (newXRuns >= 1)
             if (auto* device = deviceManager.getCurrentAudioDevice())
             {
                 const int currentSize = device->getCurrentBufferSizeSamples();
                 int nextSize = 0;
 
                 for (const int candidate : device->getAvailableBufferSizes())
-                    if (candidate > currentSize && candidate <= 1024)
+                    if (candidate > currentSize && candidate <= 2048)
                     {
                         nextSize = candidate;
                         break;
@@ -4504,20 +4578,24 @@ void MainComponent::timerCallback()
                         deviceManager.setAudioDeviceSetup (setup, false);
                     bufferChanged = true;
 
+                    if (error.isEmpty())
+                    {
+                        appProperties.getUserSettings()->setValue (
+                            "bufferSize", nextSize);
+                        appProperties.getUserSettings()->saveIfNeeded();
+                    }
+
                     juce::Logger::writeToLog (
                         "AUDIO: tuner Android " + juce::String (currentSize)
                         + " -> " + juce::String (nextSize)
                         + " apos " + juce::String (newXRuns)
-                        + " xruns/10s"
+                        + " xruns/8s"
                         + (error.isEmpty()
                                ? juce::String (" (ok)")
                                : " ERRO: " + error));
                 }
             }
 
-        // Reusa a leitura do topo — a segunda chamada era metade do custo.
-        // So reconsulta quando o buffer mudou (o contador reinicia junto
-        // com o stream).
         androidLastXRunCount = bufferChanged ? deviceManager.getXRunCount()
                                              : currentXRuns;
         androidLastBufferTuneMs = nowMs;
@@ -4622,11 +4700,11 @@ void MainComponent::timerCallback()
             }
 
             const auto liveSummary = loaded == 0
-                ? juce::String ("NENHUM TIMBRE")
+                ? juce::String ("Nenhum timbre")
                 : on == loaded
-                    ? juce::String (on) + " CANAIS ATIVOS"
+                    ? juce::String (on) + " canais ativos"
                     : juce::String (on) + " / " + juce::String (loaded)
-                        + " CANAIS ATIVOS";
+                        + " canais ativos";
             const auto summarySeparator = juce::String::fromUTF8 (" \xc2\xb7 ");
 
             // Nenhum canal em foco: em vez de deixar a coluna oca, o visor conta
@@ -4639,12 +4717,12 @@ void MainComponent::timerCallback()
             }
             else if (sel < 0)
             {
-                slot = "CHURCH LIVE";
+                slot = "Church Live";
                 title = liveSummary;
             }
             else
             {
-                slot = juce::String ("CANAL ") + juce::String (sel + 1)
+                slot = juce::String ("Canal ") + juce::String (sel + 1)
                         + summarySeparator + liveSummary;
                 title = nameOf (sel);
 
@@ -4760,6 +4838,7 @@ void MainComponent::timerCallback()
 
     // chips premium: nome do controlador MIDI + interface de audio
     juce::String controllerName;
+    juce::String controllerTransport;
     int midiCount = 0;
 
     for (const auto& d : midiInputsCached (nowMs))
@@ -4767,7 +4846,11 @@ void MainComponent::timerCallback()
         if (deviceManager.isMidiInputDeviceEnabled (d.identifier))
         {
             if (controllerName.isEmpty())
+            {
                 controllerName = prettifyDeviceName (d.name);
+                controllerTransport =
+                    ChurchDAWAndroidCulto::midiTransportTag (d.name);
+            }
 
             ++midiCount;
         }
@@ -4779,7 +4862,10 @@ void MainComponent::timerCallback()
     const int mappingCount = getMidiMappingCount();
     const bool recentMidi = nowMs - lastMidiActivityMs.load() < 1100;
     deviceBar.setControllerName (controllerName, midiCount > 0);
+    deviceBar.setControllerTransport (controllerTransport);
     deviceBar.setInterfaceName (ifaceName, ifaceOn);
+    deviceBar.setInterfaceTransport (
+        ChurchDAWAndroidCulto::audioTransportTag (ifaceName));
     deviceBar.setMappingCount (mappingCount);
     deviceBar.setMidiActivity (recentMidi);
     midiLearnPanel.setDevice (controllerName, midiCount > 0);
@@ -7132,10 +7218,18 @@ void MainComponent::saveAudioStateNow()
 // painel do seletor de audio EMBUTIDO na DAW: card premium com sombra, acento
 // vermelho, arrastavel pela barra de titulo — sem janela do Windows. Marca o
 // periodo em que esta aberto (a config so e salva com ele aberto)
+//
+// No Android vira PAGINA full-bleed (nao card flutuante): cabecalho fixo,
+// seletor JUCE no meio, rodape em secoes (MIDI / acoes). O seletor continua
+// sendo o componente testado do JUCE — so o envelope visual e o layout mudam.
 struct AudioSettingsHolder : public juce::Component,
                              private juce::Timer
 {
+   #if JUCE_ANDROID || JUCE_IOS
+    static constexpr int margin = 0, headerH = 64, footerPad = 14;
+   #else
     static constexpr int margin = 12, headerH = 56;
+   #endif
 
     explicit AudioSettingsHolder (MainComponent& mc)
         : owner (&mc),
@@ -7145,12 +7239,36 @@ struct AudioSettingsHolder : public juce::Component,
         brandIcon = juce::ImageCache::getFromMemory (BinaryData::icon_png, BinaryData::icon_pngSize);
 
        #if JUCE_ANDROID || JUCE_IOS
-        selector.setItemHeight (38);
+        selector.setItemHeight (44);
         selectorViewport.setViewedComponent (&selector, false);
         selectorViewport.setScrollBarsShown (true, false);
-        selectorViewport.setScrollOnDragEnabled (true);
+        selectorViewport.setScrollOnDragMode (juce::Viewport::ScrollOnDragMode::all);
         selectorViewport.setWantsKeyboardFocus (false);
         addAndMakeVisible (selectorViewport);
+
+        sectionDevice.setText (juce::String::fromUTF8 ("DISPOSITIVO"), juce::dontSendNotification);
+        sectionDevice.setFont (juce::Font (juce::FontOptions (11.0f)).boldened()
+                                   .withExtraKerningFactor (0.12f));
+        sectionDevice.setColour (juce::Label::textColourId,
+                                 NordLookAndFeel::nordRedBright().withAlpha (0.90f));
+        sectionDevice.setJustificationType (juce::Justification::centredLeft);
+        addAndMakeVisible (sectionDevice);
+
+        sectionMidi.setText (juce::String::fromUTF8 ("MIDI E TECLADO"), juce::dontSendNotification);
+        sectionMidi.setFont (juce::Font (juce::FontOptions (11.0f)).boldened()
+                                 .withExtraKerningFactor (0.12f));
+        sectionMidi.setColour (juce::Label::textColourId,
+                               NordLookAndFeel::nordRedBright().withAlpha (0.90f));
+        sectionMidi.setJustificationType (juce::Justification::centredLeft);
+        addAndMakeVisible (sectionMidi);
+
+        statusChip.setText (juce::String::fromUTF8 (u8"Ajuste saída, latência e teclado"),
+                            juce::dontSendNotification);
+        statusChip.setFont (juce::Font (juce::FontOptions (12.5f)));
+        statusChip.setColour (juce::Label::textColourId,
+                              NordLookAndFeel::txtSecondary());
+        statusChip.setJustificationType (juce::Justification::centredLeft);
+        addAndMakeVisible (statusChip);
        #else
         selector.setItemHeight (26);
         addAndMakeVisible (selector);
@@ -7168,10 +7286,11 @@ struct AudioSettingsHolder : public juce::Component,
         // nao gravador, e por isso nao pede acesso ao microfone. Mostrar ali um
         // toggle que nunca poderia funcionar era uma promessa falsa.
        #if JUCE_ANDROID || JUCE_IOS
-        audioInputNote.setText (juce::String::fromUTF8 ("\xe2\x9c\x93 O app n\xc3\xa3o usa o microfone"),
+        audioInputNote.setText (juce::String::fromUTF8 (
+                                    "\xe2\x9c\x93 Sem microfone \xc2\xb7 s\xc3\xb3 instrumento"),
                                 juce::dontSendNotification);
         audioInputNote.setJustificationType (juce::Justification::centredLeft);
-        audioInputNote.setFont (juce::Font (juce::FontOptions (12.0f)));
+        audioInputNote.setFont (juce::Font (juce::FontOptions (12.5f)).boldened());
         audioInputNote.setColour (juce::Label::textColourId, NordLookAndFeel::greenOk());
         addAndMakeVisible (audioInputNote);
        #else
@@ -7183,10 +7302,17 @@ struct AudioSettingsHolder : public juce::Component,
         // pra mesma forca. Fica aqui, e nao na regua master, porque e do mesmo
         // assunto da entrada MIDI logo acima -- calibragem do equipamento, se
         // ajusta uma vez por teclado.
+       #if JUCE_ANDROID || JUCE_IOS
+        velLabel.setText (juce::String::fromUTF8 ("Resposta do teclado"),
+                          juce::dontSendNotification);
+        velLabel.setJustificationType (juce::Justification::centredLeft);
+        velLabel.setFont (juce::Font (juce::FontOptions (12.5f)).boldened());
+       #else
         velLabel.setText (juce::String::fromUTF8 ("Resposta do teclado:"), juce::dontSendNotification);
         velLabel.setJustificationType (juce::Justification::centredRight);
         velLabel.setFont (juce::Font (juce::FontOptions (12.0f)));
-        velLabel.setColour (juce::Label::textColourId, NordLookAndFeel::dimText());
+       #endif
+        velLabel.setColour (juce::Label::textColourId, NordLookAndFeel::txtSecondary());
         addAndMakeVisible (velLabel);
 
         velCombo.setWantsKeyboardFocus (false);   // setas do PC nao trocam a curva
@@ -7212,12 +7338,23 @@ struct AudioSettingsHolder : public juce::Component,
             "de martelo). Pesada = exige mais for\xc3\xa7""a (teclado leve que manda "
             "velocity alta em qualquer toque). Fixa = ignora a din\xc3\xa2mica, bom "
             "para \xc3\xb3rg\xc3\xa3o e pad."));
+       #if JUCE_ANDROID || JUCE_IOS
+        velCombo.setColour (juce::ComboBox::backgroundColourId, NordLookAndFeel::bgControl());
+        velCombo.setColour (juce::ComboBox::outlineColourId, NordLookAndFeel::borderDefault());
+        velCombo.setColour (juce::ComboBox::textColourId, NordLookAndFeel::txtPrimary());
+        velCombo.setColour (juce::ComboBox::arrowColourId, NordLookAndFeel::nordRedBright());
+       #endif
         addAndMakeVisible (velCombo);
 
         // fecha o card (o destrutor salva a config)
         closeBtn.setButtonText (juce::String::fromUTF8 ("\xc3\x97"));   // ×
+       #if JUCE_ANDROID || JUCE_IOS
+        closeBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff2a3038));
+        closeBtn.setColour (juce::TextButton::textColourOffId, NordLookAndFeel::txtPrimary());
+       #else
         closeBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff2a2d34));
         closeBtn.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
+       #endif
         closeBtn.onClick = [this]
         {
             juce::Component::SafePointer<MainComponent> mc2 (owner.getComponent());
@@ -7229,42 +7366,153 @@ struct AudioSettingsHolder : public juce::Component,
         };
         addAndMakeVisible (closeBtn);
 
-        // recupera o driver de "pipocos" SEM desplugar o cabo (e sem travar o app)
-        restartBtn.setButtonText (juce::String::fromUTF8 ("\xe2\x86\xbb Reiniciar \xc3\xa1udio"));   // ↻
-        restartBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff8f0c21));
+        // recupera o driver de "pipocos" SEM desplugar o cabo (e sem travar o app).
+        // No Android o texto deixa claro o caso USB class-compliant.
+       #if JUCE_ANDROID
+        const auto restartLabel = juce::String::fromUTF8 ("Recuperar USB");
+       #else
+        const auto restartLabel = juce::String::fromUTF8 (
+            "\xe2\x86\xbb Reiniciar \xc3\xa1udio");   // ↻
+       #endif
+        restartBtn.setButtonText (restartLabel);
+        restartBtn.setColour (juce::TextButton::buttonColourId, NordLookAndFeel::nordRed());
+        restartBtn.setColour (juce::TextButton::buttonOnColourId, NordLookAndFeel::nordRedBright());
         restartBtn.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
-        restartBtn.onClick = [this]
+        restartBtn.setColour (juce::TextButton::textColourOnId, juce::Colours::white);
+        restartBtn.setTooltip (
+           #if JUCE_ANDROID
+            juce::String::fromUTF8 (
+                "Fecha e reabre a saida de audio. Use se a interface USB "
+                "sumiu, voltou muda ou ficou com estalo apos plug/unplug.")
+           #else
+            juce::String::fromUTF8 (
+                "Fecha e reabre o driver de audio sem desligar o app.")
+           #endif
+        );
+        restartBtn.onClick = [this, restartLabel]
         {
             restartBtn.setEnabled (false);
-            restartBtn.setButtonText ("Reiniciando...");
+            restartBtn.setButtonText ("...");
 
             juce::Component::SafePointer<AudioSettingsHolder> safe (this);
-            juce::MessageManager::callAsync ([safe]
+            juce::MessageManager::callAsync ([safe, restartLabel]
             {
                 if (auto* h = safe.getComponent())
                     if (auto* mc2 = h->owner.getComponent())
+                    {
+                       #if JUCE_ANDROID
+                        mc2->androidForceAudioReconcile = true;
+                       #endif
                         mc2->restartAudioDevice();
+                    }
 
-                juce::Timer::callAfterDelay (600, [safe]
+                juce::Timer::callAfterDelay (600, [safe, restartLabel]
                 {
                     if (auto* h = safe.getComponent())
                     {
                         h->restartBtn.setEnabled (true);
-                        h->restartBtn.setButtonText (juce::String::fromUTF8 ("\xe2\x86\xbb Reiniciar \xc3\xa1udio"));
+                        h->restartBtn.setButtonText (restartLabel);
                     }
                 });
             });
         };
         addAndMakeVisible (restartBtn);
 
-        // 616 deixava ~140px de buraco embaixo do seletor: o card parecia
-        // inacabado. A altura agora acompanha o conteudo real do JUCE.
-        // +42 = a linha da resposta do teclado, acrescentada acima da faixa de baixo
+       #if JUCE_ANDROID
+        // MIDI BLE: permissoes + atalho para Ajustes de Bluetooth (pareamento).
+        bleMidiBtn.setButtonText (juce::String::fromUTF8 ("MIDI Bluetooth"));
+        bleMidiBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff252a32));
+        bleMidiBtn.setColour (juce::TextButton::textColourOffId, NordLookAndFeel::txtPrimary());
+        bleMidiBtn.setTooltip (juce::String::fromUTF8 (
+            "Pede permissao de Bluetooth e abre os ajustes para parear um "
+            "teclado MIDI BLE. Depois o app lista a porta automaticamente."));
+        bleMidiBtn.onClick = [this]
+        {
+            // Manter LocalRef vivo: getMainActivity().get() em temporário
+            // invalida o jobject e causa SIGSEGV em openBluetoothSettings.
+            auto launch = [safeOwner = owner]
+            {
+                if (juce::BluetoothMidiDevicePairingDialogue::isAvailable()
+                    && juce::RuntimePermissions::isGranted (
+                           juce::RuntimePermissions::bluetoothMidi))
+                {
+                    if (juce::BluetoothMidiDevicePairingDialogue::open())
+                    {
+                        if (auto* mc2 = safeOwner.getComponent())
+                            mc2->refreshMidiInputs();
+                        return;
+                    }
+                }
+
+                auto* env = juce::getEnv();
+                juce::LocalRef<jobject> activity (juce::getMainActivity());
+                if (env == nullptr || activity.get() == nullptr)
+                    return;
+
+                jclass clazz = env->FindClass ("com/churchdaw/app/ChurchDAWMidiBleBridge");
+                if (clazz == nullptr)
+                {
+                    env->ExceptionClear();
+                    return;
+                }
+
+                jboolean requestedPerms = JNI_FALSE;
+                if (jmethodID method = env->GetStaticMethodID (
+                        clazz, "requestMidiBlePermissions",
+                        "(Landroid/app/Activity;I)Z"))
+                {
+                    requestedPerms = env->CallStaticBooleanMethod (
+                        clazz, method, activity.get(), (jint) 0x41DA);
+                    if (env->ExceptionCheck())
+                        env->ExceptionClear();
+                }
+                else
+                {
+                    env->ExceptionClear();
+                }
+
+                if (requestedPerms == JNI_FALSE)
+                {
+                    if (jmethodID method = env->GetStaticMethodID (
+                            clazz, "openBluetoothSettings",
+                            "(Landroid/app/Activity;)Z"))
+                    {
+                        env->CallStaticBooleanMethod (clazz, method, activity.get());
+                        if (env->ExceptionCheck())
+                            env->ExceptionClear();
+                    }
+                    else
+                    {
+                        env->ExceptionClear();
+                    }
+                }
+
+                env->DeleteLocalRef (clazz);
+
+                if (auto* mc2 = safeOwner.getComponent())
+                    mc2->refreshMidiInputs();
+            };
+
+            if (! juce::RuntimePermissions::isGranted (
+                    juce::RuntimePermissions::bluetoothMidi))
+            {
+                juce::RuntimePermissions::request (
+                    juce::RuntimePermissions::bluetoothMidi,
+                    [launch] (bool)
+                    {
+                        juce::MessageManager::callAsync (launch);
+                    });
+                return;
+            }
+
+            juce::MessageManager::callAsync (launch);
+        };
+        addAndMakeVisible (bleMidiBtn);
+       #endif
+
        #if JUCE_ANDROID || JUCE_IOS
         // O tamanho final vem de showAudioSettings(), usando a janela real.
-        // O seletor permanece em escala 1:1 e rola somente a regiao de
-        // configuracao quando a altura e curta.
-        setSize (352, 650);
+        setSize (360, 640);
        #else
         setSize (620 + margin * 2, 542 + margin * 2);
        #endif
@@ -7285,7 +7533,34 @@ struct AudioSettingsHolder : public juce::Component,
         }
     }
 
-    void timerCallback() override { restyleSelector (selector); }
+    void timerCallback() override
+    {
+       #if ! JUCE_ANDROID && ! JUCE_IOS
+        // Snapshot SOMENTE LEITURA do estado de audio enquanto o painel esta
+        // aberto (a cada 700 ms). Quando o processo morre ao trocar de driver
+        // (ASIO4ALL), a ultima linha do log mostra o que estava selecionado ANTES
+        // do clique fatal -- so assim fecha o ponto exato da queda sem
+        // adivinhar. Nao altera nenhum combo nem chama setAudioDeviceSetup.
+        if (owner != nullptr)
+        {
+            auto& dm = owner->deviceManager;
+            const auto setup = dm.getAudioDeviceSetup();
+            const auto* type = dm.getCurrentDeviceTypeObject();
+            const auto* dev = dm.getCurrentAudioDevice();
+            juce::Logger::writeToLog (
+                "AUDIO_DIALOG type=\""
+                + (type != nullptr ? type->getTypeName() : juce::String())
+                + "\" output=\"" + setup.outputDeviceName
+                + "\" input=\"" + setup.inputDeviceName
+                + "\" inChannels=" + juce::String (setup.inputChannels.countNumberOfSetBits())
+                + " buffer=" + juce::String (setup.bufferSize)
+                + " rate=" + juce::String (setup.sampleRate, 0)
+                + (dev != nullptr ? juce::String (" open=yes \"") + dev->getName() + "\""
+                                   : juce::String (" open=NO")));
+        }
+       #endif
+        restyleSelector (selector);
+    }
 
     // Acabamento por fora no seletor do JUCE: rotulos deixam de ter peso de
     // formulario e os botoes ganham hierarquia — "Resetar" e o unico perigoso,
@@ -7293,41 +7568,159 @@ struct AudioSettingsHolder : public juce::Component,
     // pior caso volta o visual padrao: nada quebra.
     static void restyleSelector (juce::Component& parent)
     {
+       #if JUCE_ANDROID || JUCE_IOS
+        const float labelPt = 12.5f;
+        const juce::uint32 comboBg = 0xff22272f;
+       #else
+        const float labelPt = 12.0f;
+        const juce::uint32 comboBg = 0xff2a2d34;
+       #endif
+
         for (auto* child : parent.getChildren())
         {
             // o ComboBox desenha o VALOR num Label filho: apagar esse texto faria
             // o valor escolhido parecer desabilitado
-            if (dynamic_cast<juce::ComboBox*> (child) != nullptr)
+            if (auto* box = dynamic_cast<juce::ComboBox*> (child))
+            {
+                box->setColour (juce::ComboBox::backgroundColourId, juce::Colour ((juce::uint32) comboBg));
+                box->setColour (juce::ComboBox::outlineColourId, NordLookAndFeel::borderDefault());
+                box->setColour (juce::ComboBox::textColourId, NordLookAndFeel::txtPrimary());
+                box->setColour (juce::ComboBox::arrowColourId, NordLookAndFeel::nordRedBright());
+                restyleSelector (*child);
                 continue;
+            }
 
             if (auto* label = dynamic_cast<juce::Label*> (child))
             {
-                label->setColour (juce::Label::textColourId, NordLookAndFeel::dimText().withAlpha (0.8f));
-                label->setFont (juce::Font (juce::FontOptions (12.0f)));
+                label->setColour (juce::Label::textColourId, NordLookAndFeel::txtSecondary());
+                label->setFont (juce::Font (juce::FontOptions (labelPt)));
             }
             else if (auto* button = dynamic_cast<juce::TextButton*> (child))
             {
                 const auto text = button->getButtonText();
 
-                if (text.containsIgnoreCase ("Resetar"))
+                if (text.containsIgnoreCase ("Resetar") || text.containsIgnoreCase ("Reset"))
                 {
                     button->setColour (juce::TextButton::buttonColourId, juce::Colour (0xff3a2226));
                     button->setColour (juce::TextButton::textColourOffId, juce::Colour (0xffe08a6a));
                 }
                 else
                 {
-                    button->setColour (juce::TextButton::buttonColourId, juce::Colour (0xff2a2d34));
-                    button->setColour (juce::TextButton::textColourOffId, NordLookAndFeel::textColour());
+                    button->setColour (juce::TextButton::buttonColourId, NordLookAndFeel::bgControl());
+                    button->setColour (juce::TextButton::textColourOffId, NordLookAndFeel::txtPrimary());
                 }
+            }
+            else if (auto* toggle = dynamic_cast<juce::ToggleButton*> (child))
+            {
+                toggle->setColour (juce::ToggleButton::textColourId, NordLookAndFeel::txtPrimary());
+                toggle->setColour (juce::ToggleButton::tickColourId, NordLookAndFeel::nordRedBright());
+                toggle->setColour (juce::ToggleButton::tickDisabledColourId,
+                                   NordLookAndFeel::txtDisabled());
             }
 
             restyleSelector (*child);   // as listas de canais/MIDI tem filhos proprios
         }
     }
 
+    // No landscape o seletor JUCE (label a esquerda + combo a direita) vira
+    // lixo se a largura for a tela inteira: labels num canto, controles no
+    // outro, mar negro no meio. Card central estreito (~600-680) e o layout
+    // natural do JUCE de novo.
+    juce::Rectangle<int> contentColumn() const
+    {
+        auto full = getLocalBounds();
+       #if JUCE_ANDROID || JUCE_IOS
+        const int maxW = juce::jmin (680, juce::jmax (320, full.getWidth() - 48));
+        return full.withSizeKeepingCentre (maxW, full.getHeight()).reduced (0, 10);
+       #else
+        return full.reduced (margin);
+       #endif
+    }
+
     void paint (juce::Graphics& g) override
     {
-        auto card = getLocalBounds().toFloat().reduced ((float) margin);
+       #if JUCE_ANDROID || JUCE_IOS
+        // Scrim escuro sobre o mixer + card central premium.
+        g.setColour (juce::Colours::black.withAlpha (0.72f));
+        g.fillRect (getLocalBounds());
+
+        auto col = contentColumn().toFloat();
+        const float rad = 18.0f;
+        {
+            juce::Path sp;
+            sp.addRoundedRectangle (col, rad);
+            juce::DropShadow (juce::Colours::black.withAlpha (0.65f), 36, { 0, 10 })
+                .drawForPath (g, sp);
+        }
+
+        g.setGradientFill (juce::ColourGradient (
+            juce::Colour (0xff1c2028), col.getX(), col.getY(),
+            juce::Colour (0xff12151a), col.getX(), col.getBottom(), false));
+        g.fillRoundedRectangle (col, rad);
+        g.setColour (juce::Colours::white.withAlpha (0.07f));
+        g.drawRoundedRectangle (col.reduced (0.5f), rad, 1.0f);
+        g.setColour (NordLookAndFeel::nordRed().withAlpha (0.70f));
+        g.drawRoundedRectangle (col, rad, 1.4f);
+
+        // Barra vermelha no topo do card
+        g.setColour (NordLookAndFeel::nordRed());
+        g.fillRoundedRectangle (col.getX() + 20.0f, col.getY() + 1.0f,
+                                col.getWidth() - 40.0f, 3.0f, 1.5f);
+
+        auto head = col.toNearestInt().removeFromTop (headerH);
+        if (brandIcon.isValid())
+        {
+            g.setOpacity (1.0f);
+            g.drawImageWithin (brandIcon, head.getX() + 18, head.getY() + 14, 34, 34,
+                               juce::RectanglePlacement::centred);
+        }
+        else
+        {
+            NordLookAndFeel::drawChurchDAWMark (
+                g, { (float) head.getX() + 16.0f, (float) head.getY() + 12.0f, 38.0f, 38.0f });
+        }
+
+        g.setColour (NordLookAndFeel::txtPrimary());
+        g.setFont (juce::Font (juce::FontOptions (17.0f)).boldened()
+                       .withExtraKerningFactor (0.04f));
+        g.drawText (juce::String::fromUTF8 ("\xc3\x81UDIO / MIDI"),
+                    head.withTrimmedLeft (60).withTrimmedRight (52)
+                        .withTrimmedTop (8),
+                    juce::Justification::centredLeft);
+
+        g.setColour (NordLookAndFeel::txtSecondary().withAlpha (0.85f));
+        g.setFont (juce::Font (juce::FontOptions (11.5f)));
+        g.drawText (juce::String::fromUTF8 ("Sa\xc3\xad" "da, lat\xc3\xaa" "ncia e teclado"),
+                    head.withTrimmedLeft (60).withTrimmedRight (52)
+                        .withTrimmedTop (30),
+                    juce::Justification::centredLeft);
+
+        g.setColour (NordLookAndFeel::borderDefault().withAlpha (0.8f));
+        g.fillRect (head.getX() + 16, head.getBottom() - 1, head.getWidth() - 32, 1);
+
+        // Faixa de acoes no rodape do card
+        if (! footerBand.isEmpty())
+        {
+            g.setColour (juce::Colour (0xff161a20));
+            g.fillRoundedRectangle (footerBand.toFloat().getX(),
+                                    (float) footerBand.getY(),
+                                    footerBand.toFloat().getWidth(),
+                                    footerBand.toFloat().getHeight() + 8.0f,
+                                    0.0f);
+            // arredonda so a base do card cobrindo o footer
+            g.setColour (juce::Colour (0xff161a20));
+            auto foot = footerBand.toFloat();
+            juce::Path p;
+            p.addRoundedRectangle (foot.getX(), foot.getY() - 1.0f,
+                                   foot.getWidth(), foot.getHeight() + 10.0f,
+                                   0.0f, 0.0f, false, false, true, true);
+            g.fillPath (p);
+            g.setColour (NordLookAndFeel::borderDefault().withAlpha (0.55f));
+            g.fillRect (foot.getX() + 16.0f, foot.getY(), foot.getWidth() - 32.0f, 1.0f);
+        }
+       #else
+        auto bounds = getLocalBounds().toFloat();
+        auto card = bounds.reduced ((float) margin);
         const float rad = 14.0f;
 
         // sombra: card flutuando sobre o mixer
@@ -7376,48 +7769,65 @@ struct AudioSettingsHolder : public juce::Component,
 
         g.setColour (NordLookAndFeel::nordRed().withAlpha (0.55f));
         g.fillRect (head.getX() + 14, head.getBottom() - 1, head.getWidth() - 28, 1);
+       #endif
     }
 
     void resized() override
     {
-        auto card = getLocalBounds().reduced (margin);
        #if JUCE_ANDROID || JUCE_IOS
-        closeBtn.setBounds (
-            card.getRight() - 48, card.getY() + 4, 48, 48);
+        auto col = contentColumn();
+        closeBtn.setBounds (col.getRight() - 50, col.getY() + 12, 40, 40);
 
-        auto area = card;
-        area.removeFromTop (headerH + 2);
+        auto body = col;
+        body.removeFromTop (headerH + 6);
+        body = body.reduced (18, 0).withTrimmedBottom (12);
 
-        auto bottom = area.removeFromBottom (
-            juce::jmin (104, area.getHeight() / 2));
-        auto deviceRow = bottom.removeFromBottom (50);
-        restartBtn.setBounds (
-            deviceRow.removeFromRight (
-                juce::jmin (148, deviceRow.getWidth() / 2)));
-        deviceRow.removeFromRight (8);
-        audioInputNote.setBounds (deviceRow);
+        // Rodape compacto: velocity + 2 botoes + status. Sem "metade da tela".
+        constexpr int footerH = 168;
+        footerBand = body.removeFromBottom (juce::jmin (footerH, body.getHeight() - 120));
+        auto foot = footerBand.reduced (4, 8);
 
-        auto velRow = bottom.reduced (0, 3);
-        velLabel.setJustificationType (
-            juce::Justification::centredLeft);
-        velLabel.setBounds (
-            velRow.removeFromLeft (
-                juce::jmin (122, velRow.getWidth() / 3)));
+        sectionMidi.setBounds (foot.removeFromTop (16));
+        foot.removeFromTop (4);
+
+        // velocity: label esquerda, combo direita (uma linha)
+        auto velRow = foot.removeFromTop (40);
+        velLabel.setJustificationType (juce::Justification::centredLeft);
+        velLabel.setBounds (velRow.removeFromLeft (juce::jmin (150, velRow.getWidth() / 3))
+                               .withSizeKeepingCentre (juce::jmin (150, velRow.getWidth()), 22));
         velRow.removeFromLeft (8);
-        velCombo.setBounds (
-            velRow.withTrimmedRight (2)
-                .withSizeKeepingCentre (
-                    velRow.getWidth(),
-                    juce::jmin (44, velRow.getHeight())));
+        velCombo.setBounds (velRow.withSizeKeepingCentre (velRow.getWidth(), 36));
 
-        auto viewportArea = area.reduced (8, 4);
-        selectorViewport.setBounds (viewportArea);
-        const int selectorWidth = juce::jmax (
-            260, viewportArea.getWidth() - 14);
-        selector.setBounds (
-            0, 0, selectorWidth,
-            juce::jmax (420, viewportArea.getHeight()));
+        foot.removeFromTop (8);
+        auto actions = foot.removeFromTop (44);
+       #if JUCE_ANDROID
+        {
+            const int gap = 10;
+            const int w = (actions.getWidth() - gap) / 2;
+            bleMidiBtn.setBounds (actions.removeFromLeft (w));
+            actions.removeFromLeft (gap);
+            restartBtn.setBounds (actions);
+        }
        #else
+        restartBtn.setBounds (actions);
+       #endif
+
+        foot.removeFromTop (6);
+        audioInputNote.setBounds (foot.removeFromTop (20));
+
+        // Corpo: titulo da secao + seletor com LARGURA do card (nao da tela).
+        sectionDevice.setBounds (body.removeFromTop (16));
+        body.removeFromTop (4);
+        statusChip.setBounds (body.removeFromTop (18));
+        body.removeFromTop (4);
+
+        selectorViewport.setBounds (body);
+        // Altura do seletor ~ conteudo real (item 44 * ~6 linhas + labels).
+        // Nao esticar ate o fundo — o "mar" preto some.
+        const int contentH = juce::jmax (260, selector.getItemHeight() * 7 + 48);
+        selector.setBounds (0, 0, juce::jmax (260, body.getWidth()), contentH);
+       #else
+        auto card = getLocalBounds().reduced (margin);
         closeBtn.setBounds (card.getRight() - 38, card.getY() + 12, 26, 22);
 
         auto area = card;
@@ -7426,12 +7836,7 @@ struct AudioSettingsHolder : public juce::Component,
         auto extra = area.removeFromBottom (46).reduced (20, 10);
         restartBtn.setBounds (extra.removeFromRight (160));
         extra.removeFromRight (12);
-
-       #if JUCE_ANDROID || JUCE_IOS
-        audioInputNote.setBounds (extra);
-       #else
         owner->inputToggle.setBounds (extra);
-       #endif
 
         auto velRow = area.removeFromBottom (42).reduced (20, 8);
         velLabel.setBounds (velRow.removeFromLeft (150));
@@ -7444,24 +7849,38 @@ struct AudioSettingsHolder : public juce::Component,
 
     void paintOverChildren (juce::Graphics& g) override
     {
+       #if ! (JUCE_ANDROID || JUCE_IOS)
         // separador acima da secao de baixo (resposta do teclado + entrada + reiniciar)
         auto row = getLocalBounds().reduced (margin).removeFromBottom (46 + 42);
         g.setColour (NordLookAndFeel::panelOutline());
         g.fillRect (row.removeFromTop (1).reduced (14, 0));
+       #else
+        juce::ignoreUnused (g);
+       #endif
     }
 
-    // arrasta o card pela faixa do cabecalho
+    // arrasta o card pela faixa do cabecalho (desktop). No mobile a pagina
+    // e full-bleed e nao se arrasta.
     void mouseDown (const juce::MouseEvent& e) override
     {
+       #if JUCE_ANDROID || JUCE_IOS
+        juce::ignoreUnused (e);
+        dragging = false;
+       #else
         dragging = e.position.y < (float) (margin + headerH);
         if (dragging)
             dragger.startDraggingComponent (this, e);
+       #endif
     }
 
     void mouseDrag (const juce::MouseEvent& e) override
     {
+       #if JUCE_ANDROID || JUCE_IOS
+        juce::ignoreUnused (e);
+       #else
         if (dragging)
             dragger.dragComponent (this, e, nullptr);
+       #endif
     }
 
     void mouseUp (const juce::MouseEvent&) override   { dragging = false; }
@@ -7470,8 +7889,13 @@ struct AudioSettingsHolder : public juce::Component,
     juce::AudioDeviceSelectorComponent selector;
    #if JUCE_ANDROID || JUCE_IOS
     juce::Viewport selectorViewport;
+    juce::Label sectionDevice, sectionMidi, statusChip;
+    juce::Rectangle<int> footerBand;
    #endif
     juce::TextButton restartBtn, closeBtn;
+   #if JUCE_ANDROID
+    juce::TextButton bleMidiBtn;
+   #endif
     juce::Label velLabel, audioInputNote;
     juce::ComboBox velCombo;
     std::unique_ptr<juce::ComboBoxParameterAttachment> velAttachment;
@@ -7747,18 +8171,62 @@ void MainComponent::showAudioSettings()
     if (audioPanel != nullptr)
     {
         audioPanel.reset();
+        audioSettingsButton.repaint();
         return;
     }
 
+   #if JUCE_ANDROID
+    // Central full-screen com abas (AUDIO / LATENCIA / MIDI-USB).
+    AndroidAudioMidiCenter::Host host {
+        deviceManager,
+        appProperties,
+        [safe = juce::Component::SafePointer<MainComponent> (this)]
+        {
+            if (auto* c = safe.getComponent())
+            {
+                c->audioPanel.reset();
+                c->audioSettingsButton.repaint();
+            }
+        },
+        [safe = juce::Component::SafePointer<MainComponent> (this)]
+        {
+            if (auto* c = safe.getComponent())
+                c->restartAudioDevice();
+        },
+        [safe = juce::Component::SafePointer<MainComponent> (this)]
+        {
+            if (auto* c = safe.getComponent())
+                c->refreshMidiInputs();
+        },
+        [safe = juce::Component::SafePointer<MainComponent> (this)]
+        {
+            if (auto* c = safe.getComponent())
+            {
+                c->androidForceAudioReconcile = true;
+                c->reconcileAndroidAudioTopology();
+            }
+        },
+        [safe = juce::Component::SafePointer<MainComponent> (this)]() -> TimbresProcessor*
+        {
+            return safe != nullptr ? safe->getChurchLive() : nullptr;
+        },
+        audioDialogOpen
+    };
+    auto* center = new AndroidAudioMidiCenter (std::move (host));
+    audioPanel.reset (center);
+    audioSettingsButton.repaint();
+    addAndMakeVisible (center);
+    // Full-screen (não modal desktop). resized() do MainComponent re-aplica.
+    center->setBounds (getLocalBounds());
+    center->toFront (true);
+    center->grabKeyboardFocus();
+   #else
     auto* holder = new AudioSettingsHolder (*this);
     audioPanel.reset (holder);
+    audioSettingsButton.repaint();
     addAndMakeVisible (holder);
 
-   #if JUCE_ANDROID || JUCE_IOS
-    // No celular isto e uma PAGINA, nao um card flutuante de desktop: o
-    // modal de 620x650 centrado deixava texto apertado, scrollbar interna e
-    // o "Reiniciar audio" espremido (revisao de design de 30/07). A pagina
-    // ocupa toda a area util; so o seletor interno rola.
+   #if JUCE_IOS
     holder->setBounds (layoutContentBounds.isEmpty() ? getLocalBounds()
                                                      : layoutContentBounds);
    #else
@@ -7773,15 +8241,13 @@ void MainComponent::showAudioSettings()
     const int visualW = juce::roundToInt ((float) holder->getWidth()  * panelScale);
     const int visualH = juce::roundToInt ((float) holder->getHeight() * panelScale);
 
-    // Component::setTransform tambem transforma a posicao do componente no
-    // pai. Portanto a coordenada logica precisa ser dividida pela escala; sem
-    // isso o card cabia, mas ficava puxado para o canto superior esquerdo.
     const int visualX = juce::jmax (2, (getWidth()  - visualW) / 2);
     const int visualY = juce::jmax (2, (getHeight() - visualH) / 2);
     holder->setTopLeftPosition (juce::roundToInt ((float) visualX / panelScale),
                                 juce::roundToInt ((float) visualY / panelScale));
    #endif
     holder->toFront (true);
+   #endif
 }
 
 //==============================================================================

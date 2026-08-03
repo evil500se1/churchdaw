@@ -55,9 +55,18 @@ public:
         int kind = 0;           // TimbreGlyph::Kind (int pra nao criar dependencia circular)
         juce::String category;  // chave da familia ("PIANOS", "ORGAOS", ...)
         juce::String subtitle;  // "Piano acustico · Church Live"
+
+        // Pack online ainda nao instalado: aparece na lista com acao Baixar.
+        // O download e por biblioteca (unidade real do catalogo), um por vez.
+        bool downloadable = false;
+        juce::String packId;
+        juce::String actionLabel;   // "Baixar · 235 MB", "Instalando 42%", "Em breve"
+        bool actionEnabled = true;
+        float progress = -1.0f;     // -1 = sem barra; 0..1 = progresso
     };
 
     std::function<void (int)> onPick;
+    std::function<void (const juce::String& packId)> onDownload;
     std::function<void()> onCancel;
 
     // quem cria o picker diz como desenhar o icone (o glyph vive em outro header)
@@ -164,6 +173,49 @@ public:
         repaint();
     }
 
+    // Atualiza progresso/rotulo de um pack em download sem fechar o seletor.
+    void updateDownloadState (const juce::String& packId, float progressValue,
+                              juce::String label, bool enabled)
+    {
+        bool changed = false;
+
+        for (auto& it : items)
+        {
+            if (! it.downloadable || it.packId != packId)
+                continue;
+
+            it.progress = progressValue;
+            it.actionLabel = label;
+            it.actionEnabled = enabled;
+            changed = true;
+        }
+
+        if (! changed)
+            return;
+
+        for (auto& r : rows)
+        {
+            if (! r.downloadable || r.packId != packId)
+                continue;
+
+            r.progress = progressValue;
+            r.actionLabel = label;
+            r.actionEnabled = enabled;
+        }
+
+        list.repaint();
+        repaint();
+    }
+
+    // Substitui a lista (ex.: apos instalar um pack e rescanear).
+    void replaceItems (juce::Array<Item> newItems, int currentId)
+    {
+        items = std::move (newItems);
+        currentSelectedId = currentId;
+        removeBtn.setVisible (currentSelectedId >= 2);
+        rebuildRows();
+    }
+
     // grabKeyboardFocus dentro de visibilityChanged() nao pega: o componente
     // ainda nao esta na tela. O foco e pedido depois, ja montado.
     void focusSearch()
@@ -179,35 +231,40 @@ public:
 
     void paint (juce::Graphics& g) override
     {
+        // Dim do fundo atras do modal.
+        g.setColour (juce::Colours::black.withAlpha (0.45f));
+        g.fillRect (getLocalBounds());
+
         auto card = getLocalBounds().toFloat().reduced ((float) margin);
-        const float rad = 14.0f;
+        const float rad = NordLookAndFeel::radiusPanel;
 
         {
             juce::Path sp;
             sp.addRoundedRectangle (card, rad);
-            juce::DropShadow (juce::Colours::black.withAlpha (0.6f), 28, { 0, 8 }).drawForPath (g, sp);
+            juce::DropShadow (juce::Colours::black.withAlpha (0.72f), 36, { 0, 12 }).drawForPath (g, sp);
         }
 
-        g.setGradientFill (juce::ColourGradient (juce::Colour (0xff1a1f28), card.getX(), card.getY(),
-                                                 juce::Colour (0xff11141b), card.getX(), card.getBottom(), false));
+        g.setGradientFill (juce::ColourGradient (juce::Colour (0xff1c222c), card.getX(), card.getY(),
+                                                 juce::Colour (0xff0e1116), card.getX(), card.getBottom(), false));
         g.fillRoundedRectangle (card, rad);
-        g.setColour (juce::Colours::white.withAlpha (0.06f));
-        g.drawLine (card.getX() + 14.0f, card.getY() + 1.5f, card.getRight() - 14.0f, card.getY() + 1.5f, 1.0f);
-        // moldura NEUTRA: o vermelho fica para estados, nao para a moldura
-        g.setColour (juce::Colours::white.withAlpha (0.10f));
-        g.drawRoundedRectangle (card, rad, 1.2f);
+        g.setColour (juce::Colours::white.withAlpha (0.08f));
+        g.drawLine (card.getX() + 16.0f, card.getY() + 1.4f,
+                    card.getRight() - 16.0f, card.getY() + 1.4f, 1.1f);
+        g.setColour (juce::Colours::white.withAlpha (0.12f));
+        g.drawRoundedRectangle (card, rad, 1.25f);
 
-        g.setColour (NordLookAndFeel::nordRed());
-        g.fillRoundedRectangle (card.reduced (16.0f, 0.0f).removeFromTop (8.0f).withTrimmedTop (6.0f), 1.0f);
+        g.setColour (NordLookAndFeel::nordRedBright());
+        g.fillRoundedRectangle (card.reduced (18.0f, 0.0f).removeFromTop (9.0f).withTrimmedTop (6.0f)
+                                    .withHeight (3.0f), 1.5f);
 
         // ---- header: titulo + badge do canal + timbre atual ----
         auto head = card.toNearestInt().reduced (20, 0)
                         .withTop (card.toNearestInt().getY() + 14)
                         .withHeight (touchLayout ? 26 : 22);
         g.setColour (juce::Colours::white);
-        g.setFont (juce::Font (juce::FontOptions (touchLayout ? 15.0f : 14.0f))
-                       .boldened().withExtraKerningFactor (0.10f));
-        const juce::String title ("ESCOLHER INSTRUMENTO");
+        g.setFont (juce::Font (juce::FontOptions (touchLayout ? 16.0f : 14.5f))
+                       .boldened().withExtraKerningFactor (0.04f));
+        const juce::String title ("Escolher instrumento");
         g.drawText (title, head, juce::Justification::centredLeft);
 
         if (channelBadge.isNotEmpty())
@@ -248,8 +305,9 @@ public:
                         juce::Justification::centredBottom);
             g.setColour (NordLookAndFeel::dimText().withAlpha (0.55f));
             g.setFont (juce::Font (juce::FontOptions (12.5f)));
-            g.drawText ("Tente outro nome ou escolha outra categoria",
-                        empty.withTrimmedTop (6), juce::Justification::centredTop);
+            g.drawText (
+                "Tente outra busca, categoria, ou baixe uma biblioteca abaixo",
+                empty.withTrimmedTop (6), juce::Justification::centredTop);
         }
 
         // ---- rodape ----
@@ -430,6 +488,11 @@ private:
         int id = 0;
         int kind = 0;
         juce::String subtitle;
+        bool downloadable = false;
+        juce::String packId;
+        juce::String actionLabel;
+        bool actionEnabled = true;
+        float progress = -1.0f;
     };
 
     static constexpr int margin = 16;
@@ -497,7 +560,9 @@ private:
             }
 
             rows.add ({ false, it.name, it.id, it.kind,
-                        it.subtitle.isNotEmpty() ? it.subtitle : it.section });
+                        it.subtitle.isNotEmpty() ? it.subtitle : it.section,
+                        it.downloadable, it.packId, it.actionLabel,
+                        it.actionEnabled, it.progress });
         }
 
         list.updateContent();
@@ -554,7 +619,18 @@ private:
 
         const auto& r = rows.getReference (row);
 
-        if (! r.header && onPick != nullptr)
+        if (r.header)
+            return;
+
+        if (r.downloadable)
+        {
+            if (r.actionEnabled && onDownload != nullptr && r.packId.isNotEmpty())
+                onDownload (r.packId);
+
+            return;
+        }
+
+        if (onPick != nullptr)
             onPick (r.id);
     }
 
@@ -588,40 +664,66 @@ private:
         {
             auto rowArea = juce::Rectangle<float> (3.0f, 1.0f, (float) width - 6.0f, (float) height - 2.0f);
 
-            g.setGradientFill (juce::ColourGradient (NordLookAndFeel::nordRed().withAlpha (0.55f),
+            g.setGradientFill (juce::ColourGradient (NordLookAndFeel::nordRed().withAlpha (0.50f),
                                                      rowArea.getX(), rowArea.getY(),
-                                                     NordLookAndFeel::nordRedDark().withAlpha (0.45f),
+                                                     NordLookAndFeel::nordRedDark().withAlpha (0.38f),
                                                      rowArea.getX(), rowArea.getBottom(), false));
-            g.fillRoundedRectangle (rowArea, 6.0f);
+            g.fillRoundedRectangle (rowArea, 8.0f);
             g.setColour (NordLookAndFeel::nordRedBright());
-            g.fillRoundedRectangle (rowArea.withWidth (3.0f), 1.5f);
-            g.setColour (juce::Colours::white.withAlpha (0.14f));
-            g.drawRoundedRectangle (rowArea, 6.0f, 1.0f);
+            g.fillRoundedRectangle (rowArea.withWidth (3.5f), 1.8f);
+            g.setColour (juce::Colours::white.withAlpha (0.16f));
+            g.drawRoundedRectangle (rowArea, 8.0f, 1.1f);
         }
         else if (isCurrent)
         {
-            // timbre JA CARREGADO: chapa sutil + borda na cor da familia
             auto rowArea = juce::Rectangle<float> (3.0f, 1.0f, (float) width - 6.0f, (float) height - 2.0f);
-            g.setColour (juce::Colour (0xff222833).withAlpha (0.9f));
-            g.fillRoundedRectangle (rowArea, 6.0f);
-            g.setColour (accent.withAlpha (0.55f));
-            g.drawRoundedRectangle (rowArea.reduced (0.5f), 6.0f, 1.2f);
-            g.fillRoundedRectangle (rowArea.withWidth (3.0f), 1.5f);
+            g.setGradientFill (juce::ColourGradient (juce::Colour (0xff232a36),
+                                                     rowArea.getX(), rowArea.getY(),
+                                                     juce::Colour (0xff171b22),
+                                                     rowArea.getX(), rowArea.getBottom(), false));
+            g.fillRoundedRectangle (rowArea, 8.0f);
+            g.setColour (NordLookAndFeel::greenOk().withAlpha (0.55f));
+            g.drawRoundedRectangle (rowArea.reduced (0.5f), 8.0f, 1.2f);
+            g.fillRoundedRectangle (rowArea.withWidth (3.5f), 1.8f);
+        }
+        else
+        {
+            // Separador hairline entre linhas (lista premium).
+            g.setColour (juce::Colours::white.withAlpha (0.04f));
+            g.fillRect (12, height - 1, width - 24, 1);
         }
 
         // tile do icone com a cor da familia: reconhecimento num relance
         const float tile = (float) height - (touchLayout ? 14.0f : 8.0f);
         auto tileArea = juce::Rectangle<float> (10.0f, ((float) height - tile) * 0.5f, tile, tile);
-        g.setColour (accent.withAlpha (0.16f));
-        g.fillRoundedRectangle (tileArea, 6.0f);
-        g.setColour (accent.withAlpha (0.35f));
-        g.drawRoundedRectangle (tileArea.reduced (0.5f), 6.0f, 1.0f);
+        g.setGradientFill (juce::ColourGradient (accent.withAlpha (0.22f),
+                                                 tileArea.getX(), tileArea.getY(),
+                                                 accent.withAlpha (0.08f),
+                                                 tileArea.getX(), tileArea.getBottom(), false));
+        g.fillRoundedRectangle (tileArea, 8.0f);
+        g.setColour (accent.withAlpha (0.40f));
+        g.drawRoundedRectangle (tileArea.reduced (0.5f), 8.0f, 1.1f);
 
         if (drawIcon != nullptr && r.kind != 0)
             drawIcon (g, tileArea.reduced (3.0f), r.kind);
 
+        // Reserva a direita para badge de acao (Baixar / Selecionado).
+        float rightReserve = 12.0f;
+
+        if (r.downloadable && r.actionLabel.isNotEmpty())
+        {
+            auto actionFont = NordLookAndFeel::stageLabel (touchLayout ? 10.0f : 9.0f);
+            rightReserve = juce::jmax (
+                88.0f,
+                juce::GlyphArrangement::getStringWidth (actionFont, r.actionLabel) + 28.0f);
+        }
+        else if (isCurrent)
+        {
+            rightReserve = 96.0f;
+        }
+
         const int textX = (int) tileArea.getRight() + 10;
-        const int textW = width - textX - (isCurrent ? 96 : 12);
+        const int textW = juce::jmax (40, width - textX - (int) rightReserve);
 
         g.setColour (rowIsSelected ? juce::Colours::white : NordLookAndFeel::textColour());
 
@@ -647,17 +749,51 @@ private:
             g.drawText (r.text, textX, 0, textW, height, juce::Justification::centredLeft, true);
         }
 
-        if (isCurrent)
+        if (r.downloadable && r.actionLabel.isNotEmpty())
         {
-            // tag "Selecionado" no lugar do check solto
+            auto tagFont = NordLookAndFeel::stageLabel (touchLayout ? 10.0f : 9.0f);
+            const float tagW = juce::jmin (
+                (float) width - 20.0f,
+                juce::GlyphArrangement::getStringWidth (tagFont, r.actionLabel) + 16.0f);
+            auto tagArea = juce::Rectangle<float> ((float) width - tagW - 10.0f,
+                                                   (float) height * 0.5f - 11.0f, tagW, 22.0f);
+
+            if (r.progress >= 0.0f)
+            {
+                // Barra sob o badge enquanto instala.
+                auto bar = juce::Rectangle<float> (tagArea.getX(), tagArea.getBottom() + 2.0f,
+                                                   tagArea.getWidth(), 3.0f);
+                g.setColour (juce::Colours::white.withAlpha (0.12f));
+                g.fillRoundedRectangle (bar, 1.5f);
+                g.setColour (NordLookAndFeel::nordRedBright());
+                g.fillRoundedRectangle (
+                    bar.withWidth (bar.getWidth()
+                                   * juce::jlimit (0.0f, 1.0f, r.progress)),
+                    1.5f);
+                tagArea.translate (0.0f, -2.0f);
+            }
+
+            const auto fill = r.actionEnabled
+                                  ? NordLookAndFeel::nordRed().withAlpha (0.88f)
+                                  : juce::Colour (0xff2a2f38);
+            g.setColour (fill);
+            g.fillRoundedRectangle (tagArea, 11.0f);
+            g.setColour (juce::Colours::white.withAlpha (r.actionEnabled ? 1.0f : 0.55f));
+            g.setFont (tagFont);
+            g.drawText (r.actionLabel, tagArea.toNearestInt(),
+                        juce::Justification::centred, false);
+        }
+        else if (isCurrent)
+        {
+            // Tag "Pronto" verde: feedback claro de timbre ja no canal.
             auto tagFont = NordLookAndFeel::stageLabel (9.0f);
-            const juce::String tag ("SELECIONADO");
-            const float tagW = juce::GlyphArrangement::getStringWidth (tagFont, tag) + 14.0f;
+            const juce::String tag (juce::String::fromUTF8 ("\xe2\x9c\x93 Pronto"));
+            const float tagW = juce::GlyphArrangement::getStringWidth (tagFont, tag) + 16.0f;
             auto tagArea = juce::Rectangle<float> ((float) width - tagW - 10.0f,
                                                    (float) height * 0.5f - 9.0f, tagW, 18.0f);
-            g.setColour (accent.withAlpha (0.22f));
+            g.setColour (NordLookAndFeel::greenOk().withAlpha (0.20f));
             g.fillRoundedRectangle (tagArea, 9.0f);
-            g.setColour (accent.brighter (0.4f));
+            g.setColour (NordLookAndFeel::greenOk().brighter (0.15f));
             g.setFont (tagFont);
             g.drawText (tag, tagArea.toNearestInt(), juce::Justification::centred, false);
         }

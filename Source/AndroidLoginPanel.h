@@ -226,8 +226,9 @@ public:
             case LibraryState::notStarted:
                 libraryStatusLabel.setText (
                     juce::String::fromUTF8 (
-                        "\xe2\x97\x8f Biblioteca n\xc3\xa3o preparada\n"
-                        "Necess\xc3\xa1ria para iniciar o teste."),
+                        "\xe2\x97\x8f Sem samples no aparelho\n"
+                        "Voc\xc3\xaa pode entrar e baixar s\xc3\xb3 o que quiser "
+                        "(timbres 1 a 1 ou pack completo)."),
                     juce::dontSendNotification);
                 break;
             case LibraryState::downloading:
@@ -1618,9 +1619,12 @@ private:
         else if (libraryState == LibraryState::processing)
             trialButton.setButtonText ("Preparando timbres");
         else
-            trialButton.setButtonText ("Preparar biblioteca");
-        trialButton.setDownloadIconVisible (
-            libraryState == LibraryState::notStarted);
+            // Nao obriga download na entrada: demo inicia e o cliente baixa
+            // timbres individuais (ou pack) depois, no seletor/Bibliotecas.
+            trialButton.setButtonText (
+                juce::String::fromUTF8 (
+                    "Experimentar sem baixar"));
+        trialButton.setDownloadIconVisible (false);
 
         trialButton.setEnabled (
             ! busy

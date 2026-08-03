@@ -37,7 +37,9 @@ public:
        #if CHURCHDAW_UI_BISECT
         // experimento: medidores congelados, para medir quanto eles custam
        #elif JUCE_ANDROID || JUCE_IOS
-        startTimerHz (15);
+        // 10 Hz: ainda le fluido no palco e devolve CPU ao audio (era 15/30).
+        // Sem voice limit — so menos pintura na message thread.
+        startTimerHz (10);
        #else
         startTimerHz (30);
        #endif
@@ -76,8 +78,11 @@ public:
         if (peakReadout && channels == 2)
             peakRow = bounds.removeFromBottom (17.0f);
 
-        g.setColour (juce::Colour (0xff15171b));
+        // Fundo um pouco mais escuro + moldura sutil: o meter se destaca do card.
+        g.setColour (juce::Colour (0xff0e1014));
         g.fillRoundedRectangle (bounds, 5.0f);
+        g.setColour (juce::Colours::white.withAlpha (0.06f));
+        g.drawRoundedRectangle (bounds.reduced (0.5f), 5.0f, 1.0f);
 
         // luz de clip DENTRO da moldura, como tampa do medidor: flutuando acima
         // com um vao ela lia como um elemento vermelho perdido/cortado
@@ -143,7 +148,9 @@ public:
             // dos -6 e dos -3 dBFS fica no mesmo lugar em todos os canais, e o
             // musico aprende a posicao em vez de julgar o tom da cor.
             const float lvl = displayDb[ch];
-            const float segH = 3.0f, segGap = 1.0f, step = segH + segGap;
+            // Segmentos um pouco mais altos: meter le de longe no palco.
+            const float segH = barArea.getWidth() >= 10.0f ? 3.6f : 3.0f;
+            const float segGap = 1.0f, step = segH + segGap;
             const int numSeg = juce::jmax (4, (int) ((barArea.getHeight() + segGap) / step));
 
             for (int i = 0; i < numSeg; ++i)
@@ -331,7 +338,12 @@ private:
             for (int ch = 0; ch < channels; ++ch)
                 top = juce::jmax (top, dbToProportion (displayDb[ch]));
 
-            onLevel (top);
+            // Nao acorda ActivityBar a cada tick se o nivel mal mudou.
+            if (std::abs (top - lastOnLevel) > 0.04f || (top < 0.02f && lastOnLevel > 0.02f))
+            {
+                lastOnLevel = top;
+                onLevel (top);
+            }
         }
     }
 
@@ -349,6 +361,7 @@ private:
     // Nasce true: medidor recem-construido (re-dock do editor) tambem encontra
     // acumulo de quando nao existia consumidor -- o primeiro tick sempre drena
     bool wasHidden = true;
+    float lastOnLevel = -1.0f;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (LevelMeter)
 };

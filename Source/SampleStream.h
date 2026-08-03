@@ -452,8 +452,10 @@ private:
                     didWork = true;
             }
 
+            // Idle curto: acorda rapido quando uma nota pede janela (menos
+            // "buraco" no ataque). Sem voice limit — so a thread de disco.
             if (! didWork)
-                wait (5);
+                wait (2);
         }
     }
 

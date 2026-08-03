@@ -16,7 +16,7 @@ endif()
 
 # Versao do produto desktop. O Android mantem versionName/versionCode no
 # ChurchDAW.jucer e pode ser publicado em um ciclo independente.
-project(MinhaDAW VERSION 1.5.8)
+project(MinhaDAW VERSION 1.6.0)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

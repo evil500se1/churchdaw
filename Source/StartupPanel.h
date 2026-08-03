@@ -201,14 +201,21 @@ public:
 
         mode = Mode::starterChoice;
         eyebrow = juce::String::fromUTF8 (u8"PRIMEIRA CONFIGURAÇÃO");
-        title = starterRequiredForAccess
-                    ? juce::String::fromUTF8 (
-                          u8"Baixe o Church Live completo para iniciar a demonstração")
-                    : juce::String::fromUTF8 (
-                          "Baixe o Church Live completo ou entre sem samples");
+
+        const bool offlineCultoStarter = starterPack != nullptr
+            && (starterPack->id.equalsIgnoreCase ("pad-continuo")
+                || starterPack->id.equalsIgnoreCase ("culto-offline")
+                || starterPack->id.equalsIgnoreCase ("culto-offline-v1"));
+
+        title = juce::String::fromUTF8 (
+            u8"Baixe o que quiser — ou entre sem samples");
         progress = 0.0f;
         footnote = juce::String::fromUTF8 (
-            u8"Os samples ficam fora do APK, sobrevivem a atualizações e podem ser instalados depois.");
+            offlineCultoStarter
+                ? u8"Culto offline (leve) ou pack completo em Bibliotecas. "
+                  u8"No mixer você também baixa timbre por timbre (ex.: Pad 2, piano)."
+                : u8"Pack completo, pack leve ou timbres 1 a 1 no seletor do canal. "
+                  u8"Nada é obrigatório para abrir o app.");
 
         // O cache pode desenhar o catalogo, mas uma primeira instalacao enorme
         // nao deve nascer de URL vencida quando nenhum servidor respondeu.
@@ -217,15 +224,23 @@ public:
             const auto temporaryBytes =
                 starterPack->downloadBytes + starterPack->installedBytes
                 + ChurchDAWServices::installerStorageReserve;
-            detail = juce::String::fromUTF8 (u8"PACK COMPLETO  /  download ")
+            detail = juce::String::fromUTF8 (
+                         offlineCultoStarter ? u8"CULTO OFFLINE  /  download "
+                                             : u8"PACK COMPLETO  /  download ")
                    + ChurchDAWServices::humanBytes (starterPack->downloadBytes)
                    + juce::String::fromUTF8 (u8"\nPico estimado de espaço: ")
                    + ChurchDAWServices::humanBytes (temporaryBytes)
                    + juce::String::fromUTF8 (u8"\nPartes já retomadas podem reduzir esse pico.")
-                   + "\n" + starterPack->description
+                   + "\n"
+                   + (offlineCultoStarter
+                          ? juce::String::fromUTF8 (
+                                "Pads A–G para culto ao vivo sem baixar 12 GB agora.")
+                          : starterPack->description)
                    + juce::String::fromUTF8 (
                          u8"\nPrefira Wi-Fi e mantenha o app aberto durante a instalação.");
-            primaryButton.setButtonText ("Baixar pack completo");
+            primaryButton.setButtonText (
+                offlineCultoStarter ? "Baixar Culto offline"
+                                    : "Baixar pack completo");
             primaryButton.setVisible (true);
             primaryButton.onClick = [safe = juce::Component::SafePointer<StartupPanel> (this)]
             {
@@ -266,29 +281,20 @@ public:
             }
         }
 
-        if (starterRequiredForAccess)
+        // Sempre permite entrar sem baixar (demo e conta). Download fica
+        // opcional: pack leve, pack completo ou timbres individuais depois.
+        secondaryButton.setButtonText ("Abrir sem baixar");
+        secondaryButton.setVisible (true);
+        secondaryButton.onClick = [safe = juce::Component::SafePointer<StartupPanel> (this)]
         {
-            footnote = juce::String::fromUTF8 (
-                u8"A demonstração só inicia depois que a biblioteca estiver instalada. "
-                u8"O tempo de 20 minutos não corre durante o download.");
-            secondaryButton.setVisible (false);
-            secondaryButton.onClick = nullptr;
-        }
-        else
-        {
-            secondaryButton.setButtonText ("Abrir sem baixar");
-            secondaryButton.setVisible (true);
-            secondaryButton.onClick = [safe = juce::Component::SafePointer<StartupPanel> (this)]
+            if (auto* self = safe.getComponent())
             {
-                if (auto* self = safe.getComponent())
-                {
-                    ChurchDAWServices::rememberStarterChoiceCompleted();
+                ChurchDAWServices::rememberStarterChoiceCompleted();
 
-                    if (self->onContinue != nullptr)
-                        self->onContinue();
-                }
-            };
-        }
+                if (self->onContinue != nullptr)
+                    self->onContinue();
+            }
+        };
 
         resized();
         repaint();

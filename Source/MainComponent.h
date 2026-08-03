@@ -11,6 +11,7 @@
 #include "MasterProcessor.h"
 #include "LevelMeter.h"
 #include "DeviceInfoBar.h"
+#include "AudioMidiButton.h"
 #include "PadProcessor.h"
 #include "PadPanel.h"
 #include "LaunchkeyControl.h"
@@ -162,6 +163,7 @@ private:
     bool audioDialogOpen = false;         // config de audio so e salva com o dialogo aberto (escolha do usuario)
 
     friend struct AudioSettingsHolder;
+    friend class AndroidAudioMidiCenter;
 
     void saveAudioStateNow();
     void restartAudioDevice();   // recupera o driver ASIO sem desplugar (anti-pipoco)
@@ -173,7 +175,7 @@ private:
    #endif
 
     // ---- interface ----
-    juce::TextButton audioSettingsButton { "Audio / MIDI" };
+    AudioMidiButton audioSettingsButton { "Audio / MIDI" };
     juce::TextButton scanButton { "Plugins" };
     juce::TextButton saveButton { "Salvar" };
     juce::Colour corDoSalvoNormal;   // verde do "Salvo"; guardado para voltar apos um "FALHOU"

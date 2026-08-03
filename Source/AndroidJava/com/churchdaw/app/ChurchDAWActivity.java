@@ -54,6 +54,9 @@ public final class ChurchDAWActivity extends Activity {
             WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
         ChurchDAWAudioDeviceBridge.initialize(getApplicationContext());
         ChurchDAWLicenseBridge.initialize(this);
+        // BLE MIDI: pede CONNECT/SCAN cedo (API 31+). Sem isso o MidiManager
+        // omite teclados Bluetooth e o app parece "sem MIDI".
+        ChurchDAWMidiBleBridge.requestMidiBlePermissions(this, 0x41DA);
     }
 
     @Override

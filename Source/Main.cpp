@@ -1439,13 +1439,12 @@ public:
                 ? check.localLibraryReady
                 : false;
            #endif
+        // Android: entrar SEM baixar e baixar so o que quiser depois
+        // (timbres 1 a 1 no seletor, ou pack completo em Bibliotecas).
+        // "Abrir sem baixar" grava starterChoice e as aberturas seguintes
+        // nao pedem de novo. Demo/trial tambem nao obriga biblioteca.
         const bool mayContinueWithoutLibrary =
-           #if JUCE_ANDROID
-            ! androidTrialPreparationPending
-                && ChurchDAWServices::starterChoiceWasCompleted();
-           #else
             ChurchDAWServices::starterChoiceWasCompleted();
-           #endif
 
         if (hasInstalledLibrary || mayContinueWithoutLibrary)
         {
@@ -1459,13 +1458,15 @@ public:
             return;
         }
 
+        // Primeira vez: download opcional + "Abrir sem baixar" sempre visivel.
+        // requireInstalledLibrary = false em todas as plataformas Android.
         startupWindow->panel.showStarterChoice (
             check.manifest.starterPack(),
             check.reachedServer
            #if JUCE_ANDROID
-            , androidTrialPreparationPending
+            , false
            #endif
-        );
+            );
     }
 
     void beginMainWindow()

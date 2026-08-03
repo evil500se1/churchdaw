@@ -1436,20 +1436,57 @@ try {
 
     foreach ($fixed in @(
         @($RemoteAndroidDirectory, 'manifest.json', $previousManifestPath,
-          $ExpectedPreviousManifestSha256, 'Packaging/AndroidHosting/app/android/manifest.json'),
+          $ExpectedPreviousManifestSha256, 'Packaging/AndroidHosting/app/android/manifest.json', "$PublicAndroidBaseUrl/manifest.json"),
         @($RemoteAndroidDirectory, 'update-policy.json', $previousLegacyPath,
-          $ExpectedPreviousLegacyPolicySha256, 'Packaging/AndroidHosting/app/android/update-policy.json'),
+          $ExpectedPreviousLegacyPolicySha256, 'Packaging/AndroidHosting/app/android/update-policy.json', "$PublicAndroidBaseUrl/update-policy.json"),
         @($RemoteAndroidDirectory, 'update-policy-v2.json', $previousPolicyPath,
-          $ExpectedPreviousPolicySha256, 'Packaging/AndroidHosting/app/android/update-policy-v2.json'),
+          $ExpectedPreviousPolicySha256, 'Packaging/AndroidHosting/app/android/update-policy-v2.json', "$PublicAndroidBaseUrl/update-policy-v2.json"),
         @($RemoteRootDirectory, 'index.html', $previousSitePath,
-          $ExpectedPreviousSiteSha256, 'Packaging/SiteProduction/index.html')
+          $ExpectedPreviousSiteSha256, 'Packaging/SiteProduction/index.html', $PublicSiteUrl)
     )) {
+        $expectedSha = ([string] $fixed[3]).ToLowerInvariant()
+        $needSync = $false
         if (-not (Test-FtpsFileExists $fixed[0] $fixed[1])) {
+            $needSync = $true
+        } else {
+            try {
+                Download-FtpsFile $fixed[0] $fixed[1] $fixed[2]
+                $currentRecord = Get-FileRecord $fixed[2]
+                if ($currentRecord.sha256 -ne $expectedSha) {
+                    $needSync = $true
+                }
+            } catch {
+                $needSync = $true
+            }
+        }
+        if ($needSync) {
+            $synced = $false
             $seedPath = $fixed[4]
             if ($seedPath -and (Test-Path -LiteralPath $seedPath -PathType Leaf)) {
                 $seedRecord = Get-FileRecord $seedPath
-                if ($seedRecord.sha256 -eq ([string] $fixed[3]).ToLowerInvariant()) {
+                if ($seedRecord.sha256 -eq $expectedSha) {
                     Upload-FtpsFile $seedPath $fixed[0] $fixed[1]
+                    $synced = $true
+                }
+            }
+            if (-not $synced -and $fixed.Count -gt 5 -and $fixed[5]) {
+                $httpsTemp = Join-Path $tempRoot "sync-https-$($fixed[1])"
+                if (Test-Path -LiteralPath $httpsTemp -PathType Leaf) {
+                    Remove-Item -LiteralPath $httpsTemp -Force
+                }
+                $res = Invoke-Curl -AllowFailure -Label "Download HTTPS baseline $($fixed[1])" -Arguments @(
+                    '--disable', '--silent', '--show-error', '--fail', '--location',
+                    '--proto', '=https', '--tlsv1.2',
+                    '--connect-timeout', '30', '--max-time', '60',
+                    '--header', 'Cache-Control: no-cache',
+                    '--output', $httpsTemp, $fixed[5]
+                )
+                if ($res.ExitCode -eq 0 -and (Test-Path -LiteralPath $httpsTemp -PathType Leaf)) {
+                    $httpsRec = Get-FileRecord $httpsTemp
+                    if ($httpsRec.sha256 -eq $expectedSha) {
+                        Upload-FtpsFile $httpsTemp $fixed[0] $fixed[1]
+                        $synced = $true
+                    }
                 }
             }
         }
@@ -1459,7 +1496,7 @@ try {
         }
         Download-FtpsFile $fixed[0] $fixed[1] $fixed[2]
         $record = Get-FileRecord $fixed[2]
-        Assert-OrdinalEqual $record.sha256 ([string] $fixed[3]).ToLowerInvariant() `
+        Assert-OrdinalEqual $record.sha256 $expectedSha `
             "hash otimista de $($fixed[1])"
     }
     $previousManifestRecord = Get-FileRecord $previousManifestPath

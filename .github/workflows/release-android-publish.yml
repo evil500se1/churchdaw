@@ -58,7 +58,7 @@ jobs:
   verify-provenance:
     if: inputs.confirmation == 'PUBLISH'
     name: Provar tag, run e artefato Android exatos
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
       artifact_id: ${{ steps.provenance.outputs.artifact_id }}
@@ -250,7 +250,7 @@ jobs:
   verify-android:
     needs: verify-provenance
     name: Revalidar APK Android assinado
-    runs-on: windows-2022
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     outputs:
       apk_sha256: ${{ steps.verify.outputs.apk_sha256 }}
@@ -331,16 +331,19 @@ jobs:
             throw 'Metadata Android diverge do APK/tag/commit'
           }
 
-          $buildTools = Get-ChildItem "$env:ANDROID_HOME\build-tools" -Directory |
+          $apksignerExe = if ($IsWindows) { 'apksigner.bat' } else { 'apksigner' }
+          $aaptExe = if ($IsWindows) { 'aapt.exe' } else { 'aapt' }
+          $androidSdk = if ($env:ANDROID_HOME) { $env:ANDROID_HOME } else { $env:ANDROID_SDK_ROOT }
+          $buildTools = Get-ChildItem "$androidSdk/build-tools" -Directory |
             Sort-Object { try { [version] $_.Name } catch { [version] '0.0' } } `
               -Descending | Where-Object {
-                (Test-Path (Join-Path $_.FullName 'apksigner.bat')) -and
-                (Test-Path (Join-Path $_.FullName 'aapt.exe'))
+                (Test-Path (Join-Path $_.FullName $apksignerExe)) -and
+                (Test-Path (Join-Path $_.FullName $aaptExe))
               } | Select-Object -First 1
           if ($null -eq $buildTools) {
             throw 'apksigner/aapt nao encontrados no Android SDK do runner'
           }
-          $signerOutput = @(& (Join-Path $buildTools.FullName 'apksigner.bat') `
+          $signerOutput = @(& (Join-Path $buildTools.FullName $apksignerExe) `
             verify --verbose --print-certs $apk[0].FullName)
           if ($LASTEXITCODE -ne 0 -or
               -not ($signerOutput -match
@@ -362,7 +365,7 @@ jobs:
             throw 'Certificado real diverge da metadata'
           }
 
-          $badging = @(& (Join-Path $buildTools.FullName 'aapt.exe') `
+          $badging = @(& (Join-Path $buildTools.FullName $aaptExe) `
             dump badging $apk[0].FullName)
           if ($LASTEXITCODE -ne 0) { throw 'aapt dump badging falhou' }
           $packageLine = $badging | Where-Object { $_ -like 'package:*' } |
@@ -406,7 +409,7 @@ jobs:
       - verify-provenance
       - verify-android
     name: Promover APK, catalogos e policy v2 por ultimo
-    runs-on: windows-2022
+    runs-on: ubuntu-latest
     timeout-minutes: 90
     environment: desktop-production
     env:

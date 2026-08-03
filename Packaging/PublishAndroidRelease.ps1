@@ -1462,10 +1462,19 @@ try {
         if ($needSync) {
             $synced = $false
             $seedPath = $fixed[4]
+            $uploadAtomicFtps = {
+                param([string] $srcPath, [string] $remoteDir, [string] $name)
+                $tmpName = "$name.tmp.$runToken"
+                if (Test-FtpsFileExists $remoteDir $tmpName) {
+                    try { Remove-FtpsFile $remoteDir $tmpName } catch {}
+                }
+                Upload-FtpsFile $srcPath $remoteDir $tmpName
+                Rename-FtpsFile $remoteDir $tmpName $name
+            }
             if ($seedPath -and (Test-Path -LiteralPath $seedPath -PathType Leaf)) {
                 $seedRecord = Get-FileRecord $seedPath
                 if ($seedRecord.sha256 -eq $expectedSha) {
-                    Upload-FtpsFile $seedPath $fixed[0] $fixed[1]
+                    &$uploadAtomicFtps $seedPath $fixed[0] $fixed[1]
                     $synced = $true
                 }
             }
@@ -1484,7 +1493,7 @@ try {
                 if ($res.ExitCode -eq 0 -and (Test-Path -LiteralPath $httpsTemp -PathType Leaf)) {
                     $httpsRec = Get-FileRecord $httpsTemp
                     if ($httpsRec.sha256 -eq $expectedSha) {
-                        Upload-FtpsFile $httpsTemp $fixed[0] $fixed[1]
+                        &$uploadAtomicFtps $httpsTemp $fixed[0] $fixed[1]
                         $synced = $true
                     }
                 }

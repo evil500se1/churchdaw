@@ -469,8 +469,12 @@ function Get-FtpsNames {
         throw "curl nao criou a listagem FTPS: $RemoteDirectory"
     }
     $names = @([IO.File]::ReadAllLines($listPath) |
-        ForEach-Object { ([string] $_).Trim() } |
-        Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        ForEach-Object {
+            $line = ([string] $_).Trim()
+            if (-not [string]::IsNullOrWhiteSpace($line)) {
+                [IO.Path]::GetFileName($line)
+            }
+        } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
     $uniqueNames = @($names | Sort-Object -Unique -CaseSensitive)
     if ($names.Count -ne $uniqueNames.Count) {
         throw "Listagem FTPS duplicada/ambigua: $RemoteDirectory"

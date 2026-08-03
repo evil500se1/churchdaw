@@ -525,6 +525,74 @@ juce_add_binary_data(ChurchAssets SOURCES
     Assets/glyph_bells.png
     Assets/glyph_lead.png)
 
+juce_add_console_app(ChurchDAWAudioMidiButtonTests
+    PRODUCT_NAME "ChurchDAWAudioMidiButtonTests")
+
+target_sources(ChurchDAWAudioMidiButtonTests PRIVATE
+    Tests/UI/AudioMidiButtonTests.cpp)
+
+target_include_directories(ChurchDAWAudioMidiButtonTests PRIVATE Source)
+
+target_compile_definitions(ChurchDAWAudioMidiButtonTests PRIVATE
+    JUCE_WEB_BROWSER=0
+    JUCE_PUSH_NOTIFICATIONS=0
+    JUCE_USE_CURL=0)
+
+target_link_libraries(ChurchDAWAudioMidiButtonTests
+    PRIVATE
+        ChurchAssets
+        juce::juce_gui_basics
+        juce::juce_gui_extra
+        juce::juce_audio_utils
+        juce::juce_audio_processors
+        juce::juce_audio_devices
+        juce::juce_dsp
+        juce::juce_cryptography
+    PUBLIC
+        juce::juce_recommended_config_flags)
+
+if(MSVC)
+    target_compile_options(ChurchDAWAudioMidiButtonTests PRIVATE /utf-8)
+endif()
+
+add_test(
+    NAME ChurchDAWAudioMidiButton
+    COMMAND ChurchDAWAudioMidiButtonTests)
+
+juce_add_console_app(ChurchDAWAndroidAudioMidiCenterTests
+    PRODUCT_NAME "ChurchDAWAndroidAudioMidiCenterTests")
+
+target_sources(ChurchDAWAndroidAudioMidiCenterTests PRIVATE
+    Tests/UI/AndroidAudioMidiCenterTests.cpp)
+
+target_include_directories(ChurchDAWAndroidAudioMidiCenterTests PRIVATE Source)
+
+target_compile_definitions(ChurchDAWAndroidAudioMidiCenterTests PRIVATE
+    JUCE_WEB_BROWSER=0
+    JUCE_PUSH_NOTIFICATIONS=0
+    JUCE_USE_CURL=0)
+
+target_link_libraries(ChurchDAWAndroidAudioMidiCenterTests
+    PRIVATE
+        ChurchAssets
+        juce::juce_gui_basics
+        juce::juce_gui_extra
+        juce::juce_audio_utils
+        juce::juce_audio_processors
+        juce::juce_audio_devices
+        juce::juce_dsp
+        juce::juce_cryptography
+    PUBLIC
+        juce::juce_recommended_config_flags)
+
+if(MSVC)
+    target_compile_options(ChurchDAWAndroidAudioMidiCenterTests PRIVATE /utf-8)
+endif()
+
+add_test(
+    NAME ChurchDAWAndroidAudioMidiCenter
+    COMMAND ChurchDAWAndroidAudioMidiCenterTests)
+
 #
 # Church Organ Engine: os quatro motores e a UI sao nativos e comuns a
 # Windows, macOS e Android. A lista unica impede que o app e as sondas do
@@ -726,6 +794,7 @@ if(CHURCHDAW_BUILD_AUDIO_TESTS AND NOT ANDROID AND NOT IOS)
     target_link_libraries(ChurchDAWTimbreLoadStressTests
         PRIVATE
             ChurchAssets
+            juce::juce_cryptography
             juce::juce_dsp
             juce::juce_audio_utils
             juce::juce_audio_processors
@@ -778,6 +847,7 @@ if(CHURCHDAW_BUILD_AUDIO_TESTS AND NOT ANDROID AND NOT IOS)
         ChurchDAWHostedInstrumentMidiRoutingTests
         PRIVATE
             ChurchAssets
+            juce::juce_cryptography
             juce::juce_dsp
             juce::juce_audio_utils
             juce::juce_audio_processors

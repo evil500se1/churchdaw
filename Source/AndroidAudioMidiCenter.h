@@ -318,6 +318,16 @@ public:
         layoutCurrentTab();
     }
 
+    void setTab (int index)
+    {
+        current = static_cast<Tab> (juce::jlimit (0, 2, index));
+        for (int i = 0; i < tabs.size(); ++i)
+            styleTab (*tabs[i], i == (int) current);
+        refreshStatus();
+        layoutCurrentTab();
+        repaint();
+    }
+
 private:
     enum class Tab { Audio = 0, Latency = 1, MidiUsb = 2 };
 
@@ -440,16 +450,6 @@ private:
     {
         const int w = juce::jlimit (120, 172, getWidth() / 3);
         return { getWidth() - 56 - 10 - w, 15, w, 28 };
-    }
-
-    void setTab (int index)
-    {
-        current = static_cast<Tab> (juce::jlimit (0, 2, index));
-        for (int i = 0; i < tabs.size(); ++i)
-            styleTab (*tabs[i], i == (int) current);
-        refreshStatus();
-        layoutCurrentTab();
-        repaint();
     }
 
     void hideAllPageWidgets()
@@ -1391,6 +1391,7 @@ private:
                 }
             }
 
+#if JUCE_ANDROID
             auto* env = juce::getEnv();
             // LocalRef deve viver por TODA a sequência JNI abaixo.
             juce::LocalRef<jobject> activity (juce::getMainActivity());
@@ -1461,6 +1462,7 @@ private:
             }
 
             env->DeleteLocalRef (clazz);
+#endif
 
             if (safe->host.refreshMidiInputs)
                 safe->host.refreshMidiInputs();

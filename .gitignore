@@ -39,3 +39,19 @@ Packaging/AndroidHosting/**/*.apk
 Packaging/AndroidHosting/app/android/packs/
 Packaging/**/*.apk
 Tests/**/outputs/
+
+# Artifacts and agent metadata
+*.log
+catalog.json
+Packaging/*.log
+Packaging/DevicePrivateBackup/
+Packaging/screen-captures/
+Packaging/*.py
+Packaging/*.ps1
+Packaging/*.tar
+Packaging/**/*.zip
+Packaging/TimbrePacks/
+.agents/
+ORIGINAL_REQUEST.md
+PROJECT.md
+

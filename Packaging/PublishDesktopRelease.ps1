@@ -539,7 +539,8 @@ function Invoke-FtpsQuote {
         '--disable', '--silent', '--show-error', '--fail',
         '--connect-timeout', '30', '--max-time', '60',
         '--insecure', '--ssl-reqd', '--tlsv1.2', '--ftp-pasv',
-        '--netrc-file', $NetrcPath
+        '--netrc-file', $NetrcPath,
+        '--quote', "CWD $RemoteDirectory"
     )
     foreach ($command in $Commands) {
         $arguments += @('--quote', $command)

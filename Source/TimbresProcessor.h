@@ -1,5 +1,12 @@
 #pragma once
 
+// juce::MidiInput (lista de teclados por canal) vive em juce_audio_devices.
+// Testes console e o app desktop precisam do include explicito; sem ele o CI
+// macOS falha em ChurchDAWTimbreLoadStressTests com "no member named MidiInput".
+#include <juce_audio_devices/juce_audio_devices.h>
+#include <juce_audio_utils/juce_audio_utils.h>
+#include <juce_gui_extra/juce_gui_extra.h>
+
 #include "AppPaths.h"
 #include "SampleStream.h"
 #include "WorshipReverb.h"

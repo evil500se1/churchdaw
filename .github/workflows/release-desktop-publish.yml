@@ -103,7 +103,7 @@ jobs:
           [[ "$GITHUB_REF" == "refs/heads/$default_branch" ]] \
             || { echo "Despache o publicador pelo branch default protegido" >&2; exit 1; }
 
-          git fetch --force origin "+refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          git fetch "https://x-access-token:$GH_TOKEN@github.com/$GITHUB_REPOSITORY.git" "+refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
 
           local_tag_object="$(git rev-parse --verify "refs/tags/$RELEASE_TAG")"
           local_tag_commit="$(git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}")"

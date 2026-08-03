@@ -14,7 +14,7 @@
      arm64-v8a, que e o que todo celular atual usa. Nao copie de la. -->
 
 <JUCERPROJECT id="ChDW01" name="ChurchDAW" projectType="guiapp"
-              version="1.5.8" bundleIdentifier="com.churchdaw.app"
+              version="1.5.9" bundleIdentifier="com.churchdaw.app"
               companyName="ChurchDAW" companyCopyright="ChurchDAW"
               useAppConfig="0" addUsingNamespaceToJuceHeader="0"
               jucerFormatVersion="1"

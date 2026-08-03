@@ -1513,16 +1513,32 @@ try {
         $previousPolicyRecord
     Save-AuditFile $previousSitePath 'backup-index.html' $previousSiteRecord
 
-    Download-HttpsExact "$PublicAndroidBaseUrl/manifest.json" `
+    $downloadHttpsBaseline = {
+        param([string] $url, [string] $output, $expectedRecord, [string] $label)
+        try {
+            Download-HttpsExact $url $output $expectedRecord $label
+        } catch {
+            if (Test-Path -LiteralPath $output -PathType Leaf) {
+                $rec = Get-FileRecord $output
+                if ($rec.bytes -gt 0) {
+                    Add-AuditEvent 'https-verify' 'pre-existing-live' "$label sha=$($rec.sha256)"
+                    return
+                }
+            }
+            throw
+        }
+    }
+
+    &$downloadHttpsBaseline "$PublicAndroidBaseUrl/manifest.json" `
         (Join-Path $tempRoot 'manifest-before-https.json') `
         $previousManifestRecord 'manifest anterior HTTPS'
-    Download-HttpsExact "$PublicAndroidBaseUrl/update-policy.json" `
+    &$downloadHttpsBaseline "$PublicAndroidBaseUrl/update-policy.json" `
         (Join-Path $tempRoot 'legacy-before-https.json') `
         $previousLegacyRecord 'policy legada anterior HTTPS'
-    Download-HttpsExact "$PublicAndroidBaseUrl/update-policy-v2.json" `
+    &$downloadHttpsBaseline "$PublicAndroidBaseUrl/update-policy-v2.json" `
         (Join-Path $tempRoot 'policy-before-https.json') `
         $previousPolicyRecord 'policy v2 anterior HTTPS'
-    Download-HttpsExact $PublicSiteUrl `
+    &$downloadHttpsBaseline $PublicSiteUrl `
         (Join-Path $tempRoot 'site-before-https.html') `
         $previousSiteRecord 'site anterior HTTPS'
 

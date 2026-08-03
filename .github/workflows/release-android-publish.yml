@@ -108,6 +108,8 @@ jobs:
             "$expected_commit" "refs/remotes/origin/$default_branch" \
             || { echo "Commit da tag nao esta no branch default" >&2; exit 1; }
 
+          git fetch --force origin "+refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+
           local_tag_object="$(git rev-parse --verify "refs/tags/$RELEASE_TAG")"
           local_tag_commit="$(git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}")"
           [[ "$local_tag_object" =~ ^[0-9a-fA-F]{40}$ ]]

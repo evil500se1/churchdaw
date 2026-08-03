@@ -106,10 +106,10 @@ struct AppPaths
     // Onde o instalador coloca as bibliotecas compartilhadas.
     //   Windows: C:\ProgramData\ChurchDAW
     //   macOS:   /Library/Application Support/ChurchDAW
-    //   Android: dataDir/ChurchDAW (gerenciado pelo proprio app)
+    //   Android/iOS: sandbox/ChurchDAW (gerenciado pelo proprio app)
     static juce::File sharedDataFolder()
     {
-       #if JUCE_ANDROID
+       #if JUCE_ANDROID || JUCE_IOS
         return managedDataFolder();
        #endif
 
@@ -118,7 +118,8 @@ struct AppPaths
     }
 
     // Raiz privada e gravavel usada por downloads, cache e instalacoes atomicas.
-    // No Android e /data/user/0/com.churchdaw.app/ChurchDAW.
+    // No Android e /data/user/0/com.churchdaw.app/ChurchDAW; no iOS fica na
+    // Library gravavel do sandbox, nunca na /Library global nem no bundle.
     static juce::File managedDataFolder()
     {
         return juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory)

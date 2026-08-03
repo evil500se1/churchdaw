@@ -2,6 +2,7 @@
 
 #include <juce_gui_extra/juce_gui_extra.h>
 #include "ChurchDAWServices.h"
+#include "AndroidCultoConnectivity.h"
 #include "NordLookAndFeel.h"
 
 class LibraryCatalogPanel;
@@ -43,20 +44,22 @@ public:
         installText.clear();
         lastError.clear();
 
-        const auto managedFolder = pack.installedFolder();
+        const auto managedFolder = pack.detectedInstalledFolder();
+        const bool managedPathExists = managedFolder.exists();
         const bool managedFolderExists = managedFolder.isDirectory();
         const int installedVersion = pack.installedVersion();
         const bool managedContentIsUsable =
             managedFolderExists && containsUsableSample (managedFolder);
         const bool managedInstallIsInconsistent =
-            managedFolderExists
-            && (! pack.markerFile().existsAsFile()
+            managedPathExists
+            && (! managedFolderExists
+                || ! managedFolder.getChildFile (".churchdaw-library.json").existsAsFile()
                 || installedVersion <= 0
                 || ! managedContentIsUsable);
         const bool installed = pack.isInstalled() && ! managedInstallIsInconsistent;
         const bool updateAvailable = installedVersion > 0
                                   && installedVersion < pack.version
-                                  && (! managedFolderExists || managedContentIsUsable);
+                                  && (! managedPathExists || managedContentIsUsable);
 
         if (installed)
         {
@@ -172,7 +175,9 @@ public:
         auto titleArea = area.removeFromTop (dense ? 22 : compact ? 27 : 35);
         g.setColour (juce::Colours::white);
         g.setFont (juce::Font (juce::FontOptions (dense ? 15.0f : compact ? 17.0f : 19.0f)).boldened());
-        g.drawFittedText (pack.name, titleArea, juce::Justification::centredLeft, 1, 0.8f);
+        g.drawFittedText (
+            ChurchDAWAndroidCulto::displayNameForPack (pack.id, pack.name),
+            titleArea, juce::Justification::centredLeft, 1, 0.8f);
 
         juce::String meta;
 
@@ -195,7 +200,8 @@ public:
         g.setFont (juce::Font (juce::FontOptions (dense ? 10.5f : compact ? 12.0f : 12.5f)));
         const auto bodyText = installing ? installText
                             : lastError.isNotEmpty() ? lastError
-                                                   : pack.description;
+                            : ChurchDAWAndroidCulto::descriptionHintForPack (
+                                  pack.id, pack.description);
         g.drawFittedText (bodyText, area, juce::Justification::topLeft,
                           compact ? 2 : 3, 0.8f);
 
@@ -228,10 +234,41 @@ public:
     std::function<void (const ChurchDAWServices::LibraryPack&)> onAction;
 
 private:
-    static bool containsUsableSample (const juce::File& folder)
+    bool containsUsableSample (const juce::File& folder) const
     {
         if (! folder.isDirectory())
             return false;
+
+        // O Pad Continuo e um conjunto indivisivel de sete notas naturais.
+        // Um marker valido mais apenas um WAV fazia o card dizer INSTALADA e
+        // desabilitar o botao, enquanto o painel do Pad continuava indisponivel.
+        // Nesse caso o catalogo deve oferecer Reparar.
+        if (pack.id == "pad-continuo")
+        {
+            auto complete = [] (const juce::File& candidate)
+            {
+                if (! candidate.isDirectory())
+                    return false;
+
+                for (const char note : { 'A', 'B', 'C', 'D', 'E', 'F', 'G' })
+                    if (! candidate.getChildFile (
+                              "pad_" + juce::String::charToString (note) + ".wav")
+                             .existsAsFile())
+                        return false;
+
+                return true;
+            };
+
+            if (complete (folder))
+                return true;
+
+            for (const auto& entry : juce::RangedDirectoryIterator (
+                     folder, true, "*", juce::File::findDirectories))
+                if (complete (entry.getFile()))
+                    return true;
+
+            return false;
+        }
 
         // Iterador lazy: para no primeiro sample, sem materializar os milhares
         // de arquivos do Church Live apenas para decidir o estado do botao.

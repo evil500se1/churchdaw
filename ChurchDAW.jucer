@@ -14,7 +14,7 @@
      arm64-v8a, que e o que todo celular atual usa. Nao copie de la. -->
 
 <JUCERPROJECT id="ChDW01" name="ChurchDAW" projectType="guiapp"
-              version="1.5.4" bundleIdentifier="com.churchdaw.app"
+              version="1.5.8" bundleIdentifier="com.churchdaw.app"
               companyName="ChurchDAW" companyCopyright="ChurchDAW"
               useAppConfig="0" addUsingNamespaceToJuceHeader="0"
               jucerFormatVersion="1"
@@ -45,6 +45,8 @@
       <FILE id="srcDev" name="DeviceInfoBar.h"      compile="0" resource="0" file="Source/DeviceInfoBar.h"/>
       <FILE id="srcLkc" name="LaunchkeyControl.h"   compile="0" resource="0" file="Source/LaunchkeyControl.h"/>
       <FILE id="srcMlp" name="MidiLearnPanel.h"     compile="0" resource="0" file="Source/MidiLearnPanel.h"/>
+      <FILE id="srcLvs" name="LiveScenes.h"         compile="0" resource="0" file="Source/LiveScenes.h"/>
+      <FILE id="srcLsp" name="LiveScenePanel.h"     compile="0" resource="0" file="Source/LiveScenePanel.h"/>
       <FILE id="srcOld" name="OledDisplay.h"        compile="0" resource="0" file="Source/OledDisplay.h"/>
       <FILE id="srcAbt" name="AboutPanel.h"         compile="0" resource="0" file="Source/AboutPanel.h"/>
       <FILE id="srcChd" name="ChordDetect.h"        compile="0" resource="0" file="Source/ChordDetect.h"/>
@@ -132,7 +134,7 @@
                    androidCpp11="1"
                    androidMinimumSDK="24"
                    androidTargetSDK="36"
-                   androidVersionCode="10"
+                   androidVersionCode="14"
                    androidInternetNeeded="1"
                    androidReadMediaAudioPermission="1"
                    androidReadMediaImagesPermission="0"
@@ -146,7 +148,7 @@
                    androidDependencies=""
                    androidCustomAppBuildGradleContent="&#10;    // A distribuicao e feita pelo churchdaw.com. A chave de release fica fora&#10;    // do projeto; sem as credenciais o Gradle nunca assina um APK de producao.&#10;    def churchStore = System.getenv(&quot;CHURCHDAW_UPLOAD_STORE_FILE&quot;)&#10;    def churchStorePass = System.getenv(&quot;CHURCHDAW_UPLOAD_STORE_PASSWORD&quot;)&#10;    def churchKeyAlias = System.getenv(&quot;CHURCHDAW_UPLOAD_KEY_ALIAS&quot;)&#10;    def churchKeyPass = System.getenv(&quot;CHURCHDAW_UPLOAD_KEY_PASSWORD&quot;)&#10;    if (churchStore &amp;&amp; churchStorePass &amp;&amp; churchKeyAlias &amp;&amp; churchKeyPass) {&#10;        signingConfigs.create(&quot;churchDawWebRelease&quot;) {&#10;            storeFile(file(churchStore))&#10;            storePassword(churchStorePass)&#10;            keyAlias(churchKeyAlias)&#10;            keyPassword(churchKeyPass)&#10;            storeType(&quot;jks&quot;)&#10;        }&#10;        buildTypes.release.signingConfig = signingConfigs.churchDawWebRelease&#10;    } else {&#10;        buildTypes.release.signingConfig = null&#10;    }&#10;"
                    extraCompilerFlags="-funroll-loops"
-                   androidManifestCustomXmlElements="&#10;&lt;manifest&gt;&#10;  &lt;!-- SEM ESTA LINHA O TECLADO NAO TOCA. O Android so entrega dispositivos&#10;       MIDI a um app que declara a feature; sem ela o MidiManager devolve&#10;       lista VAZIA, sem erro nenhum -- o app abre, o timbre carrega, e apertar&#10;       a tecla nao faz nada. Foi exatamente o sintoma no aparelho. --&gt;&#10;  &lt;uses-feature android:name=&quot;android.software.midi&quot; android:required=&quot;true&quot; /&gt;&#10;  &lt;uses-feature android:name=&quot;android.hardware.usb.host&quot; android:required=&quot;false&quot; /&gt;&#10;  &lt;!-- INTERNET faz o JUCE declarar multicast; torne Wi-Fi opcional para nao&#10;       excluir tablets Android com outra conectividade na Play Store. --&gt;&#10;  &lt;uses-feature android:name=&quot;android.hardware.wifi&quot; android:required=&quot;false&quot; /&gt;&#10;  &lt;!-- Libraries pode ocupar dezenas de GB e nunca deve entrar em Auto Backup.&#10;       O icone adaptativo e a fonte oficial do launcher; o roundIcon usa a mesma&#10;       arte para respeitar a mascara escolhida pelo fabricante. --&gt;&#10;  &lt;application android:allowBackup=&quot;false&quot; android:fullBackupContent=&quot;false&quot;&#10;               android:icon=&quot;@mipmap/ic_launcher&quot;&#10;               android:roundIcon=&quot;@mipmap/ic_launcher&quot; /&gt;&#10;&lt;/manifest&gt;&#10;">
+                   androidManifestCustomXmlElements="&#10;&lt;manifest&gt;&#10;  &lt;!-- SEM ESTA LINHA O TECLADO NAO TOCA. O Android so entrega dispositivos&#10;       MIDI a um app que declara a feature; sem ela o MidiManager devolve&#10;       lista VAZIA, sem erro nenhum -- o app abre, o timbre carrega, e apertar&#10;       a tecla nao faz nada. Foi exatamente o sintoma no aparelho. --&gt;&#10;  &lt;uses-feature android:name=&quot;android.software.midi&quot; android:required=&quot;true&quot; /&gt;&#10;  &lt;uses-feature android:name=&quot;android.hardware.usb.host&quot; android:required=&quot;false&quot; /&gt;&#10;  &lt;!-- INTERNET faz o JUCE declarar multicast; torne Wi-Fi opcional para nao&#10;       excluir tablets Android com outra conectividade na Play Store. --&gt;&#10;  &lt;uses-feature android:name=&quot;android.hardware.wifi&quot; android:required=&quot;false&quot; /&gt;&#10;  &lt;!-- Libraries pode ocupar dezenas de GB e nunca deve entrar em Auto Backup.&#10;       O icone adaptativo e a fonte oficial do launcher; o roundIcon usa a mesma&#10;       arte para respeitar a mascara escolhida pelo fabricante. --&gt;&#10;  &lt;application android:allowBackup=&quot;false&quot; android:fullBackupContent=&quot;false&quot;&#10;               android:icon=&quot;@mipmap/ic_launcher&quot;&#10;               android:roundIcon=&quot;@mipmap/ic_launcher&quot; /&gt;&#10;  &lt;!-- MIDI Bluetooth LE: sem CONNECT/SCAN (API 31+) o MidiManager nao lista teclados BLE. --&gt;&#10;  &lt;uses-permission android:name=&quot;android.permission.BLUETOOTH&quot; android:maxSdkVersion=&quot;30&quot; /&gt;&#10;  &lt;uses-permission android:name=&quot;android.permission.BLUETOOTH_ADMIN&quot; android:maxSdkVersion=&quot;30&quot; /&gt;&#10;  &lt;uses-permission android:name=&quot;android.permission.BLUETOOTH_CONNECT&quot; /&gt;&#10;  &lt;uses-permission android:name=&quot;android.permission.BLUETOOTH_SCAN&quot; android:usesPermissionFlags=&quot;neverForLocation&quot; /&gt;&#10;  &lt;uses-feature android:name=&quot;android.hardware.bluetooth_le&quot; android:required=&quot;false&quot; /&gt;&#10;&lt;/manifest&gt;&#10;">
       <CONFIGURATIONS>
         <CONFIGURATION name="Debug"   isDebug="1" targetName="ChurchDAW"
                        androidArchitectures="arm64-v8a"

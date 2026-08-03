@@ -112,9 +112,15 @@ bool PluginDirectoryScanner::scanNextFile (bool dontRescanIfAlreadyInList,
 
             list.scanAndAddFile (file, dontRescanIfAlreadyInList, typesFound, format);
 
-            // Managed to load without crashing, so remove it from the dead-man's-pedal.
-            crashedPlugins.removeString (file);
-            setDeadMansPedalFile (crashedPlugins);
+            // O CustomScanner devolve false para crash/timeout e a blacklist
+            // e persistida depois por ChangeBroadcaster. Nao apague o journal
+            // antes disso: uma segunda queda nessa janela faria o culpado
+            // reaparecer como habilitado no proximo boot.
+            if (! list.isBlacklisted (file, false))
+            {
+                crashedPlugins.removeString (file);
+                setDeadMansPedalFile (crashedPlugins);
+            }
 
             if (typesFound.size() == 0 && ! list.getBlacklistedFiles().contains (file))
                 failedFiles.add (file);

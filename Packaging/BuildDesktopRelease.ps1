@@ -396,7 +396,14 @@ if ($audioTestsEnabled) {
             'ChurchDAWChannelToneTests',
             'ChurchDAWMidiMappingSafetyTests',
             'ChurchDAWChannelRotaryTests',
+            'ChurchDAWPadProcessorTests',
+            'ChurchDAWLibraryPackPathTests',
+            'ChurchDAWLiveScenesTests',
+            'ChurchDAWSceneFileWriteProbe',
+            'ChurchDAWPluginScanPolicyTests',
+            'ChurchDAWAndroidStageLayoutTests',
             'ChurchDAWTimbreLoadStressTests',
+            'ChurchDAWHostedInstrumentMidiRoutingTests',
             'ChurchDAWReverbBoundsProbe',
             'ChurchDAWUpdatePolicyTests',
             '--parallel', "$Parallel") `
@@ -407,10 +414,9 @@ if ($audioTestsEnabled) {
             '--test-dir', $BuildDir,
             '-C', 'Release',
             '--output-on-failure',
-            '--no-tests=error',
-            '-R', '^ChurchDAW(ReverbPitch|MasterLimiter|ChannelTone|MidiMappingSafety|ChannelRotary|ChannelControlState|ReverbBounds)$') `
+            '--no-tests=error') `
         -LogPath (Join-Path $logsDir '05-audio-tests-release.log') `
-        -Label 'release audio tests'
+        -Label 'complete release tests'
 
     $null = Invoke-ReleaseCommand -FilePath $cmake `
         -Arguments @(
@@ -503,8 +509,8 @@ $appSha = (Get-FileHash -LiteralPath $appBinary `
 if ($audioTestsEnabled) {
     $fixtureDirectory = Join-Path $BuildDir 'update-policy-fixtures'
     New-Item -ItemType Directory -Path $fixtureDirectory | Out-Null
-    $fixture4 = Join-Path $fixtureDirectory 'policy-serial-4.json'
-    $fixture5 = Join-Path $fixtureDirectory 'policy-serial-5.json'
+    $fixture1 = Join-Path $fixtureDirectory 'policy-serial-1.json'
+    $fixture2 = Join-Path $fixtureDirectory 'policy-serial-2.json'
     $fixtureUrl =
         "https://churchdaw.com/app/desktop/$([IO.Path]::GetFileName($appBinary))"
     $fixtureCommon = @{
@@ -526,23 +532,25 @@ if ($audioTestsEnabled) {
         $fixtureCommon.AllowUnsignedWindowsInstallerForTest = $true
     }
 
-    $fixture4Arguments = @{} + $fixtureCommon
-    $fixture4Arguments.PolicySerial = 4
-    $fixture4Arguments.Output = $fixture4
+    $fixture1Arguments = @{} + $fixtureCommon
+    $fixture1Arguments.PolicySerial = 1
+    $fixture1Arguments.Output = $fixture1
     $null = & (Join-Path $PSScriptRoot `
-        'SignDesktopUpdatePolicy.ps1') @fixture4Arguments
+        'SignDesktopUpdatePolicy.ps1') @fixture1Arguments
 
-    Copy-FileAndVerify -Source $fixture4 -Destination $fixture5
-    $fixture5Arguments = @{} + $fixtureCommon
-    $fixture5Arguments.PolicySerial = 5
-    $fixture5Arguments.Output = $fixture5
+    $fixture2Arguments = @{} + $fixtureCommon
+    $fixture2Arguments.PolicySerial = 2
+    $fixture2Arguments.LatestVersionCode = 10500
+    $fixture2Arguments.LatestVersionName = '1.5.0'
+    $fixture2Arguments.PreviousPolicy = $fixture1
+    $fixture2Arguments.Output = $fixture2
     $null = & (Join-Path $PSScriptRoot `
-        'SignDesktopUpdatePolicy.ps1') @fixture5Arguments
+        'SignDesktopUpdatePolicy.ps1') @fixture2Arguments
 
     $updateTests = Resolve-UniqueBuildFile -Root $BuildDir `
         -Name 'ChurchDAWUpdatePolicyTests.exe'
     $null = Invoke-ReleaseCommand -FilePath $updateTests `
-        -Arguments @($repo, $fixture4, $fixture5) `
+        -Arguments @($repo, $fixture1, $fixture2) `
         -LogPath (Join-Path $logsDir '11-update-policy-tests.log') `
         -Label 'desktop update policy tests'
 }
@@ -652,10 +660,6 @@ if ($PolicySerial -gt 0) {
     }
 
     $policyPath = Join-Path $stagingDir 'update-policy-v1.json'
-    if (-not [string]::IsNullOrWhiteSpace($PreviousPolicy)) {
-        Copy-FileAndVerify -Source $PreviousPolicy -Destination $policyPath
-    }
-
     $policyArguments = @{
         PolicySerial = $PolicySerial
         LatestVersionCode = $versionCode
@@ -667,6 +671,7 @@ if ($PolicySerial -gt 0) {
             "https://churchdaw.com/app/desktop/$(
                 [IO.Path]::GetFileName($stagedInstaller))"
         PrivateKey = $UpdatePolicyPrivateKey
+        PreviousPolicy = $PreviousPolicy
         Output = $policyPath
         ReleaseMode = $ReleaseMode
         ExpectedWindowsPublisher = $signingPolicy.ExpectedPublisher

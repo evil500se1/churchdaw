@@ -65,19 +65,30 @@ public:
 
     void paintCell (Graphics& g, int row, int columnId, int width, int height, bool /*rowIsSelected*/) override
     {
+        const auto types = list.getTypes();
+        const auto blacklisted = list.getBlacklistedFiles();
+        const int numTypes = types.size();
         String text;
-        bool isBlacklisted = row >= list.getNumTypes();
+        const bool isBlacklisted = row >= numTypes;
 
         if (isBlacklisted)
         {
+            const int blacklistIndex = row - numTypes;
+
+            if (! isPositiveAndBelow (blacklistIndex, blacklisted.size()))
+                return;   // a lista mudou entre getNumRows() e este repaint
+
             if (columnId == nameCol)
-                text = list.getBlacklistedFiles() [row - list.getNumTypes()];
+                text = blacklisted[blacklistIndex];
             else if (columnId == descCol)
                 text = TRANS ("Deactivated after failing to initialise correctly");
         }
         else
         {
-            auto desc = list.getTypes()[row];
+            if (! isPositiveAndBelow (row, types.size()))
+                return;   // snapshot defensivo durante a varredura em worker
+
+            const auto& desc = types.getReference (row);
 
             switch (columnId)
             {
@@ -262,7 +273,10 @@ private:
                                                    if (result != 0)
                                                        warnUserAboutUnsuitablePaths (weakSelf);
                                                    else
+                                                   {
+                                                       requestStop();
                                                        finishedScan();
+                                                   }
                                                }));
         }
         else
@@ -294,7 +308,10 @@ private:
                     if (result != 0)
                         startScan (weakSelf);
                     else
+                    {
+                        requestStop();
                         finishedScan();
+                    }
                 });
 
                 return;
@@ -355,7 +372,7 @@ private:
         progressWindow.enterModalState (true, ModalCallbackFunction::create ([weakSelf] (auto)
         {
             if (const auto strong = weakSelf.lock())
-                strong->flags |= stopRequested;
+                strong->requestStop();
         }));
 
         if (numThreads > 0)
@@ -369,6 +386,21 @@ private:
         startTimer (20);
     }
 
+    void requestStop()
+    {
+        flags |= stopRequested;
+
+        // KnownPluginList::CustomScanner::shouldExit() observes the exit flag
+        // of the current ThreadPoolJob, not Scanner::flags. ThreadPool owns the
+        // lock/lifetime while it signals jobs; getJob()+raw pointer aqui teria
+        // corrida com o worker apagando o job. Se todos ainda estavam apenas
+        // na fila, removeAllJobs os retira sem executar runJob, portanto somos
+        // nos que precisamos marcar `finished` nesse caso.
+        if (pool != nullptr)
+            if (pool->removeAllJobs (true, 0))
+                flags |= finished;
+    }
+
     void finishedScan()
     {
         const auto blacklisted = owner.list.getBlacklistedFiles();
@@ -380,7 +412,8 @@ private:
                              std::back_inserter (newBlacklistedFiles));
 
         owner.scanFinished (scanner != nullptr ? scanner->getFailedFiles() : StringArray(),
-                            newBlacklistedFiles);
+                            newBlacklistedFiles,
+                            (flags & stopRequested) != 0);
     }
 
     void timerCallback() override
@@ -419,8 +452,14 @@ private:
 
         JobStatus runJob() override
         {
-            while (scanner.doNextScan() && ! shouldExit())
+            while (! shouldExit() && scanner.doNextScan())
             {}
+
+            // removeAllJobs(true, ...) also signals the job when the owning
+            // dialog is closed. Mark the shared scanner as cancelled/finished
+            // here so no second file starts and the UI cannot remain waiting.
+            if (shouldExit())
+                scanner.flags |= stopRequested | finished;
 
             return jobHasFinished;
         }
@@ -477,7 +516,10 @@ PluginListComponent::PluginListComponent (AudioPluginFormatManager& manager, Kno
     table.getHeader().reSortTable();
 
     PluginDirectoryScanner::applyBlacklistingsFromDeadMansPedal (list, deadMansPedalFile);
-    deadMansPedalFile.deleteFile();
+    // Este arquivo e o journal duravel de crash/timeout. Apaga-lo ao apenas
+    // reabrir a janela cria uma janela em que o ChangeBroadcaster ainda nao
+    // persistiu a blacklist e uma queda reabilita o plugin culpado. O host o
+    // limpa somente depois de persistir a quarentena, na revalidacao explicita.
 }
 
 PluginListComponent::~PluginListComponent()
@@ -550,13 +592,23 @@ void PluginListComponent::setTableModel (TableListBoxModel* model)
 
 static bool canShowFolderForPlugin (KnownPluginList& list, int index)
 {
-    return File::createFileWithoutCheckingPath (list.getTypes()[index].fileOrIdentifier).exists();
+    const auto types = list.getTypes();
+    return isPositiveAndBelow (index, types.size())
+        && File::createFileWithoutCheckingPath (
+               types.getReference (index).fileOrIdentifier).exists();
 }
 
 static void showFolderForPlugin (KnownPluginList& list, int index)
 {
-    if (canShowFolderForPlugin (list, index))
-        File (list.getTypes()[index].fileOrIdentifier).revealToUser();
+    const auto types = list.getTypes();
+
+    if (isPositiveAndBelow (index, types.size()))
+    {
+        const File folder (types.getReference (index).fileOrIdentifier);
+
+        if (folder.exists())
+            folder.revealToUser();
+    }
 }
 
 void PluginListComponent::removeMissingPlugins()
@@ -574,10 +626,13 @@ void PluginListComponent::removeMissingPlugins()
 
 void PluginListComponent::removePluginItem (int index)
 {
-    if (index < list.getNumTypes())
-        list.removeType (list.getTypes()[index]);
-    else
-        list.removeFromBlacklist (list.getBlacklistedFiles() [index - list.getNumTypes()]);
+    const auto types = list.getTypes();
+    const auto blacklisted = list.getBlacklistedFiles();
+
+    if (isPositiveAndBelow (index, types.size()))
+        list.removeType (types.getReference (index));
+    else if (isPositiveAndBelow (index - types.size(), blacklisted.size()))
+        list.removeFromBlacklist (blacklisted[index - types.size()]);
 }
 
 PopupMenu PluginListComponent::createOptionsMenu()
@@ -628,15 +683,42 @@ PopupMenu PluginListComponent::createOptionsMenu()
 PopupMenu PluginListComponent::createMenuForRow (int rowNumber)
 {
     PopupMenu menu;
+    const auto types = list.getTypes();
+    const auto blacklisted = list.getBlacklistedFiles();
 
-    if (rowNumber >= 0 && rowNumber < tableModel->getNumRows())
+    if (isPositiveAndBelow (rowNumber, types.size()))
     {
+        const auto description = types.getReference (rowNumber);
+        const auto pluginFile = File::createFileWithoutCheckingPath (
+            description.fileOrIdentifier);
+
         menu.addItem (PopupMenu::Item (TRANS ("Remove plug-in from list"))
-                        .setAction ([this, rowNumber] { removePluginItem (rowNumber); }));
+                        .setAction ([this, description]
+                        {
+                            list.removeType (description);
+                        }));
 
         menu.addItem (PopupMenu::Item (TRANS ("Show folder containing plug-in"))
-                        .setEnabled (canShowFolderForPlugin (list, rowNumber))
-                        .setAction ([this, rowNumber] { showFolderForPlugin (list, rowNumber); }));
+                        .setEnabled (pluginFile.exists())
+                        .setAction ([pluginFile]
+                        {
+                            if (pluginFile.exists())
+                                pluginFile.revealToUser();
+                        }));
+    }
+    else
+    {
+        const int blacklistIndex = rowNumber - types.size();
+
+        if (isPositiveAndBelow (blacklistIndex, blacklisted.size()))
+        {
+            const auto identifier = blacklisted[blacklistIndex];
+            menu.addItem (PopupMenu::Item (TRANS ("Remove plug-in from list"))
+                            .setAction ([this, identifier]
+                            {
+                                list.removeFromBlacklist (identifier);
+                            }));
+        }
     }
 
     return menu;
@@ -682,6 +764,8 @@ void PluginListComponent::scanFor (AudioPluginFormat& format)
 
 void PluginListComponent::scanFor (AudioPluginFormat& format, const StringArray& filesOrIdentifiersToScan)
 {
+    lastScanWasCancelled = false;
+    lastScanWasInconclusive = false;
     currentScanner = Scanner::make (*this,
                                     format,
                                     filesOrIdentifiersToScan,
@@ -697,9 +781,26 @@ bool PluginListComponent::isScanning() const noexcept
     return currentScanner != nullptr;
 }
 
-void PluginListComponent::scanFinished (const StringArray& failedFiles,
-                                        const std::vector<String>& newBlacklistedFiles)
+bool PluginListComponent::consumeLastScanWasCancelled() noexcept
 {
+    const bool result = lastScanWasCancelled;
+    lastScanWasCancelled = false;
+    return result;
+}
+
+bool PluginListComponent::consumeLastScanWasInconclusive() noexcept
+{
+    const bool result = lastScanWasInconclusive;
+    lastScanWasInconclusive = false;
+    return result;
+}
+
+void PluginListComponent::scanFinished (const StringArray& failedFiles,
+                                        const std::vector<String>& newBlacklistedFiles,
+                                        bool wasCancelled)
+{
+    lastScanWasCancelled = wasCancelled;
+    lastScanWasInconclusive = list.consumeLastScanWasInconclusive();
     StringArray warnings;
 
     const auto addWarningText = [&warnings] (const auto& range, const auto& prefix)
@@ -715,8 +816,11 @@ void PluginListComponent::scanFinished (const StringArray& failedFiles,
         warnings.add (prefix + ":\n\n" + names.joinIntoString (", "));
     };
 
-    addWarningText (newBlacklistedFiles,  TRANS ("The following files encountered fatal errors during validation"));
-    addWarningText (failedFiles,          TRANS ("The following files appeared to be plugin files, but failed to load correctly"));
+    if (! wasCancelled)
+    {
+        addWarningText (newBlacklistedFiles,  TRANS ("The following files encountered fatal errors during validation"));
+        addWarningText (failedFiles,          TRANS ("The following files appeared to be plugin files, but failed to load correctly"));
+    }
 
     currentScanner.reset(); // mustn't delete this before using the failed files array
 

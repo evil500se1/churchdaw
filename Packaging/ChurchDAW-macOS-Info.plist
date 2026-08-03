@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+        Catalina is the overall floor for the Intel build. Apple Silicon was
+        introduced with macOS 11, so Launch Services must not try to select
+        the arm64 slice below that version. The Mach-O deployment targets are
+        audited independently with vtool in CI and in the release script.
+    -->
+    <key>LSMinimumSystemVersion</key>
+    <string>10.15</string>
+    <key>LSMinimumSystemVersionByArchitecture</key>
+    <dict>
+        <key>x86_64</key>
+        <string>10.15</string>
+        <key>arm64</key>
+        <string>11.0</string>
+    </dict>
+</dict>
+</plist>

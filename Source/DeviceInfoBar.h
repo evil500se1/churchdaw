@@ -9,12 +9,15 @@
 // verde/cinza e um mini-icone vetorial). Substitui o antigo botao de entrada
 // de guitarra/mic. So exibe informacao — nada de clicar.
 //==============================================================================
-class DeviceInfoBar : public juce::Component
+class DeviceInfoBar : public juce::Component,
+                      public juce::SettableTooltipClient
 {
 public:
     DeviceInfoBar()
     {
-        setInterceptsMouseClicks (false, false);
+        // Precisa participar do hit-test para o TooltipWindow encontrar o nome
+        // completo; nao ha onClick nem filhos interativos.
+        setInterceptsMouseClicks (true, false);
     }
 
     void setControllerName (const juce::String& name, bool connected)
@@ -23,6 +26,18 @@ public:
         {
             controller = name;
             ctrlOn = connected;
+            updateTooltip();
+            repaint();
+        }
+    }
+
+    // Tag de transporte (USB / BLE) no chip MIDI — opcional.
+    void setControllerTransport (const juce::String& transportTag)
+    {
+        if (controllerTransport != transportTag)
+        {
+            controllerTransport = transportTag;
+            updateTooltip();
             repaint();
         }
     }
@@ -33,6 +48,17 @@ public:
         {
             interfaceName = name;
             ifaceOn = connected;
+            updateTooltip();
+            repaint();
+        }
+    }
+
+    void setInterfaceTransport (const juce::String& transportTag)
+    {
+        if (interfaceTransport != transportTag)
+        {
+            interfaceTransport = transportTag;
+            updateTooltip();
             repaint();
         }
     }
@@ -75,15 +101,23 @@ public:
 
         juce::String keyboardTag (compact ? "MIDI" : "TECLADO");
 
+        if (controllerTransport.isNotEmpty())
+            keyboardTag = controllerTransport + " " + keyboardTag;
+
         if (mappingCount > 0)
             keyboardTag << "  " << juce::String::charToString ((juce::juce_wchar) 0x2022)
                         << "  " << mappingCount << (mappingCount == 1 ? " MAPA" : " MAPAS");
 
         if (compact)
         {
+            const int nameLines = area.getHeight() >= 38 ? 2 : 1;
+            const auto shownName = controller.isNotEmpty()
+                ? (nameLines > 1 ? controller : shortControllerName (controller))
+                : juce::String ("Nenhum");
             drawChip (g, area.toFloat(), keyboardTag,
-                      controller.isNotEmpty() ? controller : juce::String ("Nenhum"),
-                      ctrlOn, Glyph::keys, midiActivity);
+                      shownName,
+                      ctrlOn, Glyph::keys, midiActivity,
+                      nameLines);
             return;
         }
 
@@ -101,8 +135,12 @@ public:
 
         area.removeFromLeft (gap);
 
+        juce::String audioTag (juce::String::fromUTF8 ("\xc3\x81UDIO")); // ÁUDIO
+        if (interfaceTransport.isNotEmpty())
+            audioTag = interfaceTransport + " " + audioTag;
+
         drawChip (g, area.toFloat(),
-                  juce::String::fromUTF8 ("\xc3\x81UDIO"),   // ÁUDIO
+                  audioTag,
                   interfaceName.isNotEmpty() ? interfaceName : juce::String ("Nenhum"),
                   ifaceOn, Glyph::speaker, false);
     }
@@ -110,16 +148,35 @@ public:
 private:
     enum class Glyph { keys, speaker };
 
+    static juce::String shortControllerName (juce::String name)
+    {
+        if (name.containsIgnoreCase ("Automated CC"))
+            return "Automated CC";
+
+        const int launchkey = name.indexOfIgnoreCase ("Launchkey");
+        if (launchkey >= 0)
+            return name.substring (launchkey).upToFirstOccurrenceOf ("  ", false, false);
+
+        if (name.containsIgnoreCase ("loopMIDI"))
+            return "loopMIDI";
+
+        return name.length() <= 16
+            ? name
+            : name.substring (0, 15)
+                + juce::String::charToString ((juce::juce_wchar) 0x2026);
+    }
+
     static void drawChip (juce::Graphics& g, juce::Rectangle<float> chip,
                           const juce::String& tag, const juce::String& name,
-                          bool connected, Glyph glyph, bool activity)
+                          bool connected, Glyph glyph, bool activity,
+                          int nameLines = 1)
     {
         // HIERARQUIA: estes chips sao informacao de contexto, nao acao. Tinham
         // chapa, borda e brilho iguais aos dos botoes e competiam com eles no
         // topo. Agora sao quase transparentes -- so uma sombra de contorno.
-        g.setColour (juce::Colours::black.withAlpha (0.18f));
+        g.setColour (juce::Colours::black.withAlpha (0.32f));
         g.fillRoundedRectangle (chip, NordLookAndFeel::radiusControl);
-        g.setColour (juce::Colours::white.withAlpha (0.045f));
+        g.setColour (juce::Colours::white.withAlpha (0.10f));
         g.drawRoundedRectangle (chip.reduced (0.5f), NordLookAndFeel::radiusControl, 1.0f);
 
         if (activity)
@@ -153,18 +210,36 @@ private:
         // A tag era VERMELHA de 8.5px dentro de um chip escuro — praticamente
         // ilegivel. Cinza claro com espacamento resolve e ainda tira vermelho
         // de um lugar onde ele nao significava nada.
-        g.setColour (NordLookAndFeel::dimText().withAlpha (0.50f));
-        g.setFont (juce::Font (juce::FontOptions (9.0f)).boldened().withExtraKerningFactor (0.10f));
+        g.setColour (juce::Colours::white.withAlpha (0.68f));
+        g.setFont (juce::Font (juce::FontOptions (9.2f)).boldened()
+                       .withExtraKerningFactor (0.10f));
         g.drawText (tag, inner.removeFromTop (10.0f).toNearestInt(),
                     juce::Justification::bottomLeft, false);
 
         // nome do aparelho: peso normal, nao negrito. Antes gritava tanto quanto
         // o rotulo de um botao de acao.
-        g.setColour (connected ? juce::Colours::white.withAlpha (0.72f)
+        g.setColour (connected ? juce::Colours::white.withAlpha (0.92f)
                                : juce::Colours::white.withAlpha (0.34f));
-        g.setFont (juce::Font (juce::FontOptions (12.0f)));
+        g.setFont (juce::Font (juce::FontOptions (
+            nameLines > 1 ? 10.5f : 11.6f, juce::Font::bold)));
         g.drawFittedText (name, inner.toNearestInt(), juce::Justification::centredLeft,
-                          1, 0.82f);
+                          nameLines, 0.68f);
+    }
+
+    void updateTooltip()
+    {
+        juce::String midiLine = juce::String ("TECLADO");
+        if (controllerTransport.isNotEmpty())
+            midiLine << " (" << controllerTransport << ")";
+        midiLine << ": " << (controller.isNotEmpty() ? controller : juce::String ("Nenhum"));
+
+        juce::String audioLine = juce::String::fromUTF8 ("\xc3\x81UDIO");
+        if (interfaceTransport.isNotEmpty())
+            audioLine << " (" << interfaceTransport << ")";
+        audioLine << ": " << (interfaceName.isNotEmpty() ? interfaceName
+                                                         : juce::String ("Nenhum"));
+
+        setTooltip (midiLine + "\n" + audioLine);
     }
 
     static void drawKeysIcon (juce::Graphics& g, juce::Rectangle<float> r)
@@ -196,6 +271,7 @@ private:
     }
 
     juce::String controller, interfaceName;
+    juce::String controllerTransport, interfaceTransport;
     bool ctrlOn = false, ifaceOn = false;
     bool compact = false, midiActivity = false;
     int mappingCount = 0;

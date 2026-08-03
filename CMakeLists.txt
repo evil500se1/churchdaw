@@ -1,8 +1,22 @@
 cmake_minimum_required(VERSION 3.22)
-# Versao unica do produto: acompanha o ChurchDAW.jucer (Android ja esta
-# em 1.5.4). Publicar conteudo novo com numero velho fazia o updater dos
-# clientes 1.4.0 achar que nao havia atualizacao.
-project(MinhaDAW VERSION 1.5.4)
+
+# Configure o target Apple ANTES de project()/enable_language(). Caso contrario,
+# CMake pode inicializar o compilador com o SDK atual e gravar um minos novo
+# demais nos objetos antes de CMAKE_OSX_DEPLOYMENT_TARGET ser alterado.
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "14.0" CACHE STRING "" FORCE)
+elseif(CMAKE_HOST_SYSTEM_NAME STREQUAL "Darwin"
+       AND (NOT CMAKE_SYSTEM_NAME OR CMAKE_SYSTEM_NAME STREQUAL "Darwin"))
+    # O piso geral e do Info.plist e Catalina para o slice Intel. O toolchain
+    # Apple eleva automaticamente o slice arm64 ao piso real da arquitetura,
+    # macOS 11.0; os workflows verificam cada slice com lipo + vtool.
+    set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "" FORCE)
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "10.15" CACHE STRING "" FORCE)
+endif()
+
+# Versao do produto desktop. O Android mantem versionName/versionCode no
+# ChurchDAW.jucer e pode ser publicado em um ciclo independente.
+project(MinhaDAW VERSION 1.6.0)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -31,27 +45,6 @@ option(CHURCHDAW_UPDATE_ALLOW_LOCALHOST
 
 # runtime do C++ embutido no exe: roda em qualquer PC sem instalar redistribuivel
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
-
-# Apple Silicon + Intel no mesmo binario — precisa valer para TODOS os alvos
-# (app, assets, juceaide), senao o linker mistura arquiteturas e falha.
-if(APPLE)
-    set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "" FORCE)
-
-    # PISO DE COMPATIBILIDADE DO macOS.
-    #
-    # Sem esta linha o piso vira o SDK da maquina que compilou. Medido em
-    # 28/07/2026 no Mac de build (Xcode 26.5): o binario saiu com
-    # "minos 26.0" -- ou seja, recusaria abrir em qualquer macOS anterior ao
-    # 26. Praticamente nenhum comprador teria essa versao.
-    #
-    # E uma falha silenciosa: compila, roda na maquina de build, e so quebra
-    # no computador do cliente. E piora sozinha a cada atualizacao do Xcode.
-    #
-    # 11.0 (Big Sur, 2020) e o primeiro macOS com Apple Silicon, entao cobre
-    # as duas arquiteturas do binario universal sem excluir maquinas Intel
-    # ainda em uso nas igrejas.
-    set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "" FORCE)
-endif()
 
 add_subdirectory(JUCE)
 
@@ -99,6 +92,27 @@ if(CHURCHDAW_BUILD_AUDIO_TESTS AND NOT ANDROID AND NOT IOS)
     juce_add_console_app(ChurchDAWChannelRotaryTests
         PRODUCT_NAME "ChurchDAWChannelRotaryTests")
 
+    juce_add_console_app(ChurchDAWPadProcessorTests
+        PRODUCT_NAME "ChurchDAWPadProcessorTests")
+
+    juce_add_console_app(ChurchDAWLibraryPackPathTests
+        PRODUCT_NAME "ChurchDAWLibraryPackPathTests")
+
+    juce_add_console_app(ChurchDAWLiveScenesTests
+        PRODUCT_NAME "ChurchDAWLiveScenesTests")
+
+    juce_add_console_app(ChurchDAWSceneFileWriteProbe
+        PRODUCT_NAME "ChurchDAWSceneFileWriteProbe")
+
+    juce_add_console_app(ChurchDAWPluginScanPolicyTests
+        PRODUCT_NAME "ChurchDAWPluginScanPolicyTests")
+
+    juce_add_console_app(ChurchDAWChildProcessReapTests
+        PRODUCT_NAME "ChurchDAWChildProcessReapTests")
+
+    add_executable(ChurchDAWAndroidStageLayoutTests
+        Tests/UI/AndroidStageLayoutTests.cpp)
+
     target_sources(ChurchDAWMasterLimiterTests PRIVATE
         Tests/Audio/StereoLookaheadLimiterTests.cpp)
 
@@ -111,10 +125,34 @@ if(CHURCHDAW_BUILD_AUDIO_TESTS AND NOT ANDROID AND NOT IOS)
     target_sources(ChurchDAWChannelRotaryTests PRIVATE
         Tests/Audio/ChannelRotarySpeakerTests.cpp)
 
+    target_sources(ChurchDAWPadProcessorTests PRIVATE
+        Tests/Audio/PadProcessorTests.cpp)
+
+    target_sources(ChurchDAWLibraryPackPathTests PRIVATE
+        Tests/Library/LibraryPackPathTests.cpp)
+
+    target_sources(ChurchDAWLiveScenesTests PRIVATE
+        Tests/Live/LiveScenesTests.cpp)
+
+    target_sources(ChurchDAWSceneFileWriteProbe PRIVATE
+        Tests/Live/SceneFileWriteProbe.cpp)
+
+    target_sources(ChurchDAWPluginScanPolicyTests PRIVATE
+        Tests/Plugin/PluginScanPolicyTests.cpp)
+
+    target_sources(ChurchDAWChildProcessReapTests PRIVATE
+        Tests/Plugin/ConnectedChildProcessReapTests.cpp)
+
     target_include_directories(ChurchDAWMasterLimiterTests PRIVATE Source)
     target_include_directories(ChurchDAWChannelToneTests PRIVATE Source)
     target_include_directories(ChurchDAWMidiMappingSafetyTests PRIVATE Source)
     target_include_directories(ChurchDAWChannelRotaryTests PRIVATE Source)
+    target_include_directories(ChurchDAWPadProcessorTests PRIVATE Source)
+    target_include_directories(ChurchDAWLibraryPackPathTests PRIVATE Source)
+    target_include_directories(ChurchDAWLiveScenesTests PRIVATE Source)
+    target_include_directories(ChurchDAWSceneFileWriteProbe PRIVATE Source)
+    target_include_directories(ChurchDAWPluginScanPolicyTests PRIVATE Source)
+    target_include_directories(ChurchDAWAndroidStageLayoutTests PRIVATE Source)
     target_compile_definitions(ChurchDAWMasterLimiterTests PRIVATE
         JUCE_WEB_BROWSER=0
         JUCE_PUSH_NOTIFICATIONS=0
@@ -128,6 +166,31 @@ if(CHURCHDAW_BUILD_AUDIO_TESTS AND NOT ANDROID AND NOT IOS)
         JUCE_PUSH_NOTIFICATIONS=0
         JUCE_USE_CURL=0)
     target_compile_definitions(ChurchDAWChannelRotaryTests PRIVATE
+        JUCE_WEB_BROWSER=0
+        JUCE_PUSH_NOTIFICATIONS=0
+        JUCE_USE_CURL=0)
+    target_compile_definitions(ChurchDAWPadProcessorTests PRIVATE
+        JUCE_WEB_BROWSER=0
+        JUCE_PUSH_NOTIFICATIONS=0
+        JUCE_USE_CURL=0)
+    target_compile_definitions(ChurchDAWLibraryPackPathTests PRIVATE
+        JUCE_WEB_BROWSER=0
+        JUCE_PUSH_NOTIFICATIONS=0
+        JUCE_USE_CURL=0)
+    target_compile_definitions(ChurchDAWLiveScenesTests PRIVATE
+        JUCE_WEB_BROWSER=0
+        JUCE_PUSH_NOTIFICATIONS=0
+        JUCE_USE_CURL=0)
+    target_compile_definitions(ChurchDAWSceneFileWriteProbe PRIVATE
+        JUCE_WEB_BROWSER=0
+        JUCE_PUSH_NOTIFICATIONS=0
+        JUCE_USE_CURL=0)
+    target_compile_definitions(ChurchDAWPluginScanPolicyTests PRIVATE
+        JUCE_PLUGINHOST_VST3=1
+        JUCE_WEB_BROWSER=0
+        JUCE_PUSH_NOTIFICATIONS=0
+        JUCE_USE_CURL=0)
+    target_compile_definitions(ChurchDAWChildProcessReapTests PRIVATE
         JUCE_WEB_BROWSER=0
         JUCE_PUSH_NOTIFICATIONS=0
         JUCE_USE_CURL=0)
@@ -159,11 +222,177 @@ if(CHURCHDAW_BUILD_AUDIO_TESTS AND NOT ANDROID AND NOT IOS)
         PUBLIC
             juce::juce_recommended_config_flags)
 
+    target_link_libraries(ChurchDAWPadProcessorTests
+        PRIVATE
+            juce::juce_audio_formats
+            juce::juce_audio_processors
+        PUBLIC
+            juce::juce_recommended_config_flags)
+
+    target_link_libraries(ChurchDAWLibraryPackPathTests
+        PRIVATE
+            juce::juce_cryptography
+            juce::juce_gui_extra
+        PUBLIC
+            juce::juce_recommended_config_flags)
+
+    # LiveScenes.h so precisa de juce_core (XmlElement, String, jlimit) — e
+    # isso e proposital: a serializacao das cenas nao conhece audio nem UI.
+    target_link_libraries(ChurchDAWLiveScenesTests
+        PRIVATE
+            juce::juce_core
+        PUBLIC
+            juce::juce_recommended_config_flags)
+
+    target_link_libraries(ChurchDAWSceneFileWriteProbe
+        PRIVATE
+            juce::juce_core
+        PUBLIC
+            juce::juce_recommended_config_flags)
+
+    target_link_libraries(ChurchDAWPluginScanPolicyTests
+        PRIVATE
+            juce::juce_audio_processors
+        PUBLIC
+            juce::juce_recommended_config_flags)
+
+    target_link_libraries(ChurchDAWChildProcessReapTests
+        PRIVATE
+            juce::juce_events
+        PUBLIC
+            juce::juce_recommended_config_flags)
+
+    if(APPLE OR WIN32)
+        # Smoke real do transporte V2. O mesmo executavel funciona como
+        # coordenador e como processo filho descartavel. No macOS usa o
+        # DLSMusicDevice; no Windows exige um VST3 indicado pelo ambiente.
+        # No Windows, uma fixture sintetica adicional prova em processo real
+        # que uma classe valida sobrevive ao crash da classe irma no mesmo DLL.
+        if(WIN32)
+            set(churchdaw_vst3_sdk_dir
+                "${CMAKE_CURRENT_SOURCE_DIR}/JUCE/modules/juce_audio_processors_headless/format_types/VST3_SDK")
+
+            add_library(ChurchDAWVST3MultiClassCrashFixture MODULE
+                Tests/Plugin/Fixtures/VST3MultiClassCrashFixture.cpp
+                "${churchdaw_vst3_sdk_dir}/pluginterfaces/base/funknown.cpp"
+                "${churchdaw_vst3_sdk_dir}/pluginterfaces/base/coreiids.cpp"
+                "${churchdaw_vst3_sdk_dir}/public.sdk/source/vst/vstinitiids.cpp")
+            target_include_directories(
+                ChurchDAWVST3MultiClassCrashFixture PRIVATE
+                "${churchdaw_vst3_sdk_dir}")
+            target_link_libraries(
+                ChurchDAWVST3MultiClassCrashFixture PRIVATE ole32)
+            set_target_properties(
+                ChurchDAWVST3MultiClassCrashFixture PROPERTIES
+                PREFIX ""
+                OUTPUT_NAME "ChurchDAWVST3MultiClassCrashFixture"
+                SUFFIX ".vst3")
+        endif()
+
+        juce_add_console_app(ChurchDAWPluginScanIntegrationTests
+            PRODUCT_NAME "ChurchDAWPluginScanIntegrationTests")
+
+        target_sources(ChurchDAWPluginScanIntegrationTests PRIVATE
+            Tests/Plugin/PluginScanSubprocessV2IntegrationTests.cpp)
+        target_include_directories(
+            ChurchDAWPluginScanIntegrationTests PRIVATE Source)
+        target_compile_definitions(
+            ChurchDAWPluginScanIntegrationTests PRIVATE
+            JUCE_PLUGINHOST_VST3=1
+            JUCE_WEB_BROWSER=0
+            JUCE_PUSH_NOTIFICATIONS=0
+            JUCE_USE_CURL=0)
+        target_link_libraries(
+            ChurchDAWPluginScanIntegrationTests
+            PRIVATE
+                juce::juce_audio_processors
+            PUBLIC
+                juce::juce_recommended_config_flags)
+
+        if(APPLE)
+            target_compile_definitions(
+                ChurchDAWPluginScanIntegrationTests PRIVATE
+                JUCE_PLUGINHOST_AU=1)
+            target_compile_options(
+                ChurchDAWPluginScanIntegrationTests PRIVATE
+                -Werror=unguarded-availability-new)
+            target_link_libraries(
+                ChurchDAWPluginScanIntegrationTests PRIVATE
+                "-framework AudioUnit"
+                "-framework AudioToolbox"
+                "-framework CoreAudioKit")
+
+            add_test(
+                NAME ChurchDAWPluginScanIntegration
+                COMMAND ChurchDAWPluginScanIntegrationTests)
+            set_tests_properties(
+                ChurchDAWPluginScanIntegration
+                PROPERTIES TIMEOUT 300)
+        elseif(DEFINED ENV{CHURCHDAW_PLUGIN_SCAN_FIXTURE}
+               AND NOT "$ENV{CHURCHDAW_PLUGIN_SCAN_FIXTURE}" STREQUAL "")
+            # A fixture e o diretorio isolado de relatorios sao impostos
+            # externamente ao executavel. Sem fixture, o alvo continua
+            # compilavel, mas nao vira um CTest que falharia por configuracao
+            # ausente.
+            set(churchdaw_plugin_scan_test_appdata
+                "${CMAKE_CURRENT_BINARY_DIR}/plugin-scan-integration-appdata")
+            file(MAKE_DIRECTORY "${churchdaw_plugin_scan_test_appdata}")
+            add_test(
+                NAME ChurchDAWPluginScanIntegration
+                COMMAND ChurchDAWPluginScanIntegrationTests)
+            set_tests_properties(
+                ChurchDAWPluginScanIntegration
+                PROPERTIES
+                    TIMEOUT 300
+                    ENVIRONMENT
+                        "CHURCHDAW_PLUGIN_SCAN_FIXTURE=$ENV{CHURCHDAW_PLUGIN_SCAN_FIXTURE};CHURCHDAW_PLUGIN_SCAN_REPORT_DIR=${churchdaw_plugin_scan_test_appdata}/reports")
+        endif()
+
+        if(WIN32)
+            add_dependencies(
+                ChurchDAWPluginScanIntegrationTests
+                ChurchDAWVST3MultiClassCrashFixture)
+
+            set(churchdaw_plugin_scan_synthetic_appdata
+                "${CMAKE_CURRENT_BINARY_DIR}/plugin-scan-synthetic-appdata")
+            file(MAKE_DIRECTORY
+                "${churchdaw_plugin_scan_synthetic_appdata}")
+
+            add_test(
+                NAME ChurchDAWPluginScanSyntheticShell
+                COMMAND "${CMAKE_COMMAND}" -E env
+                    "CHURCHDAW_PLUGIN_SCAN_REPORT_DIR=${churchdaw_plugin_scan_synthetic_appdata}/reports"
+                    "CHURCHDAW_PLUGIN_SCAN_FIXTURE=$<TARGET_FILE:ChurchDAWVST3MultiClassCrashFixture>"
+                    "CHURCHDAW_PLUGIN_SCAN_MIN_LOADED=1"
+                    "CHURCHDAW_PLUGIN_SCAN_MIN_FACTORY_CLASSES=2"
+                    "CHURCHDAW_PLUGIN_SCAN_MIN_FAILED_CLASSES=1"
+                    "CHURCHDAW_PLUGIN_SCAN_REQUIRED_FAILURE_STATUS=crash"
+                    "CHURCHDAW_PLUGIN_SCAN_STRICT_SYNTHETIC=1"
+                    "$<TARGET_FILE:ChurchDAWPluginScanIntegrationTests>")
+            set_tests_properties(
+                ChurchDAWPluginScanSyntheticShell PROPERTIES
+                TIMEOUT 120
+                WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+        endif()
+    endif()
+
     if(MSVC)
         target_compile_options(ChurchDAWMasterLimiterTests PRIVATE /utf-8)
         target_compile_options(ChurchDAWChannelToneTests PRIVATE /utf-8)
         target_compile_options(ChurchDAWMidiMappingSafetyTests PRIVATE /utf-8)
         target_compile_options(ChurchDAWChannelRotaryTests PRIVATE /utf-8)
+        target_compile_options(ChurchDAWPadProcessorTests PRIVATE /utf-8)
+        target_compile_options(ChurchDAWLibraryPackPathTests PRIVATE /utf-8)
+        target_compile_options(ChurchDAWLiveScenesTests PRIVATE /utf-8)
+        target_compile_options(ChurchDAWSceneFileWriteProbe PRIVATE /utf-8)
+        target_compile_options(ChurchDAWPluginScanPolicyTests PRIVATE /utf-8)
+        target_compile_options(ChurchDAWChildProcessReapTests PRIVATE /utf-8)
+        target_compile_options(ChurchDAWAndroidStageLayoutTests PRIVATE /utf-8)
+        target_compile_options(ChurchDAWPluginScanIntegrationTests PRIVATE /utf-8)
+        if(TARGET ChurchDAWVST3MultiClassCrashFixture)
+            target_compile_options(
+                ChurchDAWVST3MultiClassCrashFixture PRIVATE /utf-8)
+        endif()
     endif()
 
     add_test(
@@ -181,13 +410,80 @@ if(CHURCHDAW_BUILD_AUDIO_TESTS AND NOT ANDROID AND NOT IOS)
     add_test(
         NAME ChurchDAWChannelRotary
         COMMAND ChurchDAWChannelRotaryTests)
+    add_test(
+        NAME ChurchDAWPadProcessor
+        COMMAND ChurchDAWPadProcessorTests)
+    add_test(
+        NAME ChurchDAWLibraryPackPath
+        COMMAND ChurchDAWLibraryPackPathTests)
+    add_test(
+        NAME ChurchDAWLiveScenes
+        COMMAND ChurchDAWLiveScenesTests)
+    add_test(
+        NAME ChurchDAWSceneFileWrite
+        COMMAND ChurchDAWSceneFileWriteProbe)
+    add_test(
+        NAME ChurchDAWPluginScanPolicy
+        COMMAND ChurchDAWPluginScanPolicyTests)
+    add_test(
+        NAME ChurchDAWChildProcessReap
+        COMMAND ChurchDAWChildProcessReapTests)
+    add_test(
+        NAME ChurchDAWAndroidStageLayout
+        COMMAND ChurchDAWAndroidStageLayoutTests)
     set_tests_properties(
         ChurchDAWReverbPitch
         ChurchDAWMasterLimiter
         ChurchDAWChannelTone
         ChurchDAWMidiMappingSafety
         ChurchDAWChannelRotary
+        ChurchDAWPadProcessor
+        ChurchDAWLibraryPackPath
+        ChurchDAWPluginScanPolicy
+        ChurchDAWChildProcessReap
+        ChurchDAWAndroidStageLayout
         PROPERTIES TIMEOUT 240)
+endif()
+
+# As propriedades JUCE precisam ser passadas no momento de criar o alvo. Separe
+# capacidades de macOS das de iOS para nao injetar entitlements desktop no
+# bundle movel nem pedir microfone quando o app abre 0 canais de entrada.
+if(IOS)
+    set(CHURCHDAW_PLATFORM_APP_OPTIONS
+        BUILD_VERSION "1.5.8"
+        MICROPHONE_PERMISSION_ENABLED FALSE
+        TARGETED_DEVICE_FAMILY "1,2"
+        STATUS_BAR_HIDDEN TRUE
+        REQUIRES_FULL_SCREEN FALSE
+        BACKGROUND_AUDIO_ENABLED TRUE
+        FILE_SHARING_ENABLED TRUE
+        IPHONE_SCREEN_ORIENTATIONS
+            UIInterfaceOrientationPortrait
+            UIInterfaceOrientationLandscapeLeft
+            UIInterfaceOrientationLandscapeRight
+        IPAD_SCREEN_ORIENTATIONS
+            UIInterfaceOrientationPortrait
+            UIInterfaceOrientationPortraitUpsideDown
+            UIInterfaceOrientationLandscapeLeft
+            UIInterfaceOrientationLandscapeRight)
+else()
+    set(CHURCHDAW_PLATFORM_APP_OPTIONS
+        MICROPHONE_PERMISSION_ENABLED TRUE
+        MICROPHONE_PERMISSION_TEXT
+            "O ChurchDAW usa a entrada de audio somente quando voce ativa guitarra/microfone em Audio/MIDI.")
+
+    if(APPLE)
+        file(READ
+            "${CMAKE_CURRENT_SOURCE_DIR}/Packaging/ChurchDAW-macOS-Info.plist"
+            CHURCHDAW_MACOS_PLIST_TO_MERGE)
+        list(APPEND CHURCHDAW_PLATFORM_APP_OPTIONS
+            PLIST_TO_MERGE
+                "${CHURCHDAW_MACOS_PLIST_TO_MERGE}"
+            HARDENED_RUNTIME_ENABLED TRUE
+            HARDENED_RUNTIME_OPTIONS
+                "com.apple.security.device.audio-input"
+                "com.apple.security.cs.disable-library-validation")
+    endif()
 endif()
 
 juce_add_gui_app(MinhaDAW
@@ -195,12 +491,26 @@ juce_add_gui_app(MinhaDAW
     COMPANY_NAME "ChurchDAW"
     VERSION "${PROJECT_VERSION}"
     BUNDLE_ID "com.churchdaw.app"
-    MICROPHONE_PERMISSION_ENABLED TRUE
-    MICROPHONE_PERMISSION_TEXT "O ChurchDAW usa a entrada de audio somente quando voce ativa guitarra/microfone em Audio/MIDI."
-    HARDENED_RUNTIME_ENABLED TRUE
-    HARDENED_RUNTIME_OPTIONS
-        "com.apple.security.device.audio-input"
-        "com.apple.security.cs.disable-library-validation"
+    ${CHURCHDAW_PLATFORM_APP_OPTIONS}
+
+    # SEM ESTA CHAVE O macOS MATA O APP.
+    #
+    # O ChurchDAW nao tem uma linha de codigo de Bluetooth. Mas o CoreMIDI
+    # toca no Bluetooth EM NOME DO APP quando existe (ou aparece) um
+    # dispositivo MIDI Bluetooth por perto, e o TCC nao pergunta quem pediu:
+    # sem NSBluetoothAlwaysUsageDescription no Info.plist ele encerra o
+    # processo na hora.
+    #
+    # Comprovado pelo relatorio de falha do cliente em 01/08/2026, ChurchDAW
+    # 1.5.5, macOS 26.6:
+    #   Termination Reason: Namespace TCC
+    #   "...must contain an NSBluetoothAlwaysUsageDescription key"
+    #   Thread 6: __TCC_CRASHING_DUE_TO_PRIVACY_VIOLATION__
+    # Ele foi parear um pedal nas configuracoes de Bluetooth do macOS e o app
+    # fechou sozinho. Nao era bug de MIDI nem de audio: era permissao.
+    BLUETOOTH_PERMISSION_ENABLED TRUE
+    BLUETOOTH_PERMISSION_TEXT "O ChurchDAW usa o Bluetooth apenas para receber notas de teclados e pedais MIDI sem fio."
+
     ICON_BIG "${CMAKE_CURRENT_SOURCE_DIR}/Assets/icon.png"
     ICON_SMALL "${CMAKE_CURRENT_SOURCE_DIR}/Assets/icon.png")
 
@@ -249,6 +559,17 @@ target_sources(MinhaDAW PRIVATE
     Source/Main.cpp
     Source/MainComponent.cpp
     ${CHURCHDAW_ORGAN_SOURCES})
+
+if(IOS)
+    # O catalogo usa a mesma policy RSA do Android/desktop. No iOS nao ha JNI
+    # e o updater desktop e deliberadamente excluido, portanto um verificador
+    # pequeno baseado no Security.framework fecha esta lacuna.
+    target_sources(MinhaDAW PRIVATE
+        Source/IOSPolicySignatureVerifier.cpp)
+    target_link_libraries(MinhaDAW PRIVATE
+        "-framework Security"
+        juce::juce_opengl)
+endif()
 
 if(CHURCHDAW_ENABLE_DESKTOP_LICENSING AND NOT ANDROID AND NOT IOS)
     target_sources(MinhaDAW PRIVATE
@@ -336,6 +657,11 @@ target_compile_definitions(MinhaDAW PRIVATE
 if(APPLE AND NOT IOS)
     target_compile_definitions(MinhaDAW PRIVATE
         JUCE_PLUGINHOST_AU=1)
+
+    # Catalina e o contrato do slice Intel. Qualquer API mais nova usada sem
+    # @available deve quebrar a compilacao, nao somente falhar no Mac do cliente.
+    target_compile_options(MinhaDAW PRIVATE
+        -Werror=unguarded-availability-new)
 
     set_target_properties(MinhaDAW PROPERTIES
         XCODE_ATTRIBUTE_CLANG_CXX_LIBRARY "libc++"

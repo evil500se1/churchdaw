@@ -18,27 +18,39 @@ O `CFBundleVersion` e o `github.run_number`, que cresce entre execucoes do
 workflow. O `CFBundleShortVersionString` vem do projeto e precisa coincidir com
 a tag.
 
+O workflow serializa globalmente as releases macOS. Antes de expor qualquer
+credencial, ele exige que o commit da tag seja igual ou ancestral de
+`origin/main`. Depois da compilacao/notarizacao, consulta novamente a tag e o
+branch `main` pela API do GitHub e so permite uploads se a proveniencia ainda
+for valida.
+
 ## Secrets exigidos no environment `macos-production`
 
 - `MACOS_CERTIFICATE_P12_BASE64`: certificado **Developer ID Application** e
   chave privada exportados como PKCS#12 e codificados em base64.
 - `MACOS_CERTIFICATE_P12_PASSWORD`: senha do PKCS#12.
 - `APPLE_TEAM_ID`: Team ID Apple de 10 caracteres.
+- Variable `MACOS_EXPECTED_TEAM_ID`: o mesmo Team ID, fixado fora do secret
+  para detectar troca acidental de identidade.
+- Variable `MACOS_EXPECTED_CERTIFICATE_SHA256`: SHA-256 hexadecimal do DER do
+  certificado Developer ID Application autorizado.
 - `APPLE_NOTARY_KEY_P8_BASE64`: chave privada da API do App Store Connect em
   base64.
 - `APPLE_NOTARY_KEY_ID`: Key ID de 10 caracteres.
 - `APPLE_NOTARY_ISSUER_ID`: Issuer ID da API.
 
 O script cria um keychain temporario, seleciona exatamente uma identidade
-Developer ID Application do Team ID esperado e apaga o keychain e os arquivos
-de segredo ao sair.
+Developer ID Application do Team ID esperado, assina pelo SHA-1 integral dessa
+identidade e exige que o SHA-256 do certificado leaf extraido de cada assinatura
+seja o pin protegido. O keychain e os arquivos de segredo sao apagados ao sair.
 
 ## Portao fail-closed
 
 O job falha se qualquer item abaixo nao puder ser provado:
 
 - checkout limpo e exatamente no commit da tag;
-- versao, bundle ID, build number e deployment target esperados;
+- versao, bundle ID, build number, deployment target e descricoes de permissao
+  de microfone/Bluetooth esperados;
 - binario universal `arm64` + `x86_64`, sem dependencias do diretorio de build;
 - testes CTest de audio, atualizacao e licenciamento, mais o teste nativo da
   assinatura de licenca, aprovados;
@@ -48,6 +60,8 @@ O job falha se qualquer item abaixo nao puder ser provado:
   Hardened Runtime e conjunto exato de entitlements;
 - notarizacao aceita do app, ticket grampeado e Gatekeeper aprovado;
 - DMG assinado, notarizado, grampeado, montado e revalidado;
+- logs do notario com `status=Accepted` e sem `issues`, `problems` ou
+  `warnings` nao vazios, tanto para o app quanto para o DMG;
 - hash SHA-256 calculado somente depois do ultimo `stapler`.
 
 Os artefatos finais ficam em `release-macos/artifacts/` e os diagnosticos em

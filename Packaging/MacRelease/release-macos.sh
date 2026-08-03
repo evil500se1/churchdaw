@@ -34,6 +34,8 @@ require_env RELEASE_OUTPUT_ROOT
 require_env MACOS_CERTIFICATE_P12_BASE64
 require_env MACOS_CERTIFICATE_P12_PASSWORD
 require_env APPLE_TEAM_ID
+require_env MACOS_EXPECTED_TEAM_ID
+require_env MACOS_EXPECTED_CERTIFICATE_SHA256
 require_env APPLE_NOTARY_KEY_P8_BASE64
 require_env APPLE_NOTARY_KEY_ID
 require_env APPLE_NOTARY_ISSUER_ID
@@ -47,8 +49,16 @@ release_version="${RELEASE_TAG#v}"
     || fail "EXPECTED_BUNDLE_ID invalido"
 [[ "$MACOSX_DEPLOYMENT_TARGET" =~ ^[0-9]+\.[0-9]+$ ]] \
     || fail "MACOSX_DEPLOYMENT_TARGET invalido"
+[[ "$MACOSX_DEPLOYMENT_TARGET" == "10.15" ]] \
+    || fail "o release desktop deve manter Catalina 10.15 no slice Intel"
 [[ "$APPLE_TEAM_ID" =~ ^[A-Z0-9]{10}$ ]] \
     || fail "APPLE_TEAM_ID deve conter 10 caracteres A-Z/0-9"
+[[ "$MACOS_EXPECTED_TEAM_ID" =~ ^[A-Z0-9]{10}$ ]] \
+    || fail "MACOS_EXPECTED_TEAM_ID deve conter 10 caracteres A-Z/0-9"
+[[ "$APPLE_TEAM_ID" == "$MACOS_EXPECTED_TEAM_ID" ]] \
+    || fail "APPLE_TEAM_ID diverge do Team ID comercial fixado"
+[[ "$MACOS_EXPECTED_CERTIFICATE_SHA256" =~ ^[0-9A-Fa-f]{64}$ ]] \
+    || fail "MACOS_EXPECTED_CERTIFICATE_SHA256 deve conter 64 hexadecimais"
 [[ "$APPLE_NOTARY_KEY_ID" =~ ^[A-Z0-9]{10}$ ]] \
     || fail "APPLE_NOTARY_KEY_ID deve conter 10 caracteres A-Z/0-9"
 [[ "$APPLE_NOTARY_ISSUER_ID" =~ ^[0-9A-Fa-f-]{36}$ ]] \
@@ -62,7 +72,7 @@ esac
 [[ ! -e "$output_root" ]] \
     || fail "diretorio de saida ja existe; use um runner limpo: $output_root"
 
-for tool in bash cmake codesign ctest ditto file git hdiutil lipo openssl \
+for tool in bash cmake codesign cp ctest ditto file git hdiutil lipo openssl \
             otool plutil python3 security shasum spctl stat sw_vers vtool \
             xcodebuild xcrun; do
     require_command "$tool"
@@ -163,19 +173,64 @@ security set-key-partition-list \
 security find-identity -v -p codesigning "$keychain_path" \
     | tee "$logs_dir/codesigning-identities.txt"
 
-signing_identity="$(
+identity_record="$(
     security find-identity -v -p codesigning "$keychain_path" \
         | sed -nE \
-            "s/^[[:space:]]*[0-9]+\\) [0-9A-Fa-f]+ \"(Developer ID Application: .+ \\(${APPLE_TEAM_ID}\\))\"$/\\1/p"
+            "s/^[[:space:]]*[0-9]+\\) ([0-9A-Fa-f]{40}) \"(Developer ID Application: .+ \\(${APPLE_TEAM_ID}\\))\"$/\\1|\\2/p"
 )"
-identity_count="$(printf '%s\n' "$signing_identity" | awk 'NF { count++ } END { print count + 0 }')"
+identity_count="$(printf '%s\n' "$identity_record" | awk 'NF { count++ } END { print count + 0 }')"
 [[ "$identity_count" -eq 1 ]] \
     || fail "esperava uma unica identidade Developer ID Application do Team ID $APPLE_TEAM_ID; encontrei $identity_count"
+IFS='|' read -r signing_identity_sha1 signing_identity <<<"$identity_record"
+signing_identity_sha1="$(
+    printf '%s' "$signing_identity_sha1" | tr '[:lower:]' '[:upper:]'
+)"
+[[ "$signing_identity_sha1" =~ ^[0-9A-F]{40}$ ]] \
+    || fail "SHA-1 da identidade Developer ID e invalido"
 
-security find-certificate \
-    -c "$signing_identity" \
-    -p \
-    "$keychain_path" >"$certificate_pem"
+all_certificates_pem="$temp_root/all-imported-certificates.pem"
+certificate_parts_dir="$temp_root/imported-certificates"
+mkdir -p "$certificate_parts_dir"
+security find-certificate -a -p "$keychain_path" >"$all_certificates_pem"
+python3 - "$all_certificates_pem" "$certificate_parts_dir" <<'PY'
+import pathlib
+import sys
+
+source = pathlib.Path(sys.argv[1]).read_text(encoding="ascii")
+destination = pathlib.Path(sys.argv[2])
+begin = "-----BEGIN CERTIFICATE-----"
+end = "-----END CERTIFICATE-----"
+certificates = []
+for suffix in source.split(begin)[1:]:
+    body, separator, _tail = suffix.partition(end)
+    if not separator:
+        raise SystemExit("PEM importado contem certificado truncado")
+    certificates.append(begin + body + end + "\n")
+if not certificates:
+    raise SystemExit("keychain temporario nao contem certificados")
+for index, certificate in enumerate(certificates):
+    (destination / f"certificate-{index:03d}.pem").write_text(
+        certificate,
+        encoding="ascii",
+    )
+PY
+
+matching_certificate_count=0
+for candidate_certificate in "$certificate_parts_dir"/*.pem; do
+    [[ -f "$candidate_certificate" ]] || continue
+    candidate_sha1="$(
+        openssl x509 -in "$candidate_certificate" -noout -fingerprint -sha1 \
+            | awk -F= '{ print $2 }' \
+            | tr -d ':[:space:]' \
+            | tr '[:lower:]' '[:upper:]'
+    )"
+    if [[ "$candidate_sha1" == "$signing_identity_sha1" ]]; then
+        cp "$candidate_certificate" "$certificate_pem"
+        matching_certificate_count=$((matching_certificate_count + 1))
+    fi
+done
+[[ "$matching_certificate_count" -eq 1 && -s "$certificate_pem" ]] \
+    || fail "nao foi possivel vincular univocamente a identidade ao certificado importado"
 openssl x509 -in "$certificate_pem" -noout \
     -subject -issuer -serial -dates -fingerprint -sha256 \
     | tee "$logs_dir/developer-id-certificate.txt"
@@ -186,8 +241,41 @@ grep -Fq "CN=$signing_identity" <<<"$certificate_subject" \
     || fail "CN do certificado diverge da identidade selecionada"
 grep -Fq "OU=$APPLE_TEAM_ID" <<<"$certificate_subject" \
     || fail "OU do certificado diverge do APPLE_TEAM_ID"
+certificate_sha256="$(
+    openssl x509 -in "$certificate_pem" -outform DER \
+        | shasum -a 256 \
+        | awk '{print $1}'
+)"
+certificate_sha256_upper="$(
+    printf '%s' "$certificate_sha256" | tr '[:lower:]' '[:upper:]'
+)"
+expected_certificate_sha256_upper="$(
+    printf '%s' "$MACOS_EXPECTED_CERTIFICATE_SHA256" \
+        | tr '[:lower:]' '[:upper:]'
+)"
+[[ "$certificate_sha256_upper" == "$expected_certificate_sha256_upper" ]] \
+    || fail "fingerprint SHA-256 do Developer ID diverge do valor fixado"
 security verify-cert -c "$certificate_pem" -p codeSign \
     | tee "$logs_dir/certificate-trust.txt"
+
+require_signed_leaf_certificate() {
+    local target="$1"
+    local extracted_dir
+    local extracted_sha256
+    extracted_dir="$(mktemp -d "$temp_root/signed-leaf.XXXXXX")"
+    (
+        cd "$extracted_dir"
+        codesign --display --extract-certificates "$target" >/dev/null 2>&1
+    )
+    [[ -s "$extracted_dir/codesign0" ]] \
+        || fail "codesign nao extraiu o certificado leaf de $target"
+    extracted_sha256="$(
+        shasum -a 256 "$extracted_dir/codesign0" | awk '{ print $1 }' \
+            | tr '[:lower:]' '[:upper:]'
+    )"
+    [[ "$extracted_sha256" == "$expected_certificate_sha256_upper" ]] \
+        || fail "certificado leaf assinado diverge do pin SHA-256: $target"
+}
 
 xcrun notarytool history \
     --key "$notary_key_path" \
@@ -252,6 +340,8 @@ plist_read() {
     || fail "CFBundlePackageType inesperado"
 [[ -n "$(plist_read NSMicrophoneUsageDescription)" ]] \
     || fail "NSMicrophoneUsageDescription vazio"
+[[ -n "$(plist_read NSBluetoothAlwaysUsageDescription)" ]] \
+    || fail "NSBluetoothAlwaysUsageDescription vazio"
 
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUMBER" "$plist" \
     || /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $BUILD_NUMBER" "$plist"
@@ -259,6 +349,10 @@ plist_read() {
     || fail "CFBundleVersion nao recebeu o build monotonicamente crescente"
 [[ "$(plist_read LSMinimumSystemVersion)" == "$MACOSX_DEPLOYMENT_TARGET" ]] \
     || fail "LSMinimumSystemVersion diverge do deployment target"
+[[ "$(plist_read LSMinimumSystemVersionByArchitecture:x86_64)" == "$MACOSX_DEPLOYMENT_TARGET" ]] \
+    || fail "piso x86_64 do Info.plist diverge do deployment target"
+[[ "$(plist_read LSMinimumSystemVersionByArchitecture:arm64)" == "11.0" ]] \
+    || fail "piso arm64 do Info.plist precisa ser 11.0"
 
 architectures="$(lipo -archs "$executable")"
 grep -qw arm64 <<<"$architectures" || fail "slice arm64 ausente"
@@ -267,13 +361,35 @@ grep -qw x86_64 <<<"$architectures" || fail "slice x86_64 ausente"
     || fail "arquiteturas inesperadas: $architectures"
 
 vtool -show-build "$executable" | tee "$logs_dir/macho-build-versions.txt"
-minos_count="$(
-    vtool -show-build "$executable" \
-        | awk -v expected="$MACOSX_DEPLOYMENT_TARGET" \
-            '$1 == "minos" && $2 == expected { count++ } END { print count + 0 }'
-)"
-[[ "$minos_count" -eq 2 ]] \
-    || fail "deployment target nao aparece nas duas slices"
+minos_dir="$temp_root/minos-slices"
+mkdir -p "$minos_dir"
+lipo "$executable" -thin x86_64 -output "$minos_dir/ChurchDAW-x86_64"
+lipo "$executable" -thin arm64 -output "$minos_dir/ChurchDAW-arm64"
+
+require_slice_minos() {
+    local binary="$1"
+    local expected="$2"
+    local architecture="$3"
+    local actual platform
+    actual="$(
+        vtool -show-build "$binary" \
+            | awk '$1 == "minos" { print $2; exit }'
+    )"
+    platform="$(
+        vtool -show-build "$binary" \
+            | awk '$1 == "platform" { print $2; exit }'
+    )"
+    [[ "$actual" == "$expected" ]] \
+        || fail "$architecture minos=$actual; esperado=$expected"
+    [[ "$platform" == "MACOS" ]] \
+        || fail "$architecture usa plataforma Mach-O inesperada: $platform"
+    printf '%s minos=%s platform=%s\n' "$architecture" "$actual" "$platform"
+}
+
+# Catalina e o piso do produto Intel; Apple Silicon nasceu no macOS 11.
+require_slice_minos \
+    "$minos_dir/ChurchDAW-x86_64" "$MACOSX_DEPLOYMENT_TARGET" x86_64
+require_slice_minos "$minos_dir/ChurchDAW-arm64" "11.0" arm64
 
 otool -L "$executable" | tee "$logs_dir/macho-dependencies.txt"
 if grep -Eq '/Users/|build-mac-commercial' "$logs_dir/macho-dependencies.txt"; then
@@ -284,11 +400,12 @@ sign_one() {
     local target="$1"
     codesign \
         --force \
-        --sign "$signing_identity" \
+        --sign "$signing_identity_sha1" \
         --keychain "$keychain_path" \
         --options runtime \
         --timestamp \
         "$target"
+    require_signed_leaf_certificate "$target"
 }
 
 # Assina primeiro cada Mach-O, depois os bundles aninhados do mais profundo
@@ -327,12 +444,13 @@ done <"$nested_bundle_list"
 
 codesign \
     --force \
-    --sign "$signing_identity" \
+    --sign "$signing_identity_sha1" \
     --keychain "$keychain_path" \
     --options runtime \
     --timestamp \
     --entitlements "$entitlements" \
     "$app"
+require_signed_leaf_certificate "$app"
 
 codesign --verify --deep --strict --verbose=4 "$app" \
     2>&1 | tee "$logs_dir/app-codesign-verify.txt"
@@ -424,7 +542,38 @@ PY
         --key-id "$APPLE_NOTARY_KEY_ID" \
         --issuer "$APPLE_NOTARY_ISSUER_ID" \
         --output-format json >"$logs_dir/${label}-notary-log.json"
-    python3 -m json.tool "$logs_dir/${label}-notary-log.json" >/dev/null
+    python3 - "$logs_dir/${label}-notary-log.json" "$label" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+label = sys.argv[2]
+
+try:
+    raw = path.read_bytes()
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raise ValueError("BOM nao permitido")
+    payload = json.loads(raw.decode("utf-8", errors="strict"))
+except Exception as exc:
+    raise SystemExit(f"log do notario {label} nao e JSON valido: {exc}")
+
+if not isinstance(payload, dict):
+    raise SystemExit(f"log do notario {label} nao e um objeto JSON")
+if payload.get("status") != "Accepted":
+    raise SystemExit(
+        f"log do notario {label} nao confirma Accepted: "
+        f"{payload.get('status')!r}"
+    )
+
+empty_values = (None, "", [], {})
+for field in ("issues", "problems", "warnings"):
+    value = payload.get(field)
+    if value not in empty_values:
+        raise SystemExit(
+            f"log do notario {label} contem {field} nao vazio: {value!r}"
+        )
+PY
     printf '%s' "$submission_id"
 }
 
@@ -459,10 +608,11 @@ hdiutil create \
 
 codesign \
     --force \
-    --sign "$signing_identity" \
+    --sign "$signing_identity_sha1" \
     --keychain "$keychain_path" \
     --timestamp \
     "$dmg_path"
+require_signed_leaf_certificate "$dmg_path"
 codesign --verify --strict --verbose=4 "$dmg_path" \
     2>&1 | tee "$logs_dir/dmg-codesign-verify.txt"
 codesign -dvvv "$dmg_path" 2>&1 | tee "$logs_dir/dmg-codesign-details.txt"
@@ -532,11 +682,6 @@ mount_dir=""
 
 dmg_sha256="$(shasum -a 256 "$dmg_path" | awk '{print $1}')"
 dmg_bytes="$(stat -f '%z' "$dmg_path")"
-certificate_sha256="$(
-    openssl x509 -in "$certificate_pem" -outform DER \
-        | shasum -a 256 \
-        | awk '{print $1}'
-)"
 
 (
     cd "$artifacts_dir"

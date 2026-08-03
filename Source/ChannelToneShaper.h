@@ -224,7 +224,12 @@ private:
 
         const float lowHz = (float) juce::jmin (120.0, sampleRate * 0.08);
         const float midHz = (float) juce::jmin (850.0, sampleRate * 0.18);
-        const float highHz = (float) juce::jmin (8000.0, sampleRate * 0.38);
+        // "AGUDO" precisa atuar onde pianos, pads e orgaos ainda carregam
+        // energia musical. Em 8 kHz o shelf respondia no analisador, mas em
+        // muitos timbres reais quase nao havia conteudo para alterar e o knob
+        // parecia morto. 5 kHz preserva o ar acima disso e torna +/- dB
+        // imediatamente audivel sem mudar nada com o controle em 0.
+        const float highHz = (float) juce::jmin (5000.0, sampleRate * 0.30);
         // ArrayCoefficients calcula tudo na pilha. Os objetos de estado dos
         // filtros ja foram preparados fora do callback e recebem somente os
         // seis valores novos; assim girar o EQ nao cria Ptr/ref-counted objects

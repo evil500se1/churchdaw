@@ -962,6 +962,62 @@ struct DescriptionLister
         return tryLoadFast (file, file.getChildFile ("Contents").getChildFile ("moduleinfo.json"));
     }
 
+    static bool findDescriptionForClass (IPluginFactory& factory,
+                                         const File& file,
+                                         Steinberg::int32 classIndex,
+                                         PluginDescription& description)
+    {
+        PClassInfo info{};
+
+        PluginHostDiagnostics::ScopedCall getClassInfo (
+            "discovery_class", "VST3 IPluginFactory::getClassInfo", true,
+            String (classIndex));
+        const auto classInfoResult = factory.getClassInfo (classIndex, &info);
+        getClassInfo.finish (classInfoResult == kResultOk, classInfoResult,
+                             String (classIndex));
+
+        if (classInfoResult != kResultOk
+             || std::strcmp (info.category, kVstAudioEffectClass) != 0)
+            return false;
+
+        const String name (toString (info.name).trim());
+        PluginHostDiagnostics::report (
+            PluginHostDiagnostics::EventKind::info,
+            "discovery_class", "VST3 audio class selected", true,
+            classIndex, false, 0, name);
+
+        PFactoryInfo factoryInfo{};
+        factory.getFactoryInfo (&factoryInfo);
+        const auto companyName = toString (factoryInfo.vendor).trim();
+        std::unique_ptr<PClassInfo2> info2;
+        std::unique_ptr<PClassInfoW> infoW;
+
+        {
+            VSTComSmartPtr<IPluginFactory2> pf2;
+            VSTComSmartPtr<IPluginFactory3> pf3;
+
+            if (pf2.loadFrom (&factory))
+            {
+                info2.reset (new PClassInfo2());
+                pf2->getClassInfo2 (classIndex, info2.get());
+            }
+
+            if (pf3.loadFrom (&factory))
+            {
+                infoW.reset (new PClassInfoW());
+                pf3->getClassInfoUnicode (classIndex, infoW.get());
+            }
+        }
+
+        PluginHostDiagnostics::ScopedCall describe (
+            "discovery_class", "VST3 create PluginDescription", true, name);
+        createPluginDescription (description, file, companyName, name,
+                                 info, info2.get(), infoW.get(), 0, 0);
+        const bool valid = description.uniqueId != 0;
+        describe.finish (valid, valid ? 0 : -1, name);
+        return valid;
+    }
+
     static std::vector<PluginDescription> findDescriptionsSlow (VST3HostContextHeadless& host,
                                                                 IPluginFactory& factory,
                                                                 const File& file)
@@ -1029,9 +1085,22 @@ struct DescriptionLister
             {
                 VSTComSmartPtr<Vst::IComponent> component;
 
-                if (component.loadFrom (&factory, info.cid))
+                PluginHostDiagnostics::ScopedCall createComponent (
+                    "factory", "VST3 IPluginFactory::createInstance(IComponent)",
+                    true, name);
+                const auto componentCreated = component.loadFrom (&factory, info.cid);
+                createComponent.finish (componentCreated && component != nullptr,
+                                        componentCreated ? 0 : -1, name);
+
+                if (componentCreated)
                 {
-                    if (component->initialize (host.getFUnknown()) == kResultOk)
+                    PluginHostDiagnostics::ScopedCall initialiseComponent (
+                        "initialize", "VST3 IComponent::initialize", true, name);
+                    const auto initialiseResult = component->initialize (host.getFUnknown());
+                    initialiseComponent.finish (initialiseResult == kResultOk,
+                                                initialiseResult, name);
+
+                    if (initialiseResult == kResultOk)
                     {
                         auto numInputs  = getNumSingleDirectionChannelsFor (component.get(), Direction::input);
                         auto numOutputs = getNumSingleDirectionChannelsFor (component.get(), Direction::output);
@@ -1039,7 +1108,11 @@ struct DescriptionLister
                         createPluginDescription (desc, file, companyName, name,
                                                  info, info2.get(), infoW.get(), numInputs, numOutputs);
 
-                        component->terminate();
+                        PluginHostDiagnostics::ScopedCall terminateComponent (
+                            "unload", "VST3 IComponent::terminate", false, name);
+                        const auto terminateResult = component->terminate();
+                        terminateComponent.finish (terminateResult == kResultOk,
+                                                   terminateResult, name);
                     }
                     else
                     {
@@ -1069,7 +1142,10 @@ struct DLLHandle
     explicit DLLHandle (const File& fileToOpen)
         : dllFile (fileToOpen)
     {
-        open();
+        PluginHostDiagnostics::ScopedCall loadModule (
+            "factory", "VST3 load module", true, dllFile.getFullPathName());
+        const auto opened = open();
+        loadModule.finish (opened, opened ? 0 : -1, dllFile.getFullPathName());
     }
 
     ~DLLHandle()
@@ -1083,7 +1159,12 @@ struct DLLHandle
             using ExitModuleFn = bool (PLUGIN_API*)();
 
             if (auto* exitFn = (ExitModuleFn) getFunction (exitFnName))
-                exitFn();
+            {
+                PluginHostDiagnostics::ScopedCall exitModule (
+                    "unload", "VST3 module exit", false, dllFile.getFullPathName());
+                const auto exited = exitFn();
+                exitModule.finish (exited, exited ? 0 : -1, dllFile.getFullPathName());
+            }
 
            #if JUCE_WINDOWS || JUCE_LINUX || JUCE_BSD
             library.close();
@@ -1095,8 +1176,16 @@ struct DLLHandle
     VSTComSmartPtr<IPluginFactory> getPluginFactory()
     {
         if (factory == nullptr)
+        {
+            PluginHostDiagnostics::ScopedCall getFactory (
+                "factory", "VST3 GetPluginFactory", true, dllFile.getFullPathName());
+
             if (auto* proc = (GetFactoryProc) getFunction (factoryFnName))
                 factory = VSTComSmartPtr (proc(), IncrementRef::no);
+
+            getFactory.finish (factory != nullptr, factory != nullptr ? 0 : -1,
+                               dllFile.getFullPathName());
+        }
 
         // The plugin NEEDS to provide a factory to be able to be called a VST3!
         // Most likely you are trying to load a 32-bit VST3 from a 64-bit host
@@ -1646,12 +1735,26 @@ struct VST3ComponentHolder
         if (factory->getClassInfo (classIdx, &info) != kResultOk)
             return false;
 
-        if (! component.loadFrom (factory.get(), info.cid) || component == nullptr)
+        PluginHostDiagnostics::ScopedCall createComponent (
+            "creation", "VST3 IPluginFactory::createInstance(IComponent)",
+            true, module.getName());
+        const auto componentCreated = component.loadFrom (factory.get(), info.cid)
+                                   && component != nullptr;
+        createComponent.finish (componentCreated, componentCreated ? 0 : -1,
+                                module.getName());
+
+        if (! componentCreated)
             return false;
 
         cidOfComponent = FUID (info.cid);
 
-        if (warnOnFailure (component->initialize (host->getFUnknown())) != kResultOk)
+        PluginHostDiagnostics::ScopedCall initialiseComponent (
+            "initialize", "VST3 IComponent::initialize", true, module.getName());
+        const auto initialiseResult = component->initialize (host->getFUnknown());
+        initialiseComponent.finish (initialiseResult == kResultOk,
+                                    initialiseResult, module.getName());
+
+        if (warnOnFailure (initialiseResult) != kResultOk)
             return false;
 
         isComponentInitialised = true;
@@ -1663,7 +1766,11 @@ struct VST3ComponentHolder
     {
         if (isComponentInitialised)
         {
-            component->terminate();
+            PluginHostDiagnostics::ScopedCall terminateComponent (
+                "unload", "VST3 IComponent::terminate", false, module.getName());
+            const auto terminateResult = component->terminate();
+            terminateComponent.finish (terminateResult == kResultOk,
+                                       terminateResult, module.getName());
             isComponentInitialised = false;
         }
 
@@ -2166,7 +2273,15 @@ public:
         editController->setComponentHandler (nullptr);
 
         if (isControllerInitialised && ! holder->isIComponentAlsoIEditController())
-            editController->terminate();
+        {
+            PluginHostDiagnostics::ScopedCall terminateController (
+                "unload", "VST3 IEditController::terminate", false,
+                holder->module.getName());
+            const auto terminateResult = editController->terminate();
+            terminateController.finish (terminateResult == kResultOk,
+                                        terminateResult,
+                                        holder->module.getName());
+        }
 
         holder->terminate();
 
@@ -2200,7 +2315,16 @@ public:
         // If the IComponent and IEditController are the same, we will have
         // already initialized the object at this point and should avoid doing so again.
         if (! holder->isIComponentAlsoIEditController())
-            editController->initialize (holder->host->getFUnknown());
+        {
+            PluginHostDiagnostics::ScopedCall initialiseController (
+                "initialize", "VST3 IEditController::initialize", true,
+                holder->module.getName());
+            const auto initialiseResult = editController->initialize (
+                holder->host->getFUnknown());
+            initialiseController.finish (initialiseResult == kResultOk,
+                                         initialiseResult,
+                                         holder->module.getName());
+        }
 
         isControllerInitialised = true;
         editController->setComponentHandler (holder->host.get());
@@ -2320,7 +2444,13 @@ public:
         setup.sampleRate            = newSampleRate;
         setup.processMode           = isNonRealtime() ? kOffline : kRealtime;
 
-        warnOnFailure (processor->setupProcessing (setup));
+        PluginHostDiagnostics::ScopedCall setupProcessing (
+            "activate", "VST3 IAudioProcessor::setupProcessing", true,
+            holder->module.getName());
+        const auto setupResult = processor->setupProcessing (setup);
+        setupProcessing.finish (setupResult == kResultOk, setupResult,
+                                holder->module.getName());
+        warnOnFailure (setupResult);
 
         holder->initialise();
 
@@ -2332,8 +2462,16 @@ public:
         auto* inData  = inArrangements .empty() ? &nullArrangement : inArrangements .data();
         auto* outData = outArrangements.empty() ? &nullArrangement : outArrangements.data();
 
-        warnOnFailure (processor->setBusArrangements (inData,  static_cast<int32> (inArrangements .size()),
-                                                      outData, static_cast<int32> (outArrangements.size())));
+        PluginHostDiagnostics::ScopedCall setBusArrangements (
+            "activate", "VST3 IAudioProcessor::setBusArrangements", false,
+            holder->module.getName());
+        const auto arrangementsResult = processor->setBusArrangements (
+            inData, static_cast<int32> (inArrangements.size()),
+            outData, static_cast<int32> (outArrangements.size()));
+        setBusArrangements.finish (arrangementsResult == kResultOk,
+                                   arrangementsResult,
+                                   holder->module.getName());
+        warnOnFailure (arrangementsResult);
 
         const auto inArrActual  = getActualArrangements (true);
         const auto outArrActual = getActualArrangements (false);
@@ -2347,10 +2485,30 @@ public:
         auto numOutputBuses = getBusCount (false);
 
         for (int i = 0; i < numInputBuses; ++i)
-            warnOnFailure (holder->component->activateBus (Vst::kAudio, Vst::kInput,  i, getBus (true,  i)->isEnabled() ? 1 : 0));
+        {
+            PluginHostDiagnostics::ScopedCall activateInputBus (
+                "activate", "VST3 IComponent::activateBus(input)", false,
+                String (i));
+            const auto activateResult = holder->component->activateBus (
+                Vst::kAudio, Vst::kInput, i,
+                getBus (true, i)->isEnabled() ? 1 : 0);
+            activateInputBus.finish (activateResult == kResultOk,
+                                     activateResult, String (i));
+            warnOnFailure (activateResult);
+        }
 
         for (int i = 0; i < numOutputBuses; ++i)
-            warnOnFailure (holder->component->activateBus (Vst::kAudio, Vst::kOutput, i, getBus (false, i)->isEnabled() ? 1 : 0));
+        {
+            PluginHostDiagnostics::ScopedCall activateOutputBus (
+                "activate", "VST3 IComponent::activateBus(output)", false,
+                String (i));
+            const auto activateResult = holder->component->activateBus (
+                Vst::kAudio, Vst::kOutput, i,
+                getBus (false, i)->isEnabled() ? 1 : 0);
+            activateOutputBus.finish (activateResult == kResultOk,
+                                      activateResult, String (i));
+            warnOnFailure (activateResult);
+        }
 
         setLatencySamples (jmax (0, (int) processor->getLatencySamples()));
 
@@ -2359,8 +2517,22 @@ public:
 
         setStateForAllMidiBuses (true);
 
-        warnOnFailure (holder->component->setActive (true));
-        warnOnFailureIfImplemented (processor->setProcessing (true));
+        PluginHostDiagnostics::ScopedCall setActive (
+            "activate", "VST3 IComponent::setActive(true)", true,
+            holder->module.getName());
+        const auto activeResult = holder->component->setActive (true);
+        setActive.finish (activeResult == kResultOk, activeResult,
+                          holder->module.getName());
+        warnOnFailure (activeResult);
+
+        PluginHostDiagnostics::ScopedCall setProcessing (
+            "activate", "VST3 IAudioProcessor::setProcessing(true)", true,
+            holder->module.getName());
+        const auto processingResult = processor->setProcessing (true);
+        setProcessing.finish (processingResult == kResultOk
+                                  || processingResult == kNotImplemented,
+                              processingResult, holder->module.getName());
+        warnOnFailureIfImplemented (processingResult);
 
         isActive = true;
     }
@@ -2935,10 +3107,17 @@ public:
     {
         JUCE_ASSERT_MESSAGE_MANAGER_IS_LOCKED
 
+        PluginHostDiagnostics::ScopedCall createView (
+            "createEditor", "VST3 IEditController::createView", false,
+            holder->module.getName());
+
         IPlugView* v = editController->createView (Vst::ViewType::kEditor);
 
         if (v == nullptr) v = editController->createView (nullptr);
         if (v == nullptr) editController->queryInterface (IPlugView::iid, (void**) &v);
+
+        createView.finish (v != nullptr, v != nullptr ? 0 : -1,
+                           holder->module.getName());
 
         return v;
     }
@@ -2952,10 +3131,27 @@ private:
         isActive = false;
 
         if (processor != nullptr)
-            warnOnFailureIfImplemented (processor->setProcessing (false));
+        {
+            PluginHostDiagnostics::ScopedCall setProcessing (
+                "unload", "VST3 IAudioProcessor::setProcessing(false)", false,
+                holder->module.getName());
+            const auto processingResult = processor->setProcessing (false);
+            setProcessing.finish (processingResult == kResultOk
+                                      || processingResult == kNotImplemented,
+                                  processingResult, holder->module.getName());
+            warnOnFailureIfImplemented (processingResult);
+        }
 
         if (holder->component != nullptr)
-            warnOnFailure (holder->component->setActive (false));
+        {
+            PluginHostDiagnostics::ScopedCall setActive (
+                "unload", "VST3 IComponent::setActive(false)", false,
+                holder->module.getName());
+            const auto activeResult = holder->component->setActive (false);
+            setActive.finish (activeResult == kResultOk, activeResult,
+                              holder->module.getName());
+            warnOnFailure (activeResult);
+        }
 
         setStateForAllMidiBuses (false);
     }

@@ -7,6 +7,7 @@
 #include "TimbreToneMemory.h"
 #include "ChannelRotarySpeaker.h"
 #include "PerformanceMidiSafety.h"
+#include "AndroidStageLayout.h"
 #include "UiProfiler.h"
 #include "ChurchOrgan/ChurchOrganEditor.h"
 #include "ChurchOrgan/ChurchOrganLayerProcessor.h"
@@ -59,6 +60,9 @@
 #include "MasterProcessor.h"
 #include "TimbrePicker.h"
 #include "BinaryData.h"
+#include "ChurchDAWServices.h"
+#include "AndroidCultoConnectivity.h"
+#include "TimbreCatalog.h"
 
 #include <algorithm>
 #include <cmath>
@@ -71,6 +75,109 @@
 #include <thread>
 #include <utility>
 #include <vector>
+
+//==============================================================================
+// Estado pequeno e testavel do carregamento assíncrono de plugins. AUv3 exige
+// que a message thread continue livre durante a instanciação; um ticket por
+// destino permite descartar uma resposta antiga sem jamais retirar antes o
+// plugin que ainda está tocando.
+namespace ChurchDAWPluginLoading
+{
+class RequestGeneration
+{
+public:
+    using Ticket = juce::uint64;
+
+    Ticket begin() noexcept
+    {
+        const std::lock_guard<std::mutex> lock (commitGate);
+        return generation.fetch_add (1, std::memory_order_acq_rel) + 1;
+    }
+
+    void cancel() noexcept
+    {
+        const std::lock_guard<std::mutex> lock (commitGate);
+        generation.fetch_add (1, std::memory_order_acq_rel);
+    }
+
+    bool isCurrent (Ticket ticket) const noexcept
+    {
+        return ticket != 0
+            && generation.load (std::memory_order_acquire) == ticket;
+    }
+
+    template <typename Commit>
+    bool commitIfCurrent (Ticket ticket, Commit&& commit)
+    {
+        // Este gate e deliberadamente NAO recursivo. O lambda de commit deve
+        // conter somente moves/flags locais, nunca codigo de vendor, callbacks
+        // ou bombeamento de mensagens. Assim um begin/cancel reentrante nao
+        // consegue alterar a geracao no meio do swap e tambem nao passa pelo
+        // comportamento recursivo de juce::CriticalSection.
+        const std::lock_guard<std::mutex> lock (commitGate);
+
+        if (! isCurrent (ticket))
+            return false;
+
+        std::forward<Commit> (commit)();
+        return true;
+    }
+
+private:
+    std::mutex commitGate;
+    std::atomic<Ticket> generation { 0 };
+};
+
+inline bool hasDuplicateName (
+    const juce::Array<juce::PluginDescription>& choices,
+    const juce::PluginDescription& candidate)
+{
+    int matches = 0;
+
+    for (const auto& item : choices)
+        if (item.name.trim().equalsIgnoreCase (candidate.name.trim())
+             && ++matches > 1)
+            return true;
+
+    return false;
+}
+
+inline juce::String displayName (
+    const juce::PluginDescription& plugin,
+    const juce::Array<juce::PluginDescription>& choices)
+{
+    auto name = plugin.name.trim();
+
+    if (name.isEmpty())
+        name = "Plugin";
+
+    if (! hasDuplicateName (choices, plugin))
+        return name;
+
+    auto format = plugin.pluginFormatName.trim();
+    auto maker = plugin.manufacturerName.trim();
+
+    if (format.isEmpty())
+        format = "Formato desconhecido";
+
+    if (maker.isEmpty())
+        maker = "Fabricante desconhecido";
+
+    return name + " [" + format + " | " + maker + "]";
+}
+
+inline int findChoiceByIdentifier (
+    const juce::Array<juce::PluginDescription>& choices,
+    const juce::String& identifier)
+{
+    for (int i = 0; i < choices.size(); ++i)
+        if (choices.getReference (i).createIdentifierString()
+             == identifier)
+            return i;
+
+    return -1;
+}
+}
 
 //==============================================================================
 // "Church Live" - instrumento nativo da ChurchDAW.
@@ -1001,14 +1108,134 @@ public:
     void setExternalMaster (MasterProcessor* m) noexcept    { externalMaster = m; }
     MasterProcessor* getExternalMaster() const noexcept     { return externalMaster; }
 
-    // recursos da DAW para hospedar plugins dentro do canal master
-    void setPluginResources (juce::KnownPluginList* list, juce::AudioPluginFormatManager* fm) noexcept
+    using PluginLoadCompletion =
+        std::function<void (bool, const juce::String&)>;
+
+    enum class HostedPluginLocation
     {
+        insert,
+        instrument
+    };
+
+    using HostedPluginWillRetireCallback =
+        std::function<void (HostedPluginLocation, int,
+                            juce::AudioPluginInstance*)>;
+
+    static void invokePluginLoadCompletionNoThrow (
+        PluginLoadCompletion& completion,
+        bool loaded,
+        const juce::String& error) noexcept
+    {
+        if (completion == nullptr)
+            return;
+
+        try
+        {
+            completion (loaded, error);
+        }
+        catch (...)
+        {
+        }
+    }
+
+    // recursos da DAW para hospedar plugins dentro do canal master
+    void setPluginResources (
+        juce::KnownPluginList* list,
+        juce::AudioPluginFormatManager* fm,
+        const juce::StringArray* quarantine = nullptr) noexcept
+    {
+        if (formatManagerRef != fm)
+        {
+            for (int slot = 0; slot < numInserts; ++slot)
+            {
+                insertPluginLoadGeneration[slot].cancel();
+                insertPluginLoadInFlight[slot].store (
+                    false, std::memory_order_release);
+            }
+
+            for (int layer = 0; layer < numLayers; ++layer)
+            {
+                instrumentPluginLoadGeneration[layer].cancel();
+                instrumentPluginLoadInFlight[layer].store (
+                    false, std::memory_order_release);
+            }
+        }
+
         knownPluginsRef = list;
         formatManagerRef = fm;
+        pluginQuarantineRef = quarantine;
     }
 
     juce::KnownPluginList* getKnownPlugins() const noexcept { return knownPluginsRef; }
+
+    bool isHostedPluginBlocked (const juce::PluginDescription& description) const
+    {
+        const auto& file = description.fileOrIdentifier;
+
+        return (knownPluginsRef != nullptr
+                 && knownPluginsRef->isBlacklisted (file, true))
+            || (pluginQuarantineRef != nullptr
+                 && pluginQuarantineRef->contains (file, true));
+    }
+
+    void setHostedPluginWillRetireCallback (
+        HostedPluginWillRetireCallback callback)
+    {
+        const juce::ScopedLock lock (
+            hostedPluginEditorCallbackLock);
+        hostedPluginWillRetire = std::move (callback);
+    }
+
+    // O destrutor de um editor de vendor pode abrir um loop modal e entregar um
+    // callback AUv3 no meio da propria destruicao. Durante esta janela o
+    // callback de carga fica coalescido no processador ate o teardown externo
+    // terminar, evitando spin no loop modal e troca sob um editor desmontando.
+    void beginHostedPluginEditorTeardown() noexcept
+    {
+        hostedPluginEditorTeardownDepth.fetch_add (
+            1, std::memory_order_acq_rel);
+    }
+
+    void endHostedPluginEditorTeardown() noexcept
+    {
+        const int previous =
+            hostedPluginEditorTeardownDepth.fetch_sub (
+                1, std::memory_order_acq_rel);
+        jassert (previous > 0);
+
+        if (previous == 1)
+            postDeferredHostedPluginFinishes();
+    }
+
+    bool getPendingInsertDescription (
+        int slot, juce::PluginDescription& result)
+    {
+        if (! juce::isPositiveAndBelow (slot, numInserts))
+            return false;
+
+        const juce::ScopedLock lock (getCallbackLock());
+
+        if (! pendingInsertDescriptionValid[slot])
+            return false;
+
+        result = pendingInsertDescriptions[slot];
+        return true;
+    }
+
+    bool getPendingInstrumentDescription (
+        int layer, juce::PluginDescription& result) const
+    {
+        if (! juce::isPositiveAndBelow (layer, numLayers))
+            return false;
+
+        const juce::ScopedLock lock (layerIdentityLock);
+
+        if (! pendingVstDescriptionValid[layer])
+            return false;
+
+        result = pendingVstDescriptions[layer];
+        return true;
+    }
 
     static constexpr int numInserts = 2;
 
@@ -1201,34 +1428,311 @@ public:
             worshipReverb.reset();
     }
 
-    // carrega um plugin de efeito dentro do Church Live (thread de mensagens)
-    bool loadInsert (int slot, const juce::PluginDescription& desc)
+    // Agenda a criação sem bloquear a message thread. O retorno diz apenas se
+    // o pedido foi aceito; sucesso/falha real chega em completion. O insert atual
+    // continua processando até a nova instância estar criada, restaurada e
+    // preparada (swap em duas fases, indispensável para AUv3).
+    bool loadInsert (
+        int slot,
+        const juce::PluginDescription& desc,
+        const juce::MemoryBlock* restoredState = nullptr,
+        PluginLoadCompletion completion = {},
+        bool preservePendingOnFailure = false)
     {
-        if (! juce::isPositiveAndBelow (slot, numInserts) || formatManagerRef == nullptr)
+        if (! juce::isPositiveAndBelow (slot, numInserts)
+             || formatManagerRef == nullptr
+             || isHostedPluginBlocked (desc))
             return false;
 
-        juce::String error;
-        auto instance = formatManagerRef->createPluginInstance (desc, hostSampleRate,
-                                                                juce::jmax (64, lastBlockSize), error);
+        ChurchDAWPluginLoading::RequestGeneration::Ticket ticket = 0;
+
+        try
+        {
+            juce::MemoryBlock stateToRestore;
+
+            if (restoredState != nullptr && restoredState->getSize() > 0)
+                stateToRestore = *restoredState;
+
+            // Termine todas as copias que podem alocar antes de invalidar o
+            // pedido anterior. Depois de begin(), apenas moves/clear entram no
+            // estado compartilhado.
+            auto requestedId = desc.createIdentifierString();
+            auto requestedState = stateToRestore.toBase64Encoding();
+            juce::PluginDescription requestedDescription (desc);
+            ticket = insertPluginLoadGeneration[slot].begin();
+
+            {
+                const juce::ScopedLock callbackGuard (
+                    getCallbackLock());
+                pendingInsertIds[slot] = std::move (requestedId);
+                pendingInsertStates[slot] =
+                    std::move (requestedState);
+                pendingInsertDescriptions[slot] =
+                    std::move (requestedDescription);
+                pendingInsertDescriptionValid[slot] = true;
+                insertPluginLoadInFlight[slot].store (
+                    true, std::memory_order_release);
+
+                if (! preservePendingOnFailure)
+                    insertStateRestorePending[slot].store (
+                        false, std::memory_order_release);
+            }
+
+            juce::WeakReference<TimbresProcessor> weakThis (this);
+            formatManagerRef->createPluginInstanceAsync (
+                desc, hostSampleRate, juce::jmax (64, lastBlockSize),
+                [weakThis, slot, ticket,
+                 preservePendingOnFailure,
+                 stateToRestore = std::move (stateToRestore),
+                 completion = std::move (completion)] (
+                    std::unique_ptr<juce::AudioPluginInstance> instance,
+                    const juce::String& error) mutable
+                {
+                    struct Result
+                    {
+                        std::unique_ptr<juce::AudioPluginInstance> instance;
+                        juce::String error;
+                    };
+
+                    auto result = std::make_shared<Result>();
+                    result->instance = std::move (instance);
+                    result->error = error;
+
+                    auto deliver =
+                        [weakThis, slot, ticket, result,
+                         preservePendingOnFailure,
+                         stateToRestore = std::move (stateToRestore),
+                         completion = std::move (completion)] () mutable
+                    {
+                        if (auto* self = weakThis.get())
+                            self->finishInsertPluginLoad (
+                                slot, ticket,
+                                std::move (result->instance),
+                                result->error, stateToRestore,
+                                std::move (completion),
+                                preservePendingOnFailure);
+                    };
+
+                    if (juce::MessageManager::getInstance()
+                            ->isThisTheMessageThread())
+                        deliver();
+                    else
+                        (void) juce::MessageManager::callAsync (
+                            std::move (deliver));
+                });
+
+            return true;
+        }
+        catch (...)
+        {
+            // O pedido nem chegou ao format manager. Se ele ja havia publicado
+            // uma intencao interativa, volte ao plugin que continua tocando;
+            // restore conserva o alvo para autocura no proximo boot.
+            if (ticket != 0)
+            {
+                const juce::ScopedLock callbackGuard (
+                    getCallbackLock());
+                (void) insertPluginLoadGeneration[slot]
+                    .commitIfCurrent (ticket, [this, slot,
+                                               preservePendingOnFailure]
+                {
+                    insertPluginLoadInFlight[slot].store (
+                        false, std::memory_order_release);
+
+                    if (! preservePendingOnFailure)
+                    {
+                        pendingInsertIds[slot].clear();
+                        pendingInsertStates[slot].clear();
+                        pendingInsertDescriptionValid[slot] = false;
+                        insertStateRestorePending[slot].store (
+                            false, std::memory_order_release);
+                    }
+                });
+            }
+            return false;
+        }
+    }
+
+    void finishInsertPluginLoad (
+        int slot,
+        ChurchDAWPluginLoading::RequestGeneration::Ticket ticket,
+        std::unique_ptr<juce::AudioPluginInstance> instance,
+        const juce::String& creationError,
+        const juce::MemoryBlock& restoredState,
+        PluginLoadCompletion completion,
+        bool preservePendingOnFailure)
+    {
+        jassert (juce::MessageManager::getInstance()
+                    ->isThisTheMessageThread());
+
+        if (! juce::isPositiveAndBelow (slot, numInserts)
+             || ! insertPluginLoadGeneration[slot].isCurrent (ticket))
+            return;
+
+        if (isHostedPluginEditorTeardownActive())
+        {
+            try
+            {
+                struct DeferredResult
+                {
+                    std::unique_ptr<juce::AudioPluginInstance> instance;
+                    juce::String error;
+                    juce::MemoryBlock state;
+                    PluginLoadCompletion completion;
+                };
+
+                auto deferred = std::make_shared<DeferredResult>();
+                deferred->instance = std::move (instance);
+                deferred->error = creationError;
+                deferred->state = restoredState;
+                deferred->completion = std::move (completion);
+                juce::WeakReference<TimbresProcessor> weakThis (this);
+
+                deferHostedPluginFinish (
+                    HostedPluginLocation::insert, slot,
+                    [weakThis, slot, ticket, deferred,
+                     preservePendingOnFailure] () mutable
+                    {
+                        if (auto* self = weakThis.get())
+                            self->finishInsertPluginLoad (
+                                slot, ticket,
+                                std::move (deferred->instance),
+                                deferred->error, deferred->state,
+                                std::move (deferred->completion),
+                                preservePendingOnFailure);
+                    });
+            }
+            catch (...)
+            {
+                // O alvo continua pendente e podera ser restaurado no proximo
+                // boot; nunca troque uma instancia durante teardown de editor.
+            }
+            return;
+        }
+
+        auto failCurrentRequest =
+            [this, slot, ticket, preservePendingOnFailure,
+             &completion] (const juce::String& error) mutable
+        {
+            if (preservePendingOnFailure
+                 && insertStateRestorePending[slot].load (
+                        std::memory_order_acquire))
+            {
+                if (! finishFailedInsertStateRestore (
+                        slot, ticket))
+                    return;
+
+                if (insertPluginLoadGeneration[slot]
+                        .isCurrent (ticket))
+                    invokePluginLoadCompletionNoThrow (
+                        completion, false, error);
+                return;
+            }
+
+            const bool stillCurrent = [&]
+                {
+                    const juce::ScopedLock callbackGuard (
+                        getCallbackLock());
+                    return insertPluginLoadGeneration[slot]
+                        .commitIfCurrent (
+                            ticket,
+                            [this, slot,
+                             preservePending = bool (preservePendingOnFailure)]
+                    {
+                        insertPluginLoadInFlight[slot].store (
+                            false, std::memory_order_release);
+                        insertStateRestorePending[slot].store (
+                            false, std::memory_order_release);
+
+                        if (! preservePending)
+                        {
+                            pendingInsertIds[slot].clear();
+                            pendingInsertStates[slot].clear();
+                            pendingInsertDescriptionValid[slot] = false;
+                        }
+                    });
+                }();
+
+            if (! stillCurrent)
+                return;
+
+            sendChangeMessage();
+            invokePluginLoadCompletionNoThrow (
+                completion, false, error);
+        };
+
+        const auto requestStillAllowed = [this, slot]
+        {
+            juce::PluginDescription pending;
+            return getPendingInsertDescription (slot, pending)
+                && ! isHostedPluginBlocked (pending);
+        };
+
+        if (! requestStillAllowed())
+        {
+            juce::Logger::writeToLog (
+                "PLUGIN: insert bloqueado durante carga assincrona");
+            failCurrentRequest (
+                "Plugin foi colocado em quarentena durante a carga");
+            return;
+        }
 
         if (instance == nullptr)
-            return false;
+        {
+            juce::Logger::writeToLog (
+                "PLUGIN: falha ao criar insert "
+                + juce::String (slot + 1) + ": " + creationError);
+            failCurrentRequest (creationError);
+
+            return;
+        }
+
+        bool temporaryNeedsRelease = true;
+        const juce::ScopeGuard releaseTemporaryOnExit {
+            [this, &instance, &temporaryNeedsRelease]
+        {
+            if (temporaryNeedsRelease)
+                releasePluginResourcesNoThrow (instance.get());
+        } };
 
         try
         {
             instance->prepareToPlay (
                 hostSampleRate,
                 juce::jmax (64, lastBlockSize));
+
+            if (restoredState.getSize() > 0)
+                instance->setStateInformation (
+                    restoredState.getData(),
+                    (int) restoredState.getSize());
         }
         catch (...)
         {
-            releasePluginResourcesNoThrow (
-                instance.get());
-            return false;
+            failCurrentRequest (
+                "Plugin falhou durante prepare/restore");
+
+            return;
         }
 
         std::unique_ptr<juce::AudioPluginInstance> old;
         bool oldWasPrepared = false;
+        notifyHostedPluginWillRetire (
+            HostedPluginLocation::insert, slot,
+            getInsert (slot));
+
+        // Fechar o editor pode bombear mensagens; o scanner pode concluir e
+        // colocar exatamente este ID em quarentena nessa janela.
+        if (! requestStillAllowed())
+        {
+            failCurrentRequest (
+                "Plugin foi colocado em quarentena antes do commit");
+            return;
+        }
+
+        // Fechar o editor pode bombear mensagens e iniciar outro pedido. O
+        // commit atomico e revalidado DEPOIS disso; callback stale nao troca o
+        // grafo nem apaga o pending do pedido mais novo.
+        bool committed = false;
         {
             const bool resumeAfterSwap = ! isSuspended();
 
@@ -1241,44 +1745,80 @@ public:
                     suspendProcessing (false);
             } };
 
-            {
-                const juce::ScopedLock callbackGuard (
-                    getCallbackLock());
-                oldWasPrepared =
-                    insertPrepared[slot].exchange (
-                    false,
-                    std::memory_order_acq_rel);
-                old = std::move (inserts[slot]);
-                inserts[slot] = std::move (instance);
-                insertPrepared[slot].store (
-                    true,
-                    std::memory_order_release);
-                refreshExternalReverbSlot (slot);
+            const juce::ScopedLock callbackGuard (
+                getCallbackLock());
+            committed = insertPluginLoadGeneration[slot]
+                .commitIfCurrent (ticket, [this, slot, &instance,
+                                           &old, &oldWasPrepared,
+                                           &temporaryNeedsRelease]
+                {
+                    oldWasPrepared =
+                        insertPrepared[slot].exchange (
+                        false,
+                        std::memory_order_acq_rel);
+                    old = std::move (inserts[slot]);
+                    inserts[slot] = std::move (instance);
+                    temporaryNeedsRelease = false;
+                    insertPrepared[slot].store (
+                        true,
+                        std::memory_order_release);
+                    pendingInsertIds[slot].clear();
+                    pendingInsertStates[slot].clear();
+                    pendingInsertDescriptionValid[slot] = false;
+                    insertPluginLoadInFlight[slot].store (
+                        false, std::memory_order_release);
+                    insertStateRestorePending[slot].store (
+                        false, std::memory_order_release);
+                });
+        }
 
-                // Reverb como ENVIO exige o plugin 100% molhado: o seco ja vem
-                // do caminho direto do canal. Com MIX no meio, o seco voltaria
-                // dobrado.
-                forceExternalReverbWet (
-                    getReverbSlot());
-            }
+        if (! committed)
+            return;
+
+        try
+        {
+            refreshExternalReverbSlot (slot);
+
+            // Reverb como ENVIO exige o plugin 100% molhado: o seco ja vem do
+            // caminho direto do canal. Com MIX no meio, o seco voltaria dobrado.
+            forceExternalReverbWet (getReverbSlot());
+        }
+        catch (...)
+        {
+            juce::Logger::writeToLog (
+                "PLUGIN: insert instalado; atualizacao do roteamento de reverb falhou");
         }
 
         if (oldWasPrepared)
             releasePluginResourcesNoThrow (old.get());
         old.reset();
 
-        // carga ok: o estado guardado de uma restauracao falhada nao vale mais
-        pendingInsertIds[slot].clear();
-        pendingInsertStates[slot].clear();
-
         sendChangeMessage();
-        return true;
+
+        // releaseResources/destrutor do plugin antigo podem bombear a fila e
+        // iniciar D. C ja foi instalado, mas nao conclui a UI nem toca no
+        // estado persistente de D se deixou de ser o pedido atual.
+        if (insertPluginLoadGeneration[slot].isCurrent (ticket))
+            invokePluginLoadCompletionNoThrow (
+                completion, true, {});
     }
 
     void unloadInsert (int slot)
     {
         if (! juce::isPositiveAndBelow (slot, numInserts))
             return;
+
+        notifyHostedPluginWillRetire (
+            HostedPluginLocation::insert, slot,
+            getInsert (slot));
+
+        // A limpeza explicita deve vencer qualquer pedido entregue por um loop
+        // modal aberto ao destruir o editor; por isso cancela DEPOIS do aviso.
+        insertPluginLoadGeneration[slot].cancel();
+        insertPluginLoadInFlight[slot].store (
+            false, std::memory_order_release);
+        insertStateRestorePending[slot].store (
+            false, std::memory_order_release);
 
         std::unique_ptr<juce::AudioPluginInstance> old;
         bool oldWasPrepared = false;
@@ -1313,8 +1853,13 @@ public:
         old.reset();
 
         // slot esvaziado de proposito: estado pendente de restauracao cai junto
-        pendingInsertIds[slot].clear();
-        pendingInsertStates[slot].clear();
+        {
+            const juce::ScopedLock callbackGuard (
+                getCallbackLock());
+            pendingInsertIds[slot].clear();
+            pendingInsertStates[slot].clear();
+            pendingInsertDescriptionValid[slot] = false;
+        }
 
         sendChangeMessage();
     }
@@ -1380,6 +1925,28 @@ public:
 
     ~TimbresProcessor() override
     {
+        for (auto& generation : insertPluginLoadGeneration)
+            generation.cancel();
+
+        for (auto& generation : instrumentPluginLoadGeneration)
+            generation.cancel();
+
+        // O editor precisa largar AudioProcessorEditor/GenericEditor antes que
+        // qualquer instancia seja liberada. Gerações já canceladas tornam
+        // inofensivo um callback AUv3 entregue por um loop modal do vendor.
+        for (int slot = 0; slot < numInserts; ++slot)
+            notifyHostedPluginWillRetire (
+                HostedPluginLocation::insert, slot,
+                getInsert (slot));
+
+        for (int layer = 0; layer < numLayers; ++layer)
+            notifyHostedPluginWillRetire (
+                HostedPluginLocation::instrument, layer,
+                getLayerInstrument (layer));
+
+        setHostedPluginWillRetireCallback ({});
+        releaseResources();
+
         masterReference.clear();
 
         for (auto& requestAbort : layerLoadAbort)
@@ -1762,6 +2329,35 @@ public:
     void setSelectedLayer (int l)        { uiSelectedLayer.store (l < 0 ? -1 : juce::jlimit (0, numLayers - 1, l)); }
     bool getLayerMute (int l) const                     { return juce::isPositiveAndBelow (l, numLayers) && layers[l].mute != nullptr && layers[l].mute->get(); }
     bool getLayerSolo (int l) const                     { return juce::isPositiveAndBelow (l, numLayers) && layers[l].solo != nullptr && layers[l].solo->get(); }
+    bool isLayerLoaded (int l) const noexcept
+    {
+        return juce::isPositiveAndBelow (l, numLayers)
+            && (loadedLayerMask.load (std::memory_order_acquire)
+                 & (juce::uint32 (1) << l)) != 0;
+    }
+
+    // Uma unica definicao de SOLO global para audio, UI e LiveScenes. A
+    // identidade vem de uma mascara atomica porque String/unique_ptr/locks nao
+    // podem entrar no callback de audio.
+    static bool hasAnySoloInMasks (juce::uint32 loadedMask,
+                                   juce::uint32 soloMask) noexcept
+    {
+        return (loadedMask & soloMask) != 0;
+    }
+
+    bool hasAnyLoadedSolo() const noexcept
+    {
+        const auto loaded = loadedLayerMask.load (
+            std::memory_order_acquire);
+        juce::uint32 solos = 0;
+
+        for (int l = 0; l < numLayers; ++l)
+            if (layers[l].solo != nullptr
+                 && layers[l].solo->get())
+                solos |= juce::uint32 (1) << l;
+
+        return hasAnySoloInMasks (loaded, solos);
+    }
     bool isLoading() const noexcept                     { return loadingCount->load() > 0; }
 
     // Tem trabalho pendente? Cobre as TRES fases: escaneamento da biblioteca,
@@ -1773,15 +2369,50 @@ public:
         if (loadingCount->load() > 0)
             return true;
 
+        // AUv3/AU/VST sao criados assincronamente e nao passam pelo contador
+        // de samples. Uma cena-pagina so pode aplicar os faders finais depois
+        // que esses pedidos terminaram; caso contrario o callback do plugin
+        // restauraria defaults por cima da cena alguns quadros depois.
+        {
+            const juce::ScopedLock callbackLock (getCallbackLock());
+
+            for (int i = 0; i < numInserts; ++i)
+                if (insertPluginLoadInFlight[i].load (
+                        std::memory_order_acquire))
+                    return true;
+        }
+
         {
             const juce::ScopedLock lock (layerIdentityLock);
 
             for (int l = 0; l < numLayers; ++l)
-                if (pendingLayerLabels[l].isNotEmpty())
+                if (pendingLayerLabels[l].isNotEmpty()
+                     || instrumentPluginLoadInFlight[l].load (
+                            std::memory_order_acquire))
                     return true;
         }
 
         return ! entriesScanned;
+    }
+
+    // Diferente de isBusyLoading(): um plugin ausente pode deixar a intencao
+    // de restore guardada para autocura sem haver trabalho em execucao. A
+    // splash nao deve ficar eterna por isso, mas uma troca de CENA precisa
+    // saber que a pagina ainda nao terminou e avisar em vez de declarar
+    // sucesso com metade do som.
+    bool hasPendingStateRestore() const noexcept
+    {
+        for (int i = 0; i < numInserts; ++i)
+            if (insertStateRestorePending[i].load (
+                    std::memory_order_acquire))
+                return true;
+
+        for (int l = 0; l < numLayers; ++l)
+            if (layerStateRestorePending[l].load (
+                    std::memory_order_acquire))
+                return true;
+
+        return false;
     }
 
     // PRESET SHOWROOM: pedido pelo MainComponent quando NAO existe setup salvo
@@ -1797,6 +2428,31 @@ public:
     juce::AudioParameterChoice* getVelCurveParam() const noexcept { return velCurve; }
 
     // ---- parametros expostos pro controle externo (Launchkey em modo DAW) ----
+    //== Acessores usados pelo LIVE MODE (cenas) =============================
+    //
+    // A cena le e escreve APENAS estes campos. Nada aqui recarrega sample:
+    // sao todas escritas de parametro, instantaneas, e com a rampa do
+    // pos-fader nem cortam a cauda da musica anterior.
+    juce::AudioParameterBool*  getLayerMuteParam (int l) const
+    {
+        return juce::isPositiveAndBelow (l, numLayers) ? layers[l].mute : nullptr;
+    }
+
+    juce::AudioParameterBool*  getLayerSoloParam (int l) const
+    {
+        return juce::isPositiveAndBelow (l, numLayers) ? layers[l].solo : nullptr;
+    }
+
+    juce::AudioParameterInt*   getLayerTransposeParam (int l) const
+    {
+        return juce::isPositiveAndBelow (l, numLayers) ? layers[l].transp : nullptr;
+    }
+
+    juce::AudioParameterFloat* getLayerReverbSendParam (int l) const
+    {
+        return juce::isPositiveAndBelow (l, numLayers) ? layers[l].reverbSend : nullptr;
+    }
+
     juce::AudioProcessorParameter* getLayerVolParam (int l) const
     {
         return juce::isPositiveAndBelow (l, numLayers) ? layers[l].vol : nullptr;
@@ -1909,7 +2565,136 @@ public:
         return juce::isPositiveAndBelow (l, numLayers) && layers[l].on != nullptr && layers[l].on->get();
     }
 
+    //==============================================================================
+    // Roteamento MIDI por canal (desktop: 2 teclados → piano / pad).
+    mutable juce::CriticalSection midiRouteLock;
+    juce::String layerMidiDeviceId[numLayers];
+    std::atomic<int> layerMidiListenChannel[numLayers] {};
+    juce::StringArray forceMidiDeviceIds;
+    juce::Array<int> forceMidiChannels;
+
+    void rebuildMidiDeviceForceMap()
+    {
+        // Chamar com midiRouteLock tomado.
+        forceMidiDeviceIds.clearQuick();
+        forceMidiChannels.clearQuick();
+
+        for (int l = 0; l < numLayers; ++l)
+        {
+            const auto& id = layerMidiDeviceId[l];
+            const int ch = layerMidiListenChannel[l].load (
+                std::memory_order_relaxed);
+            if (id.isEmpty() || ch <= 0)
+                continue;
+
+            if (! forceMidiDeviceIds.contains (id))
+            {
+                forceMidiDeviceIds.add (id);
+                forceMidiChannels.add (ch);
+            }
+        }
+    }
+
+    // ---- Entrada MIDI por canal (2 teclados: um piano, outro pad) ------------
+    // deviceId vazio = Todos os teclados. listenChannel 0 = omni.
+    juce::String getLayerMidiInputDevice (int l) const
+    {
+        const juce::ScopedLock sl (midiRouteLock);
+        return juce::isPositiveAndBelow (l, numLayers) ? layerMidiDeviceId[l]
+                                                       : juce::String();
+    }
+
+    int getLayerMidiListenChannel (int l) const noexcept
+    {
+        if (! juce::isPositiveAndBelow (l, numLayers))
+            return 0;
+        return layerMidiListenChannel[l].load (std::memory_order_relaxed);
+    }
+
+    void setLayerMidiInputDevice (int l, juce::String deviceId)
+    {
+        if (! juce::isPositiveAndBelow (l, numLayers))
+            return;
+
+        deviceId = deviceId.trim();
+        {
+            const juce::ScopedLock sl (midiRouteLock);
+            layerMidiDeviceId[l] = deviceId;
+
+            if (deviceId.isEmpty())
+            {
+                layerMidiListenChannel[l].store (0, std::memory_order_relaxed);
+            }
+            else
+            {
+                int ch = 0;
+                for (int i = 0; i < numLayers; ++i)
+                    if (i != l && layerMidiDeviceId[i] == deviceId)
+                    {
+                        ch = layerMidiListenChannel[i].load (
+                            std::memory_order_relaxed);
+                        if (ch > 0)
+                            break;
+                    }
+
+                if (ch <= 0)
+                {
+                    bool used[17] = {};
+                    for (int i = 0; i < numLayers; ++i)
+                    {
+                        const int c = layerMidiListenChannel[i].load (
+                            std::memory_order_relaxed);
+                        if (c >= 1 && c <= 16)
+                            used[c] = true;
+                    }
+
+                    ch = juce::jlimit (1, 16, l + 1);
+                    if (used[ch])
+                    {
+                        ch = 1;
+                        while (ch <= 16 && used[ch])
+                            ++ch;
+                        if (ch > 16)
+                            ch = (l % 16) + 1;
+                    }
+                }
+
+                layerMidiListenChannel[l].store (ch, std::memory_order_relaxed);
+            }
+
+            rebuildMidiDeviceForceMap();
+        }
+
+        sendChangeMessage();
+    }
+
+    // Thread de MIDI: teclado amarrado a um canal de layer → força o canal MIDI
+    // da mensagem (teclados USB costumam mandar tudo no canal 1).
+    int getForcedMidiChannelForDevice (const juce::String& deviceId) const
+    {
+        if (deviceId.isEmpty())
+            return 0;
+
+        const juce::ScopedLock sl (midiRouteLock);
+        for (int i = 0; i < forceMidiDeviceIds.size(); ++i)
+            if (forceMidiDeviceIds.getReference (i) == deviceId)
+                return forceMidiChannels.getUnchecked (i);
+
+        return 0;
+    }
+
     juce::AudioProcessorParameter* getGlobalTranspParam() const { return globalTransp; }
+
+    // Globais em unidade REAL, para o LIVE MODE.
+    //
+    // A cena precisa gravar e devolver volume geral, transpose global e
+    // retorno de reverb. Chegar neles pelo ponteiro generico obrigaria a
+    // guardar valor normalizado, e o normalizado ja custou um bug: a unidade
+    // do volume geral e 1,0 de ganho, que normalizado da 0,667 — quem lesse
+    // "1,0" como normalizado entregaria 1,5 de ganho, +3,5 dB.
+    juce::AudioParameterFloat* getVolumeGeralParam()   const noexcept { return gain; }
+    juce::AudioParameterInt*   getTransposeGeralParam() const noexcept { return globalTransp; }
+    juce::AudioParameterFloat* getRetornoDeReverbParam() const noexcept { return reverbReturn; }
 
     // pico do canal por lado; a UI le e zera (so pode existir UM leitor)
     void readAndResetLayerLevels (int l, float& outL, float& outR) noexcept
@@ -2056,6 +2841,11 @@ public:
         if (! juce::isPositiveAndBelow (layerIndex, numLayers))
             return;
 
+        // Retira primeiro o bit transitivo: durante a troca, um SOLO deste
+        // canal nao pode contaminar os que continuam carregados.
+        *layers[layerIndex].solo = false;
+        setLayerLoaded (layerIndex, false);
+
         const juce::ScopedLock toneLock (layerToneTransactionLock);
         // Limpar o canal nao deve apagar a regulagem feita para o timbre. Se o
         // cliente o selecionar novamente, ENV/EQ retornam como estavam.
@@ -2152,6 +2942,12 @@ public:
             hasInstrument = layers[layerIndex].instrument != nullptr;
         }
 
+        // clearLayer remove a identidade nativa, mas pode ser a primeira metade
+        // de uma troca que ainda preserva plugin/Church Organ. Reponha o bit
+        // somente se uma dessas identidades realmente sobreviveu.
+        setLayerLoaded (layerIndex,
+                        hasInstrument || isLayerChurchOrgan (layerIndex));
+
         if (! preserveRestore && ! hasInstrument)
             completeLayerStateRestore (layerIndex);
         sendChangeMessage();
@@ -2227,6 +3023,7 @@ public:
             pluginPitchCentresPending[layerIndex].store (
                 true,
                 std::memory_order_release);
+            setLayerLoaded (layerIndex, true);
         }
 
         if (oldWasPrepared)
@@ -2362,6 +3159,13 @@ public:
              || familyIndex >= churchOrganFamilyCount)
             return false;
 
+        notifyHostedPluginWillRetire (
+            HostedPluginLocation::instrument, layerIndex,
+            getLayerInstrument (layerIndex));
+        instrumentPluginLoadGeneration[layerIndex].cancel();
+        instrumentPluginLoadInFlight[layerIndex].store (
+            false, std::memory_order_release);
+
         const juce::ScopedLock toneLock (layerToneTransactionLock);
         auto* organ = layers[layerIndex].churchOrgan.get();
 
@@ -2406,6 +3210,7 @@ public:
                 layers[layerIndex].instrumentName.clear();
                 pendingVstIds[layerIndex].clear();
                 pendingVstStates[layerIndex].clear();
+                pendingVstDescriptionValid[layerIndex] = false;
             }
 
             organ->setProcessingSuspended (true);
@@ -2473,6 +3278,7 @@ public:
                 sustainStateUnknown,
                 std::memory_order_release);
 
+            bool supersededByPlugin = false;
             {
                 const juce::ScopedLock identityLock (
                     layerIdentityLock);
@@ -2485,6 +3291,7 @@ public:
                 pendingLayerLabels[layerIndex].clear();
                 pendingLayerLibs[layerIndex].clear();
             }
+            setLayerLoaded (layerIndex, configured);
 
             bool recalledChurchOrganTone = false;
 
@@ -2722,20 +3529,50 @@ public:
                 value);
     }
 
-    // carrega um instrumento VST no canal (thread de mensagens)
-    bool loadInstrumentPlugin (int layerIndex,
-                               const juce::PluginDescription& desc,
-                               bool applyFactoryDefaults = true,
-                               const juce::MemoryBlock* restoredState = nullptr)
+    // Agenda um VST/AU/AUv3 sem esperar sua fábrica na message thread. O canal
+    // atual permanece audível até o callback preparar e validar o substituto.
+    bool loadInstrumentPlugin (
+        int layerIndex,
+        const juce::PluginDescription& desc,
+        bool applyFactoryDefaults = true,
+        const juce::MemoryBlock* restoredState = nullptr,
+        PluginLoadCompletion completion = {})
     {
-        if (! juce::isPositiveAndBelow (layerIndex, numLayers) || formatManagerRef == nullptr)
+        if (! juce::isPositiveAndBelow (layerIndex, numLayers)
+             || formatManagerRef == nullptr
+             || isHostedPluginBlocked (desc))
             return false;
 
-        const juce::ScopedLock toneLock (layerToneTransactionLock);
+        ChurchDAWPluginLoading::RequestGeneration::Ticket ticket = 0;
+
         try
         {
+            juce::MemoryBlock stateToRestore;
+
+            if (restoredState != nullptr && restoredState->getSize() > 0)
+                stateToRestore = *restoredState;
+
+            auto requestedId = desc.createIdentifierString();
+            auto requestedState = stateToRestore.toBase64Encoding();
+            juce::PluginDescription requestedDescription (desc);
+            auto restoreTargetId = requestedId;
+            auto restoreTargetState = requestedState;
+            ticket = instrumentPluginLoadGeneration[layerIndex].begin();
+
             {
                 const juce::ScopedLock lock (layerIdentityLock);
+
+                // Manual e restore ficam serializaveis desde a aceitacao. Sem
+                // isto um autosave durante a fabrica AUv3 lenta gravava o plugin
+                // antigo que ainda estava tocando.
+                pendingVstIds[layerIndex] = std::move (requestedId);
+                pendingVstStates[layerIndex] =
+                    std::move (requestedState);
+                pendingVstDescriptions[layerIndex] =
+                    std::move (requestedDescription);
+                pendingVstDescriptionValid[layerIndex] = true;
+                instrumentPluginLoadInFlight[layerIndex].store (
+                    true, std::memory_order_release);
 
                 if (layerStateRestorePending[layerIndex].load (
                         std::memory_order_acquire))
@@ -2743,51 +3580,256 @@ public:
                     layerStateRestoreTargetTimbre[layerIndex].clear();
                     layerStateRestoreTargetLibrary[layerIndex].clear();
                     layerStateRestoreTargetVstId[layerIndex] =
-                        desc.createIdentifierString();
-
-                    if (applyFactoryDefaults)
-                        layerStateRestoreTargetVstState[layerIndex].clear();
+                        std::move (restoreTargetId);
+                    layerStateRestoreTargetVstState[layerIndex] =
+                        applyFactoryDefaults
+                            ? juce::String()
+                            : std::move (restoreTargetState);
                 }
             }
 
-            juce::String error;
-            auto instance = formatManagerRef->createPluginInstance (
-                desc, hostSampleRate,
-                juce::jmax (64, lastBlockSize), error);
+            juce::WeakReference<TimbresProcessor> weakThis (this);
+            formatManagerRef->createPluginInstanceAsync (
+                desc, hostSampleRate, juce::jmax (64, lastBlockSize),
+                [weakThis, layerIndex, ticket, desc,
+                 applyFactoryDefaults,
+                 stateToRestore = std::move (stateToRestore),
+                 completion = std::move (completion)] (
+                    std::unique_ptr<juce::AudioPluginInstance> instance,
+                    const juce::String& error) mutable
+                {
+                    struct Result
+                    {
+                        std::unique_ptr<juce::AudioPluginInstance> instance;
+                        juce::String error;
+                    };
 
-            if (instance == nullptr)
-                return false;
+                    auto result = std::make_shared<Result>();
+                    result->instance = std::move (instance);
+                    result->error = error;
 
-            // Se qualquer etapa posterior ao prepare falhar (estado de plugin,
-            // reserva do scratch ou swap), finalize a instância temporária.
-            // Destruir um AudioProcessor preparado sem o release pareado deixa
-            // AU/VSTs com threads/recursos nativos órfãos.
-            bool temporaryNeedsRelease = false;
-            const juce::ScopeGuard releaseTemporaryOnFailure {
-                [this, &instance, &temporaryNeedsRelease]
+                    auto deliver =
+                        [weakThis, layerIndex, ticket, desc,
+                         applyFactoryDefaults, result,
+                         stateToRestore = std::move (stateToRestore),
+                         completion = std::move (completion)] () mutable
+                    {
+                        if (auto* self = weakThis.get())
+                            self->finishInstrumentPluginLoad (
+                                layerIndex, ticket, desc,
+                                applyFactoryDefaults,
+                                stateToRestore,
+                                std::move (result->instance),
+                                result->error,
+                                std::move (completion));
+                    };
+
+                    if (juce::MessageManager::getInstance()
+                            ->isThisTheMessageThread())
+                        deliver();
+                    else
+                        (void) juce::MessageManager::callAsync (
+                            std::move (deliver));
+                });
+
+            return true;
+        }
+        catch (...)
+        {
+            if (ticket != 0)
             {
-                if (temporaryNeedsRelease)
-                    releasePluginResourcesNoThrow (
-                        instance.get());
-            } };
+                const bool stillCurrent = [&]
+                {
+                    const juce::ScopedLock lock (layerIdentityLock);
+                    return instrumentPluginLoadGeneration[layerIndex]
+                        .commitIfCurrent (
+                            ticket,
+                            [this, layerIndex, applyFactoryDefaults]
+                    {
+                        instrumentPluginLoadInFlight[layerIndex].store (
+                            false, std::memory_order_release);
+
+                        if (applyFactoryDefaults)
+                        {
+                            pendingVstIds[layerIndex].clear();
+                            pendingVstStates[layerIndex].clear();
+                            pendingVstDescriptionValid[layerIndex] = false;
+                        }
+                    });
+                }();
+
+                if (applyFactoryDefaults && stillCurrent)
+                    completeLayerStateRestore (layerIndex);
+            }
+            return false;
+        }
+    }
+
+    void finishInstrumentPluginLoad (
+        int layerIndex,
+        ChurchDAWPluginLoading::RequestGeneration::Ticket ticket,
+        const juce::PluginDescription& desc,
+        bool applyFactoryDefaults,
+        const juce::MemoryBlock& restoredState,
+        std::unique_ptr<juce::AudioPluginInstance> instance,
+        const juce::String& creationError,
+        PluginLoadCompletion completion)
+    {
+        jassert (juce::MessageManager::getInstance()
+                    ->isThisTheMessageThread());
+
+        if (! juce::isPositiveAndBelow (layerIndex, numLayers)
+             || ! instrumentPluginLoadGeneration[layerIndex]
+                     .isCurrent (ticket))
+            return;
+
+        if (isHostedPluginEditorTeardownActive())
+        {
+            try
+            {
+                struct DeferredResult
+                {
+                    juce::PluginDescription description;
+                    juce::MemoryBlock state;
+                    std::unique_ptr<juce::AudioPluginInstance> instance;
+                    juce::String error;
+                    PluginLoadCompletion completion;
+                };
+
+                auto deferred = std::make_shared<DeferredResult>();
+                deferred->description = desc;
+                deferred->state = restoredState;
+                deferred->instance = std::move (instance);
+                deferred->error = creationError;
+                deferred->completion = std::move (completion);
+                juce::WeakReference<TimbresProcessor> weakThis (this);
+
+                deferHostedPluginFinish (
+                    HostedPluginLocation::instrument, layerIndex,
+                    [weakThis, layerIndex, ticket,
+                     applyFactoryDefaults, deferred] () mutable
+                    {
+                        if (auto* self = weakThis.get())
+                            self->finishInstrumentPluginLoad (
+                                layerIndex, ticket,
+                                deferred->description,
+                                applyFactoryDefaults,
+                                deferred->state,
+                                std::move (deferred->instance),
+                                deferred->error,
+                                std::move (deferred->completion));
+                    });
+            }
+            catch (...)
+            {
+                // A intencao continua persistida; nunca troque a instancia no
+                // meio da destruicao de um editor de vendor.
+            }
+            return;
+        }
+
+        auto failCurrentRequest =
+            [this, layerIndex, ticket, applyFactoryDefaults,
+             &completion] (const juce::String& error) mutable
+        {
+            const bool preservePending = ! applyFactoryDefaults;
+
+            if (preservePending
+                 && layerStateRestorePending[layerIndex].load (
+                        std::memory_order_acquire))
+            {
+                if (! finishFailedInstrumentStateRestore (
+                        layerIndex, ticket))
+                    return;
+
+                if (instrumentPluginLoadGeneration[layerIndex]
+                        .isCurrent (ticket))
+                    invokePluginLoadCompletionNoThrow (
+                        completion, false, error);
+                return;
+            }
+
+            const bool stillCurrent = [&]
+                {
+                    const juce::ScopedLock lock (
+                        layerIdentityLock);
+                    return instrumentPluginLoadGeneration[layerIndex]
+                        .commitIfCurrent (
+                            ticket,
+                            [this, layerIndex, preservePending]
+                    {
+                        instrumentPluginLoadInFlight[layerIndex].store (
+                            false, std::memory_order_release);
+
+                        if (! preservePending)
+                        {
+                            pendingVstIds[layerIndex].clear();
+                            pendingVstStates[layerIndex].clear();
+                            pendingVstDescriptionValid[layerIndex] = false;
+                        }
+                    });
+                }();
+
+            if (! stillCurrent)
+                return;
+
+            if (! preservePending)
+                completeLayerStateRestore (layerIndex);
+
+            sendChangeMessage();
+            invokePluginLoadCompletionNoThrow (
+                completion, false, error);
+        };
+
+        if (isHostedPluginBlocked (desc))
+        {
+            juce::Logger::writeToLog (
+                "PLUGIN: instrumento bloqueado durante carga assincrona "
+                + desc.fileOrIdentifier);
+            failCurrentRequest (
+                "Plugin foi colocado em quarentena durante a carga");
+            return;
+        }
+
+        if (instance == nullptr)
+        {
+            juce::Logger::writeToLog (
+                "PLUGIN: falha ao criar instrumento " + desc.name
+                + ": " + creationError);
+            failCurrentRequest (creationError);
+
+            return;
+        }
+
+        const juce::ScopedLock toneLock (layerToneTransactionLock);
+        // Se qualquer etapa anterior ao commit falhar, finalize a instancia
+        // temporaria. Depois do move, a carga e sucesso e nenhum catch pode
+        // anunciar falha deixando o plugin ja instalado.
+        bool temporaryNeedsRelease = false;
+        const juce::ScopeGuard releaseTemporaryOnFailure {
+            [this, &instance, &temporaryNeedsRelease]
+        {
+            if (temporaryNeedsRelease)
+                releasePluginResourcesNoThrow (instance.get());
+        } };
 
         // DESLIGA os barramentos de saida extras ANTES de preparar. O Kontakt abre
         // com varios pares de saida por padrao: sem isto ele RENDERIZA todos eles a
         // cada bloco e nos jogamos fora tudo menos o primeiro par. Era a maior
         // conta do motor — o mesmo Kontakt sozinho, com 2 canais, roda folgado.
-        if (instance->getBusCount (false) > 1)
-        {
-            auto layout = instance->getBusesLayout();
-
-            for (int b = 1; b < layout.outputBuses.size(); ++b)
-                layout.outputBuses.getReference (b) = juce::AudioChannelSet::disabled();
-
-            instance->setBusesLayout (layout);   // se o plugin recusar, segue como estava
-        }
-
-        bool pluginIsOrgan = false;
         try
         {
+            if (instance->getBusCount (false) > 1)
+            {
+                auto layout = instance->getBusesLayout();
+
+                for (int b = 1; b < layout.outputBuses.size(); ++b)
+                    layout.outputBuses.getReference (b) =
+                        juce::AudioChannelSet::disabled();
+
+                instance->setBusesLayout (layout);
+            }
+
             temporaryNeedsRelease = true;
             instance->prepareToPlay (
                 hostSampleRate, juce::jmax (64, lastBlockSize));
@@ -2796,23 +3838,106 @@ public:
             // de limpar/trocar o canal atual. Base64 corrompido ou plugin que
             // lanca deixa o timbre anterior intacto e o alvo pendente salvo.
             if (! applyFactoryDefaults
-                 && restoredState != nullptr
-                 && restoredState->getSize() > 0)
+                 && restoredState.getSize() > 0)
                 instance->setStateInformation (
-                    restoredState->getData(),
-                    (int) restoredState->getSize());
+                    restoredState.getData(),
+                    (int) restoredState.getSize());
 
-            pluginIsOrgan = looksLikeOrgan (desc.name, {});
         }
         catch (...)
         {
-            return false;
+            failCurrentRequest (
+                "Plugin falhou durante prepare/restore");
+
+            return;
         }
 
-        const auto pluginIdentifier = desc.createIdentifierString();
+        juce::String pluginIdentifier;
+        juce::String pluginName;
+        bool pluginIsOrgan = false;
+        try
+        {
+            pluginIdentifier = desc.createIdentifierString();
+            pluginName = desc.name;
+            pluginIsOrgan = looksLikeOrgan (pluginName, {});
+            rememberOutgoingTimbreTone (layerIndex);
+        }
+        catch (...)
+        {
+            failCurrentRequest (
+                "Plugin falhou antes do commit no canal");
+            return;
+        }
+
+        bool scratchReady = false;
+        {
+            const bool resumeAfterReserve = ! isSuspended();
+
+            if (resumeAfterReserve)
+                suspendProcessing (true);
+            const juce::ScopeGuard restoreProcessing {
+                [this, resumeAfterReserve]
+            {
+                if (resumeAfterReserve)
+                    suspendProcessing (false);
+            } };
+
+            try
+            {
+                reserveInstrumentScratchFor (*instance);
+                scratchReady = true;
+            }
+            catch (...)
+            {
+            }
+        }
+
+        if (! scratchReady)
+        {
+            failCurrentRequest (
+                "Plugin nao conseguiu reservar o buffer do canal");
+            return;
+        }
+
         std::unique_ptr<juce::AudioPluginInstance>
             oldInstrument;
         bool oldInstrumentWasPrepared = false;
+
+        if (! instrumentPluginLoadGeneration[layerIndex]
+                 .isCurrent (ticket))
+            return;
+
+        if (isHostedPluginBlocked (desc))
+        {
+            failCurrentRequest (
+                "Plugin foi colocado em quarentena antes do commit");
+            return;
+        }
+
+        // Retire o timbre nativo antes de fechar o editor antigo. Esse callback
+        // pode bombear mensagens e iniciar outro pedido; depois dele este
+        // resultado antigo apenas revalida o ticket, nunca limpa o pedido novo.
+        clearLayer (layerIndex, true);
+
+        if (! instrumentPluginLoadGeneration[layerIndex]
+                 .isCurrent (ticket))
+            return;
+
+        notifyHostedPluginWillRetire (
+            HostedPluginLocation::instrument, layerIndex,
+            getLayerInstrument (layerIndex));
+
+        // O callback do editor pode reentrar na message thread e concluir um
+        // scan. Nunca limpe o canal atual se o candidato acabou de ser
+        // bloqueado nessa janela.
+        if (isHostedPluginBlocked (desc))
+        {
+            failCurrentRequest (
+                "Plugin foi colocado em quarentena antes do commit");
+            return;
+        }
+
+        bool committed = false;
         {
             const bool resumeAfterSwap = ! isSuspended();
 
@@ -2825,70 +3950,94 @@ public:
                     suspendProcessing (false);
             } };
 
-            // Um AU/VST pode ser carregado depois de prepareToPlay(). Reserve
-            // sua geometria AQUI, com processamento suspenso e antes do swap:
-            // aumentar instrumentBuf no callback criaria heap/bad_alloc na
-            // thread de áudio justamente na primeira nota do plugin.
-            reserveInstrumentScratchFor (*instance);
+            const juce::ScopedLock pluginLock (
+                layerPluginStateLock);
+            const juce::ScopedLock identityLock (
+                layerIdentityLock);
+            committed = instrumentPluginLoadGeneration[layerIndex]
+                .commitIfCurrent (
+                    ticket,
+                    [this, layerIndex, &instance,
+                     &oldInstrument, &oldInstrumentWasPrepared,
+                     &temporaryNeedsRelease, &pluginIdentifier,
+                    &pluginName, pluginIsOrgan]
+                    {
+                        oldInstrumentWasPrepared =
+                            pluginPrepared[layerIndex].exchange (
+                                false, std::memory_order_acq_rel);
+                        oldInstrument = std::move (
+                            layers[layerIndex].instrument);
+                        layers[layerIndex].instrument =
+                            std::move (instance);
+                        temporaryNeedsRelease = false;
+                        pluginPrepared[layerIndex].store (
+                            true, std::memory_order_release);
+                        pluginSustainMirror[layerIndex].store (
+                            sustainStateUnknown,
+                            std::memory_order_release);
+                        pluginPitchCentresPending[layerIndex].store (
+                            true, std::memory_order_release);
 
-            // Clear + swap acontecem dentro da MESMA suspensao: nenhum bloco
-            // vazio escapa entre o timbre nativo e o VST/AU novo.
-            oldInstrumentWasPrepared =
-                pluginPrepared[layerIndex].load (
-                    std::memory_order_acquire);
-            clearLayer (layerIndex, true);
-            {
-                const juce::ScopedLock pluginLock (layerPluginStateLock);
-                oldInstrument = std::move (
-                    layers[layerIndex].instrument);
-                layers[layerIndex].instrument = std::move (instance);
-                temporaryNeedsRelease = false;
-                pluginPrepared[layerIndex].store (
-                    true,
-                    std::memory_order_release);
-                pluginSustainMirror[layerIndex].store (
-                    sustainStateUnknown,
-                    std::memory_order_release);
-                // Inicialização pertence SOMENTE ao plugin recém-instalado.
-                // Pedir centros ao guard global também os entregaria aos outros
-                // canais VST/AU e faria uma nota sustentada saltar de afinação.
-                pluginPitchCentresPending[layerIndex].store (
-                    true,
-                    std::memory_order_release);
-                {
-                    const juce::ScopedLock identityLock (layerIdentityLock);
-                    layers[layerIndex].instrumentId = pluginIdentifier;
-                    layers[layerIndex].instrumentName = desc.name;
-                }
-            }
+                        layers[layerIndex].instrumentId.swapWith (
+                            pluginIdentifier);
+                        layers[layerIndex].instrumentName.swapWith (
+                            pluginName);
+                        pendingVstIds[layerIndex].clear();
+                        pendingVstStates[layerIndex].clear();
+                        pendingVstDescriptionValid[layerIndex] = false;
+                        instrumentPluginLoadInFlight[layerIndex].store (
+                            false, std::memory_order_release);
+                        layerStateRestoreTargetTimbre[layerIndex].clear();
+                        layerStateRestoreTargetLibrary[layerIndex].clear();
+                        layerStateRestoreTargetVstId[layerIndex].clear();
+                        layerStateRestoreTargetVstState[layerIndex].clear();
+                        layerStateRestorePending[layerIndex].store (
+                            false, std::memory_order_release);
+
+                        layerCategory[layerIndex].clear();
+                        layerIsOrgan[layerIndex].store (
+                            pluginIsOrgan, std::memory_order_relaxed);
+                        layerNativeFamilyTrim[layerIndex].store (
+                            1.0f, std::memory_order_relaxed);
+                        setLayerLoaded (layerIndex, true);
+                    });
+
+            if (! committed)
+                return;
+
             // Auto EQ por categoria pertence aos packs nativos. Um VST/AU nao
             // pode herdar os coeficientes do piano/pad anterior.
-            layerCategory[layerIndex].clear();
-            if (applyFactoryDefaults)
+            try
             {
-                // VST/AU novo parte em bypass de Rotary: muitos orgaos externos
-                // ja trazem Leslie e dois rotores criariam afinacao instavel.
-                applyFactoryTimbreShape (
-                    layerIndex, desc.name, {}, false);
-                applyRememberedTimbreTone (
-                    layerIndex, desc.name,
-                    pluginToneLibrary (pluginIdentifier));
+                if (applyFactoryDefaults)
+                {
+                    // VST/AU novo parte em bypass de Rotary: muitos orgaos
+                    // externos ja trazem Leslie e dois rotores criariam afinacao
+                    // instavel.
+                    applyFactoryTimbreShape (
+                        layerIndex, desc.name, {}, false);
+                    applyRememberedTimbreTone (
+                        layerIndex, desc.name,
+                        pluginToneLibrary (
+                            desc.createIdentifierString()));
+                }
+                updateLayerEq (layerIndex);
+                manualEqs[layerIndex].syncToTargets (
+                    layers[layerIndex].eqLow != nullptr
+                        ? (float) *layers[layerIndex].eqLow : 0.0f,
+                    layers[layerIndex].eqMid != nullptr
+                        ? (float) *layers[layerIndex].eqMid : 0.0f,
+                    layers[layerIndex].eqHigh != nullptr
+                        ? (float) *layers[layerIndex].eqHigh : 0.0f);
             }
-            updateLayerEq (layerIndex);
-            manualEqs[layerIndex].syncToTargets (
-                layers[layerIndex].eqLow != nullptr
-                    ? (float) *layers[layerIndex].eqLow : 0.0f,
-                layers[layerIndex].eqMid != nullptr
-                    ? (float) *layers[layerIndex].eqMid : 0.0f,
-                layers[layerIndex].eqHigh != nullptr
-                    ? (float) *layers[layerIndex].eqHigh : 0.0f);
-            layerIsOrgan[layerIndex].store (
-                pluginIsOrgan,
-                std::memory_order_relaxed);
-            // VST/AU possui calibracao propria. O trim por familia pertence
-            // exclusivamente aos samples PAD/AMBIENCE nativos.
-            layerNativeFamilyTrim[layerIndex].store (
-                1.0f, std::memory_order_relaxed);
+            catch (...)
+            {
+                // O plugin ja pertence ao grafo. Falha cosmetica/default nao
+                // pode produzir completion=false nem destruir o antigo sem o
+                // release pareado.
+                juce::Logger::writeToLog (
+                    "PLUGIN: instrumento instalado; defaults/EQ nao puderam ser aplicados");
+            }
         }
 
         if (oldInstrumentWasPrepared)
@@ -2896,33 +4045,33 @@ public:
                 oldInstrument.get());
         oldInstrument.reset();
 
-        if (applyFactoryDefaults)
-        {
-            // Selecao interativa conclui aqui. Restore de projeto continua
-            // pendente ate o estado binario do plugin ser aceito com sucesso.
-            {
-                const juce::ScopedLock lock (layerIdentityLock);
-                pendingVstIds[layerIndex].clear();
-                pendingVstStates[layerIndex].clear();
-            }
-            completeLayerStateRestore (layerIndex);
-        }
-
         sendChangeMessage();
-        return true;
-        }
-        catch (...)
-        {
-            // API bool: falha extrema de plugin/alocacao nunca atravessa a
-            // MessageManager. Os ScopeGuards internos restauram a suspensao.
-            return false;
-        }
+
+        if (instrumentPluginLoadGeneration[layerIndex]
+                .isCurrent (ticket))
+            invokePluginLoadCompletionNoThrow (
+                completion, true, {});
     }
 
     void clearInstrumentPlugin (int layerIndex)
     {
         if (! juce::isPositiveAndBelow (layerIndex, numLayers))
             return;
+
+        notifyHostedPluginWillRetire (
+            HostedPluginLocation::instrument, layerIndex,
+            getLayerInstrument (layerIndex));
+
+        // A limpeza explicita vence qualquer pedido entregue enquanto o editor
+        // de vendor fecha e bombeia mensagens.
+        instrumentPluginLoadGeneration[layerIndex].cancel();
+        instrumentPluginLoadInFlight[layerIndex].store (
+            false, std::memory_order_release);
+
+        // A API e publica: mesmo um chamador futuro que nao passe antes por
+        // clearLayer nao pode deixar SOLO/identidade fantasma do plugin.
+        *layers[layerIndex].solo = false;
+        setLayerLoaded (layerIndex, false);
 
         const juce::ScopedLock toneLock (layerToneTransactionLock);
         rememberOutgoingTimbreTone (layerIndex);
@@ -2972,11 +4121,21 @@ public:
             const juce::ScopedLock lock (layerIdentityLock);
             pendingVstIds[layerIndex].clear();
             pendingVstStates[layerIndex].clear();
+            pendingVstDescriptionValid[layerIndex] = false;
         }
 
         if (oldWasPrepared)
             releasePluginResourcesNoThrow (old.get());
         old.reset();
+
+        bool nativeIdentitySurvived = isLayerChurchOrgan (layerIndex);
+        {
+            const juce::ScopedLock identityLock (layerIdentityLock);
+            nativeIdentitySurvived = nativeIdentitySurvived
+                                  || layers[layerIndex].timbre.isNotEmpty();
+        }
+        setLayerLoaded (layerIndex, nativeIdentitySurvived);
+
         completeLayerStateRestore (layerIndex);
         sendChangeMessage();
     }
@@ -2987,6 +4146,18 @@ public:
     {
         if (! juce::isPositiveAndBelow (layerIndex, numLayers))
             return;
+
+        // Uma escolha nativa substitui também qualquer AU/VST ainda em
+        // criação; o callback antigo será descartado pelo ticket.
+        instrumentPluginLoadGeneration[layerIndex].cancel();
+        instrumentPluginLoadInFlight[layerIndex].store (
+            false, std::memory_order_release);
+        {
+            const juce::ScopedLock lock (layerIdentityLock);
+            pendingVstIds[layerIndex].clear();
+            pendingVstStates[layerIndex].clear();
+            pendingVstDescriptionValid[layerIndex] = false;
+        }
 
         {
             const juce::ScopedLock lock (layerIdentityLock);
@@ -3216,6 +4387,31 @@ public:
         const int block = juce::jmax (64, samplesPerBlock);
         lastBlockSize = block;
 
+        // A rampa comeca do valor real de cada canal, e nao de zero: senao
+        // todo canal ligado faria um fade-in de 20 ms ao trocar o buffer de
+        // audio no meio do culto.
+        //
+        // O SOLO PRECISA ENTRAR NESTA CONTA. Sem ele, um canal silenciado por
+        // solo alheio comecava com o ganho cheio e a rampa o levava a zero
+        // tocando — ou seja, vazava audio de canais que deviam estar mudos
+        // logo apos qualquer troca de buffer. Esta condicao tem de ser a
+        // mesma do "audible" usado no render.
+        const bool algumSolo = hasAnyLoadedSolo();
+
+        for (int l = 0; l < numLayers; ++l)
+        {
+            const auto& lay = layers[l];
+            const bool audivel = lay.on != nullptr && (bool) *lay.on
+                                  && ! (lay.mute != nullptr && (bool) *lay.mute)
+                                  && (! algumSolo
+                                       || (lay.solo != nullptr && (bool) *lay.solo));
+
+            const float ganhoGlobalAtual = gain != nullptr ? (float) *gain : 1.0f;
+            postGainSuave[l] = audivel && lay.vol != nullptr
+                                 ? (float) *lay.vol * ganhoGlobalAtual
+                                 : 0.0f;
+        }
+
         // O callback copia/remapeia MIDI ate tres vezes. Reserve uma rajada
         // deliberadamente grande aqui para que aftertouch/CC de alta taxa e o
         // PANIC de 16 canais nao facam o MidiBuffer crescer durante o audio.
@@ -3366,6 +4562,7 @@ public:
                     false, std::memory_order_release);
                 layerIsOrgan[l].store (
                     false, std::memory_order_release);
+                setLayerLoaded (l, false);
             }
 
             organ->setProcessingSuspended (
@@ -3550,6 +4747,8 @@ public:
             streamer.stream ((int) (&v - voices)).stop();
            #endif
         }
+
+        processorPrepared.store (true, std::memory_order_release);
     }
 
     void releaseResources() override
@@ -3558,6 +4757,9 @@ public:
         // processador. Cada prepareToPlay() encaminhado a AU/VST/insert precisa
         // de um releaseResources() correspondente; o corpo vazio antigo vazava
         // recursos de plugins que dependem desse pareamento.
+        const bool wasProcessorPrepared =
+            processorPrepared.exchange (
+                false, std::memory_order_acq_rel);
         const bool resumeAfterRelease = ! isSuspended();
 
         if (resumeAfterRelease)
@@ -3626,7 +4828,12 @@ public:
 
             refreshExternalReverbSlot (-1);
 
-            stopAllVoices();
+            // Um processor pode ser destruido antes do primeiro prepareToPlay
+            // (scan/teste/erro de rota). Nesse estado SampleStreamer ainda nao
+            // possui maxVoices entradas e stopAllVoices acessaria fora do vetor.
+            // O exchange tambem torna release/destrutor idempotentes.
+            if (wasProcessorPrepared)
+                stopAllVoices();
             pitchBendGuard.reset();
             panicPending.store (
                 false,
@@ -4304,9 +5511,20 @@ public:
     const juce::String getProgramName (int) override            { return {}; }
     void changeProgramName (int, const juce::String&) override  {}
 
+    bool consumeLastStateCaptureHadFailure() noexcept
+    {
+        const juce::ScopedLock captureLock (
+            layerToneTransactionLock);
+        return lastStateCaptureHadFailure.exchange (
+            false, std::memory_order_acq_rel);
+    }
+
     void getStateInformation (juce::MemoryBlock& dest) override
     {
         const juce::ScopedLock toneLock (layerToneTransactionLock);
+        lastStateCaptureHadFailure.store (
+            false, std::memory_order_release);
+        bool stateCaptureHadFailure = false;
 
         // Plugins nao garantem que getStateInformation seja seguro enquanto
         // processBlock roda. Salvar e raro; uma pausa curta e preferivel a
@@ -4350,8 +5568,22 @@ public:
         // ignorados por builds antigos, portanto o arquivo continua retroativo.
         timbreToneMemory.writeToXml (xml);
 
-        for (int i = 0; i < numInserts; ++i)
-            if (inserts[i] != nullptr)
+        {
+            const juce::ScopedLock callbackGuard (
+                getCallbackLock());
+
+            for (int i = 0; i < numInserts; ++i)
+            if (pendingInsertIds[i].isNotEmpty())
+            {
+                // Durante o two-phase o plugin antigo ainda toca, mas a intenção
+                // persistente já é o novo alvo. Assim fechar no meio da criação
+                // não troca silenciosamente o projeto de volta para o antigo.
+                auto* insXml = xml.createNewChildElement ("INSERT");
+                insXml->setAttribute ("slot", i);
+                insXml->setAttribute ("id", pendingInsertIds[i]);
+                insXml->setAttribute ("state", pendingInsertStates[i]);
+            }
+            else if (inserts[i] != nullptr)
             {
                 auto* insXml = xml.createNewChildElement ("INSERT");
                 insXml->setAttribute ("slot", i);
@@ -4365,17 +5597,11 @@ public:
                 catch (...)
                 {
                     mb.reset();
+                    stateCaptureHadFailure = true;
                 }
                 insXml->setAttribute ("state", mb.toBase64Encoding());
             }
-            else if (pendingInsertIds[i].isNotEmpty())
-            {
-                // auto-cura: plugin que falhou no restore nao perde id/estado
-                auto* insXml = xml.createNewChildElement ("INSERT");
-                insXml->setAttribute ("slot", i);
-                insXml->setAttribute ("id", pendingInsertIds[i]);
-                insXml->setAttribute ("state", pendingInsertStates[i]);
-            }
+        }
 
         for (int l = 0; l < numLayers; ++l)
         {
@@ -4432,7 +5658,7 @@ public:
                 && layerIsChurchOrgan[l].load (
                     std::memory_order_acquire);
 
-            if (! restorePending)
+            if (! restorePending && pendingVstId.isEmpty())
             {
                 // Mantem a instancia viva enquanto captura o blob, mas nunca
                 // segura o lock leve de Strings ao executar codigo de terceiro.
@@ -4455,6 +5681,7 @@ public:
                     catch (...)
                     {
                         livePluginState.reset();
+                        stateCaptureHadFailure = true;
                     }
                 }
             }
@@ -4489,7 +5716,10 @@ public:
             layerXml->setAttribute ("transp", (int) *layers[l].transp);
             layerXml->setAttribute ("loop", (bool) *layers[l].loop);
             layerXml->setAttribute ("mute", (bool) *layers[l].mute);
-            layerXml->setAttribute ("solo", (bool) *layers[l].solo);
+            // SOLO e monitoracao momentanea de ensaio, nao parte do setup.
+            // Persisti-lo fazia um canal antigo/oculto voltar em solo no boot e
+            // todos os demais so soavam depois de tambem apertar SOLO.
+            layerXml->setAttribute ("solo", false);
             layerXml->setAttribute ("on", (bool) *layers[l].on);
             layerXml->setAttribute ("comp", (double) *layers[l].comp);
             layerXml->setAttribute ("dly", (double) *layers[l].delay);
@@ -4512,6 +5742,15 @@ public:
                             ? juce::jlimit (0.0f, 1.0f, rotaryAmount)
                             : 0.0f));
             layerXml->setAttribute ("cor", layerColourIdx[l]);
+            {
+                const juce::ScopedLock sl (midiRouteLock);
+                if (layerMidiDeviceId[l].isNotEmpty())
+                    layerXml->setAttribute ("midiDev", layerMidiDeviceId[l]);
+                const int mch = layerMidiListenChannel[l].load (
+                    std::memory_order_relaxed);
+                if (mch > 0)
+                    layerXml->setAttribute ("midiCh", mch);
+            }
 
             if (hasLiveChurchOrgan)
             {
@@ -4543,21 +5782,26 @@ public:
                     layerXml->setAttribute ("vstState", restoreVstState);
                 }
             }
+            else if (pendingVstId.isNotEmpty())
+            {
+                // Escolha AU/AUv3 aceita, mas ainda em criação: a intenção nova
+                // vence o instrumento antigo que continua audível durante o
+                // two-phase. Falha interativa limpa este pending e o próximo
+                // save volta naturalmente ao plugin antigo.
+                layerXml->setAttribute ("vstId", pendingVstId);
+                layerXml->setAttribute ("vstState", pendingVstState);
+            }
             else if (hasLivePlugin)
             {
                 layerXml->setAttribute ("vstId", livePluginId);
                 layerXml->setAttribute (
                     "vstState", livePluginState.toBase64Encoding());
             }
-            else if (pendingVstId.isNotEmpty())
-            {
-                // auto-cura: VSTi que falhou no restore nao perde id/estado
-                layerXml->setAttribute ("vstId", pendingVstId);
-                layerXml->setAttribute ("vstState", pendingVstState);
-            }
         }
 
         copyXmlToBinary (xml, dest);
+        lastStateCaptureHadFailure.store (
+            stateCaptureHadFailure, std::memory_order_release);
     }
 
     void setStateInformation (const void* data, int size) override
@@ -4586,12 +5830,14 @@ public:
         } };
 
         const juce::XmlElement* restoreLayerXml[numLayers] {};
+        const juce::XmlElement* restoreInsertXml[numInserts] {};
 
         // Descobre TODOS os alvos antes de mudar banco/parametros/inserts. Se
         // um save reentrar durante a restauracao, ele ja enxerga o novo projeto
         // completo (ou canal vazio), nunca identidades do projeto anterior.
         if (currentState)
             for (const auto* child : xml->getChildIterator())
+            {
                 if (child->hasTagName ("LAYER"))
                 {
                     const int layer =
@@ -4601,6 +5847,16 @@ public:
                          && restoreLayerXml[layer] == nullptr)
                         restoreLayerXml[layer] = child;
                 }
+                else if (child->hasTagName ("INSERT"))
+                {
+                    const int slot =
+                        child->getIntAttribute ("slot", -1);
+
+                    if (juce::isPositiveAndBelow (slot, numInserts)
+                         && restoreInsertXml[slot] == nullptr)
+                        restoreInsertXml[slot] = child;
+                }
+            }
 
         {
             // Arma identidades e alvos numa unica secao critica. Um autosave
@@ -4644,7 +5900,26 @@ public:
         {
             cancelLayerLoad (l);
             ++layerLoadGeneration[l];
+            instrumentPluginLoadGeneration[l].cancel();
+            instrumentPluginLoadInFlight[l].store (
+                false, std::memory_order_release);
         }
+
+        for (int slot = 0; slot < numInserts; ++slot)
+        {
+            insertPluginLoadGeneration[slot].cancel();
+            insertPluginLoadInFlight[slot].store (
+                false, std::memory_order_release);
+            insertStateRestorePending[slot].store (
+                false, std::memory_order_release);
+        }
+
+        // Restore e substitutivo tambem nos MASTER FX. A ausencia de <INSERT>
+        // representa slot vazio, nao autorizacao para herdar o efeito do projeto
+        // anterior (inclusive no formato legado TIMBRES).
+        for (int slot = 0; slot < numInserts; ++slot)
+            if (restoreInsertXml[slot] == nullptr)
+                unloadInsert (slot);
 
         // Carregar outro projeto substitui o banco anterior por completo.
         // Estados antigos nao possuem TONE e simplesmente comecam vazios.
@@ -4738,10 +6013,16 @@ public:
         worshipReverb.setPreset (nativeReverbPreset->getIndex());
 
         // estado novo substitui qualquer pendencia de restauracao anterior
-        for (int i = 0; i < numInserts; ++i)
         {
-            pendingInsertIds[i].clear();
-            pendingInsertStates[i].clear();
+            const juce::ScopedLock callbackGuard (
+                getCallbackLock());
+
+            for (int i = 0; i < numInserts; ++i)
+            {
+                pendingInsertIds[i].clear();
+                pendingInsertStates[i].clear();
+                pendingInsertDescriptionValid[i] = false;
+            }
         }
 
         {
@@ -4751,72 +6032,75 @@ public:
             {
                 pendingVstIds[l].clear();
                 pendingVstStates[l].clear();
+                pendingVstDescriptionValid[l] = false;
             }
         }
 
-        for (auto* insXml : xml->getChildIterator())
+        for (int slot = 0; slot < numInserts; ++slot)
         {
-            if (! insXml->hasTagName ("INSERT"))
+            const auto* insXml = restoreInsertXml[slot];
+
+            if (insXml == nullptr)
                 continue;
 
-            const int slot = insXml->getIntAttribute ("slot", -1);
+            insertStateRestorePending[slot].store (
+                true, std::memory_order_release);
 
-            if (! juce::isPositiveAndBelow (slot, numInserts))
-                continue;
+            const auto identifier =
+                insXml->getStringAttribute ("id");
+            const auto encodedState =
+                insXml->getStringAttribute ("state");
 
-            bool restored = false;
+            // O alvo fica serializável durante toda a criação assíncrona. O
+            // commit bem-sucedido limpa estes campos; ausência, base64 ruim ou
+            // falha do vendor preserva a auto-cura para a próxima abertura.
+            {
+                const juce::ScopedLock callbackGuard (
+                    getCallbackLock());
+                pendingInsertIds[slot] = identifier;
+                pendingInsertStates[slot] = encodedState;
+                pendingInsertDescriptionValid[slot] = false;
+            }
+
+            juce::MemoryBlock decodedState;
+            const bool decoded = encodedState.isEmpty()
+                || decodedState.fromBase64Encoding (encodedState);
+            std::unique_ptr<juce::PluginDescription> description;
 
             if (knownPluginsRef != nullptr)
-                if (auto desc = knownPluginsRef->getTypeForIdentifierString (insXml->getStringAttribute ("id")))
-                    if (loadInsert (slot, *desc))
-                    {
-                        juce::MemoryBlock mb;
-                        mb.fromBase64Encoding (insXml->getStringAttribute ("state"));
+                description = knownPluginsRef
+                    ->getTypeForIdentifierString (identifier);
 
-                        const bool resumeAfterInsertState =
-                            ! isSuspended();
+            const bool accepted = decoded
+                && description != nullptr
+                && ! isHostedPluginBlocked (*description)
+                && loadInsert (
+                    slot, *description,
+                    decodedState.getSize() > 0
+                        ? &decodedState : nullptr,
+                    {}, true);
 
-                        if (resumeAfterInsertState)
-                            suspendProcessing (true);
-                        const juce::ScopeGuard restoreProcessing {
-                            [this, resumeAfterInsertState]
-                        {
-                            if (resumeAfterInsertState)
-                                suspendProcessing (false);
-                        } };
-                        {
-                            const juce::ScopedLock callbackGuard (getCallbackLock());
-
-                            if (mb.getSize() > 0 && inserts[slot] != nullptr)
-                                try
-                                {
-                                    inserts[slot]->setStateInformation (
-                                        mb.getData(), (int) mb.getSize());
-                                }
-                                catch (...)
-                                {
-                                    // Estado defeituoso de terceiro nao derruba
-                                    // a restauracao do restante da sessao.
-                                }
-
-                            // Captura DEPOIS do estado: numa futura democao o
-                            // plugin volta ao MIX salvo pelo usuario, nao ao
-                            // default que tinha logo apos ser criado.
-                            captureExternalReverbMix (slot);
-
-                            // O estado binario antigo pode trazer o MIX abaixo
-                            // de 100%; no barramento de envio ele deve ser wet.
-                            forceExternalReverbWet (slot);
-                        }
-
-                        restored = true;
-                    }
-
-            // auto-cura: plugin ausente/falho guarda id+estado pro proximo save
-            if (! restored)
+            if (! accepted)
             {
-                pendingInsertIds[slot] = insXml->getStringAttribute ("id");
-                pendingInsertStates[slot] = insXml->getStringAttribute ("state");
+                // Restore e substitutivo mesmo se o ID sumiu, o state esta
+                // corrompido ou o scanner bloqueou o plugin: nunca deixe o
+                // efeito da pagina anterior tocando sob a nova identidade.
+                unloadInsert (slot);
+
+                const juce::ScopedLock callbackGuard (
+                    getCallbackLock());
+                pendingInsertIds[slot] = identifier;
+                pendingInsertStates[slot] = encodedState;
+                pendingInsertDescriptionValid[slot] =
+                    description != nullptr;
+
+                if (description != nullptr)
+                    pendingInsertDescriptions[slot] = *description;
+
+                insertPluginLoadInFlight[slot].store (
+                    false, std::memory_order_release);
+                insertStateRestorePending[slot].store (
+                    true, std::memory_order_release);
             }
         }
 
@@ -4856,7 +6140,10 @@ public:
                                     : 0;
             *layers[l].loop = layerXml->getBoolAttribute ("loop", false);
             *layers[l].mute = layerXml->getBoolAttribute ("mute", false);
-            *layers[l].solo = layerXml->getBoolAttribute ("solo", false);
+            // Estados antigos podem conter solo=true. Ignore sempre: abrir um
+            // projeto nunca deve nascer silenciando os outros canais por uma
+            // monitoracao temporaria da sessao anterior.
+            *layers[l].solo = false;
             *layers[l].on = layerXml->getBoolAttribute ("on", true);
             *layers[l].comp = (float) layerXml->getDoubleAttribute ("comp", 0.0);
             *layers[l].delay = (float) layerXml->getDoubleAttribute ("dly", 0.0);
@@ -4889,6 +6176,16 @@ public:
             *layers[l].rotaryAmount = (float) safeAttribute (
                 "rotAmt", 0.0, 0.0, 1.0);
             layerColourIdx[l] = layerXml->getIntAttribute ("cor", -1);   // -1 = automatico
+            {
+                const juce::ScopedLock sl (midiRouteLock);
+                layerMidiDeviceId[l] =
+                    layerXml->getStringAttribute ("midiDev");
+                const int mch = juce::jlimit (
+                    0, 16, layerXml->getIntAttribute ("midiCh", 0));
+                // Se salvou device sem canal, reatribui no fim do restore.
+                layerMidiListenChannel[l].store (
+                    mch, std::memory_order_relaxed);
+            }
 
             if (layerXml->getBoolAttribute (
                     "churchOrgan", false))
@@ -4925,7 +6222,6 @@ public:
 
             if (vstId.isNotEmpty())
             {
-                bool restored = false;
                 const auto savedVstState =
                     layerXml->getStringAttribute ("vstState");
                 juce::MemoryBlock decodedVstState;
@@ -4933,31 +6229,46 @@ public:
                     savedVstState.isEmpty()
                     || decodedVstState.fromBase64Encoding (savedVstState);
 
-                if (decoded && knownPluginsRef != nullptr)
-                    if (auto d = knownPluginsRef->getTypeForIdentifierString (vstId))
-                        if (loadInstrumentPlugin (
-                                l, *d, false,
-                                decodedVstState.getSize() > 0
-                                    ? &decodedVstState : nullptr))
-                        {
-                            // O blob ja foi aceito pela instancia temporaria
-                            // antes do swap; somente agora a transacao termina.
-                            completeLayerStateRestore (l);
-                            {
-                                const juce::ScopedLock lock (
-                                    layerIdentityLock);
-                                pendingVstIds[l].clear();
-                                pendingVstStates[l].clear();
-                            }
-                            restored = true;
-                        }
+                std::unique_ptr<juce::PluginDescription> description;
 
-                // auto-cura: VSTi ausente/falho guarda id+estado pro proximo save
-                if (! restored)
+                if (knownPluginsRef != nullptr)
+                    description = knownPluginsRef
+                        ->getTypeForIdentifierString (vstId);
+
+                const bool accepted = decoded
+                    && description != nullptr
+                    && ! isHostedPluginBlocked (*description)
+                    && loadInstrumentPlugin (
+                        l, *description, false,
+                        decodedVstState.getSize() > 0
+                            ? &decodedVstState : nullptr);
+
+                if (! accepted)
                 {
+                    // Um alvo ausente/bloqueado continua serializavel para
+                    // autocura, mas o audio e sempre o da pagina nova: vazio.
+                    clearLayer (l);
+
+                    if (layers[l].instrument != nullptr)
+                        clearInstrumentPlugin (l);
+
                     const juce::ScopedLock lock (layerIdentityLock);
                     pendingVstIds[l] = vstId;
                     pendingVstStates[l] = savedVstState;
+                    pendingVstDescriptionValid[l] =
+                        description != nullptr;
+
+                    if (description != nullptr)
+                        pendingVstDescriptions[l] = *description;
+
+                    instrumentPluginLoadInFlight[l].store (
+                        false, std::memory_order_release);
+                    layerStateRestoreTargetTimbre[l].clear();
+                    layerStateRestoreTargetLibrary[l].clear();
+                    layerStateRestoreTargetVstId[l] = vstId;
+                    layerStateRestoreTargetVstState[l] = savedVstState;
+                    layerStateRestorePending[l].store (
+                        true, std::memory_order_release);
                 }
             }
             else
@@ -4981,9 +6292,344 @@ public:
                 }
             }
         }
+
+        // Restaura mapa teclado→canal (2 teclados: piano/pad). Se salvou
+        // device sem canal, reatribui canais estáveis.
+        {
+            const juce::ScopedLock sl (midiRouteLock);
+            for (int l = 0; l < numLayers; ++l)
+            {
+                if (layerMidiDeviceId[l].isEmpty())
+                    continue;
+                if (layerMidiListenChannel[l].load (
+                        std::memory_order_relaxed) > 0)
+                    continue;
+
+                // Reusa a mesma lógica do setLayerMidiInputDevice.
+                int ch = 0;
+                for (int i = 0; i < numLayers; ++i)
+                    if (i != l && layerMidiDeviceId[i] == layerMidiDeviceId[l])
+                    {
+                        ch = layerMidiListenChannel[i].load (
+                            std::memory_order_relaxed);
+                        if (ch > 0)
+                            break;
+                    }
+                if (ch <= 0)
+                {
+                    bool used[17] = {};
+                    for (int i = 0; i < numLayers; ++i)
+                    {
+                        const int c = layerMidiListenChannel[i].load (
+                            std::memory_order_relaxed);
+                        if (c >= 1 && c <= 16)
+                            used[c] = true;
+                    }
+                    ch = juce::jlimit (1, 16, l + 1);
+                    if (used[ch])
+                    {
+                        ch = 1;
+                        while (ch <= 16 && used[ch])
+                            ++ch;
+                        if (ch > 16)
+                            ch = (l % 16) + 1;
+                    }
+                }
+                layerMidiListenChannel[l].store (
+                    ch, std::memory_order_relaxed);
+            }
+            rebuildMidiDeviceForceMap();
+        }
     }
 
 private:
+    bool isHostedPluginEditorTeardownActive() const noexcept
+    {
+        return hostedPluginEditorTeardownDepth.load (
+                   std::memory_order_acquire) > 0;
+    }
+
+    void deferHostedPluginFinish (
+        HostedPluginLocation location,
+        int index,
+        std::function<void()> finish)
+    {
+        const juce::ScopedLock lock (
+            hostedPluginDeferredFinishLock);
+
+        if (location == HostedPluginLocation::insert)
+        {
+            if (juce::isPositiveAndBelow (index, numInserts))
+                deferredInsertPluginFinishes[index] =
+                    std::move (finish);
+        }
+        else if (juce::isPositiveAndBelow (index, numLayers))
+        {
+            deferredInstrumentPluginFinishes[index] =
+                std::move (finish);
+        }
+    }
+
+    void postDeferredHostedPluginFinishes() noexcept
+    {
+        std::function<void()> insertFinishes[numInserts];
+        std::function<void()> instrumentFinishes[numLayers];
+
+        {
+            const juce::ScopedLock lock (
+                hostedPluginDeferredFinishLock);
+
+            for (int slot = 0; slot < numInserts; ++slot)
+                insertFinishes[slot].swap (
+                    deferredInsertPluginFinishes[slot]);
+
+            for (int layer = 0; layer < numLayers; ++layer)
+                instrumentFinishes[layer].swap (
+                    deferredInstrumentPluginFinishes[layer]);
+        }
+
+        const auto postOnce = [] (
+            std::function<void()> finish) noexcept
+        {
+            if (! finish)
+                return;
+
+            std::function<void()> fallback;
+
+            try
+            {
+                fallback = finish;
+
+                if (juce::MessageManager::callAsync (
+                        std::move (finish)))
+                    return;
+            }
+            catch (...)
+            {
+            }
+
+            // Se o message loop ja estiver fechando, depth e zero e executar
+            // aqui e mais seguro que perder ownership/completion para sempre.
+            try
+            {
+                if (fallback)
+                    fallback();
+                else if (finish)
+                    finish();
+            }
+            catch (...)
+            {
+            }
+        };
+
+        for (auto& finish : insertFinishes)
+            postOnce (std::move (finish));
+
+        for (auto& finish : instrumentFinishes)
+            postOnce (std::move (finish));
+    }
+
+    void notifyHostedPluginWillRetire (
+        HostedPluginLocation location,
+        int index,
+        juce::AudioPluginInstance* instance) noexcept
+    {
+        if (instance == nullptr)
+            return;
+
+        HostedPluginWillRetireCallback callback;
+
+        try
+        {
+            const juce::ScopedLock lock (
+                hostedPluginEditorCallbackLock);
+            callback = hostedPluginWillRetire;
+        }
+        catch (...)
+        {
+            return;
+        }
+
+        if (callback == nullptr)
+            return;
+
+        try
+        {
+            callback (location, index, instance);
+        }
+        catch (...)
+        {
+            // UI de plugin nunca pode impedir a troca/limpeza do grafo.
+        }
+    }
+
+    bool finishFailedInsertStateRestore (
+        int slot,
+        ChurchDAWPluginLoading::RequestGeneration::Ticket ticket)
+    {
+        if (! juce::isPositiveAndBelow (slot, numInserts)
+             || ! insertPluginLoadGeneration[slot].isCurrent (ticket))
+            return false;
+
+        // O editor guarda uma referencia ao plugin antigo. Feche-o antes de
+        // retirar a instancia, mas revalide o ticket depois: o loop modal do
+        // vendor pode iniciar um pedido mais novo, que sempre deve vencer.
+        notifyHostedPluginWillRetire (
+            HostedPluginLocation::insert, slot,
+            getInsert (slot));
+
+        std::unique_ptr<juce::AudioPluginInstance> old;
+        bool oldWasPrepared = false;
+        bool committed = false;
+        {
+            const bool resumeAfterClear = ! isSuspended();
+
+            if (resumeAfterClear)
+                suspendProcessing (true);
+            const juce::ScopeGuard restoreProcessing {
+                [this, resumeAfterClear]
+            {
+                if (resumeAfterClear)
+                    suspendProcessing (false);
+            } };
+
+            const juce::ScopedLock callbackGuard (
+                getCallbackLock());
+            committed = insertPluginLoadGeneration[slot]
+                .commitIfCurrent (ticket, [this, slot, &old,
+                                           &oldWasPrepared]
+                {
+                    oldWasPrepared = insertPrepared[slot].exchange (
+                        false, std::memory_order_acq_rel);
+                    old = std::move (inserts[slot]);
+                    insertPluginLoadInFlight[slot].store (
+                        false, std::memory_order_release);
+                    insertStateRestorePending[slot].store (
+                        true, std::memory_order_release);
+                    // ID/estado/descricao permanecem como intencao de
+                    // autocura. O pending fica armado para a cena detectar a
+                    // falha e executar timeout/rollback, sem prender a splash.
+                });
+        }
+
+        if (! committed)
+            return false;
+
+        try
+        {
+            refreshExternalReverbSlot (slot);
+            forceExternalReverbWet (getReverbSlot());
+        }
+        catch (...)
+        {
+        }
+
+        if (oldWasPrepared)
+            releasePluginResourcesNoThrow (old.get());
+        old.reset();
+        sendChangeMessage();
+        return true;
+    }
+
+    bool finishFailedInstrumentStateRestore (
+        int layerIndex,
+        ChurchDAWPluginLoading::RequestGeneration::Ticket ticket)
+    {
+        if (! juce::isPositiveAndBelow (layerIndex, numLayers)
+             || ! instrumentPluginLoadGeneration[layerIndex]
+                    .isCurrent (ticket))
+            return false;
+
+        // A pagina pediu uma fonte que terminou em falha. Nao deixe o timbre
+        // da cena anterior tocando sob a identidade nova. A limpeza nativa vem
+        // antes do callback de editor, para um pedido reentrante iniciado ao
+        // fechar a janela nao ser cancelado por este resultado antigo.
+        clearLayer (layerIndex, true);
+
+        if (! instrumentPluginLoadGeneration[layerIndex]
+                .isCurrent (ticket))
+            return false;
+
+        notifyHostedPluginWillRetire (
+            HostedPluginLocation::instrument, layerIndex,
+            getLayerInstrument (layerIndex));
+
+        std::unique_ptr<juce::AudioPluginInstance> old;
+        bool oldWasPrepared = false;
+        bool committed = false;
+        {
+            const bool resumeAfterClear = ! isSuspended();
+
+            if (resumeAfterClear)
+                suspendProcessing (true);
+            const juce::ScopeGuard restoreProcessing {
+                [this, resumeAfterClear]
+            {
+                if (resumeAfterClear)
+                    suspendProcessing (false);
+            } };
+
+            const juce::ScopedLock pluginLock (
+                layerPluginStateLock);
+            const juce::ScopedLock identityLock (
+                layerIdentityLock);
+            committed = instrumentPluginLoadGeneration[layerIndex]
+                .commitIfCurrent (
+                    ticket,
+                    [this, layerIndex, &old, &oldWasPrepared]
+                    {
+                        oldWasPrepared =
+                            pluginPrepared[layerIndex].exchange (
+                                false, std::memory_order_acq_rel);
+                        old = std::move (
+                            layers[layerIndex].instrument);
+                        instNotesOn[layerIndex] = 0;
+                        noteTranspose.clearLayer (layerIndex);
+                        pluginSustainMirror[layerIndex].store (
+                            sustainStateUnknown,
+                            std::memory_order_release);
+                        pluginPitchCentresPending[layerIndex].store (
+                            false, std::memory_order_release);
+                        layers[layerIndex].instrumentId.clear();
+                        layers[layerIndex].instrumentName.clear();
+                        instrumentPluginLoadInFlight[layerIndex].store (
+                            false, std::memory_order_release);
+                        layerStateRestorePending[layerIndex].store (
+                            true, std::memory_order_release);
+                        layerCategory[layerIndex].clear();
+                        layerIsOrgan[layerIndex].store (
+                            false, std::memory_order_relaxed);
+                        layerNativeFamilyTrim[layerIndex].store (
+                            1.0f, std::memory_order_relaxed);
+                        setLayerLoaded (layerIndex, false);
+                        // pendingVstIds/States/Description ficam preservados
+                        // para o proximo scan/boot, sem fingir que ainda carrega.
+                    });
+        }
+
+        if (! committed)
+            return false;
+
+        if (oldWasPrepared)
+            releasePluginResourcesNoThrow (old.get());
+        old.reset();
+        sendChangeMessage();
+        return true;
+    }
+
+    void setLayerLoaded (int layerIndex, bool loaded) noexcept
+    {
+        if (! juce::isPositiveAndBelow (layerIndex, numLayers))
+            return;
+
+        const auto bit = juce::uint32 (1) << layerIndex;
+
+        if (loaded)
+            loadedLayerMask.fetch_or (bit, std::memory_order_release);
+        else
+            loadedLayerMask.fetch_and (~bit, std::memory_order_release);
+    }
+
     static void releasePluginResourcesNoThrow (
         juce::AudioPluginInstance* instance) noexcept
     {
@@ -5142,6 +6788,13 @@ private:
             std::memory_order_release);
         layerNativeFamilyTrim[layerIndex].store (
             1.0f, std::memory_order_relaxed);
+        {
+            const juce::ScopedLock sl (midiRouteLock);
+            layerMidiDeviceId[layerIndex].clear();
+            layerMidiListenChannel[layerIndex].store (
+                0, std::memory_order_relaxed);
+            rebuildMidiDeviceForceMap();
+        }
         const bool resumeAfterDspReset = ! isSuspended();
 
         if (resumeAfterDspReset)
@@ -5496,6 +7149,12 @@ private:
         // continua avançando durante o silêncio. Ao a janela voltar, esta rampa
         // curta impede que a nota reapareça num degrau.
         float streamRecoveryGain = 1.0f;
+
+        // A primeira janela do disco e pedida UMA vez por nota. Sem esta marca
+        // o pedido se repetia a cada bloco durante meio segundo e a thread de
+        // leitura relia o mesmo trecho sem parar. Zerada junto com o resto no
+        // note-on (a voz e reatribuida por atribuicao de struct).
+        bool primeiraJanelaPedida = false;
     };
 
     // Curva historica do motor. Continua sendo a resposta para material que NAO
@@ -6330,6 +7989,32 @@ private:
             const bool targetIsOrgan = looksLikeOrgan (label, cat);
             const float targetFamilyTrim =
                 nativeFamilyTrimForCategory (cat);
+            notifyHostedPluginWillRetire (
+                HostedPluginLocation::instrument, layerIndex,
+                getLayerInstrument (layerIndex));
+
+            bool supersededByPlugin = false;
+            {
+                const juce::ScopedLock identityLock (
+                    layerIdentityLock);
+
+                // Destruir o editor antigo pode entregar uma selecao AU/VST
+                // mais nova. Nesse caso ela vence e este decode nativo fica
+                // stale sem apagar sua descricao/pending.
+                if (pendingVstIds[layerIndex].isNotEmpty())
+                {
+                    loadingLabels[layerIndex].clear();
+                    loadingLibs[layerIndex].clear();
+                    supersededByPlugin = true;
+                }
+            }
+
+            if (supersededByPlugin)
+            {
+                sendChangeMessage();
+                return;
+            }
+
             std::unique_ptr<juce::AudioPluginInstance> oldInstrument;
             bool oldInstrumentWasPrepared = false;
             bool retired = false;
@@ -6385,6 +8070,7 @@ private:
                         loadingLibs[layerIndex].clear();
                         pendingVstIds[layerIndex].clear();
                         pendingVstStates[layerIndex].clear();
+                        pendingVstDescriptionValid[layerIndex] = false;
                         layers[layerIndex].instrumentId.clear();
                         layers[layerIndex].instrumentName.clear();
                         layers[layerIndex].timbre = label;
@@ -6411,6 +8097,7 @@ private:
                     std::memory_order_release);
                 pendingChurchOrganStates[layerIndex].reset();
                 churchOrganReverbBuffers[layerIndex].clear();
+                setLayerLoaded (layerIndex, true);
 
                 if (auto* organ =
                         layers[layerIndex].churchOrgan.get())
@@ -7030,6 +8717,7 @@ private:
         v->released = false;
         v->heldByPedal = false;
         v->streamRecoveryGain = 1.0f;
+        v->primeiraJanelaPedida = false;   // nota nova volta a poder pedir o disco
         v->startOrder = ++voiceCounter;
         v->adsr.setSampleRate (hostSampleRate);
         const float attack = ChurchDAWChannelTone::attackForPlayback (
@@ -7078,6 +8766,17 @@ private:
         v->active = true;
     }
 
+    bool layerAcceptsMidiChannel (int layer, int midiChannel) const noexcept
+    {
+        if (! juce::isPositiveAndBelow (layer, numLayers))
+            return false;
+
+        const int listen = layerMidiListenChannel[layer].load (
+            std::memory_order_relaxed);
+        // 0 = omni (todos os teclados / qualquer canal MIDI)
+        return listen == 0 || listen == midiChannel;
+    }
+
     void noteOn (int channel, int note, int vel)
     {
         if (juce::isPositiveAndBelow (note, 128))
@@ -7088,7 +8787,8 @@ private:
         }
 
         for (int l = 0; l < numLayers; ++l)
-            startVoiceForLayer (l, note, vel, channel);
+            if (layerAcceptsMidiChannel (l, channel))
+                startVoiceForLayer (l, note, vel, channel);
     }
 
     void noteOff (int channel, int note)
@@ -7218,10 +8918,7 @@ private:
         const int numOut = juce::jmin (2, buffer.getNumChannels());
         const float masterGain = (float) *gain;
 
-        bool anySolo = false;
-
-        for (const auto& l : layers)
-            anySolo = anySolo || (bool) *l.solo;
+        const bool anySolo = hasAnyLoadedSolo();
 
         // buffers por canal (crescem junto com o bloco do driver - sem isso
         // um bloco maior que o preparado corrompia o audio)
@@ -7405,6 +9102,18 @@ private:
                 for (const auto meta : midiCopy)
                 {
                     auto m = meta.getMessage();
+                    // Teclado dedicado a outro canal: ignore notes/CC de canal
+                    // MIDI (panic global e sustain global seguem o path nativo).
+                    if ((m.isNoteOnOrOff() || m.isAftertouch()
+                          || m.isPitchWheel()
+                          || (m.isController()
+                               && m.getControllerNumber() != 64
+                               && m.getControllerNumber() != 120
+                               && m.getControllerNumber() != 121
+                               && m.getControllerNumber() != 123))
+                         && ! layerAcceptsMidiChannel (l, m.getChannel()))
+                        continue;
+
                     const int eventOffset = juce::jlimit (
                         0, juce::jmax (0, numSamples - 1),
                         (int) meta.samplePosition);
@@ -7839,6 +9548,16 @@ private:
             for (const auto meta : midiCopy)
             {
                 auto m = meta.getMessage();
+                if ((m.isNoteOnOrOff() || m.isAftertouch()
+                      || m.isPitchWheel()
+                      || (m.isController()
+                           && m.getControllerNumber() != 64
+                           && m.getControllerNumber() != 120
+                           && m.getControllerNumber() != 121
+                           && m.getControllerNumber() != 123))
+                     && ! layerAcceptsMidiChannel (l, m.getChannel()))
+                    continue;
+
                 const int eventOffset = juce::jlimit (
                     0, juce::jmax (0, numSamples - 1),
                     (int) meta.samplePosition);
@@ -8112,15 +9831,31 @@ private:
                     // precisa, e so as notas que realmente sustentam pagam esse
                     // custo. Notas curtas morrem antes daqui e nunca tocam o
                     // disco.
-                    if (v.pos > (double) preloadLen - hostSampleRate * 0.5)
+                    // PEDIR UMA VEZ, NAO A CADA BLOCO.
+                    //
+                    // A condicao abaixo fica verdadeira durante ~0,5 s de cada
+                    // nota sustentada. Como request() se re-arma assim que a
+                    // leitura anterior termina e fillImpl nao verifica se a
+                    // janela ja esta carregada, o mesmo trecho era relido a
+                    // cada bloco: a thread de disco nunca chegava ao wait() e
+                    // saturava um nucleo, roubando CPU do callback de audio.
+                    // No celular isso virava chiado e "FALHA-STREAM".
+                    if (! v.primeiraJanelaPedida
+                         && v.pos > (double) preloadLen - hostSampleRate * 0.5)
                     {
                         // A primeira janela tambem sobrepoe o fim do preload.
                         // Se ela comecar exatamente em preloadLen, o bloco que
                         // cruza essa fronteira nao cabe inteiro em nenhum dos
                         // dois buffers e vira um bloco de silencio audivel.
-                        st.request (juce::jmax ((juce::int64) 0,
-                                               (juce::int64) preloadLen
-                                                 - (juce::int64) SampleStreamer::windowOverlap));
+                        //
+                        // So marca como pedida quando o pedido ENTROU. Se ele
+                        // foi recusado (ja havia leitura em andamento) ou a
+                        // leitura falhar, o proximo bloco tenta de novo — que
+                        // era o comportamento antigo e o que evita o clique.
+                        v.primeiraJanelaPedida =
+                            st.request (juce::jmax ((juce::int64) 0,
+                                                   (juce::int64) preloadLen
+                                                     - (juce::int64) SampleStreamer::windowOverlap));
                         streamer.wake();
                     }
                 }
@@ -8631,13 +10366,36 @@ private:
             const bool audible = (bool) *lay.on
                                   && ! (bool) *lay.mute
                                   && (! anySolo || (bool) *lay.solo);
-            const float postGain =
+            // RAMPA NO GANHO POS-FADER.
+            //
+            // Antes o ganho era constante dentro do bloco e mudava de degrau
+            // na fronteira: ir de 1.0 a 0.0 ao desligar um canal cortava a
+            // onda no meio — estalo audivel, e a cauda nao decaia, sumia. Da
+            // para ouvir isso hoje nos pads 1-5 do Launchkey.
+            //
+            // 20 ms e o menor tempo que nao se ouve como clique e ainda soa
+            // como "desligou agora". Como isto roda por bloco, o teto e o
+            // proprio tamanho do bloco.
+            const float postGainAlvo =
                 (audible ? (float) *lay.vol : 0.0f)
                 * masterGain;
 
+            const float postGainAnterior = postGainSuave[l];
+            const float passoMaximo =
+                (float) numSamples / (float) juce::jmax (1.0, 0.020 * hostSampleRate);
+
+            const float postGain = postGainAnterior
+                                 + juce::jlimit (-passoMaximo, passoMaximo,
+                                                 postGainAlvo - postGainAnterior);
+
+            postGainSuave[l] = postGain;
+
             float blockPeak = 0.0f;
 
-            if (postGain > 0.0f)
+            // Continua somando enquanto a rampa desce, mesmo com o alvo ja em
+            // zero: e justamente esse rabo que faz a cauda decair em vez de
+            // ser cortada.
+            if (postGain > 0.0f || postGainAnterior > 0.0f)
             {
                 // pico POR LADO, pos-fader e pos-mute (postGain ja carrega os dois):
                 // o medidor do canal e estereo, entao L e R viajam separados
@@ -8653,7 +10411,8 @@ private:
                 }
 
                 for (int ch = 0; ch < numOut; ++ch)
-                    buffer.addFrom (ch, 0, lb, ch, 0, numSamples, postGain);
+                    buffer.addFromWithRamp (ch, 0, lb.getReadPointer (ch), numSamples,
+                                            postGainAnterior, postGain);
 
                 // ENVIO PARA O REVERB: o mesmo sinal pos-fader vai tambem para o
                 // barramento do Church Reverb/BigSky, na dose do knob REVERB. E assim
@@ -8662,7 +10421,8 @@ private:
                 if (juce::jmax (sendStart, sendEnd) > 0.0005f && reverbBusActive)
                     for (int ch = 0; ch < 2; ++ch)
                         reverbBus.addFromWithRamp (ch, 0, lb.getReadPointer (ch),
-                                                  numSamples, postGain * sendStart,
+                                                  numSamples,
+                                                  postGainAnterior * sendStart,
                                                   postGain * sendEnd);
 
                 // Worship Hybrid fornece um envio próprio, separado do áudio
@@ -8674,9 +10434,9 @@ private:
                         churchOrganReverbBuffers[l];
 
                     for (int ch = 0; ch < 2; ++ch)
-                        reverbBus.addFrom (
-                            ch, 0, organSend, ch, 0,
-                            numSamples, postGain);
+                        reverbBus.addFromWithRamp (
+                            ch, 0, organSend.getReadPointer (ch),
+                            numSamples, postGainAnterior, postGain);
                 }
             }
 
@@ -8692,6 +10452,7 @@ private:
         fxTicks += juce::Time::getHighResolutionTicks() - fxStart;
        #endif
     }
+
 
     //==============================================================================
     Layer layers[numLayers];
@@ -8710,6 +10471,7 @@ private:
     // Dois teclados no MESMO canal e mesma nota continuam ambiguos (limite do MIDI).
     juce::uint16 keyDown[128] = {};
     double hostSampleRate = 44100.0;
+    std::atomic<bool> processorPrepared { false };
 
     std::atomic<int> uiSelectedLayer { -1 };   // abre sem canal selecionado
     // ATENCAO ao mexer em numLayers: listas escritas a mao ("{-1,-1,...}")
@@ -8718,6 +10480,11 @@ private:
     // inicializarCanais(), chamado no construtor.
     int layerColourIdx[numLayers] {};   // -1 = segue a categoria
     std::atomic<juce::uint32> heldBits[4] {};   // teclas pressionadas (para o acorde)
+    // Ganho pos-fader efetivo do bloco anterior, por canal. So a thread de
+    // audio toca nisto — e a memoria da rampa que evita o degrau ao ligar,
+    // desligar, mutar ou dar solo num canal.
+    float postGainSuave[numLayers] {};
+
     std::atomic<float> layerLevelsL[numLayers] {};
     std::atomic<float> layerLevelsR[numLayers] {};
     std::atomic<float> layerLevelShown[numLayers] {};   // espelho p/ o visor CANAIS
@@ -8758,10 +10525,19 @@ private:
     ChurchDAWChannelTone::ThreeBandEq manualEqs[numLayers];
     ChurchDAWTimbreTone::Store<numLayers> timbreToneMemory;
     std::atomic<int> programmaticToneChangeDepth { 0 };
+    std::atomic<bool> lastStateCaptureHadFailure { false };
     mutable juce::CriticalSection layerToneTransactionLock;
     mutable juce::CriticalSection layerIdentityLock;
     mutable juce::CriticalSection layerPluginStateLock;
+    static_assert (numLayers <= 32,
+                   "A mascara de identidade usa um bit por canal");
+    static_assert (std::atomic<juce::uint32>::is_always_lock_free,
+                   "A identidade dos canais precisa ser lock-free no callback");
+    std::atomic<juce::uint32> loadedLayerMask { 0 };
     std::atomic<bool> layerStateRestorePending[numLayers] {};
+    std::atomic<bool> insertStateRestorePending[numInserts] {};
+    std::atomic<bool> insertPluginLoadInFlight[numInserts] {};
+    std::atomic<bool> instrumentPluginLoadInFlight[numLayers] {};
     juce::String layerStateRestoreTargetTimbre[numLayers];
     juce::String layerStateRestoreTargetLibrary[numLayers];
     juce::String layerStateRestoreTargetVstId[numLayers];
@@ -8805,6 +10581,17 @@ private:
     bool externalReverbOriginalMixValid[numInserts] { false, false };
     juce::KnownPluginList* knownPluginsRef = nullptr;
     juce::AudioPluginFormatManager* formatManagerRef = nullptr;
+    const juce::StringArray* pluginQuarantineRef = nullptr;   // pertence ao MainComponent
+    mutable juce::CriticalSection hostedPluginEditorCallbackLock;
+    mutable juce::CriticalSection hostedPluginDeferredFinishLock;
+    HostedPluginWillRetireCallback hostedPluginWillRetire;
+    std::atomic<int> hostedPluginEditorTeardownDepth { 0 };
+    std::function<void()> deferredInsertPluginFinishes[numInserts];
+    std::function<void()> deferredInstrumentPluginFinishes[numLayers];
+    ChurchDAWPluginLoading::RequestGeneration
+        insertPluginLoadGeneration[numInserts];
+    ChurchDAWPluginLoading::RequestGeneration
+        instrumentPluginLoadGeneration[numLayers];
 
     std::vector<std::vector<std::unique_ptr<Zone>>> retiredZones;   // samples antigos ate as vozes acabarem
 
@@ -8820,6 +10607,10 @@ private:
     std::shared_ptr<std::atomic<bool>> layerLoadAbort[numLayers]; // cancela decode velho por canal
     juce::String pendingVstIds[numLayers], pendingVstStates[numLayers];           // VSTi que falhou no restore (auto-cura no save)
     juce::String pendingInsertIds[numInserts], pendingInsertStates[numInserts];   // idem para os INSERTs
+    juce::PluginDescription pendingVstDescriptions[numLayers];
+    juce::PluginDescription pendingInsertDescriptions[numInserts];
+    bool pendingVstDescriptionValid[numLayers] {};
+    bool pendingInsertDescriptionValid[numInserts] {};
     bool showroomPending = false;   // primeira execucao: carregar setup de fabrica pos-scan
     // Compartilhado com os tickets dos workers: mesmo se callAsync falhar ou o
     // processador morrer antes do callback, cada pedido decrementa exatamente
@@ -9761,7 +11552,14 @@ public:
     {
         newLevel = juce::jlimit (0.0f, 1.0f, newLevel);
 
-        if (std::abs (newLevel - level) > 0.03f)
+        // Limiar maior no touch: menos repaint, mesma leitura de "esta tocando".
+       #if JUCE_ANDROID || JUCE_IOS
+        const float thresh = 0.06f;
+       #else
+        const float thresh = 0.03f;
+       #endif
+
+        if (std::abs (newLevel - level) > thresh)
         {
             level = newLevel;
             repaint();
@@ -9775,12 +11573,18 @@ public:
 
         auto r = getLocalBounds().toFloat();
 
-        // brilho que sangra pros lados quando o canal esta forte
+       #if JUCE_ANDROID || JUCE_IOS
+        // Sem glow expandido (caro no software renderer) — barra solida basta.
+        g.setColour (NordLookAndFeel::nordRed().withAlpha (
+            juce::jmin (1.0f, 0.30f + level * 1.2f)));
+        g.fillRoundedRectangle (r, r.getHeight() * 0.5f);
+       #else
         g.setColour (NordLookAndFeel::nordRedBright().withAlpha (level * 0.30f));
         g.fillRoundedRectangle (r.expanded (3.0f, 2.5f), 4.0f);
-
-        g.setColour (NordLookAndFeel::nordRedBright().withAlpha (juce::jmin (1.0f, 0.25f + level * 1.5f)));
+        g.setColour (NordLookAndFeel::nordRedBright().withAlpha (
+            juce::jmin (1.0f, 0.25f + level * 1.5f)));
         g.fillRoundedRectangle (r, r.getHeight() * 0.5f);
+       #endif
     }
 
 private:
@@ -9825,6 +11629,11 @@ public:
     {
         if (closedCallback)
             closedCallback();
+    }
+
+    juce::AudioPluginInstance* getPluginInstance() noexcept
+    {
+        return &plugin;
     }
 
 private:
@@ -9935,6 +11744,11 @@ public:
 
     void mouseUp (const juce::MouseEvent&) override   { dragging = false; }
 
+    juce::AudioPluginInstance* getPluginInstance() noexcept
+    {
+        return &plugin;
+    }
+
 private:
     void fitToEditor()
     {
@@ -9974,9 +11788,13 @@ public:
         if (auto* m = proc.getExternalMaster())
             m->addChangeListener (this);
 
+        if (auto* plugins = proc.getKnownPlugins())
+            plugins->addChangeListener (this);
+
+        // Desktop: "CHURCH LIVE" em vermelho discreto de secao (nao neon).
         title.setText ("CHURCH LIVE", juce::dontSendNotification);
-        title.setFont (juce::Font (juce::FontOptions (16.0f)).boldened());
-        title.setColour (juce::Label::textColourId, NordLookAndFeel::nordRedBright());
+        title.setFont (NordLookAndFeel::stageLabel (12.0f));
+        title.setColour (juce::Label::textColourId, NordLookAndFeel::nordRed().withAlpha (0.92f));
         addAndMakeVisible (title);
 
         // Navegacao entre os 14 canais (8 aparecem por vez).
@@ -10000,26 +11818,50 @@ public:
         status.setColour (juce::Label::textColourId, NordLookAndFeel::dimText());
         addAndMakeVisible (status);
 
-        editToneButton.setButtonText ("EDITAR SOM");
+        editToneButton.setButtonText ("Editar som");
         editToneButton.setTooltip (
             "Abrir o canal selecionado em modo focado, sem interromper o audio");
+        // Desktop "EDITAR SOM": chapa grafite, nao bloco vermelho solido.
         editToneButton.setColour (juce::TextButton::buttonColourId,
                                   juce::Colour (0xff252a32));
         editToneButton.setColour (juce::TextButton::buttonOnColourId,
-                                  NordLookAndFeel::nordRedDark());
+                                  juce::Colour (0xff2e343e));
         editToneButton.setColour (juce::TextButton::textColourOffId,
                                   NordLookAndFeel::txtSecondary());
         editToneButton.setColour (juce::TextButton::textColourOnId,
-                                  juce::Colours::white);
+                                  NordLookAndFeel::txtPrimary());
         editToneButton.onClick = [this]
         {
-           #if ! JUCE_ANDROID && ! JUCE_IOS
+           #if JUCE_ANDROID
+            // No touch, o editor focado continua sendo a mesa de edicao. O
+            // Modo Palco abre as reguas compactas com fader, meter, M/S e
+            // master atualizando juntas, como no Windows/macOS. A troca e so
+            // visual: attachments e audio nunca sao desmontados.
+            mobileStageMode = ! mobileStageMode;
+            mobileMasterPage = false;
+            editToneButton.setToggleState (mobileStageMode,
+                                           juce::dontSendNotification);
+            editToneButton.setButtonText (mobileStageMode
+                                            ? "Editar canal"
+                                            : "Modo palco");
+            editToneButton.setTooltip (mobileStageMode
+                ? "Voltar ao canal em foco para editar todos os controles"
+                : "Ver faders, meters, Mute, Solo e Master em tempo real");
+
+            // O layout conhece quantas reguas cabem nesta tela. Ele centraliza
+            // o canal editado na primeira pagina somente depois de calcular
+            // esse numero, evitando paginas parciais no fim da lista.
+            androidStageRevealSelected = mobileStageMode;
+
+            resized();
+            repaint();
+           #elif ! JUCE_IOS
             desktopToneEditMode = ! desktopToneEditMode;
             mobileMasterPage = false;
             editToneButton.setToggleState (desktopToneEditMode,
                                            juce::dontSendNotification);
             editToneButton.setButtonText (
-                desktopToneEditMode ? "VOLTAR AO MIXER" : "EDITAR SOM");
+                desktopToneEditMode ? "Voltar ao mixer" : "Editar som");
             editToneButton.setTooltip (
                 desktopToneEditMode
                     ? "Voltar para a visao geral dos cinco canais"
@@ -10054,9 +11896,10 @@ public:
             mobileTab.onClick = [this, l] { activateMobileLayerPage (l); };
             addAndMakeVisible (mobileTab);
 
-            s.name.setText ("CANAL " + juce::String (l + 1), juce::dontSendNotification);
+            s.name.setText ("Canal " + juce::String (l + 1), juce::dontSendNotification);
             s.name.setJustificationType (juce::Justification::centred);
-            // rotulo de secao no estilo silkscreen da Nord: caixa alta, pesado,
+            // Rotulo de secao: sentence case (menos grito); M/S/ON/MASTER em caps.
+
             // espacado. O canal em foco fica ACESO em vermelho, os outros apagados
             // -- e a mesma ideia da "rotulagem em LED" deles para palco escuro.
             s.name.setFont (NordLookAndFeel::stageLabel (11.0f));
@@ -10065,8 +11908,9 @@ public:
 
             // botao liga/desliga do canal
             s.onBtn.setClickingTogglesState (true);
-            s.onBtn.setColour (juce::TextButton::buttonOnColourId, NordLookAndFeel::nordRedBright());
-            s.onBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff3a3d44));   // OFF = cinza
+            // ON: vermelho da marca (como desktop), sem bright neon.
+            s.onBtn.setColour (juce::TextButton::buttonOnColourId, NordLookAndFeel::nordRed());
+            s.onBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff3a3d44));
             s.onBtn.setColour (juce::TextButton::textColourOnId, juce::Colours::white);
             s.onBtn.setColour (juce::TextButton::textColourOffId, NordLookAndFeel::dimText());
             // texto muda ON/OFF conforme o estado (nao ambiguo)
@@ -10091,24 +11935,84 @@ public:
             // gritava em 17px negrito e competia com o nome do som logo abaixo.
             // Agora ela e rotulo de apoio; o heroi e o seletor de preset.
             s.timbreName.setJustificationType (juce::Justification::centredLeft);
+           #if JUCE_ANDROID || JUCE_IOS
             s.timbreName.setFont (NordLookAndFeel::stageLabel (11.0f));
+           #else
+            // Categoria precisa caber entre o icone e o ON inclusive em
+            // "Instrumento"; sem kerning extra ela continua firme e nao vira
+            // "Stri..." nos strips de 720p.
+            s.timbreName.setFont (juce::Font (juce::FontOptions (
+                10.25f, juce::Font::bold)));
+           #endif
             s.timbreName.setColour (juce::Label::textColourId, NordLookAndFeel::txtSecondary());
             s.timbreName.setMinimumHorizontalScale (0.7f);
             addAndMakeVisible (s.timbreName);
 
-            // card vazio: botao grande "+ Adicionar instrumento" abre o seletor
-            s.addButton.setColour (juce::TextButton::buttonColourId, juce::Colours::transparentBlack);
-            s.addButton.setColour (juce::TextButton::textColourOffId, NordLookAndFeel::dimText());
-            s.addButton.onClick = [this, l] { selectStrip (l); strips[l].combo.showPopup(); };
+            // Card vazio (desktop): texto cinza, sem chapa rosa.
+            s.addButton.setButtonText ("Adicionar");
+            s.addButton.setColour (juce::TextButton::buttonColourId,
+                                   juce::Colours::transparentBlack);
+            s.addButton.setColour (juce::TextButton::textColourOffId,
+                                   NordLookAndFeel::txtSecondary());
+            s.addButton.onClick = [this, l]
+            {
+                // Abre o seletor (com TIMBRES PARA BAIXAR) mesmo sem pack
+                // completo instalado. So manda para Bibliotecas se o seletor
+                // ainda nao tiver nem organ engine nem catalogo baixavel.
+                selectStrip (l);
+                openPickerFor (l);
+            };
             addChildComponent (s.addButton);
 
-            s.combo.setTextWhenNothingSelected ("+ Adicionar instrumento");
+            s.combo.setTextWhenNothingSelected ("Adicionar");
             // o menu padrao do JUCE nao tem busca; com centenas de timbres isso
             // virava rolagem infinita — clicar no combo abre o seletor com busca
             s.combo.onShowPopup = [this, l] { openPickerFor (l); };
-            s.combo.onChange = [this, l]
+
+            // MIDI de entrada por canal (cliente Mac/Windows: 2 teclados).
+            s.midiInBox.setTextWhenNothingSelected (
+                juce::String::fromUTF8 ("MIDI: Todos"));
+            s.midiInBox.setTooltip (
+                juce::String::fromUTF8 (
+                    "Qual teclado controla este canal. "
+                    "Ex.: teclado 1 no piano, teclado 2 no pad."));
+            s.midiInBox.onChange =
+                [this, l, lifetime = editorCallbackLifetime]
             {
-                if (updatingCombos)
+                if (! lifetime->load (std::memory_order_acquire)
+                     || updatingCombos)
+                    return;
+
+                selectStrip (l);
+                const int id = strips[l].midiInBox.getSelectedId();
+                if (id <= 1)
+                {
+                    proc.setLayerMidiInputDevice (l, {});
+                    return;
+                }
+
+                // id 2..n mapeia para devices na mesma ordem da lista.
+                const auto devices = juce::MidiInput::getAvailableDevices();
+                const int index = id - 2;
+                if (juce::isPositiveAndBelow (index, devices.size()))
+                    proc.setLayerMidiInputDevice (
+                        l, devices.getReference (index).identifier);
+                else
+                {
+                    // Item offline: extrai o id do texto "MIDI: xxx (offline)".
+                    auto t = strips[l].midiInBox.getText();
+                    if (t.startsWith ("MIDI: "))
+                        t = t.fromFirstOccurrenceOf ("MIDI: ", false, false);
+                    t = t.upToFirstOccurrenceOf (" (offline)", false, false).trim();
+                    proc.setLayerMidiInputDevice (l, t);
+                }
+            };
+            addAndMakeVisible (s.midiInBox);
+            s.combo.onChange =
+                [this, l, lifetime = editorCallbackLifetime]
+            {
+                if (! lifetime->load (std::memory_order_acquire)
+                     || updatingCombos)
                     return;
 
                 selectStrip (l);
@@ -10123,7 +12027,12 @@ public:
                 if (churchOrganOverlayLayer == l)
                     closeChurchOrganEditor();
 
-                if (id == 1)
+                if (id >= downloadBaseId)
+                {
+                    // Pack online: nao e um timbre selecionavel no combo.
+                    return;
+                }
+                else if (id == 1)
                 {
                     proc.clearLayer (l);
                     proc.clearInstrumentPlugin (l);
@@ -10146,20 +12055,47 @@ public:
                 }
                 else if (id >= vstBaseId && id - vstBaseId < instrumentsCache.size())
                 {
-                    // VSTi externo (Kontakt) no canal
-                    if (proc.loadInstrumentPlugin (
-                            l, instrumentsCache.getReference (
-                                   id - vstBaseId)))
+                    // AUv3 e alguns Audio Units concluem em outro ciclo da
+                    // message thread. Só abra o editor e altere os controles
+                    // depois do commit real; até lá o instrumento anterior toca.
+                    auto safe =
+                        juce::Component::SafePointer<TimbresEditor> (
+                            this);
+                    std::weak_ptr<std::atomic<bool>> lifetime (
+                        editorCallbackLifetime);
+                    const bool accepted = proc.loadInstrumentPlugin (
+                        l,
+                        instrumentsCache.getReference (id - vstBaseId),
+                        true, nullptr,
+                        [safe, lifetime, l] (
+                            bool loaded, const juce::String&)
+                        {
+                            const auto alive = lifetime.lock();
+
+                            if (alive == nullptr
+                                 || ! alive->load (
+                                     std::memory_order_acquire))
+                                return;
+
+                            if (auto* editor = safe.getComponent())
+                            {
+                                if (loaded)
+                                {
+                                    *editor->proc.layers[l].on = true;
+                                    *editor->proc.layers[l].mute = false;
+                                    *editor->proc.layers[l].solo = false;
+                                    editor->openLayerPlugin (l);
+                                }
+                                else
+                                {
+                                    // O canal anterior permaneceu intacto.
+                                    editor->refreshFromProcessor();
+                                }
+                            }
+                        });
+
+                    if (! accepted)
                     {
-                        *proc.layers[l].on = true;
-                        *proc.layers[l].mute = false;
-                        *proc.layers[l].solo = false;
-                        openLayerPlugin (l);
-                    }
-                    else
-                    {
-                        // O canal anterior permaneceu intacto. Reposiciona o
-                        // seletor na verdade do motor e nao abre janela nula.
                         refreshFromProcessor();
                     }
                 }
@@ -10196,8 +12132,12 @@ public:
                 const bool silent = v <= 0.0009;
                 const float db = silent ? -100.0f : (float) juce::Decibels::gainToDecibels (v);
 
-                strips[l].volDb.setText (silent ? juce::String ("-inf dB")
-                                                : juce::String (db, 1) + " dB",
+                const auto readout = silent
+                    ? juce::String::fromUTF8 ("\xe2\x88\x92\xe2\x88\x9e dB")
+                    : (db >= 0.0f ? "+" : juce::String())
+                        + juce::String (db, 1) + " dB";
+
+                strips[l].volDb.setText (readout,
                                          juce::dontSendNotification);
 
                 // Cor avisa quando o canal esta quente. MESMA escala do readout do
@@ -10215,7 +12155,11 @@ public:
             addAndMakeVisible (s.vol);
 
             s.volDb.setJustificationType (juce::Justification::centred);
-            s.volDb.setFont (juce::Font (juce::FontOptions (15.0f)).boldened());
+            // Readout de mixer: caixa fixa + algarismos de largura fixa. Isso
+            // alinha "+3.5", "-1.2" e "−∞" na mesma linha em todos os canais.
+            s.volDb.setFont (juce::Font (juce::FontOptions (
+                juce::Font::getDefaultMonospacedFontName(), 14.0f,
+                juce::Font::bold)));
             s.volDb.setColour (juce::Label::textColourId, juce::Colours::white);
             addAndMakeVisible (s.volDb);
             s.vol.onValueChange();   // texto inicial
@@ -10271,6 +12215,7 @@ public:
 
             // botao Auto EQ (mix de louvor por tipo): liga aplica, desliga volta ao original
             s.autoEqBtn.setClickingTogglesState (true);
+            s.autoEqBtn.setTooltip ("Auto EQ do canal");
             s.autoEqBtn.setColour (juce::TextButton::buttonOnColourId, NordLookAndFeel::nordRedBright());
             s.autoEqBtn.setColour (juce::TextButton::textColourOnId, juce::Colours::white);
             // sem selectStrip aqui pelo mesmo motivo do botao ON: o attachment
@@ -10280,16 +12225,28 @@ public:
             addAndMakeVisible (s.autoEqBtn);
 
             s.muteBtn.setClickingTogglesState (true);
-            // MUTE = vermelho da marca (spec: o vermelho e o acento de Mute);
-            // SOLO = ambar. Cores distintas, sem laranja intermediario ambiguo.
-            s.muteBtn.setColour (juce::TextButton::buttonOnColourId, NordLookAndFeel::nordRed());
-            s.muteBtn.setColour (juce::TextButton::textColourOnId, juce::Colours::white);
+            // Palco escuro: M ativo = ambar (atencao), S ativo = verde (foco).
+            // Vermelho fica para ON e PANIC — estados criticos de marca.
+            s.muteBtn.setColour (juce::TextButton::buttonColourId,
+                                 juce::Colour (0xff2a2e36));
+            s.muteBtn.setColour (juce::TextButton::buttonOnColourId,
+                                 NordLookAndFeel::amberSolo());
+            s.muteBtn.setColour (juce::TextButton::textColourOffId,
+                                 NordLookAndFeel::txtSecondary());
+            s.muteBtn.setColour (juce::TextButton::textColourOnId,
+                                 juce::Colours::black);
             s.muteAttachment = std::make_unique<juce::ButtonParameterAttachment> (*proc.layers[l].mute, s.muteBtn);
             addAndMakeVisible (s.muteBtn);
 
             s.soloBtn.setClickingTogglesState (true);
-            s.soloBtn.setColour (juce::TextButton::buttonOnColourId, NordLookAndFeel::amberSolo());
-            s.soloBtn.setColour (juce::TextButton::textColourOnId, juce::Colours::black);
+            s.soloBtn.setColour (juce::TextButton::buttonColourId,
+                                 juce::Colour (0xff2a2e36));
+            s.soloBtn.setColour (juce::TextButton::buttonOnColourId,
+                                 NordLookAndFeel::greenOk());
+            s.soloBtn.setColour (juce::TextButton::textColourOffId,
+                                 NordLookAndFeel::txtSecondary());
+            s.soloBtn.setColour (juce::TextButton::textColourOnId,
+                                 juce::Colours::black);
             s.soloAttachment = std::make_unique<juce::ButtonParameterAttachment> (*proc.layers[l].solo, s.soloBtn);
             addAndMakeVisible (s.soloBtn);
 
@@ -10465,7 +12422,14 @@ public:
         // caixa de texto maior: o dB do master e o numero que o tecladista mais
         // consulta na mesa, e estava do mesmo tamanho dos dB de canal
         masterDbSlider.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 74, 22);
-        masterDbSlider.setTextValueSuffix (" dB");
+        masterDbSlider.textFromValueFunction = [] (double value)
+        {
+            if (value <= MasterProcessor::minusInfinityDb + 0.05)
+                return juce::String::fromUTF8 ("\xe2\x88\x92\xe2\x88\x9e dB");
+
+            return (value >= 0.0 ? "+" : juce::String())
+                    + juce::String (value, 1) + " dB";
+        };
         masterDbSlider.onValueChange = [this]
         {
             if (auto* m = proc.getExternalMaster())
@@ -10484,14 +12448,17 @@ public:
                 [m] (int ch) { return m->readAndResetLevel (ch); },
                 [m]          { return m->readAndResetClip(); });
             masterMeter->setChannelLabels (true);
+            masterMeter->setPeakReadout (true);
             addAndMakeVisible (*masterMeter);
         }
 
-        // O botao mais critico ao vivo estava do mesmo tamanho e cor de tudo o
-        // resto. Agora e o unico vermelho VIVO da regua e o maior alvo de clique
-        // (os toggles ligados usam um vermelho escuro pra nao competir com ele).
-        panicButton.setColour (juce::TextButton::buttonColourId, NordLookAndFeel::nordRedBright());
-        panicButton.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
+        // PANIC contido: chapa escura + contorno vermelho (ver NordLookAndFeel
+        // drawButtonBackground com componentID "panicOutline").
+        panicButton.setComponentID ("panicOutline");
+        panicButton.setColour (juce::TextButton::buttonColourId,
+                               juce::Colour (0xff1a1014));
+        panicButton.setColour (juce::TextButton::textColourOffId,
+                               NordLookAndFeel::nordRed());
         panicButton.onClick = [this] { proc.panic(); };
         addAndMakeVisible (panicButton);
 
@@ -10505,7 +12472,7 @@ public:
         gTranspAttachment = std::make_unique<juce::SliderParameterAttachment> (*proc.globalTransp, gTranspSlider);
         addAndMakeVisible (gTranspSlider);
 
-        gTranspLabel.setText ("TRANSPOSE GLOBAL", juce::dontSendNotification);
+        gTranspLabel.setText ("Transpose global", juce::dontSendNotification);
         gTranspLabel.setJustificationType (juce::Justification::centred);
         gTranspLabel.setFont (juce::Font (juce::FontOptions (10.0f)));
         gTranspLabel.setColour (juce::Label::textColourId, NordLookAndFeel::dimText());
@@ -10557,10 +12524,12 @@ public:
         addChildComponent (reverbReturnLabel);
 
         sustainToggle.setButtonText ("Sustain");
+        sustainToggle.setTooltip ("Sustain global: mantém as notas mesmo sem pedal físico");
         sustainAttachment = std::make_unique<juce::ButtonParameterAttachment> (*proc.globalSustain, sustainToggle);
         addAndMakeVisible (sustainToggle);
 
-        invPedalToggle.setButtonText ("Inv. pedal");
+        invPedalToggle.setButtonText ("Inverter pedal");
+        invPedalToggle.setTooltip ("Inverter a polaridade do pedal de sustain");
         invPedalAttachment = std::make_unique<juce::ButtonParameterAttachment> (*proc.pedalInvert, invPedalToggle);
         addAndMakeVisible (invPedalToggle);
 
@@ -10578,7 +12547,10 @@ public:
         {
             if (auto* m = proc.getExternalMaster())
                 m->setAutoEq (masterAutoEqBtn.getToggleState());
+
+            refreshMasterUtilityLabels();
         };
+        masterAutoEqBtn.setTooltip ("Auto EQ Master: curva global otimizada para mix de louvor");
         addAndMakeVisible (masterAutoEqBtn);
 
         masterPunchBtn.setButtonText ("Punch / Peso");
@@ -10593,8 +12565,12 @@ public:
         {
             if (auto* m = proc.getExternalMaster())
                 m->setPunch (masterPunchBtn.getToggleState());
+
+            refreshMasterUtilityLabels();
         };
+        masterPunchBtn.setTooltip ("Punch / Peso: reforço de impacto e corpo no master");
         addAndMakeVisible (masterPunchBtn);
+        refreshMasterUtilityLabels();
 
         // ---- painel inferior: plugins de efeito no canal master (BigSky etc.) ----
         fxTitle.setText ("MASTER FX", juce::dontSendNotification);
@@ -10603,27 +12579,25 @@ public:
         fxTitle.setColour (juce::Label::textColourId, NordLookAndFeel::dimText());   // subtitulo, nao marca
         addAndMakeVisible (fxTitle);
 
-        if (auto* kl = proc.getKnownPlugins())
-            for (const auto& d : kl->getTypes())
-            {
-                if (! d.isInstrument)
-                    effectsCache.add (d);
-                else
-                    instrumentsCache.add (d);   // Kontakt e outros VSTi para os canais
-            }
+        rebuildPluginCaches();
 
         for (int i = 0; i < TimbresProcessor::numInserts; ++i)
         {
             insertCombos[i].addItem ("Sem efeito", 1);
 
             for (int e = 0; e < effectsCache.size(); ++e)
-                insertCombos[i].addItem (effectsCache.getReference (e).name, e + 2);
+                insertCombos[i].addItem (
+                    ChurchDAWPluginLoading::displayName (
+                        effectsCache.getReference (e), effectsCache),
+                    e + 2);
 
             insertCombos[i].setTextWhenNothingSelected ("Sem efeito");
             insertCombos[i].setWantsKeyboardFocus (false);   // setas do PC nao trocam o efeito
-            insertCombos[i].onChange = [this, i]
+            insertCombos[i].onChange =
+                [this, i, lifetime = editorCallbackLifetime]
             {
-                if (updatingCombos)
+                if (! lifetime->load (std::memory_order_acquire)
+                     || updatingCombos)
                     return;
 
                 insertWindows[i].reset();   // fecha o editor embutido antes de trocar
@@ -10637,7 +12611,8 @@ public:
             };
             addAndMakeVisible (insertCombos[i]);
 
-            insertOpenButtons[i].setButtonText ("Abrir");
+            insertOpenButtons[i].setButtonText ("Editar");
+            insertOpenButtons[i].setTooltip ("Abrir o editor do efeito carregado");
             insertOpenButtons[i].onClick = [this, i] { openInsertEmbedded (i); };
             addAndMakeVisible (insertOpenButtons[i]);
         }
@@ -10653,25 +12628,79 @@ public:
 
         populateCombos();
         refreshFromProcessor();
+        // Puxa o catalogo de timbres individuais cedo (rede), para a secao
+        // "TIMBRES PARA BAIXAR" ja existir quando o musico abrir o seletor.
+        ensureTimbreCatalogLoaded();
         setSize (960, 622);
+
+        auto safe = juce::Component::SafePointer<TimbresEditor> (
+            this);
+        std::weak_ptr<std::atomic<bool>> lifetime (
+            editorCallbackLifetime);
+        proc.setHostedPluginWillRetireCallback (
+            [safe, lifetime] (
+                TimbresProcessor::HostedPluginLocation location,
+                int index,
+                juce::AudioPluginInstance* instance)
+            {
+                const auto alive = lifetime.lock();
+
+                if (alive == nullptr
+                     || ! alive->load (std::memory_order_acquire))
+                    return;
+
+                if (auto* editor = safe.getComponent())
+                    editor->closeHostedPluginEditorBeforeRetire (
+                        location, index, instance);
+            });
     }
 
     ~TimbresEditor() override
     {
-        churchOrganOverlay.reset();
+        // SafePointer continua resolvendo durante o corpo do destrutor. Feche a
+        // porta das completions primeiro e bloqueie commits AUv3 enquanto os
+        // editores de vendor (que podem bombear mensagens) sao desmontados.
+        editorCallbackLifetime->store (
+            false, std::memory_order_release);
 
-        for (auto& w : layerPluginWindows)
-            w.reset();
-
+        // Listeners podem ter callbacks ja enfileirados. Desconecte todas as
+        // fontes antes de resetar qualquer editor de vendor, cujo destrutor pode
+        // bombear a fila de mensagens e reentrar neste objeto em teardown.
         if (auto* m = proc.getExternalMaster())
             m->removeChangeListener (this);
 
+        if (auto* plugins = proc.getKnownPlugins())
+            plugins->removeChangeListener (this);
+
         proc.removeChangeListener (this);
+
+        proc.beginHostedPluginEditorTeardown();
+        {
+            const juce::ScopeGuard finishEditorTeardown { [this]
+            {
+                proc.endHostedPluginEditorTeardown();
+            } };
+
+            proc.setHostedPluginWillRetireCallback ({});
+
+            for (auto& w : insertWindows)
+                w.reset();
+
+            for (auto& w : layerPluginWindows)
+                w.reset();
+        }
+
+        churchOrganOverlay.reset();
     }
 
     bool isMobileMasterPageActive() const noexcept
     {
         return focusedMobileLayout && mobileMasterPage;
+    }
+
+    void setOpenLibrariesCallback (std::function<void()> callback)
+    {
+        onOpenLibraries = std::move (callback);
     }
 
     void activateMobileLayerPage (int layer)
@@ -10783,11 +12812,8 @@ public:
     void paint (juce::Graphics& g) override
     {
         CHURCHDAW_UI_SCOPE ("TimbresEditor::paint");
-        // fundo com leve vinheta vertical (profundidade sutil) em vez de preto
-        // chapado: faz os cards com sombra parecerem pousados numa superficie
-        g.setGradientFill (juce::ColourGradient (juce::Colour (0xff181920), 0.0f, 0.0f,
-                                                 juce::Colour (0xff101013), 0.0f, (float) getHeight(), false));
-        g.fillRect (getLocalBounds());
+        // Fundo premium com vinheta (console no escuro do templo).
+        NordLookAndFeel::fillAppBackground (g, getLocalBounds().toFloat());
 
         auto drawCard = [this, &g] (juce::Rectangle<int> r, bool selected, bool empty,
                                     bool muted = false, bool dimmed = false, bool master = false,
@@ -10797,129 +12823,48 @@ public:
                 return;
 
             auto card = r.toFloat();
-            const float radius = shortLandscapeMobileLayout ? 5.0f
+            const float radius = shortLandscapeMobileLayout ? 6.0f
                                                             : NordLookAndFeel::radiusCard;
 
-            // sombra suave de elevacao (em vez do retangulo preto duro): faz o
-            // card parecer uma placa fresada pousada sobre a mesa
+            // No editor focado o card e a tela toda: moldura vermelha gritaria.
+            const bool paintSelected = selected && ! focusedMobileLayout;
+            // Master: acento fino (desktop). Categoria pinta a barra; selected
+            // nao precisa de vermelho extra.
+            const auto accent = empty   ? juce::Colour()
+                              : soloed  ? NordLookAndFeel::amberSolo()
+                              : master  ? NordLookAndFeel::nordRed()
+                              : accentColour;
+
+            NordLookAndFeel::drawGlassCard (g, card, radius, paintSelected,
+                                            accent, empty, master);
+
+            if (selected && focusedMobileLayout)
             {
-                juce::Path sp;
-                sp.addRoundedRectangle (card, radius);
-                juce::DropShadow (juce::Colours::black.withAlpha (
-                                      shortLandscapeMobileLayout ? 0.30f : 0.45f),
-                                  shortLandscapeMobileLayout ? 5 : 12,
-                                  { 0, shortLandscapeMobileLayout ? 1 : 4 }).drawForPath (g, sp);
+                g.setColour (juce::Colours::white.withAlpha (0.14f));
+                g.drawRoundedRectangle (card, radius, 1.4f);
             }
 
-            // corpo "vidro fosco": gradiente vertical iluminado no topo
-            // (selecionado mais claro; vazio levemente levantado = "disponivel")
-            juce::Colour top, bot;
-            // o MASTER e um barramento, nao mais um canal: chapa um tom acima
-            // pra ele se ler como "a saida" e nao como "o sexto canal"
-            // GRAFITE NEUTRO, QUASE PRETO. Tentei duas vezes puxar a cor pro azul
-            // do painel fisico da Nord e as duas perderam classe na tela: ardosia
-            // media ficou chapada, grafite azulado ficou sujo. A estrutura da Nord
-            // (LED, barra de seccao, escada de medidor) e o que importa -- a cor
-            // preta neutra e o que faz a tela parecer caro.
-            if      (master)   { top = juce::Colour (0xff2d3138); bot = juce::Colour (0xff1a1d23); }
-            else if (selected) { top = juce::Colour (0xff2b2f37); bot = juce::Colour (0xff20232a); }
-            else if (empty)    { top = juce::Colour (0xff1a1c21); bot = juce::Colour (0xff141519); }
-            else               { top = juce::Colour (0xff21242b); bot = juce::Colour (0xff17191e); }
-
-            g.setGradientFill (juce::ColourGradient (top, card.getX(), card.getY(),
-                                                     bot, card.getX(), card.getBottom(), false));
-            g.fillRoundedRectangle (card, radius);
-
-            g.setColour (juce::Colours::white.withAlpha (0.05f));   // brilho de 1px no topo
-            g.drawLine (card.getX() + 10.0f, card.getY() + 1.0f, card.getRight() - 10.0f, card.getY() + 1.0f, 1.0f);
-
-            if (selected)
-            {
-                // No touch o proprio card ja ocupa a maior parte da tela. Uma
-                // auréola externa de 3 px parecia selecao de editor; uma borda
-                // solida + chapa mais clara comunica "canal ativo" com mais
-                // firmeza e menos ruido.
-                if (! focusedMobileLayout)
-                {
-                    g.setColour (NordLookAndFeel::nordRedBright().withAlpha (0.25f));
-                    g.drawRoundedRectangle (card.expanded (2.5f), radius + 2.5f, 3.0f);
-                }
-
-                // No touch o card em foco e a tela inteira: moldura vermelha
-                // gritando competia com ON e AUTO EQ (revisao do dono, item
-                // 5). Cinza discreto; o vermelho fica para os ESTADOS, e a
-                // categoria continua na linha de topo colorida.
-                if (focusedMobileLayout)
-                {
-                    g.setColour (juce::Colours::white.withAlpha (0.16f));
-                    g.drawRoundedRectangle (card, radius, 1.4f);
-                }
-                else
-                {
-                    g.setColour (NordLookAndFeel::nordRedBright());
-                    g.drawRoundedRectangle (card, radius,
-                                            shortLandscapeMobileLayout ? 1.2f : 2.0f);
-                }
-            }
-            else
-            {
-                g.setColour (master ? NordLookAndFeel::nordRed().withAlpha (0.40f)
-                                    : NordLookAndFeel::panelOutline());
-                g.drawRoundedRectangle (card, radius,
-                                        shortLandscapeMobileLayout ? 0.9f
-                                                                   : master ? 1.4f : 1.0f);
-            }
-
-            // Barra de acento fina no topo. A chapa de titulo cheia que eu tinha
-            // posto aqui (imitando "ORGAN SECTION") pesava o card e brigava com o
-            // visor de programa; este risco deixa o card respirar.
-            {
-                // LINHA DE TOPO de 3px na cor da CATEGORIA -- e o codigo de cor que
-                // identifica o instrumento de longe. Solo troca para ambar (o spec
-                // proibe usar ambar no medidor, entao ele vive aqui).
-                auto accent = card.reduced (12.0f, 0.0f).removeFromTop (9.0f).withTrimmedTop (6.0f)
-                                  .withHeight (3.0f);
-
-                if (master)
-                    accent = accent.withHeight (4.0f);
-
-                g.setColour (empty      ? NordLookAndFeel::txtDisabled().withAlpha (0.30f)
-                            : soloed    ? NordLookAndFeel::amberSolo()
-                            : master    ? NordLookAndFeel::nordRedBright()
-                            : accentColour.isTransparent() ? NordLookAndFeel::nordRed()
-                                                           : accentColour);
-                g.fillRoundedRectangle (accent, 1.5f);
-            }
-
-            // Canal calado por SOLO de outro: escurecimento LEVE (spec pede
-            // "ligeiramente escurecidos"). O 40% de antes apagava o canal.
+            // Canal calado por SOLO de outro: escurecimento LEVE.
             if (dimmed)
             {
                 g.setColour (juce::Colours::black.withAlpha (0.22f));
                 g.fillRoundedRectangle (card, radius);
             }
 
-            // MUTE: card a ~70% de intensidade. Os controles continuam legiveis e
-            // clicaveis -- mutado nao e desabilitado.
+            // MUTE: card um pouco abafado + barra ambar.
             if (muted)
             {
-                g.setColour (NordLookAndFeel::bgApp().withAlpha (0.30f));
+                g.setColour (NordLookAndFeel::bgApp().withAlpha (0.28f));
                 g.fillRoundedRectangle (card, radius);
-            }
-
-            // MUTE: barra laranja na borda esquerda (le-se a distancia no palco)
-            if (muted)
-            {
-                g.setColour (juce::Colour (0xffe06a1e));
+                g.setColour (NordLookAndFeel::amberSolo().withAlpha (0.92f));
                 g.fillRoundedRectangle (card.getX() + 3.0f, card.getY() + 12.0f,
                                         4.0f, card.getHeight() - 24.0f, 2.0f);
             }
         };
 
-        // ha algum canal em SOLO? entao os demais estao calados
-        bool anySolo = false;
-        for (int q = 0; q < TimbresProcessor::numLayers; ++q)
-            if (proc.getLayerSolo (q)) { anySolo = true; break; }
+        // A UI usa a mesma invariante RT-safe do motor: SOLO em slot vazio nao
+        // escurece nem cala os instrumentos carregados.
+        const bool anySolo = proc.hasAnyLoadedSolo();
 
         if (focusedMobileLayout)
         {
@@ -11124,35 +13069,69 @@ public:
                             juce::Justification::centred, false);
             }
 
-            // canal vazio: UM convite so (circulo tracejado + botao logo abaixo,
-            // como grupo, centrado). Antes o circulo ficava a 32% da altura e o
-            // botao a ~55%: dois CTAs concorrentes com um buraco entre eles.
+            // Canal vazio: anel tracejado com "+" SEMPRE acima do botao
+            // "Adicionar instrumento". Nunca desenhar o + em cima da letra —
+            // a posicao do anel deriva dos bounds reais do botao.
             if (empty && ! strips[l].cardBounds.isEmpty())
             {
-                const auto c = emptyRingCentre (strips[l].cardBounds);
-                const float cx = (float) c.x, cy = (float) c.y, rr = (float) kEmptyRing;
+                const auto btn = strips[l].addButton.getBounds();
+                const float rr = (float) kEmptyRing;
+                float cx = 0.0f, cy = 0.0f;
+                bool drawRing = false;
 
-                juce::Path circ;
-                circ.addEllipse (cx - rr, cy - rr, rr * 2.0f, rr * 2.0f);
-                juce::Path dashed;
-                const float dashes[] = { 4.0f, 4.0f };
-                juce::PathStrokeType (1.5f).createDashedStroke (dashed, circ, dashes, 2);
-                g.setColour (NordLookAndFeel::dimText().withAlpha (0.35f));
-                g.fillPath (dashed);
+                if (strips[l].stageEmptyRingCentre != juce::Point<int>())
+                {
+                    cx = (float) strips[l].stageEmptyRingCentre.x;
+                    cy = (float) strips[l].stageEmptyRingCentre.y;
+                    drawRing = true;
+                }
+                else if (! btn.isEmpty())
+                {
+                    cx = (float) btn.getCentreX();
+                    cy = (float) (btn.getY() - kEmptyGapY - kEmptyRing);
+                    // So pinta se o anel couber dentro do card (abaixo do titulo).
+                    const float minY = (float) strips[l].cardBounds.getY() + 28.0f + rr;
+                    if (cy >= minY)
+                        drawRing = true;
+                }
+                else
+                {
+                    const auto c = emptyRingCentre (strips[l].cardBounds);
+                    cx = (float) c.x;
+                    cy = (float) c.y;
+                    drawRing = true;
+                }
 
-                g.setColour (NordLookAndFeel::nordRed().withAlpha (0.6f));
-                g.drawLine (cx - 11.0f, cy, cx + 11.0f, cy, 2.6f);
-                g.drawLine (cx, cy - 11.0f, cx, cy + 11.0f, 2.6f);
+                if (drawRing)
+                {
+                    // Desktop Win/Mac: anel tracejado discreto + + fino.
+                    // Sem glow vermelho (modo palco Android ficava extravagante).
+                    juce::Path circ;
+                    circ.addEllipse (cx - rr, cy - rr, rr * 2.0f, rr * 2.0f);
+                    juce::Path dashed;
+                    const float dashes[] = { 4.5f, 3.5f };
+                    juce::PathStrokeType (1.5f).createDashedStroke (dashed, circ, dashes, 2);
+                    g.setColour (NordLookAndFeel::dimText().withAlpha (0.38f));
+                    g.fillPath (dashed);
+
+                    const float arm = juce::jmin (11.0f, rr * 0.42f);
+                    g.setColour (NordLookAndFeel::nordRed().withAlpha (0.55f));
+                    g.drawLine (cx - arm, cy, cx + arm, cy, 2.2f);
+                    g.drawLine (cx, cy - arm, cx, cy + arm, 2.2f);
+                }
             }
         }
 
         drawCard (masterCardBounds, false, false, false, false, true);
         drawCard (bottomPanelBounds, false, false);
 
-        // No master mobile, cada familia ganha uma chapa e um titulo curtos.
-        // Isso elimina a antiga pilha indiferenciada de combos/fader/botoes sem
-        // consumir componentes nem alterar o layout de desktop.
-        if (focusedMobileLayout)
+        // Cada familia do master ganha uma chapa e um titulo curtos. No desktop
+        // isso transforma a coluna estreita numa sequencia de modulos legiveis;
+        // no touch conserva a mesma hierarquia em dimensoes maiores.
+        if (! masterFxGroupBounds.isEmpty()
+             || ! masterLevelGroupBounds.isEmpty()
+             || ! masterLiveGroupBounds.isEmpty()
+             || ! masterUtilityGroupBounds.isEmpty())
         {
             auto drawMasterGroup = [&g] (juce::Rectangle<int> bounds,
                                          const juce::String& tag,
@@ -11195,6 +13174,8 @@ public:
                              juce::Colour (0xff55a9c5));
             drawMasterGroup (masterLiveGroupBounds, "LIVE CONTROL",
                              juce::Colour (0xffd9a23a));
+            drawMasterGroup (masterUtilityGroupBounds, "UTILIDADES",
+                             NordLookAndFeel::dimText());
         }
 
         // divisoria do master: fecha o bloco MASTER FX e abre o bloco de saida.
@@ -11322,13 +13303,67 @@ public:
                                               shortLandscapeMobileLayout ? 4 : 6);
         // +15% de legibilidade no aparelho real (pedido do dono, 30/07):
         // 14->16 e 10->11,5 na paisagem curta, com a linha acompanhando.
+       #if JUCE_ANDROID
+        // O seletor de modo e uma acao de palco, nao um link miudo. Reserva um
+        // alvo touch de 44/48 dp e deixa o restante do editor refluindo abaixo.
+        auto top = area.removeFromTop (shortLandscapeMobileLayout ? 44 : 48);
+       #else
         auto top = area.removeFromTop (shortLandscapeMobileLayout ? 21 : 22);
+       #endif
         title.setFont (juce::Font (juce::FontOptions (16.0f)).boldened());
         status.setFont (juce::Font (juce::FontOptions (
                              shortLandscapeMobileLayout ? 11.5f : 12.0f)));
-        title.setBounds (top.removeFromLeft (shortLandscapeMobileLayout ? 150 : 160));
+       #if JUCE_ANDROID
+        // Remove primeiro os alvos touch e entrega ao titulo apenas o que
+        // realmente sobrou. Na largura de 320/360 dp, reservar o titulo antes
+        // das setas fazia a segunda seta nascer com largura negativa.
+        const int modeButtonW = juce::jlimit (98, 124,
+                                               top.getWidth() / 3);
+        editToneButton.setVisible (true);
+        editToneButton.setToggleState (mobileStageMode,
+                                       juce::dontSendNotification);
+        editToneButton.setButtonText (mobileStageMode
+                                        ? "Editar canal"
+                                        : "Modo palco");
+        editToneButton.setTooltip (mobileStageMode
+            ? "Voltar ao canal em foco para editar todos os controles"
+            : "Ver faders, meters, Mute, Solo e Master em tempo real");
+        // Modo palco: botao de modo um pouco mais estreito — mais ar pro status.
+        const int modeW = mobileStageMode
+                            ? juce::jlimit (92, 112, modeButtonW - 8)
+                            : juce::jmin (modeButtonW, top.getWidth());
+        editToneButton.setBounds (top.removeFromRight (modeW));
+        top.removeFromRight (juce::jmin (4, top.getWidth()));
+
+        if (mobileStageMode)
+        {
+            // Setas de pagina: alvos 40 dp (ainda tocaveis, menos chrome).
+            const int arrowW = juce::jmin (40, top.getHeight());
+            canalProximoBtn.setVisible (true);
+            canalProximoBtn.setBounds (top.removeFromRight (arrowW));
+            top.removeFromRight (juce::jmin (2, top.getWidth()));
+            canalAnteriorBtn.setVisible (true);
+            canalAnteriorBtn.setBounds (top.removeFromRight (arrowW));
+            top.removeFromRight (juce::jmin (3, top.getWidth()));
+            // No palco o status "Pronto" fica compacto a direita do titulo.
+            status.setFont (juce::Font (juce::FontOptions (11.0f)));
+        }
+        else
+        {
+            canalAnteriorBtn.setVisible (false);
+            canalProximoBtn.setVisible (false);
+            canalAnteriorBtn.setBounds ({});
+            canalProximoBtn.setBounds ({});
+        }
+
+        const int titleW = juce::jmin (mobileStageMode ? 130 : 160, top.getWidth());
+        title.setBounds (top.removeFromLeft (titleW));
+       #else
+        title.setBounds (top.removeFromLeft (
+            shortLandscapeMobileLayout ? 150 : 160));
         editToneButton.setVisible (false);
         editToneButton.setBounds ({});
+       #endif
         status.setBounds (top);
         area.removeFromTop (shortLandscapeMobileLayout ? 2 : 4);
        #else
@@ -11351,13 +13386,17 @@ public:
         masterFxGroupBounds = {};
         masterLevelGroupBounds = {};
         masterLiveGroupBounds = {};
+        masterUtilityGroupBounds = {};
 
        #if JUCE_ANDROID || JUCE_IOS
-        // Celular e tablet usam a mesma hierarquia: cinco abas persistentes,
-        // um canal grande para editar e o master ao lado. A area extra do tablet
-        // vira controles maiores; ela nao volta a espremer seis reguas lado a
-        // lado. No desktop a mesa tradicional de seis colunas permanece.
+        // O touch abre no editor focado (14 abas + Master). No Android, o
+        // Modo Palco explicito usa duas, quatro ou seis reguas por pagina,
+        // meters simultaneos e Master sempre ao lado.
+       #if JUCE_ANDROID
+        focusedMobileLayout = ! mobileStageMode;
+       #else
         focusedMobileLayout = true;
+       #endif
        #else
         // O mesmo editor focado do touch vira o painel de edicao detalhada do
         // desktop. Assim Windows, macOS e Android compartilham a hierarquia e
@@ -11378,8 +13417,20 @@ public:
         if (! focusedMobileLayout)
             mobileMasterPageButton.setBounds ({});
 
+       #if JUCE_ANDROID
+        if (mobileStageMode)
+        {
+            layoutAndroidStageMode (area);
+            return;
+        }
+       #endif
+
         if (focusedMobileLayout)
         {
+            canalAnteriorBtn.setVisible (false);
+            canalProximoBtn.setVisible (false);
+            canalAnteriorBtn.setBounds ({});
+            canalProximoBtn.setBounds ({});
             layoutFocusedMobile (area);
             return;
         }
@@ -11405,11 +13456,19 @@ public:
         for (auto& s : strips)
             s.tabBounds = {};
 
-        // A largura do card e sempre a de canaisNaTela + master, mesmo com
-        // 14 canais existindo: card estreito demais e pior que rolar.
+        // O master precisa de largura propria: ele concentra quatro familias de
+        // controle e um meter estereo. Cerca de 16% entrega 10--15% a mais de
+        // respiro que a versao anterior sem quebrar a grade dos oito canais.
         faixaDeCanais = area;
-        const int stripW = area.getWidth() / (canaisNaTela + 1);
-        const bool phoneLayout = getHeight() < 380;
+        const int desktopMasterW = juce::jlimit (158, 208,
+                                                  juce::roundToInt (area.getWidth() * 0.16f));
+        // Em 960 px, seis canais mantem os textos e alvos com largura util;
+        // as setas continuam dando acesso imediato aos demais. Em 1280+, a
+        // visao tradicional de oito canais permanece intacta.
+        canaisNaTela = getWidth() < 1100 ? 6 : 8;
+        const int stripW = juce::jmax (1, (area.getWidth() - desktopMasterW)
+                                           / canaisNaTela);
+        const bool phoneLayout = getHeight() < 440;
 
         limitarPrimeiroCanalVisivel();
         posicionarSetasDeCanal (area, stripW);
@@ -11561,29 +13620,38 @@ public:
 
             s.compLabel.setText ("COMP", juce::dontSendNotification);
             s.dlyLabel.setText  ("REVERB", juce::dontSendNotification);
-            s.attackLabel.setText ("ATK", juce::dontSendNotification);
-            s.releaseLabel.setText ("REL", juce::dontSendNotification);
+            s.attackLabel.setText ("ATTACK", juce::dontSendNotification);
+            s.releaseLabel.setText ("RELEASE", juce::dontSendNotification);
             s.lowLabel.setText  ("LOW", juce::dontSendNotification);
             s.midLabel.setText  ("MID", juce::dontSendNotification);
             s.highLabel.setText ("HIGH", juce::dontSendNotification);
             s.loop.setButtonText ("Loop");
-            s.autoEqBtn.setButtonText ("Auto EQ");
+            s.autoEqBtn.setButtonText ("AUTO");
 
-            inner.removeFromTop (6);
-
-            auto headRow = inner.removeFromTop (16);
-            s.onBtn.setBounds (headRow.removeFromRight (38).withSizeKeepingCentre (36, 16));
-            s.name.setBounds (headRow);
             inner.removeFromTop (4);
 
-            // [icone] Categoria (titulo forte) - icone maior e recortado justo
-            auto nameRow = inner.removeFromTop (36);
-            s.glyph.setBounds (nameRow.removeFromLeft (44).withSizeKeepingCentre (36, 36));
-            nameRow.removeFromLeft (8);
-            s.timbreName.setBounds (nameRow);
+            // Grade fixa de cabecalho: CANAL ocupa sua propria linha; abaixo,
+            // icone, categoria e ON usam colunas previsiveis em todos os cards.
+            s.name.setBounds (inner.removeFromTop (18));
             inner.removeFromTop (4);
-            s.combo.setBounds (inner.removeFromTop (24));
-            inner.removeFromTop (8);
+
+            auto identityRow = inner.removeFromTop (32);
+            s.glyph.setBounds (identityRow.removeFromLeft (29)
+                                  .withSizeKeepingCentre (26, 26));
+            identityRow.removeFromLeft (3);
+            s.onBtn.setBounds (identityRow.removeFromRight (33)
+                                  .withSizeKeepingCentre (31, 18));
+            identityRow.removeFromRight (3);
+            s.timbreName.setBounds (identityRow);
+            inner.removeFromTop (7);
+
+            // O seletor e uma regua comum: mesma altura, raio, padding e linha
+            // de base, independentemente do comprimento do preset.
+            s.combo.setBounds (inner.removeFromTop (28));
+            inner.removeFromTop (4);
+            // Teclado MIDI deste canal (desktop: 2 teclados → piano / pad).
+            s.midiInBox.setBounds (inner.removeFromTop (24));
+            inner.removeFromTop (7);
 
             // TODOS OS CANAIS ABERTOS: cada regua mostra a cadeia completa (knobs,
             // transpose, loop, Auto EQ). Antes so o canal selecionado abria e os
@@ -11603,11 +13671,14 @@ public:
             inner.removeFromTop (10);
             auto bottom = inner.removeFromTop (detailH);
 
-            auto dbRow = faderArea.removeFromBottom (18);
-            s.meter->setBounds (faderArea.removeFromRight (NordLookAndFeel::meterChanW));
+            auto dbRow = faderArea.removeFromBottom (20);
+            const auto meterArea = faderArea.removeFromRight (NordLookAndFeel::meterChanW);
+            s.meter->setBounds (meterArea);
             faderArea.removeFromRight (4);
             s.vol.setBounds (faderArea);
-            s.volDb.setBounds (dbRow.withTrimmedRight (26));
+            // Centralizado sob o conjunto fader+meter, nao sob uma largura
+            // variavel de trilho. Todos os valores ocupam a mesma caixa.
+            s.volDb.setBounds (dbRow);
 
             auto takeRow = [&bottom] (int h)
             {
@@ -11633,59 +13704,83 @@ public:
 
             takeRow (4);
 
-            // 4 knobs numa fileira so (COMP / DELAY / LOW / HIGH): mais denso,
-            // libera altura vertical e evita o corte dos controles a 720p
+            // Dois por linha: em cards de ~120 px, quatro knobs lado a lado
+            // obrigavam COMP/REVERB/ATTACK/RELEASE a parecer "CO.../RE...".
+            // A grade 2x2 usa a altura que ja sobrava no detailH e mantem todas
+            // as linhas de base identicas, inclusive em plugin/orgao.
             {
-                // 52 -> 60: os ~56px devolvidos pelo transpose viraram knob maior
-                // (o corpo estava travado em 40px e o marcador sumia de longe)
-                auto knobRow = takeRow (60);
+                auto knobGrid = takeRow (102);
 
-                s.fxGroup = knobRow;   // o paint desenha a cinta em volta desta area
+                s.fxGroup = knobGrid;   // o paint desenha a cinta em volta desta area
 
-                if (knobRow.isEmpty())
+                if (knobGrid.isEmpty())
                 {
                     for (auto* k : { &s.compKnob, &s.dlyKnob, &s.attackKnob,
+                                     &s.echoKnob, &s.rotaryKnob,
                                      &s.releaseKnob, &s.lowKnob, &s.midKnob,
                                      &s.highKnob })
                         k->setBounds ({});
                     for (auto* lb : { &s.compLabel, &s.dlyLabel, &s.attackLabel,
+                                      &s.echoLabel, &s.rotaryLabel,
                                       &s.releaseLabel, &s.lowLabel, &s.midLabel,
                                       &s.highLabel })
                         lb->setBounds ({});
+                    s.rotaryModeBox.setBounds ({});
                 }
                 else
                 {
-                    auto place1 = [] (juce::Rectangle<int> cell, juce::Slider& k, juce::Label& lb)
+                    auto placeGridKnob = [] (juce::Rectangle<int> cell,
+                                             juce::Slider& knob,
+                                             juce::Label& label)
                     {
-                        // rotulo com altura FIXA de 13 e o knob centrado no que
-                        // sobra: antes 11px + centragem no resto davam linhas de
-                        // base ligeiramente diferentes entre os quatro knobs
-                        lb.setBounds (cell.removeFromBottom (13));
+                        label.setBounds (cell.removeFromBottom (13));
                         cell.removeFromBottom (2);
-                        const int d = juce::jmin (46, juce::jmin (cell.getWidth(), cell.getHeight()));
-                        k.setBounds (cell.withSizeKeepingCentre (d, d));
+                        const int d = juce::jmin (38,
+                            juce::jmin (cell.getWidth() - 4, cell.getHeight()));
+                        knob.setBounds (cell.withSizeKeepingCentre (
+                            juce::jmax (1, d), juce::jmax (1, d)));
                     };
+
+                    const int rowGap = 4;
+                    auto topKnobs = knobGrid.removeFromTop (
+                        (knobGrid.getHeight() - rowGap) / 2);
+                    knobGrid.removeFromTop (rowGap);
+                    auto bottomKnobs = knobGrid;
+                    const int topCellW = topKnobs.getWidth() / 2;
+                    const int bottomCellW = bottomKnobs.getWidth() / 2;
 
                     if (s.eqPage)
                     {
-                        const int cw = knobRow.getWidth() / 3;
-                        place1 (knobRow.removeFromLeft (cw), s.lowKnob,  s.lowLabel);
-                        place1 (knobRow.removeFromLeft (cw), s.midKnob,  s.midLabel);
-                        place1 (knobRow,                     s.highKnob, s.highLabel);
+                        placeGridKnob (topKnobs.removeFromLeft (topCellW),
+                                       s.lowKnob, s.lowLabel);
+                        placeGridKnob (topKnobs, s.midKnob, s.midLabel);
+                        placeGridKnob (bottomKnobs.withSizeKeepingCentre (
+                                           bottomCellW, bottomKnobs.getHeight()),
+                                       s.highKnob, s.highLabel);
                     }
                     else
                     {
-                        const int numControls = isPlugin ? 2 : 4;
-                        const int cw = knobRow.getWidth() / numControls;
-                        place1 (knobRow.removeFromLeft (cw), s.compKnob, s.compLabel);
-                        place1 (isPlugin ? knobRow
-                                         : knobRow.removeFromLeft (cw),
-                                s.dlyKnob, s.dlyLabel);
+                        placeGridKnob (topKnobs.removeFromLeft (topCellW),
+                                       s.compKnob, s.compLabel);
+                        placeGridKnob (topKnobs, s.dlyKnob, s.dlyLabel);
 
-                        if (! isPlugin)
+                        if (proc.isLayerOrgan (l))
                         {
-                            place1 (knobRow.removeFromLeft (cw), s.attackKnob,  s.attackLabel);
-                            place1 (knobRow,                     s.releaseKnob, s.releaseLabel);
+                            placeGridKnob (bottomKnobs.removeFromLeft (bottomCellW),
+                                           s.rotaryKnob, s.rotaryLabel);
+                            s.rotaryModeBox.setBounds (bottomKnobs.reduced (3, 12));
+                        }
+                        else if (isPlugin)
+                        {
+                            placeGridKnob (bottomKnobs.removeFromLeft (bottomCellW),
+                                           s.echoKnob, s.echoLabel);
+                        }
+                        else
+                        {
+                            placeGridKnob (bottomKnobs.removeFromLeft (bottomCellW),
+                                           s.attackKnob, s.attackLabel);
+                            placeGridKnob (bottomKnobs,
+                                           s.releaseKnob, s.releaseLabel);
                         }
                     }
                 }
@@ -11696,10 +13791,8 @@ public:
             // entre os blocos, agora que todos os canais abrem completos.
             s.transp.setBounds ({});
             s.transpLabel.setBounds ({});
-            takeRow (10);
-
-            takeRow (2);
-            auto loopArea = takeRow (20);
+            takeRow (5);
+            auto loopArea = takeRow (22);
 
             if (loopArea.isEmpty())
             {
@@ -11711,10 +13804,13 @@ public:
             else
             {
                 auto actions = loopArea.withSizeKeepingCentre (
-                    juce::jmin (174, loopArea.getWidth()), 20);
-                const int actionW = actions.getWidth() / 3;
+                    loopArea.getWidth(), 22);
+                constexpr int actionGap = 4;
+                const int actionW = (actions.getWidth() - actionGap * 2) / 3;
                 auto left = actions.removeFromLeft (actionW);
+                actions.removeFromLeft (actionGap);
                 auto centre = actions.removeFromLeft (actionW);
+                actions.removeFromLeft (actionGap);
 
                 s.loop.setBounds (left);
                 s.pluginOpenBtn.setBounds (left);   // mesmo lugar do Loop
@@ -11802,117 +13898,421 @@ public:
             return;
         }
 
-        masterDbSlider.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 74, 22);
+        masterDbSlider.setSliderStyle (juce::Slider::LinearHorizontal);
+        masterDbSlider.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 82, 22);
         sustainToggle.setButtonText ("Sustain");
-        invPedalToggle.setButtonText ("Inv. pedal");
-        masterAutoEqBtn.setButtonText ("Auto EQ Master");
-        masterPunchBtn.setButtonText ("Punch / Peso");
-        gTranspLabel.setText ("TRANSPOSE GLOBAL", juce::dontSendNotification);
+        invPedalToggle.setButtonText ("Inverter pedal");
+        refreshMasterUtilityLabels();
+        gTranspSlider.setSliderStyle (juce::Slider::LinearHorizontal);
+        gTranspSlider.setTextBoxStyle (juce::Slider::TextBoxRight, false, 46, 20);
+        gTranspLabel.setText ("TRANSPOSE", juce::dontSendNotification);
 
-        inner.removeFromTop (6);
-        masterName.setBounds (inner.removeFromTop (20));
         inner.removeFromTop (4);
+        masterName.setBounds (inner.removeFromTop (22));
+        inner.removeFromTop (6);
+        fxTitle.setBounds ({});   // o titulo agora pertence a chapa do modulo
+        fxDivider = {};
 
-        // MASTER FX embutido na regua: escolhe o efeito (BigSky...) aqui mesmo
-        fxTitle.setBounds (inner.removeFromTop (14));
-        inner.removeFromTop (3);
+        // Cinco zonas: header acima e quatro modulos com orcamento proprio.
+        // A distribuicao proporcional absorve janelas maiores sem voltar a
+        // esmagar o OUTPUT quando a altura cai para o desktop 720p.
+        constexpr int masterGroupGap = 6;
+        const int groupsHeight = juce::jmax (
+            4, inner.getHeight() - masterGroupGap * 3);
+        const bool compactMasterVertical = groupsHeight < 350;
+        const bool veryCompactMasterVertical = groupsHeight < 300;
+        const int fxHeight = groupsHeight * 32 / 100;
+        const int outputHeight = groupsHeight * 26 / 100;
+        const int liveHeight = groupsHeight
+            * (compactMasterVertical ? 18 : 16) / 100;
 
-        // Os dois slots de FX liam como uma lista continua (3px entre eles, mesmo
-        // espacamento das linhas de dentro). 7px separa os slots como DOIS blocos,
-        // e os "Abrir" ficam alinhados numa coluna de largura fixa.
+        masterFxGroupBounds = inner.removeFromTop (fxHeight);
+        inner.removeFromTop (masterGroupGap);
+        masterLevelGroupBounds = inner.removeFromTop (outputHeight);
+        inner.removeFromTop (masterGroupGap);
+        masterLiveGroupBounds = inner.removeFromTop (liveHeight);
+        inner.removeFromTop (masterGroupGap);
+        masterUtilityGroupBounds = inner;
+
+        // ---- MASTER FX -----------------------------------------------------
+        const int groupVPad = veryCompactMasterVertical ? 3
+                            : compactMasterVertical ? 4 : 6;
+        const int groupLabelSpace = veryCompactMasterVertical ? 7
+                                  : compactMasterVertical ? 8 : 10;
+        auto fxContent = masterFxGroupBounds.reduced (8, groupVPad);
+        fxContent.removeFromTop (groupLabelSpace);
+        const int fxRowH = veryCompactMasterVertical ? 17
+                         : compactMasterVertical ? 19 : 22;
+        const int fxGap = veryCompactMasterVertical ? 1
+                        : compactMasterVertical ? 2 : 4;
+
         for (int i = 0; i < TimbresProcessor::numInserts; ++i)
         {
-            auto row = inner.removeFromTop (26);
-            insertOpenButtons[i].setBounds (row.removeFromRight (52));
-            row.removeFromRight (5);
+            auto row = fxContent.removeFromTop (fxRowH);
+
+            if (insertOpenButtons[i].isVisible())
+            {
+                insertOpenButtons[i].setBounds (row.removeFromRight (56));
+                row.removeFromRight (5);
+            }
+            else
+            {
+                insertOpenButtons[i].setBounds ({});
+            }
+
             insertCombos[i].setBounds (row);
 
             if (i < TimbresProcessor::numInserts - 1)
-                inner.removeFromTop (7);
+                fxContent.removeFromTop (fxGap);
         }
 
-        // Church Reverb existe em toda plataforma. Se houver BigSky no desktop,
-        // este mesmo seletor passa a controlar o plugin externo.
-        inner.removeFromTop (6);
+        fxContent.removeFromTop (veryCompactMasterVertical ? 2
+                                 : compactMasterVertical ? 3 : 4);
         reverbTypeCombo.setVisible (true);
-        reverbTypeCombo.setBounds (inner.removeFromTop (24));
-        inner.removeFromTop (4);
-        auto returnRow = inner.removeFromTop (24);
+        reverbTypeCombo.setBounds (fxContent.removeFromTop (fxRowH));
+        fxContent.removeFromTop (fxGap);
+        auto returnRow = fxContent.removeFromTop (
+            juce::jmin (veryCompactMasterVertical ? 15
+                        : compactMasterVertical ? 17 : 20,
+                        fxContent.getHeight()));
         reverbReturnLabel.setVisible (true);
-        reverbReturnLabel.setBounds (returnRow.removeFromLeft (52));
+        reverbReturnLabel.setBounds (returnRow.removeFromLeft (48));
         reverbReturnSlider.setVisible (true);
         reverbReturnSlider.setBounds (returnRow);
 
-        // divisoria: fecha o bloco MASTER FX e abre o bloco de saida
-        inner.removeFromTop (7);
-        fxDivider = inner.removeFromTop (1);
-        inner.removeFromTop (7);
-
-        // -96 reservava fader demais e era o que empurrava o "Punch / Peso" pra
-        // fora sempre que qualquer bloco acima crescia 10px. Com -78 o fader ainda
-        // fica confortavel e a coluna de controles tem folga estavel.
-        const int mBottomH = juce::jlimit (24, 210, inner.getHeight() - 58);
-        auto bottom = inner.removeFromBottom (mBottomH);
-        auto faderArea = inner;
+        // ---- OUTPUT / LEVEL ----------------------------------------------
+        auto levelContent = masterLevelGroupBounds.reduced (8, groupVPad);
+        levelContent.removeFromTop (groupLabelSpace);
 
         if (masterMeter != nullptr)
         {
-            masterMeter->setBounds (faderArea.removeFromRight (30));
-            faderArea.removeFromRight (6);
+            masterMeter->setBounds (levelContent.removeFromRight (
+                juce::jmin (58, juce::jmax (48, levelContent.getWidth() / 3))));
+            levelContent.removeFromRight (8);
         }
 
-        masterDbSlider.setBounds (faderArea);
+        masterDbSlider.setBounds (levelContent);
 
-        auto takeRow = [&bottom] (int h)
-        {
-            return bottom.getHeight() >= h ? bottom.removeFromTop (h)
-                                           : juce::Rectangle<int>();
-        };
+        // ---- LIVE CONTROL -------------------------------------------------
+        auto liveContent = masterLiveGroupBounds.reduced (8, groupVPad);
+        liveContent.removeFromTop (groupLabelSpace);
+        panicButton.setBounds (liveContent.removeFromTop (
+            juce::jmin (veryCompactMasterVertical ? 18
+                        : compactMasterVertical ? 20 : 26,
+                        liveContent.getHeight())));
+        liveContent.removeFromTop (compactMasterVertical ? 2 : 4);
 
-        auto panicArea = takeRow (32);
-        panicButton.setBounds (panicArea.isEmpty() ? juce::Rectangle<int>()
-                                                   : panicArea.withSizeKeepingCentre (juce::jmin (132, panicArea.getWidth()), 30));
-        takeRow (6);
-        auto transpArea = takeRow (42);   // era 56: o knob nao precisava de tanta caixa
+        auto transposeRow = liveContent;
+        gTranspLabel.setBounds (transposeRow.removeFromLeft (
+            juce::jmin (62, transposeRow.getWidth() / 2)));
+        transposeRow.removeFromLeft (4);
+        gTranspSlider.setBounds (transposeRow);
 
-        if (transpArea.isEmpty())
-        {
-            gTranspSlider.setBounds ({});
-            gTranspLabel.setBounds ({});
-        }
-        else
-        {
-            gTranspLabel.setBounds (transpArea.removeFromBottom (12));
-            gTranspSlider.setBounds (transpArea);
-        }
+        // ---- UTILIDADES ---------------------------------------------------
+        auto utilityContent = masterUtilityGroupBounds.reduced (8, groupVPad);
+        utilityContent.removeFromTop (groupLabelSpace);
+        const int switchW = utilityContent.getWidth();
+        const int switchH = veryCompactMasterVertical ? 15
+                          : compactMasterVertical ? 18 : 20;
+        const int firstSwitchGap = veryCompactMasterVertical ? 2
+                                 : compactMasterVertical ? 3 : 4;
+        const int secondSwitchGap = veryCompactMasterVertical ? 2
+                                  : compactMasterVertical ? 4 : 5;
 
-        // interruptores (nao mais checkbox): precisam do trilho + folga do texto.
-        // MESMA largura nos dois, senao os trilhos nao alinham na vertical.
-        // Frestas de 3px entre os quatro ultimos controles custavam 12px e faziam
-        // o "Punch / Peso" cair fora sempre que o painel de programa crescia.
-        // 2px separa igual e devolve a linha.
-        takeRow (2);
-        const int swW = juce::jmin (112, bottom.getWidth());
-        auto susArea = takeRow (20);
-        sustainToggle.setBounds (susArea.isEmpty() ? juce::Rectangle<int>()
-                                                   : susArea.withSizeKeepingCentre (swW, 20));
-        takeRow (2);
-        auto invArea = takeRow (20);
-        invPedalToggle.setBounds (invArea.isEmpty() ? juce::Rectangle<int>()
-                                                    : invArea.withSizeKeepingCentre (swW, 20));
-        takeRow (2);
-        auto aeqArea = takeRow (22);
-        masterAutoEqBtn.setBounds (aeqArea.isEmpty() ? juce::Rectangle<int>()
-                                                     : aeqArea.withSizeKeepingCentre (juce::jmin (120, aeqArea.getWidth()), 22));
-        takeRow (2);
-        auto punchArea = takeRow (22);
-        masterPunchBtn.setBounds (punchArea.isEmpty() ? juce::Rectangle<int>()
-                                                      : punchArea.withSizeKeepingCentre (juce::jmin (120, punchArea.getWidth()), 22));
+        auto sustainArea = utilityContent.removeFromTop (
+            juce::jmin (switchH, utilityContent.getHeight()));
+        sustainToggle.setBounds (sustainArea.withSizeKeepingCentre (
+            switchW, sustainArea.getHeight()));
+        utilityContent.removeFromTop (firstSwitchGap);
+
+        auto invertArea = utilityContent.removeFromTop (
+            juce::jmin (switchH, utilityContent.getHeight()));
+        invPedalToggle.setBounds (invertArea.withSizeKeepingCentre (
+            switchW, invertArea.getHeight()));
+        utilityContent.removeFromTop (secondSwitchGap);
+
+        auto finalRow = utilityContent.removeFromTop (
+            juce::jmin (26, utilityContent.getHeight()));
+        const int finalGap = 6;
+        const int finalW = juce::jmax (1, (finalRow.getWidth() - finalGap) / 2);
+        masterAutoEqBtn.setBounds (finalRow.removeFromLeft (finalW));
+        finalRow.removeFromLeft (finalGap);
+        masterPunchBtn.setBounds (finalRow);
     }
 
 private:
+   #if JUCE_ANDROID
+    void layoutAndroidStageMode (juce::Rectangle<int> area)
+    {
+        focusedMobileLayout = false;
+        mobileMasterPage = false;
+        mobileMasterTabBounds = {};
+        bottomPanelBounds = {};
+        masterFxGroupBounds = {};
+        masterLevelGroupBounds = {};
+        masterLiveGroupBounds = {};
+        masterUtilityGroupBounds = {};
+        fxDivider = {};
+
+        // O palco mostra apenas os controles de performance. Os componentes e
+        // attachments continuam vivos: zerar a geometria nao altera um unico
+        // parametro nem interrompe os meters.
+        for (auto& s : strips)
+            esconderStrip (s);
+
+        fxTitle.setBounds ({});
+        gTranspSlider.setBounds ({});
+        gTranspLabel.setBounds ({});
+        sustainToggle.setBounds ({});
+        invPedalToggle.setBounds ({});
+        reverbTypeCombo.setBounds ({});
+        reverbTypeCombo.setVisible (false);
+        reverbReturnSlider.setBounds ({});
+        reverbReturnSlider.setVisible (false);
+        reverbReturnLabel.setBounds ({});
+        reverbReturnLabel.setVisible (false);
+
+        for (int i = 0; i < TimbresProcessor::numInserts; ++i)
+        {
+            insertCombos[i].setBounds ({});
+            insertOpenButtons[i].setBounds ({});
+        }
+
+        canaisNaTela = juce::jmin (
+            TimbresProcessor::numLayers,
+            ChurchDAWAndroidStageLayout::stageChannelCountForWidth (
+                area.getWidth()));
+
+        if (androidStageLastChannelsOnScreen != canaisNaTela)
+        {
+            androidStageLastChannelsOnScreen = canaisNaTela;
+            androidStageRevealSelected = true;
+        }
+
+        if (androidStageRevealSelected)
+        {
+            int focus = selectedStrip;
+
+            if (! juce::isPositiveAndBelow (focus,
+                                             TimbresProcessor::numLayers))
+                focus = proc.getSelectedLayer();
+
+            if (juce::isPositiveAndBelow (focus,
+                                          TimbresProcessor::numLayers))
+                primeiroCanalVisivel =
+                    ChurchDAWAndroidStageLayout::pageContaining (
+                        focus, canaisNaTela,
+                        TimbresProcessor::numLayers);
+
+            androidStageRevealSelected = false;
+        }
+
+        limitarPrimeiroCanalVisivel();
+
+        constexpr int stageGap = 4;
+        const auto stageColumns =
+            ChurchDAWAndroidStageLayout::calculateStageColumns (
+                area.getWidth(), canaisNaTela);
+        const int masterW = stageColumns.masterWidth;
+
+        auto channelArea = area;
+        auto masterArea = channelArea.removeFromRight (
+            juce::jmin (masterW, channelArea.getWidth()));
+        channelArea.removeFromRight (
+            juce::jmin (stageGap, channelArea.getWidth()));
+        faixaDeCanais = channelArea;
+
+        const int maxStart = juce::jmax (
+            0, TimbresProcessor::numLayers - canaisNaTela);
+        const bool canPage = TimbresProcessor::numLayers > canaisNaTela;
+        canalAnteriorBtn.setVisible (canPage);
+        canalProximoBtn.setVisible (canPage);
+        canalAnteriorBtn.setEnabled (primeiroCanalVisivel > 0);
+        canalProximoBtn.setEnabled (primeiroCanalVisivel < maxStart);
+        canalAnteriorBtn.setTooltip ("Pagina anterior de canais");
+        canalProximoBtn.setTooltip ("Proxima pagina de canais");
+        canalAnteriorBtn.toFront (false);
+        canalProximoBtn.toFront (false);
+
+        auto remainingChannels = channelArea;
+        int remainingColumns = canaisNaTela;
+
+        for (int column = 0; column < canaisNaTela; ++column)
+        {
+            const int layer = primeiroCanalVisivel + column;
+            auto cell = column == canaisNaTela - 1
+                          ? remainingChannels
+                          : remainingChannels.removeFromLeft (
+                                remainingChannels.getWidth()
+                                    / remainingColumns);
+            --remainingColumns;
+
+            if (! juce::isPositiveAndBelow (layer,
+                                             TimbresProcessor::numLayers))
+                continue;
+
+            auto& s = strips[layer];
+            s.cardBounds = cell.reduced (1, 0);
+            s.activity.setBounds (s.cardBounds.getX() + 4,
+                                  s.cardBounds.getY() + 3,
+                                  juce::jmax (0,
+                                      s.cardBounds.getWidth() - 8), 2);
+
+            auto inner = s.cardBounds.reduced (4);
+            const bool loaded =
+                proc.getLayerTimbre (layer).isNotEmpty()
+                || proc.getLayerInstrument (layer) != nullptr
+                || proc.isLayerChurchOrgan (layer);
+
+            auto header = inner.removeFromTop (
+                juce::jmin (44, inner.getHeight()));
+            auto power = header.removeFromRight (
+                juce::jmin (44, header.getWidth()));
+            header.removeFromRight (juce::jmin (3, header.getWidth()));
+            s.name.setBounds (header);
+            s.onBtn.setBounds (loaded ? power
+                                      : juce::Rectangle<int>());
+            inner.removeFromTop (juce::jmin (3, inner.getHeight()));
+
+            if (! loaded)
+            {
+                // Canal vazio no Modo Palco: grupo anel (paint) + botao ABAIXO.
+                s.name.setBounds (header);
+                s.onBtn.setBounds ({});
+                s.combo.setBounds ({});
+                s.combo.setInterceptsMouseClicks (true, false);
+                s.combo.setWantsKeyboardFocus (false);
+
+                const int ringR = kEmptyRing;
+                const int btnH = juce::jlimit (36, 44,
+                    juce::jmin (kEmptyBtnH, juce::jmax (32, inner.getHeight() / 5)));
+                const int gap = kEmptyGapY;
+                const int groupH = ringR * 2 + gap + btnH;
+                const int top = inner.getY()
+                              + juce::jmax (0, (inner.getHeight() - groupH) / 2);
+
+                s.stageEmptyRingCentre = { inner.getCentreX(), top + ringR };
+
+                s.addButton.setBounds (
+                    inner.getX() + 6,
+                    top + ringR * 2 + gap,
+                    juce::jmax (1, inner.getWidth() - 12),
+                    btnH);
+                s.addButton.setVisible (true);
+                s.addButton.toFront (false);
+                continue;
+            }
+
+            // Preset = heroi do card: chip mais alto, fonte sobe com a altura.
+            s.combo.setInterceptsMouseClicks (true, false);
+            s.combo.setWantsKeyboardFocus (false);
+            s.combo.setBounds (inner.removeFromTop (
+                juce::jmin (36, inner.getHeight())));
+            inner.removeFromTop (juce::jmin (3, inner.getHeight()));
+            // Seletor de teclado compacto no modo palco.
+            if (inner.getHeight() > 160)
+            {
+                s.midiInBox.setBounds (inner.removeFromTop (
+                    juce::jmin (28, inner.getHeight())));
+                inner.removeFromTop (juce::jmin (3, inner.getHeight()));
+            }
+            else
+            {
+                s.midiInBox.setBounds ({});
+            }
+
+            auto actions = inner.removeFromBottom (
+                juce::jmin (46, inner.getHeight()));
+            constexpr int actionGap = 4;
+            const int actionW = juce::jmax (
+                1, (actions.getWidth() - actionGap) / 2);
+            s.muteBtn.setBounds (actions.removeFromLeft (actionW));
+            actions.removeFromLeft (
+                juce::jmin (actionGap, actions.getWidth()));
+            s.soloBtn.setBounds (actions);
+            inner.removeFromBottom (juce::jmin (4, inner.getHeight()));
+
+            if (inner.getHeight() >= 112)
+            {
+                auto db = inner.removeFromBottom (18);
+                s.volDb.setBounds (db);
+                inner.removeFromBottom (juce::jmin (2, inner.getHeight()));
+            }
+
+            s.vol.setSliderStyle (juce::Slider::LinearVertical);
+            s.vol.setTextBoxStyle (juce::Slider::NoTextBox,
+                                   false, 0, 0);
+
+            if (s.meter != nullptr)
+            {
+                // Meter um pouco mais largo — legivel no palco escuro.
+                const int meterW = juce::jlimit (
+                    22, 32, inner.getWidth() / 3);
+                s.meter->setBounds (inner.removeFromRight (meterW)
+                                         .reduced (0, 2));
+                inner.removeFromRight (juce::jmin (4, inner.getWidth()));
+            }
+
+            s.vol.setBounds (inner.withSizeKeepingCentre (
+                juce::jmin (56, inner.getWidth()), inner.getHeight()));
+        }
+
+        // MASTER fixo: saida e PANIC nunca saem da tela enquanto as setas
+        // paginam apenas os canais. Em telas largas, EQ/PESO ocupam uma segunda
+        // fileira; em telefones estreitos cedem espaco ao fader e ao PANIC.
+        masterCardBounds = masterArea;
+        auto masterInner = masterCardBounds.reduced (4);
+        masterName.setBounds (masterInner.removeFromTop (
+            juce::jmin (28, masterInner.getHeight())));
+        masterInner.removeFromTop (
+            juce::jmin (4, masterInner.getHeight()));
+
+        // PANIC contido (36-40 dp): master fader ganha o espaco.
+        panicButton.setBounds (masterInner.removeFromBottom (
+            juce::jmin (40, masterInner.getHeight())));
+        masterInner.removeFromBottom (
+            juce::jmin (6, masterInner.getHeight()));
+
+        // O contrato do Modo Palco e simples e seguro: canais, faders,
+        // meters, M/S, preset e PANIC. EQ/PESO/inserts continuam no editor,
+        // evitando mudancas de timbre por toque acidental no show.
+        masterAutoEqBtn.setBounds ({});
+        masterPunchBtn.setBounds ({});
+
+        masterDbSlider.setSliderStyle (juce::Slider::LinearVertical);
+        masterDbSlider.setTextBoxStyle (juce::Slider::NoTextBox,
+                                        false, 0, 0);
+
+        if (masterMeter != nullptr)
+        {
+            const int meterW = juce::jlimit (
+                24, 34, masterInner.getWidth() / 3);
+            masterMeter->setBounds (masterInner.removeFromRight (meterW)
+                                         .reduced (0, 2));
+            masterInner.removeFromRight (
+                juce::jmin (4, masterInner.getWidth()));
+        }
+
+        masterDbSlider.setBounds (masterInner.withSizeKeepingCentre (
+            juce::jmin (58, masterInner.getWidth()),
+            masterInner.getHeight()));
+    }
+   #endif
+
     void layoutFocusedMobile (juce::Rectangle<int> area)
     {
+       #if JUCE_ANDROID
+        // O Modo Palco transforma o combo em leitura. Reentrar no editor
+        // detalhado restaura imediatamente toque, teclado e D-pad.
+        faixaDeCanais = {};
+
+        for (auto& s : strips)
+        {
+            s.combo.setInterceptsMouseClicks (true, true);
+            s.combo.setWantsKeyboardFocus (true);
+        }
+       #endif
+
         // Garante que sempre exista um canal em foco. Na primeira abertura
         // prefere o primeiro carregado; se a mesa esta vazia, o canal 1 vira o
         // convite inicial.
@@ -11937,9 +14337,10 @@ private:
         // A selecao inicial nao passa por selectStrip(). Sem atualizar estas
         // cores aqui, o primeiro canal podia estar aberto e ainda parecer
         // inativo ate o usuario tocar numa aba.
+        // Desktop: canal em foco = branco, nao vermelho gritando.
         for (int l = 0; l < TimbresProcessor::numLayers; ++l)
             strips[l].name.setColour (juce::Label::textColourId,
-                                      l == focus ? NordLookAndFeel::nordRedBright()
+                                      l == focus ? juce::Colours::white
                                                  : NordLookAndFeel::dimText());
 
         // Remove toda geometria da regua que estava aberta antes. Os componentes
@@ -11953,7 +14354,7 @@ private:
 
             juce::Component* controls[] = {
                 &s.name, &s.timbreName, &s.transpLabel, &s.volDb,
-                &s.glyph, &s.activity, &s.combo, &s.vol, &s.transp,
+                &s.glyph, &s.activity, &s.combo, &s.midiInBox, &s.vol, &s.transp,
                 &s.loop, &s.muteBtn, &s.soloBtn, &s.onBtn,
                 &s.autoEqBtn, &s.tonePageBtn, &s.pluginOpenBtn, &s.addButton,
                 &s.rotaryModeBox,
@@ -11972,15 +14373,82 @@ private:
                 s.meter->setBounds ({});
         }
 
-        // C1--C5 + MASTER sao paginas. O master deixou de disputar 30% da
-        // largura com o canal: em portrait/freeform essa divisao criava uma
-        // coluna de ~130 dp e controles impossiveis de tocar.
-        constexpr int numMobilePages = TimbresProcessor::numLayers + 1;
+        // Canais + MASTER sao paginas. No Android, a faixa tambem e paginada:
+        // quinze celulas simultaneas davam apenas ~21 dp em portrait. As setas,
+        // o Master e cada aba ficam agora com alvo minimo de 44 dp.
         const int tabsH = shortLandscapeMobileLayout
                             ? juce::jmin (48, area.getHeight())
                             : juce::jlimit (48, 56, area.getHeight() / 7);
         auto tabs = area.removeFromTop (tabsH);
         const int gap = shortLandscapeMobileLayout ? 2 : 3;
+
+       #if JUCE_ANDROID
+        for (int l = 0; l < TimbresProcessor::numLayers; ++l)
+        {
+            strips[l].tabBounds = {};
+            mobilePageButtons[l].setBounds ({});
+        }
+
+        constexpr int arrowW = 44;
+        constexpr int masterTabW = 48;
+        canalAnteriorBtn.setVisible (true);
+        canalAnteriorBtn.setBounds (
+            tabs.removeFromLeft (juce::jmin (arrowW, tabs.getWidth())));
+        tabs.removeFromLeft (juce::jmin (gap, tabs.getWidth()));
+
+        mobileMasterTabBounds = tabs.removeFromRight (
+            juce::jmin (masterTabW, tabs.getWidth()));
+        mobileMasterPageButton.setBounds (mobileMasterTabBounds);
+        tabs.removeFromRight (juce::jmin (gap, tabs.getWidth()));
+
+        canalProximoBtn.setVisible (true);
+        canalProximoBtn.setBounds (
+            tabs.removeFromRight (juce::jmin (arrowW, tabs.getWidth())));
+        tabs.removeFromRight (juce::jmin (gap, tabs.getWidth()));
+
+        canaisNaTela =
+            ChurchDAWAndroidStageLayout::focusedChannelCountForWidth (
+                tabs.getWidth(), gap);
+        canaisNaTela = juce::jmin (canaisNaTela,
+                                   TimbresProcessor::numLayers);
+
+        if (focus < primeiroCanalVisivel
+             || focus >= primeiroCanalVisivel + canaisNaTela)
+            primeiroCanalVisivel =
+                ChurchDAWAndroidStageLayout::pageContaining (
+                    focus, canaisNaTela,
+                    TimbresProcessor::numLayers);
+
+        limitarPrimeiroCanalVisivel();
+        const int maxStart = juce::jmax (
+            0, TimbresProcessor::numLayers - canaisNaTela);
+        canalAnteriorBtn.setEnabled (primeiroCanalVisivel > 0);
+        canalProximoBtn.setEnabled (primeiroCanalVisivel < maxStart);
+        canalAnteriorBtn.setTooltip ("Canais anteriores");
+        canalProximoBtn.setTooltip ("Proximos canais");
+
+        const int tabW = juce::jmax (
+            1, (tabs.getWidth() - gap * (canaisNaTela - 1))
+                   / canaisNaTela);
+
+        for (int column = 0; column < canaisNaTela; ++column)
+        {
+            const int l = primeiroCanalVisivel + column;
+
+            if (! juce::isPositiveAndBelow (
+                    l, TimbresProcessor::numLayers))
+                break;
+
+            strips[l].tabBounds = column == canaisNaTela - 1
+                                    ? tabs
+                                    : tabs.removeFromLeft (tabW);
+            mobilePageButtons[l].setBounds (strips[l].tabBounds);
+
+            if (column < canaisNaTela - 1)
+                tabs.removeFromLeft (juce::jmin (gap, tabs.getWidth()));
+        }
+       #else
+        constexpr int numMobilePages = TimbresProcessor::numLayers + 1;
         const int tabW = juce::jmax (1, (tabs.getWidth() - gap * (numMobilePages - 1))
                                         / numMobilePages);
 
@@ -11993,6 +14461,7 @@ private:
 
         mobileMasterTabBounds = tabs;
         mobileMasterPageButton.setBounds (mobileMasterTabBounds);
+       #endif
         area.removeFromTop (shortLandscapeMobileLayout ? 4 : 6);
 
         auto clearMasterGeometry = [this]
@@ -12017,6 +14486,7 @@ private:
             masterFxGroupBounds = {};
             masterLevelGroupBounds = {};
             masterLiveGroupBounds = {};
+            masterUtilityGroupBounds = {};
             fxDivider = {};
 
             for (int i = 0; i < TimbresProcessor::numInserts; ++i)
@@ -12051,8 +14521,17 @@ private:
 
                 if (! loaded)
                 {
+                    // Grupo anel+botao: botao embaixo pra o paint nao desenhar
+                    // o + em cima da letra.
                     const int buttonW = juce::jmin (300, inner.getWidth() - 20);
-                    s.addButton.setBounds (inner.withSizeKeepingCentre (buttonW, 48));
+                    const int btnH = 48;
+                    const int groupH = kEmptyRing * 2 + kEmptyGapY + btnH;
+                    const int top = inner.getY()
+                                  + juce::jmax (0, (inner.getHeight() - groupH) / 2);
+                    s.addButton.setBounds (
+                        inner.getCentreX() - buttonW / 2,
+                        top + kEmptyRing * 2 + kEmptyGapY,
+                        buttonW, btnH);
                     return;
                 }
 
@@ -12364,8 +14843,16 @@ private:
 
             if (! loaded)
             {
+                // Mesma hierarquia do modo palco: anel em cima, botao embaixo.
                 const int buttonW = juce::jmin (360, inner.getWidth() - 20);
-                s.addButton.setBounds (inner.withSizeKeepingCentre (buttonW, 58));
+                const int btnH = 58;
+                const int groupH = kEmptyRing * 2 + kEmptyGapY + btnH;
+                const int top = inner.getY()
+                              + juce::jmax (0, (inner.getHeight() - groupH) / 2);
+                s.addButton.setBounds (
+                    inner.getCentreX() - buttonW / 2,
+                    top + kEmptyRing * 2 + kEmptyGapY,
+                    buttonW, btnH);
                 return;
             }
 
@@ -12884,6 +15371,10 @@ private:
         pickerLayer = layer;
         pickerOpenedAtMs = juce::Time::getMillisecondCounter();
 
+        // Garante catalogo remoto + secao TIMBRES PARA BAIXAR antes de abrir.
+        // Sem isto a lista abria com o snapshot antigo (so samples locais).
+        refreshDownloadablePickerItems();
+
         auto* p = new TimbrePicker (pickerItems, strips[layer].combo.getSelectedId());
         picker.reset (p);
 
@@ -12912,17 +15403,31 @@ private:
 
         {
             const auto currentText = strips[layer].combo.getText();
-            p->setContext ("CANAL " + juce::String (layer + 1),
+            p->setContext ("Canal " + juce::String (layer + 1),
                            currentText == "(vazio)" ? juce::String() : currentText);
         }
 
         p->onPick = [this, layer] (int id)
         {
+            // IDs de download nao carregam timbre — so a acao Baixar.
+            if (id >= downloadBaseId)
+                return;
+
             strips[layer].combo.setSelectedId (id, juce::sendNotificationSync);
             closePicker();
         };
 
-        p->onCancel = [this] { closePicker(); };
+        p->onDownload = [this] (const juce::String& packId)
+        {
+            startPickerDownload (packId);
+        };
+
+        p->onCancel = [this]
+        {
+            // Nao cancela download em andamento ao fechar: o installer segue
+            // e o rescan acontece no finished. Fecha so a UI.
+            closePicker();
+        };
 
        #if JUCE_ANDROID || JUCE_IOS
         // TELA CHEIA de verdade: dentro do editor o card tinha ~207 dp de
@@ -13019,19 +15524,25 @@ private:
 
     std::unique_ptr<TimbrePicker> picker;
     juce::Array<TimbrePicker::Item> pickerItems;
+    juce::Array<ChurchDAWServices::LibraryPack> downloadPacks;
+    juce::StringArray downloadableTimbreIds;
+    ChurchDAWTimbreCatalog::Catalog timbreCatalog;
+    bool timbreCatalogFetchRunning = false;
+    std::unique_ptr<ChurchDAWServices::LibraryInstaller> pickerInstaller;
+    std::unique_ptr<ChurchDAWTimbreCatalog::Installer> timbreInstaller;
     int pickerLayer = -1;
     juce::uint32 pickerOpenedAtMs = 0;   // guarda contra o toggle no mesmo toque
 
     // Geometria do convite do card vazio, compartilhada por paint() e resized()
     // pra o circulo tracejado e o botao nunca se separarem.
-    static constexpr int kEmptyRing = 26;   // raio do circulo tracejado
-    static constexpr int kEmptyGapY = 14;   // respiro entre o circulo e o botao
+    static constexpr int kEmptyRing = 30;   // raio do circulo tracejado (mais tocavel)
+    static constexpr int kEmptyGapY = 12;   // respiro entre o circulo e o botao
     static constexpr int kEmptyBtnH = 40;
 
     static juce::Point<int> emptyRingCentre (juce::Rectangle<int> card)
     {
         const int groupH = kEmptyRing * 2 + kEmptyGapY + kEmptyBtnH;
-        const int top = card.getCentreY() - groupH / 2 + 8;   // um respiro abaixo do centro geometrico
+        const int top = card.getCentreY() - groupH / 2;
         return { card.getCentreX(), top + kEmptyRing };
     }
 
@@ -13041,13 +15552,15 @@ private:
         TimbreGlyph glyph;
         ActivityBar activity;   // acento do topo do card acende com o sinal
         PickerComboBox combo;   // abre o seletor com busca em vez do menu padrao
+        // Entrada MIDI deste canal: Todos | Teclado A | Teclado B (desktop).
+        juce::ComboBox midiInBox;
         juce::Slider vol, transp;
         juce::TextButton loop { "Loop" };
         juce::TextButton muteBtn { "M" }, soloBtn { "S" }, onBtn { "ON" };
         juce::TextButton autoEqBtn { "Auto EQ" };
         juce::TextButton tonePageBtn { "EQ" };
         juce::TextButton pluginOpenBtn { "Abrir" };   // canal-plugin (abre a interface do VSTi)
-        juce::TextButton addButton { "+ Adicionar instrumento" };   // card vazio
+        juce::TextButton addButton { "Adicionar" };   // card vazio (+ no anel)
         // Remover o timbre exigia abrir o seletor e escolher "canal vazio" —
         // o dono chamou de esquisito (30/07) e tem razao: e uma acao de
         // limpar escondida dentro de uma acao de escolher. Este X fica na
@@ -13063,6 +15576,7 @@ private:
         std::unique_ptr<LevelMeter> meter;
         float pendingL = 0.0f, pendingR = 0.0f;   // pico lido no quadro (L e R juntos)
         juce::Rectangle<int> cardBounds, tabBounds;
+        juce::Point<int> stageEmptyRingCentre;
         juce::Rectangle<int> fxGroup;   // cinta de agrupamento em volta dos knobs
         bool lastLoaded = false;
         bool eqPage = false;
@@ -13136,12 +15650,24 @@ private:
 
     void changeListenerCallback (juce::ChangeBroadcaster* source) override
     {
+        if (auto* plugins = proc.getKnownPlugins();
+            plugins != nullptr && source == plugins)
+        {
+            refreshPluginCatalogPreservingSelection();
+            return;
+        }
+
         if (auto* m = proc.getExternalMaster(); m != nullptr && source == m)
         {
             syncingMaster = true;
             masterDbSlider.setValue (m->getMasterDb(), juce::dontSendNotification);
+            masterAutoEqBtn.setToggleState (m->getAutoEq(),
+                                            juce::dontSendNotification);
+            masterPunchBtn.setToggleState (m->getPunch(),
+                                           juce::dontSendNotification);
             syncingMaster = false;
             refreshMasterDbColour();
+            refreshMasterUtilityLabels();
             return;
         }
 
@@ -13159,28 +15685,104 @@ private:
         masterDbSlider.repaint();
     }
 
+    void refreshMasterUtilityLabels()
+    {
+       #if JUCE_ANDROID || JUCE_IOS
+        // O touch usa abreviacoes proprias definidas no layout responsivo.
+        return;
+       #else
+        if (getHeight() < 380)
+        {
+            masterAutoEqBtn.setButtonText ("EQ");
+            masterPunchBtn.setButtonText ("PESO");
+            return;
+        }
+
+        const auto dot = juce::String::fromUTF8 (" \xc2\xb7 ");
+        masterAutoEqBtn.setButtonText (
+            juce::String ("AUTO EQ") + dot
+                + (masterAutoEqBtn.getToggleState() ? "ON" : "OFF"));
+        masterPunchBtn.setButtonText (
+            juce::String ("PESO") + dot
+                + (masterPunchBtn.getToggleState() ? "ON" : "OFF"));
+       #endif
+    }
+
     void selectStrip (int l)
     {
         if (selectedStrip != l && juce::isPositiveAndBelow (l, TimbresProcessor::numLayers))
         {
+            const int previous = selectedStrip;
             selectedStrip = l;
             proc.setSelectedLayer (l);   // o visor OLED do cabecalho segue este
 
             // "acende" o rotulo do canal em foco e apaga os outros
             for (int i = 0; i < TimbresProcessor::numLayers; ++i)
                 strips[i].name.setColour (juce::Label::textColourId,
-                                          i == l ? NordLookAndFeel::nordRedBright()
+                                          i == l ? juce::Colours::white
                                                  : NordLookAndFeel::dimText());
 
-            repaint();
+            // Repaint so dos cards que mudaram (nao a tela inteira).
+            if (juce::isPositiveAndBelow (previous, TimbresProcessor::numLayers)
+                 && ! strips[previous].cardBounds.isEmpty())
+                repaint (strips[previous].cardBounds.expanded (4));
+            if (! strips[l].cardBounds.isEmpty())
+                repaint (strips[l].cardBounds.expanded (4));
+            if (strips[l].cardBounds.isEmpty() && strips[previous].cardBounds.isEmpty())
+                repaint();
 
             // relayout DEFERIDO (move os detalhes p/ o canal em foco). callAsync
             // evita re-entrancia: selectStrip e chamado de dentro do handler de
             // mouse do proprio knob/combo — chamar resized() ali corrompe o
             // despacho do evento. SafePointer protege contra destruicao.
             juce::Component::SafePointer<TimbresEditor> safe (this);
-            juce::MessageManager::callAsync ([safe] { if (auto* e = safe.getComponent()) e->resized(); });
+            juce::MessageManager::callAsync ([safe]
+            {
+                if (auto* e = safe.getComponent())
+                    e->resized();
+            });
         }
+    }
+
+    void closeHostedPluginEditorBeforeRetire (
+        TimbresProcessor::HostedPluginLocation location,
+        int index,
+        juce::AudioPluginInstance* instance)
+    {
+        if (instance == nullptr)
+            return;
+
+        const bool matches =
+            location == TimbresProcessor::HostedPluginLocation::insert
+                ? juce::isPositiveAndBelow (
+                      index, TimbresProcessor::numInserts)
+                    && insertWindows[index] != nullptr
+                    && insertWindows[index]->getPluginInstance()
+                           == instance
+                : juce::isPositiveAndBelow (
+                      index, TimbresProcessor::numLayers)
+                    && layerPluginWindows[index] != nullptr
+                    && layerPluginWindows[index]->getPluginInstance()
+                           == instance;
+
+        if (! matches)
+            return;
+
+        // AudioProcessorEditor::~AudioProcessorEditor de alguns vendors abre
+        // um loop modal. Adie qualquer completion AUv3 entregue nesse intervalo
+        // ate a referencia ao plugin ter desaparecido por completo.
+        auto* processor = &proc;
+        processor->beginHostedPluginEditorTeardown();
+        const juce::ScopeGuard finishEditorTeardown { [processor]
+        {
+            processor->endHostedPluginEditorTeardown();
+        } };
+
+        if (location
+             == TimbresProcessor::HostedPluginLocation::insert)
+            insertWindows[index].reset();
+        else
+            layerPluginWindows[index].reset();
     }
 
     // abre o editor do plugin do MASTER FX EMBUTIDO (card "nativo" dentro do
@@ -13199,11 +15801,20 @@ private:
         if (auto* p = proc.getInsert (i))
         {
             auto safe = juce::Component::SafePointer<TimbresEditor> (this);
+            std::weak_ptr<std::atomic<bool>> lifetime (
+                editorCallbackLifetime);
 
-            insertWindows[i] = std::make_unique<InsertEditorCard> (*p, [safe, i]
+            insertWindows[i] = std::make_unique<InsertEditorCard> (*p, [safe, lifetime, i]
             {
-                juce::MessageManager::callAsync ([safe, i]
+                juce::MessageManager::callAsync ([safe, lifetime, i]
                 {
+                    const auto alive = lifetime.lock();
+
+                    if (alive == nullptr
+                         || ! alive->load (
+                             std::memory_order_acquire))
+                        return;
+
                     if (auto* ed = safe.getComponent())
                         ed->insertWindows[i].reset();
                 });
@@ -13240,11 +15851,20 @@ private:
         if (auto* p = proc.getLayerInstrument (l))
         {
             auto safe = juce::Component::SafePointer<TimbresEditor> (this);
+            std::weak_ptr<std::atomic<bool>> lifetime (
+                editorCallbackLifetime);
 
-            layerPluginWindows[l] = std::make_unique<InsertPluginWindow> (*p, [safe, l]
+            layerPluginWindows[l] = std::make_unique<InsertPluginWindow> (*p, [safe, lifetime, l]
             {
-                juce::MessageManager::callAsync ([safe, l]
+                juce::MessageManager::callAsync ([safe, lifetime, l]
                 {
+                    const auto alive = lifetime.lock();
+
+                    if (alive == nullptr
+                         || ! alive->load (
+                             std::memory_order_acquire))
+                        return;
+
                     if (auto* ed = safe.getComponent())
                         ed->layerPluginWindows[l].reset();
                 });
@@ -13292,8 +15912,8 @@ private:
 
 public:
     // Botao BACK do Android (via MainComponent::handleBackButton): fecha a
-    // camada de cima — seletor de timbres primeiro, depois o organ — em vez
-    // de deixar o app morrer no palco.
+    // camada de cima — seletor de timbres, organ ou Modo Palco — em vez de
+    // deixar o app morrer durante a apresentacao.
     bool handleBackRequest()
     {
         if (picker != nullptr)
@@ -13307,6 +15927,23 @@ public:
             closeChurchOrganEditor();
             return true;
         }
+
+       #if JUCE_ANDROID
+        if (mobileStageMode)
+        {
+            mobileStageMode = false;
+            mobileMasterPage = false;
+            androidStageRevealSelected = false;
+            editToneButton.setToggleState (false,
+                                           juce::dontSendNotification);
+            editToneButton.setButtonText ("MODO PALCO");
+            editToneButton.setTooltip (
+                "Ver faders, meters, Mute, Solo e Master em tempo real");
+            resized();
+            repaint();
+            return true;
+        }
+       #endif
 
         return false;
     }
@@ -13432,6 +16069,164 @@ public:
         return "OUTROS";
     }
 
+    void rebuildPluginCaches()
+    {
+        effectsCache.clearQuick();
+        instrumentsCache.clearQuick();
+
+        const auto addUnique = [] (
+            juce::Array<juce::PluginDescription>& destination,
+            const juce::PluginDescription& description)
+        {
+            const auto identifier =
+                description.createIdentifierString();
+
+            for (const auto& existing : destination)
+                if (existing.createIdentifierString() == identifier)
+                    return;
+
+            destination.add (description);
+        };
+
+        if (auto* list = proc.getKnownPlugins())
+            for (const auto& description : list->getTypes())
+                if (! proc.isHostedPluginBlocked (description))
+                    addUnique (description.isInstrument
+                                   ? instrumentsCache
+                                   : effectsCache,
+                               description);
+
+        // Uma atualização do scanner não pode transformar em "vazio" um
+        // plugin que já está tocando. Preserve sua descrição mesmo se a lista
+        // conhecida estiver, naquele instante, sendo reconstruída.
+        for (int slot = 0; slot < TimbresProcessor::numInserts; ++slot)
+        {
+            if (auto* plugin = proc.getInsert (slot))
+                addUnique (effectsCache,
+                           plugin->getPluginDescription());
+
+            juce::PluginDescription pending;
+            if (proc.getPendingInsertDescription (slot, pending)
+                 && ! proc.isHostedPluginBlocked (pending))
+                addUnique (effectsCache, pending);
+        }
+
+        for (int layer = 0;
+             layer < TimbresProcessor::numLayers;
+             ++layer)
+        {
+            if (auto* plugin = proc.getLayerInstrument (layer))
+                addUnique (instrumentsCache,
+                           plugin->getPluginDescription());
+
+            juce::PluginDescription pending;
+            if (proc.getPendingInstrumentDescription (layer, pending)
+                 && ! proc.isHostedPluginBlocked (pending))
+                addUnique (instrumentsCache, pending);
+        }
+    }
+
+    static int findPluginChoice (
+        const juce::Array<juce::PluginDescription>& choices,
+        const juce::String& identifier)
+    {
+        return ChurchDAWPluginLoading::findChoiceByIdentifier (
+            choices, identifier);
+    }
+
+    void refreshPluginCatalogPreservingSelection()
+    {
+        juce::String selectedInsertIds[
+            TimbresProcessor::numInserts];
+        juce::String selectedInstrumentIds[
+            TimbresProcessor::numLayers];
+
+        for (int slot = 0;
+             slot < TimbresProcessor::numInserts;
+             ++slot)
+        {
+            const int oldIndex =
+                insertCombos[slot].getSelectedId() - 2;
+
+            if (juce::isPositiveAndBelow (
+                    oldIndex, effectsCache.size()))
+                selectedInsertIds[slot] =
+                    effectsCache.getReference (oldIndex)
+                        .createIdentifierString();
+            else if (auto* plugin = proc.getInsert (slot))
+                selectedInsertIds[slot] =
+                    plugin->getPluginDescription()
+                        .createIdentifierString();
+        }
+
+        for (int layer = 0;
+             layer < TimbresProcessor::numLayers;
+             ++layer)
+        {
+            const int oldIndex =
+                strips[layer].combo.getSelectedId() - vstBaseId;
+
+            if (juce::isPositiveAndBelow (
+                    oldIndex, instrumentsCache.size()))
+                selectedInstrumentIds[layer] =
+                    instrumentsCache.getReference (oldIndex)
+                        .createIdentifierString();
+            else if (auto* plugin =
+                         proc.getLayerInstrument (layer))
+                selectedInstrumentIds[layer] =
+                    plugin->getPluginDescription()
+                        .createIdentifierString();
+        }
+
+        const bool wasUpdating = updatingCombos;
+        updatingCombos = true;
+        rebuildPluginCaches();
+
+        for (int slot = 0;
+             slot < TimbresProcessor::numInserts;
+             ++slot)
+        {
+            auto& combo = insertCombos[slot];
+            combo.clear (juce::dontSendNotification);
+            combo.addItem ("Sem efeito", 1);
+
+            for (int i = 0; i < effectsCache.size(); ++i)
+                combo.addItem (
+                    ChurchDAWPluginLoading::displayName (
+                        effectsCache.getReference (i),
+                        effectsCache),
+                    i + 2);
+
+            const int selected = findPluginChoice (
+                effectsCache, selectedInsertIds[slot]);
+            combo.setSelectedId (
+                selected >= 0 ? selected + 2 : 1,
+                juce::dontSendNotification);
+        }
+
+        // Reconstrói também o picker dos canais. Depois restaura cada AU/VST
+        // pela identidade estável, nunca pelo índice que mudou com o scan.
+        populateCombos();
+
+        for (int layer = 0;
+             layer < TimbresProcessor::numLayers;
+             ++layer)
+        {
+            const int selected = findPluginChoice (
+                instrumentsCache,
+                selectedInstrumentIds[layer]);
+
+            if (selected >= 0)
+                strips[layer].combo.setSelectedId (
+                    vstBaseId + selected,
+                    juce::dontSendNotification);
+        }
+
+        updatingCombos = wasUpdating;
+        resized();
+        repaint();
+    }
+
     void populateCombos()
     {
         const auto& entries = proc.getEntriesNonBlocking();
@@ -13457,6 +16252,7 @@ public:
         // Monta a lista (id, nome, secao) UMA vez: e a mesma que alimenta os
         // combos de todos os canais E o seletor com busca.
         pickerItems.clearQuick();
+        downloadPacks.clearQuick();
 
         // O ComboBox interno sempre teve "(vazio)", mas o seletor com busca
         // substitui o popup padrao e nao copiava essa opcao. Resultado: depois
@@ -13486,11 +16282,21 @@ public:
         // VSTi externos (Kontakt etc.) primeiro - "de fora"
         for (int i = 0; i < instrumentsCache.size(); ++i)
         {
-            const auto& name = instrumentsCache.getReference (i).name;
+            const auto& plugin = instrumentsCache.getReference (i);
+            const auto name = ChurchDAWPluginLoading::displayName (
+                plugin, instrumentsCache);
+            auto detail = plugin.pluginFormatName.trim();
+
+            if (plugin.manufacturerName.trim().isNotEmpty())
+                detail += juce::String::fromUTF8 (" \xc2\xb7 ")
+                       + plugin.manufacturerName.trim();
+
             pickerItems.add ({ vstBaseId + i, name, juce::String ("PLUGINS / KONTAKT"),
-                               (int) TimbreGlyph::resolveKind (true, name, {}),
+                               (int) TimbreGlyph::resolveKind (true, plugin.name, {}),
                                juce::String ("PLUGINS"),
-                               juce::String::fromUTF8 ("Plugin externo \xc2\xb7 VST/Kontakt") });
+                               detail.isNotEmpty()
+                                   ? detail
+                                   : juce::String ("Plugin externo") });
         }
 
         // agrupa por BIBLIOTECA -> CATEGORIA (escolha timbre de qualquer lib)
@@ -13530,6 +16336,10 @@ public:
             }
         }
 
+        // Bibliotecas do catalogo ainda nao instaladas: aparecem no seletor
+        // com botao Baixar (um pack por vez — unidade real do servidor).
+        appendDownloadablePacksToPicker();
+
         for (auto& s : strips)
         {
             const int current = s.combo.getSelectedId();
@@ -13544,7 +16354,8 @@ public:
                 // O ComboBox ja recebeu "(vazio)" com id 1 logo acima. O item
                 // descritivo de remocao existe para o picker customizado; somar
                 // os dois criava IDs duplicados (cinco assertions por refresh).
-                if (it.id == 1)
+                // Packs baixaveis tambem ficam so no seletor visual.
+                if (it.id == 1 || it.downloadable)
                     continue;
 
                 if (it.section != lastSection)
@@ -13562,6 +16373,461 @@ public:
         knownEntryCount = entries.size();
     }
 
+    void ensureTimbreCatalogLoaded()
+    {
+        // Cache imediato (nao bloqueia).
+        if (! timbreCatalog.valid)
+            timbreCatalog = ChurchDAWTimbreCatalog::loadCachedCatalog();
+
+        if (timbreCatalogFetchRunning)
+            return;
+
+        // Sempre busca o remoto na primeira vez (e de novo se o cache era
+        // invalido). Assim o seletor recebe a lista de timbres individuais.
+        timbreCatalogFetchRunning = true;
+        auto safe = juce::Component::SafePointer<TimbresEditor> (this);
+        juce::Thread::launch ([safe]
+        {
+            auto remote = ChurchDAWTimbreCatalog::fetchRemoteCatalog();
+            juce::MessageManager::callAsync (
+                [safe, remote = std::move (remote)]() mutable
+                {
+                    if (auto* self = safe.getComponent())
+                    {
+                        self->timbreCatalogFetchRunning = false;
+
+                        if (remote.valid)
+                        {
+                            self->timbreCatalog = std::move (remote);
+                            juce::Logger::writeToLog (
+                                "TIMBRE-CATALOG: "
+                                + juce::String (self->timbreCatalog.instruments.size())
+                                + " instrumentos");
+
+                            // SEMPRE reconstrói a lista (antes so atualizava com
+                            // o picker aberto — por isso a secao sumia).
+                            self->populateCombos();
+
+                            if (self->picker != nullptr)
+                            {
+                                const int layer = self->pickerLayer;
+                                const int current =
+                                    juce::isPositiveAndBelow (
+                                        layer, TimbresProcessor::numLayers)
+                                        ? self->strips[layer].combo.getSelectedId()
+                                        : 0;
+                                self->picker->replaceItems (self->pickerItems,
+                                                            current);
+                            }
+                        }
+                        else
+                        {
+                            juce::Logger::writeToLog (
+                                "TIMBRE-CATALOG: falha "
+                                + remote.diagnostic);
+                        }
+                    }
+                });
+        });
+    }
+
+    // Remove itens baixaveis antigos e recoloca com o catalogo atual.
+    // Chamado ao abrir o seletor para nao depender so do populateCombos inicial.
+    void refreshDownloadablePickerItems()
+    {
+        ensureTimbreCatalogLoaded();
+
+        juce::Array<TimbrePicker::Item> kept;
+        kept.ensureStorageAllocated (pickerItems.size());
+
+        for (const auto& it : pickerItems)
+            if (! it.downloadable)
+                kept.add (it);
+
+        pickerItems = std::move (kept);
+        appendDownloadablePacksToPicker();
+    }
+
+    void appendDownloadablePacksToPicker()
+    {
+        // Nao chama ensureTimbreCatalogLoaded aqui de forma recursiva com
+        // refresh — o ensure ja foi feito pelo chamador ou populateCombos.
+        if (! timbreCatalogFetchRunning && ! timbreCatalog.valid)
+            ensureTimbreCatalogLoaded();
+
+        downloadableTimbreIds.clearQuick();
+
+        // 1) TIMBRES individuais prontos no catalogo (Baixar 1 a 1).
+        // Orgaos de sample (B3, Farf, Pipe...) NAO entram: o produto usa o
+        // Church Organ Engine. Nome limpo (sem LP/LP4/FC) e sem "N samples".
+        if (timbreCatalog.valid)
+        {
+            for (const auto& inst : timbreCatalog.instruments)
+            {
+                if (! inst.canDownload())
+                    continue;
+
+                const auto labelForFilter = inst.rawLabel.isNotEmpty()
+                                                ? inst.rawLabel
+                                                : inst.name;
+
+                if (TimbresProcessor::looksLikeOrgan (labelForFilter, inst.category)
+                     || inst.category.equalsIgnoreCase ("ORGAOS"))
+                    continue;
+
+                // id/path do pack no servidor (b3-fabio, pipe-organs, farf...)
+                if (inst.id.containsIgnoreCase ("b3")
+                     || inst.id.containsIgnoreCase ("farf")
+                     || inst.id.containsIgnoreCase ("pipe")
+                     || inst.id.containsIgnoreCase ("organ")
+                     || inst.id.containsIgnoreCase ("orgao"))
+                    continue;
+
+                if (inst.isInstalledLocally())
+                    continue;
+
+                const int id = downloadBaseId + (int) downloadableTimbreIds.size();
+                downloadableTimbreIds.add ("timbre:" + inst.id);
+
+                juce::String action = "Baixar";
+
+                if (inst.downloadBytes > 0)
+                    action += juce::String::fromUTF8 (" \xc2\xb7 ")
+                           + ChurchDAWServices::humanBytes (inst.downloadBytes);
+
+                // Nome comercial limpo: tira LP4, FC e codigos de amostra.
+                const auto pretty = displayName (
+                    labelForFilter.isNotEmpty() ? labelForFilter : inst.name);
+
+                TimbrePicker::Item item;
+                item.id = id;
+                item.name = pretty.isNotEmpty() ? pretty : inst.name;
+                item.section = juce::String::fromUTF8 ("Timbres para baixar");
+                item.kind = (int) TimbreGlyph::kindForName (labelForFilter);
+                item.category = inst.category;
+                // Subtitulo = categoria legivel; se o nome ja e generico, reforca
+                // com o id limpo pra nao parecer item quebrado.
+                item.subtitle = categoryDisplayTitle (inst.category);
+                if (item.name.equalsIgnoreCase (item.subtitle)
+                     || item.name.containsIgnoreCase ("acustico")
+                     || item.name.containsIgnoreCase ("acústico"))
+                {
+                    const auto fromId = displayName (inst.id.replaceCharacter ('-', ' '));
+                    if (fromId.isNotEmpty()
+                         && ! fromId.equalsIgnoreCase (item.subtitle))
+                        item.name = fromId;
+                }
+                item.downloadable = true;
+                item.packId = "timbre:" + inst.id;
+                item.actionLabel = action;
+                item.actionEnabled = true;
+                item.progress = -1.0f;
+                pickerItems.add (std::move (item));
+            }
+        }
+
+        // 2) Packs legados (Pad Continuo, Church Live completo) se ainda faltarem.
+        downloadPacks.clearQuick();
+        const auto manifest = ChurchDAWServices::loadCachedManifest();
+
+        if (! manifest.valid)
+            return;
+
+        for (const auto& pack : manifest.libraries)
+        {
+            if (pack.isInstalled())
+                continue;
+
+            // SEMPRE oferece pack completo (church-live / pad-continuo) alem
+            // dos timbres 1 a 1 — o cliente escolhe o que baixar.
+            const int id = downloadBaseId + downloadableTimbreIds.size();
+            downloadableTimbreIds.add (pack.id);
+            downloadPacks.add (pack);
+
+            juce::String action;
+            bool enabled = false;
+
+            if (! pack.included)
+            {
+                action = pack.priceLabel.isNotEmpty()
+                             ? pack.priceLabel
+                             : juce::String ("Em breve");
+            }
+            else if (pack.canDownload())
+            {
+                if (pack.id.equalsIgnoreCase ("church-live"))
+                    action = "Baixar tudo";
+                else
+                    action = "Baixar pack";
+
+                if (pack.downloadBytes > 0)
+                    action += juce::String::fromUTF8 (" \xc2\xb7 ")
+                           + ChurchDAWServices::humanBytes (pack.downloadBytes);
+
+                enabled = true;
+            }
+            else
+            {
+                action = "Indisponivel";
+            }
+
+            juce::String categoryKey;
+
+            if (pack.id == "pad-continuo")
+                categoryKey = "PADS";
+            else if (pack.id.containsIgnoreCase ("organ"))
+                categoryKey = "ORGAOS";
+            else if (pack.id.containsIgnoreCase ("piano")
+                      || pack.id.containsIgnoreCase ("keys"))
+                categoryKey = "PIANOS";
+
+            juce::String subtitle;
+            // Nome + subtitulo claros: evita linha generica "Piano acustico" sem
+            // contexto (pack grande lendo como um piano sozinho).
+            juce::String packName;
+            if (pack.id.equalsIgnoreCase ("church-live"))
+            {
+                packName = "Church Live completo";
+                subtitle = juce::String::fromUTF8 (
+                    "Biblioteca completa \xc2\xb7 todos os timbres (~12 GB)");
+            }
+            else if (pack.id.equalsIgnoreCase ("pad-continuo"))
+            {
+                packName = "Pad continuo";
+                subtitle = juce::String::fromUTF8 (
+                    "Pack leve para culto \xc2\xb7 pads A\xe2\x80\x93G");
+            }
+            else
+            {
+                packName = ChurchDAWAndroidCulto::displayNameForPack (
+                    pack.id, pack.name);
+                subtitle = juce::String::fromUTF8 (
+                    "Pack completo \xc2\xb7 alternativa ao download por timbre");
+            }
+
+            TimbrePicker::Item item;
+            item.id = id;
+            item.name = packName;
+            item.section = juce::String::fromUTF8 ("Bibliotecas completas");
+            item.kind = pack.id == "pad-continuo" ? (int) TimbreGlyph::pad
+                                                  : (int) TimbreGlyph::piano;
+            item.category = categoryKey;
+            item.subtitle = subtitle;
+            item.downloadable = true;
+            item.packId = pack.id;
+            item.actionLabel = action;
+            item.actionEnabled = enabled;
+            item.progress = -1.0f;
+            pickerItems.add (std::move (item));
+        }
+    }
+
+    const ChurchDAWTimbreCatalog::Instrument* findDownloadableTimbre (
+        const juce::String& timbreId) const
+    {
+        for (const auto& inst : timbreCatalog.instruments)
+            if (inst.id == timbreId)
+                return &inst;
+
+        return nullptr;
+    }
+
+    const ChurchDAWServices::LibraryPack* findDownloadPack (
+        const juce::String& packId) const
+    {
+        for (const auto& p : downloadPacks)
+            if (p.id == packId)
+                return &p;
+
+        return nullptr;
+    }
+
+    void refreshPickerAfterInstall()
+    {
+        proc.rescanLibrary();
+        populateCombos();
+
+        if (picker != nullptr)
+        {
+            const int layer = pickerLayer;
+            const int current =
+                juce::isPositiveAndBelow (layer, TimbresProcessor::numLayers)
+                    ? strips[layer].combo.getSelectedId()
+                    : 0;
+            picker->replaceItems (pickerItems, current);
+        }
+    }
+
+    void startPickerDownload (const juce::String& packId)
+    {
+        if (pickerInstaller != nullptr || timbreInstaller != nullptr)
+            return;
+
+        // ---- Timbre individual ----
+        if (packId.startsWith ("timbre:"))
+        {
+            const auto timbreId = packId.fromFirstOccurrenceOf ("timbre:", false, false);
+            const auto* found = findDownloadableTimbre (timbreId);
+
+            if (found == nullptr || ! found->canDownload())
+            {
+                if (picker != nullptr)
+                    picker->updateDownloadState (
+                        packId, -1.0f, "Indisponivel", false);
+                return;
+            }
+
+            const auto inst = *found;
+
+            auto beginTimbre = [this, inst, packId]
+            {
+                if (timbreInstaller != nullptr)
+                    return;
+
+                if (picker != nullptr)
+                    picker->updateDownloadState (packId, 0.0f, "Iniciando...", false);
+
+                auto safe = juce::Component::SafePointer<TimbresEditor> (this);
+                timbreInstaller =
+                    std::make_unique<ChurchDAWTimbreCatalog::Installer> (
+                        inst,
+                        [safe, packId] (float value, const juce::String& text)
+                        {
+                            if (auto* self = safe.getComponent())
+                                if (self->picker != nullptr)
+                                {
+                                    juce::String label =
+                                        text.isNotEmpty() ? text
+                                                          : juce::String ("Baixando...");
+
+                                    if (label.length() > 18)
+                                        label = juce::String ((int) (value * 100.0f))
+                                              + "%";
+
+                                    self->picker->updateDownloadState (
+                                        packId, value, label, false);
+                                }
+                        },
+                        [safe, packId] (juce::Result result)
+                        {
+                            if (auto* self = safe.getComponent())
+                            {
+                                self->timbreInstaller.reset();
+
+                                if (result.wasOk())
+                                    self->refreshPickerAfterInstall();
+                                else if (self->picker != nullptr)
+                                    self->picker->updateDownloadState (
+                                        packId, -1.0f, "Tentar de novo", true);
+                            }
+                        });
+                timbreInstaller->begin();
+            };
+
+            if (inst.downloadBytes >= (juce::int64) 80 * 1024 * 1024)
+            {
+                juce::AlertWindow::showOkCancelBox (
+                    juce::MessageBoxIconType::QuestionIcon,
+                    "Baixar " + inst.name + "?",
+                    "Timbre individual\n\n"
+                        "Download: "
+                        + ChurchDAWServices::humanBytes (inst.downloadBytes)
+                        + "\nSamples: " + juce::String (inst.fileCount)
+                        + "\n\nPrefira Wi-Fi. Depois ele aparece na lista "
+                          "para tocar.",
+                    "Baixar agora",
+                    "Cancelar",
+                    this,
+                    juce::ModalCallbackFunction::create (
+                        [safe = juce::Component::SafePointer<TimbresEditor> (this),
+                         beginTimbre] (int result)
+                        {
+                            if (result != 0 && safe != nullptr)
+                                beginTimbre();
+                        }));
+                return;
+            }
+
+            beginTimbre();
+            return;
+        }
+
+        // ---- Pack completo (legado) ----
+        const auto* found = findDownloadPack (packId);
+
+        if (found == nullptr || ! found->canDownload() || ! found->included)
+            return;
+
+        const auto pack = *found;
+
+        auto begin = [this, pack]()
+        {
+            if (pickerInstaller != nullptr)
+                return;
+
+            if (picker != nullptr)
+                picker->updateDownloadState (pack.id, 0.0f, "Iniciando...", false);
+
+            auto safe = juce::Component::SafePointer<TimbresEditor> (this);
+            pickerInstaller = std::make_unique<ChurchDAWServices::LibraryInstaller> (
+                pack,
+                [safe, id = pack.id] (float value, const juce::String& text)
+                {
+                    if (auto* self = safe.getComponent())
+                        if (self->picker != nullptr)
+                        {
+                            juce::String label = text.isNotEmpty()
+                                                     ? text
+                                                     : juce::String ("Baixando...");
+
+                            if (label.length() > 18)
+                                label = juce::String ((int) (value * 100.0f)) + "%";
+
+                            self->picker->updateDownloadState (
+                                id, value, label, false);
+                        }
+                },
+                [safe, id = pack.id] (juce::Result result)
+                {
+                    if (auto* self = safe.getComponent())
+                    {
+                        self->pickerInstaller.reset();
+
+                        if (result.wasOk())
+                            self->refreshPickerAfterInstall();
+                        else if (self->picker != nullptr)
+                            self->picker->updateDownloadState (
+                                id, -1.0f, "Tentar de novo", true);
+                    }
+                });
+            pickerInstaller->begin();
+        };
+
+        if (pack.downloadBytes >= (juce::int64) 100 * 1024 * 1024)
+        {
+            juce::AlertWindow::showOkCancelBox (
+                juce::MessageBoxIconType::QuestionIcon,
+                "Baixar " + pack.name + "?",
+                "Pack completo (varios timbres).\n\n"
+                    "Download: "
+                    + ChurchDAWServices::humanBytes (pack.downloadBytes)
+                    + "\nPrefira Wi-Fi e mantenha o app aberto.",
+                "Baixar agora",
+                "Cancelar",
+                this,
+                juce::ModalCallbackFunction::create (
+                    [safe = juce::Component::SafePointer<TimbresEditor> (this),
+                     begin] (int result)
+                    {
+                        if (result != 0 && safe != nullptr)
+                            begin();
+                    }));
+            return;
+        }
+
+        begin();
+    }
+
     void refreshFromProcessor()
     {
         updatingCombos = true;
@@ -13570,6 +16836,34 @@ public:
 
         if (knownEntryCount != entries.size())
             populateCombos();
+
+        // O desktop abria com selectedStrip = -1 mesmo quando cinco canais ja
+        // estavam carregados. A moldura de selecao existia, mas nunca aparecia
+        // ate o primeiro clique. Segue a selecao persistida; sem uma, prefere o
+        // primeiro canal carregado e deixa o estado imediatamente legivel.
+        if (! juce::isPositiveAndBelow (selectedStrip,
+                                        TimbresProcessor::numLayers))
+        {
+            int initial = proc.getSelectedLayer();
+
+            if (! juce::isPositiveAndBelow (initial,
+                                             TimbresProcessor::numLayers))
+                for (int l = 0; l < TimbresProcessor::numLayers; ++l)
+                    if (proc.getLayerTimbre (l).isNotEmpty()
+                         || proc.getLayerInstrument (l) != nullptr
+                         || proc.isLayerChurchOrgan (l))
+                    {
+                        initial = l;
+                        break;
+                    }
+
+            if (! juce::isPositiveAndBelow (initial,
+                                             TimbresProcessor::numLayers))
+                initial = 0;
+
+            selectedStrip = initial;
+            proc.setSelectedLayer (initial);
+        }
 
         bool layoutChanged = false;
 
@@ -13587,13 +16881,30 @@ public:
                 || isChurchOrgan;
             int selected = 1;
             bool loadedHiddenSampleOrgan = false;
+            juce::PluginDescription pendingInstrument;
+            const bool hasPendingInstrument =
+                proc.getPendingInstrumentDescription (
+                    l, pendingInstrument);
 
             // plugin do canal morreu por fora (restore de estado, troca
             // interna): a janela dele nao pode sobreviver ao instance
             if (proc.getLayerInstrument (l) == nullptr)
                 layerPluginWindows[l].reset();
 
-            if (isChurchOrgan)
+            if (hasPendingInstrument)
+            {
+                const auto pendingId =
+                    pendingInstrument.createIdentifierString();
+
+                for (int i = 0; i < instrumentsCache.size(); ++i)
+                    if (instrumentsCache.getReference (i)
+                            .createIdentifierString() == pendingId)
+                    {
+                        selected = vstBaseId + i;
+                        break;
+                    }
+            }
+            else if (isChurchOrgan)
             {
                 selected = organBaseId
                          + static_cast<int> (
@@ -13648,10 +16959,54 @@ public:
             s.timbreName.setText (isPlugin ? vstName : (loaded ? categoryTitleFor (timbre) : juce::String()),
                                   juce::dontSendNotification);
 
+            // Atualiza lista de teclados MIDI para este canal.
+            {
+                s.midiInBox.clear (juce::dontSendNotification);
+                s.midiInBox.addItem (
+                    juce::String::fromUTF8 ("MIDI: Todos"), 1);
+                int selectedId = 1;
+                const auto chosen = proc.getLayerMidiInputDevice (l);
+                const auto devices = juce::MidiInput::getAvailableDevices();
+                int nextId = 2;
+                for (const auto& d : devices)
+                {
+                    // Nome legivel; o id real fica no texto do item via
+                    // setItemEnabled + armazenamento no item text = identifier.
+                    // Usamos o identifier como item text interno? Combobox
+                    // mostra name; guardamos identifier no user data via id
+                    // sequencial e mapa — simples: item text = name, e no
+                    // onChange reconsulta devices pela ordem.
+                    // Melhor: item text = identifier, name no texto:
+                    const auto label =
+                        juce::String::fromUTF8 ("MIDI: ")
+                        + (d.name.isNotEmpty() ? d.name : d.identifier);
+                    s.midiInBox.addItem (label, nextId);
+                    // Guarda identifier no item text de forma recuperavel:
+                    // trocamos para usar identifier como selected text base.
+                    if (chosen.isNotEmpty()
+                         && (chosen == d.identifier || chosen == d.name))
+                        selectedId = nextId;
+                    ++nextId;
+                }
+                // Se o device sumiu, mantem o id escolhido como item extra.
+                if (chosen.isNotEmpty() && selectedId == 1)
+                {
+                    s.midiInBox.addItem (
+                        juce::String::fromUTF8 ("MIDI: ") + chosen
+                            + juce::String::fromUTF8 (" (offline)"),
+                        nextId);
+                    selectedId = nextId;
+                }
+                s.midiInBox.setSelectedId (
+                    selectedId, juce::dontSendNotification);
+                s.midiInBox.setEnabled (true);
+                s.midiInBox.setVisible (true);
+            }
+
             // canais nativos tem knobs de canal-strip; canal-plugin mostra "Abrir"
             s.name.setVisible (true);   // "CANAL X" sempre visivel (cheio ou vazio)
             s.name.setColour (juce::Label::textColourId,
-                              l == selectedStrip ? NordLookAndFeel::nordRedBright()
+                              l == selectedStrip ? juce::Colours::white
                                                  : NordLookAndFeel::dimText());
 
             // cor da categoria nos arcos dos knobs e no icone
@@ -13685,6 +17040,9 @@ public:
 
             for (auto* c : stripControls)
                 c->setVisible (loaded);
+
+            // MIDI de teclado: sempre visivel (pode pré-escolher com canal vazio).
+            s.midiInBox.setVisible (true);
 
             updateTonePageVisibility (l);
 
@@ -13729,8 +17087,22 @@ public:
         for (int i = 0; i < TimbresProcessor::numInserts; ++i)
         {
             int selected = 1;
+            juce::PluginDescription pendingInsert;
 
-            if (auto* p = proc.getInsert (i))
+            if (proc.getPendingInsertDescription (i, pendingInsert))
+            {
+                const auto id =
+                    pendingInsert.createIdentifierString();
+
+                for (int e = 0; e < effectsCache.size(); ++e)
+                    if (effectsCache.getReference (e)
+                            .createIdentifierString() == id)
+                    {
+                        selected = e + 2;
+                        break;
+                    }
+            }
+            else if (auto* p = proc.getInsert (i))
             {
                 const auto id = p->getPluginDescription().createIdentifierString();
 
@@ -13742,8 +17114,12 @@ public:
                     }
             }
 
+            const bool effectLoaded = proc.getInsert (i) != nullptr;
             insertCombos[i].setSelectedId (selected, juce::dontSendNotification);
-            insertOpenButtons[i].setEnabled (proc.getInsert (i) != nullptr);
+            insertOpenButtons[i].setEnabled (effectLoaded);
+            // Slot vazio ganha toda a largura. "Editar" aparece apenas quando
+            // existe algo que de fato possa ser aberto.
+            insertOpenButtons[i].setVisible (effectLoaded);
         }
 
         // segue a maquina que estiver de fato no plugin (o usuario pode ter
@@ -13754,19 +17130,56 @@ public:
         }
 
         updatingCombos = false;
-        juce::ignoreUnused (layoutChanged);
 
-        // sempre realinha o layout ao estado real do motor (nada de cache dessincronizado)
-        resized();
-        repaint();
+        // Layout so se loaded/empty mudou. Full repaint e o maior ofensor de
+        // jank no Android (software renderer) — no modo palco basta status.
+        if (layoutChanged)
+        {
+            resized();
+            repaint();
+        }
+        else
+        {
+           #if JUCE_ANDROID || JUCE_IOS
+            // Status bar + molduras leves: meters/activity se atualizam sozinhos.
+            repaint (0, 0, getWidth(), 52);
+            if (mobileStageMode)
+            {
+                for (int l = 0; l < TimbresProcessor::numLayers; ++l)
+                    if (! strips[l].cardBounds.isEmpty())
+                        repaint (strips[l].cardBounds.withHeight (48));
+            }
+           #else
+            repaint();
+           #endif
+        }
 
         const bool loading    = proc.isLoading();
         const bool ready      = ! proc.getEntriesNonBlocking().isEmpty();
         const bool libMissing = ! ready && proc.hasScannedLibrary();
+        libraryMissing = libMissing;
+
+        // O convite central e o maior alvo da tela vazia. Quando nao existe
+        // pack, ele precisa resolver a causa em vez de abrir um seletor sem
+        // itens. A cor vermelha tambem eleva o erro acima do status discreto do
+        // cabecalho, sem criar outro modal.
+        for (auto& s : strips)
+        {
+            s.addButton.setButtonText (libMissing ? "Abrir bibliotecas"
+                                                   : "Adicionar");
+            s.addButton.setColour (
+                juce::TextButton::buttonColourId,
+                libMissing ? NordLookAndFeel::nordRedDark()
+                           : juce::Colours::transparentBlack);
+            s.addButton.setColour (
+                juce::TextButton::textColourOffId,
+                libMissing ? juce::Colours::white
+                           : NordLookAndFeel::dimText());
+        }
 
         status.setText (loading ? "Carregando timbre..."
                           : ready ? "Pronto"
-                          : libMissing ? juce::String::fromUTF8 ("Biblioteca n\xc3\xa3o encontrada \xe2\x80\x94 instale o pack e reabra")
+                          : libMissing ? juce::String::fromUTF8 ("Biblioteca n\xc3\xa3o instalada \xe2\x80\x94 abra Bibliotecas")
                                        : "Lendo biblioteca...",
                         juce::dontSendNotification);
 
@@ -13782,12 +17195,17 @@ public:
                             || proc.getLayerTimbre (l).isNotEmpty()
                             || proc.getLayerInstrument (l) != nullptr;
 
+       #if JUCE_ANDROID
+        // Mesmo que o ultimo canal seja limpo enquanto o palco esta aberto, a
+        // saida para o editor detalhado nunca pode desaparecer.
+        editToneButton.setEnabled (hasLoadedChannel || mobileStageMode);
+       #else
         editToneButton.setEnabled (hasLoadedChannel);
+       #endif
         repaint (0, 0, getWidth(), 46);
     }
 
     TimbresProcessor& proc;
-    juce::TooltipWindow tooltipWindow { this, 650 };   // dicas ao passar o mouse
 
     // MESA COM 14 CANAIS, 8 NA TELA.
     //
@@ -13796,7 +17214,7 @@ public:
     // sumiam. Oito e a conta que mantem o card legivel num monitor
     // comum; o resto entra rolando de lado, com as setas ‹ › e a roda
     // do mouse. Quem usa cinco canais nao ve diferenca nenhuma.
-    static constexpr int canaisNaTela = 8;
+    int canaisNaTela = 8;
     int primeiroCanalVisivel = 0;   // 0..numLayers-canaisNaTela
     juce::TextButton canalAnteriorBtn { juce::String::fromUTF8 ("\xe2\x80\xb9") },
                      canalProximoBtn  { juce::String::fromUTF8 ("\xe2\x80\xba") };
@@ -13804,9 +17222,10 @@ public:
 
     void limitarPrimeiroCanalVisivel()
     {
-        const int maximo = juce::jmax (
-            0, TimbresProcessor::numLayers - canaisNaTela);
-        primeiroCanalVisivel = juce::jlimit (0, maximo, primeiroCanalVisivel);
+        primeiroCanalVisivel =
+            ChurchDAWAndroidStageLayout::clampPageStart (
+                primeiroCanalVisivel, canaisNaTela,
+                TimbresProcessor::numLayers);
     }
 
     /** Tira o canal da tela zerando os bounds de tudo que ele desenha.
@@ -13820,10 +17239,11 @@ public:
         s.cardBounds = {};
         s.tabBounds = {};
         s.fxGroup = {};
+        s.stageEmptyRingCentre = {};
 
         const std::initializer_list<juce::Component*> partes {
             &s.name, &s.timbreName, &s.transpLabel, &s.volDb,
-            &s.glyph, &s.activity, &s.combo, &s.vol, &s.transp,
+            &s.glyph, &s.activity, &s.combo, &s.midiInBox, &s.vol, &s.transp,
             &s.loop, &s.muteBtn, &s.soloBtn, &s.onBtn, &s.autoEqBtn,
             &s.tonePageBtn, &s.pluginOpenBtn, &s.addButton, &s.clearBtn,
             &s.rotaryModeBox, &s.compKnob, &s.dlyKnob, &s.echoKnob,
@@ -13864,6 +17284,11 @@ public:
         canalAnteriorBtn.setBounds (area.getX() + 2, y, lado, alturaBotao);
         canalProximoBtn.setBounds (
             area.getX() + canaisNaTela * stripW - lado - 2, y, lado, alturaBotao);
+        // Os labels/controles dos strips recebem bounds depois das setas e podem
+        // compartilhar esta faixa do cabecalho. Garanta que o alvo clicavel das
+        // setas fique acima deles, nao apenas o desenho visivel.
+        canalAnteriorBtn.toFront (false);
+        canalProximoBtn.toFront (false);
 
         canalAnteriorBtn.setEnabled (primeiroCanalVisivel > 0);
         canalProximoBtn.setEnabled (
@@ -13873,6 +17298,34 @@ public:
 
     void rolarCanais (int passos)
     {
+       #if JUCE_ANDROID
+        if (mobileStageMode || focusedMobileLayout)
+        {
+            const int antes = primeiroCanalVisivel;
+            if (passos > 0)
+                primeiroCanalVisivel =
+                    ChurchDAWAndroidStageLayout::nextPageStart (
+                        primeiroCanalVisivel, canaisNaTela,
+                        TimbresProcessor::numLayers);
+            else if (passos < 0)
+                primeiroCanalVisivel =
+                    ChurchDAWAndroidStageLayout::previousPageStart (
+                        primeiroCanalVisivel, canaisNaTela,
+                        TimbresProcessor::numLayers);
+
+            androidStageRevealSelected = false;
+            limitarPrimeiroCanalVisivel();
+
+            if (primeiroCanalVisivel != antes)
+            {
+                resized();
+                repaint();
+            }
+
+            return;
+        }
+       #endif
+
         const int antes = primeiroCanalVisivel;
         primeiroCanalVisivel += passos;
         limitarPrimeiroCanalVisivel();
@@ -13896,7 +17349,8 @@ public:
     juce::TextButton masterAutoEqBtn, masterPunchBtn;
     std::unique_ptr<LevelMeter> masterMeter;
     juce::Rectangle<int> masterCardBounds, bottomPanelBounds;
-    juce::Rectangle<int> masterFxGroupBounds, masterLevelGroupBounds, masterLiveGroupBounds;
+    juce::Rectangle<int> masterFxGroupBounds, masterLevelGroupBounds,
+                         masterLiveGroupBounds, masterUtilityGroupBounds;
     std::unique_ptr<juce::SliderParameterAttachment> gTranspAttachment;
     std::unique_ptr<juce::SliderParameterAttachment> reverbReturnAttachment;
     std::unique_ptr<juce::ButtonParameterAttachment> sustainAttachment, invPedalAttachment;
@@ -13909,11 +17363,14 @@ public:
     int churchOrganOverlayLayer = -1;
     static constexpr int organBaseId = 400000;
     static constexpr int vstBaseId = 500000;                 // ids do combo p/ VSTi
+    static constexpr int downloadBaseId = 800000;            // packs online (so no seletor)
     juce::ComboBox insertCombos[TimbresProcessor::numInserts];
     juce::TextButton insertOpenButtons[TimbresProcessor::numInserts];
     std::unique_ptr<InsertEditorCard> insertWindows[TimbresProcessor::numInserts];   // editores EMBUTIDOS (estilo nativo)
     bool updatingCombos = false;
     bool syncingMaster = false;
+    std::shared_ptr<std::atomic<bool>> editorCallbackLifetime =
+        std::make_shared<std::atomic<bool>> (true);
     bool desktopToneEditMode = false;
     juce::ComboBox reverbTypeCombo;   // Church Reverb ou BigSky externo
     juce::Rectangle<int> fxDivider;   // linha que separa MASTER FX do bloco de saida
@@ -13922,6 +17379,13 @@ public:
     bool focusedMobileLayout = false;
     bool shortLandscapeMobileLayout = false;
     bool mobileMasterPage = false;
+   #if JUCE_ANDROID
+    bool mobileStageMode = false;
+    bool androidStageRevealSelected = false;
+    int androidStageLastChannelsOnScreen = 0;
+   #endif
+    bool libraryMissing = false;
+    std::function<void()> onOpenLibraries;
     juce::Rectangle<int> mobileMasterTabBounds;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (TimbresEditor)

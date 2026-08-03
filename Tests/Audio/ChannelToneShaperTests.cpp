@@ -91,8 +91,11 @@ int main()
     const float boostedLow = renderRms (80.0f, 6.0f, 0.0f, 0.0f);
     const float neutralMid = renderRms (850.0f, 0.0f, 0.0f, 0.0f);
     const float cutMid = renderRms (850.0f, 0.0f, -6.0f, 0.0f);
-    const float neutralHigh = renderRms (10000.0f, 0.0f, 0.0f, 0.0f);
-    const float boostedHigh = renderRms (10000.0f, 0.0f, 0.0f, 6.0f);
+    // Prova a faixa onde existe energia em timbres reais, nao apenas um tom
+    // artificial de 10 kHz que mascarava o knob percebido como morto.
+    const float neutralHigh = renderRms (5000.0f, 0.0f, 0.0f, 0.0f);
+    const float boostedHigh = renderRms (5000.0f, 0.0f, 0.0f, 6.0f);
+    const float cutHigh = renderRms (5000.0f, 0.0f, 0.0f, -6.0f);
     const float boundedExtreme = renderRms (
         850.0f, 1000.0f, -1000.0f,
         std::numeric_limits<float>::quiet_NaN());
@@ -107,8 +110,10 @@ int main()
                  "MID -6 dB precisa reduzir a regiao central");
     ok &= check (std::isfinite (neutralHigh)
                   && std::isfinite (boostedHigh)
-                  && boostedHigh > neutralHigh * 1.45f,
-                 "HIGH +6 dB precisa aumentar agudos");
+                  && boostedHigh > neutralHigh * 1.35f
+                  && std::isfinite (cutHigh)
+                  && cutHigh < neutralHigh * 0.75f,
+                 "HIGH +/-6 dB precisa responder na faixa musical de 5 kHz");
     ok &= check (std::isfinite (boundedExtreme),
                  "EQ precisa permanecer finito com valores adversos");
 

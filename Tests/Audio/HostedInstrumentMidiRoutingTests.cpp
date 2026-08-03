@@ -22,12 +22,17 @@ struct PluginLifecycleState
 {
     int prepareCalls = 0;
     int releaseCalls = 0;
+    int destructorCalls = 0;
     int processCalls = 0;
+    int stateCaptureCalls = 0;
     bool throwOnPrepare = false;
     bool throwOnRelease = false;
+    bool throwOnGetState = false;
     bool sawPrepareWhileSuspended = false;
     bool sawReleaseWhileSuspended = false;
     std::function<bool()> hostIsSuspended;
+    std::function<void()> onRelease;
+    std::function<void()> onDestroy;
 };
 
 class CapturingPlugin final : public juce::AudioPluginInstance
@@ -36,7 +41,8 @@ public:
     explicit CapturingPlugin (
         int outputChannels = 2,
         std::shared_ptr<PluginLifecycleState>
-            lifecycleState = {})
+            lifecycleState = {},
+        juce::PluginDescription descriptionToReport = {})
         : AudioPluginInstance (
               BusesProperties().withOutput (
                   "Output",
@@ -45,8 +51,21 @@ public:
                       : juce::AudioChannelSet::discreteChannels (
                             outputChannels),
                   true)),
-          lifecycle (std::move (lifecycleState))
+          lifecycle (std::move (lifecycleState)),
+          reportedDescription (
+              std::move (descriptionToReport))
     {
+    }
+
+    ~CapturingPlugin() override
+    {
+        if (lifecycle == nullptr)
+            return;
+
+        ++lifecycle->destructorCalls;
+
+        if (lifecycle->onDestroy != nullptr)
+            lifecycle->onDestroy();
     }
 
     const juce::String getName() const override
@@ -85,6 +104,9 @@ public:
         lifecycle->sawReleaseWhileSuspended |=
             lifecycle->hostIsSuspended != nullptr
             && lifecycle->hostIsSuspended();
+
+        if (lifecycle->onRelease != nullptr)
+            lifecycle->onRelease();
 
         if (lifecycle->throwOnRelease)
             throw std::runtime_error (
@@ -159,16 +181,34 @@ public:
     void getStateInformation (
         juce::MemoryBlock&) override
     {
+        if (lifecycle == nullptr)
+            return;
+
+        ++lifecycle->stateCaptureCalls;
+
+        if (lifecycle->throwOnGetState)
+            throw std::runtime_error (
+                "state capture failure requested by test");
     }
 
     void setStateInformation (
-        const void*, int) override
+        const void* data, int size) override
     {
+        restoredState.reset();
+
+        if (data != nullptr && size > 0)
+            restoredState.append (data, (size_t) size);
     }
 
     void fillInPluginDescription (
         juce::PluginDescription& description) const override
     {
+        if (reportedDescription.name.isNotEmpty())
+        {
+            description = reportedDescription;
+            return;
+        }
+
         description.name = getName();
         description.descriptiveName = getName();
         description.pluginFormatName = "ChurchDAW Test";
@@ -198,6 +238,11 @@ public:
     int getLastProcessChannelCount() const noexcept
     {
         return lastProcessChannelCount;
+    }
+
+    const juce::MemoryBlock& getRestoredState() const noexcept
+    {
+        return restoredState;
     }
 
     void clearCapturedBlocks()
@@ -298,10 +343,136 @@ private:
         8192, 8192, 8192, 8192
     };
     std::shared_ptr<PluginLifecycleState> lifecycle;
+    juce::PluginDescription reportedDescription;
     int prepareCount = 0;
     double lastSampleRate = 0.0;
     int lastMaximumBlockSize = 0;
     int lastProcessChannelCount = 0;
+    juce::MemoryBlock restoredState;
+};
+
+class DeferredPluginFormat final : public juce::AudioPluginFormat
+{
+public:
+    static constexpr const char* formatName =
+        "ChurchDAW Async Test";
+
+    juce::String getName() const override
+    {
+        return formatName;
+    }
+
+    bool fileMightContainThisPluginType (
+        const juce::String&) override
+    {
+        return true;
+    }
+
+    juce::FileSearchPath getDefaultLocationsToSearch() override
+    {
+        return {};
+    }
+
+    bool canScanForPlugins() const override { return false; }
+    bool isTrivialToScan() const override { return true; }
+
+    void findAllTypesForFile (
+        juce::OwnedArray<juce::PluginDescription>&,
+        const juce::String&) override
+    {
+    }
+
+    bool doesPluginStillExist (
+        const juce::PluginDescription&) override
+    {
+        return true;
+    }
+
+    juce::String getNameOfPluginFromIdentifier (
+        const juce::String& identifier) override
+    {
+        return identifier;
+    }
+
+    bool pluginNeedsRescanning (
+        const juce::PluginDescription&) override
+    {
+        return false;
+    }
+
+    juce::StringArray searchPathsForPlugins (
+        const juce::FileSearchPath&, bool, bool) override
+    {
+        return {};
+    }
+
+    bool requiresUnblockedMessageThreadDuringCreation (
+        const juce::PluginDescription&) const override
+    {
+        return true;
+    }
+
+    int pendingCount() const noexcept
+    {
+        return (int) pending.size();
+    }
+
+    bool complete (
+        const juce::String& name,
+        std::shared_ptr<PluginLifecycleState> lifecycle)
+    {
+        for (size_t i = 0; i < pending.size(); ++i)
+            if (pending[i].description.name == name)
+            {
+                auto description = pending[i].description;
+                auto callback =
+                    std::move (pending[i].callback);
+                pending.erase (pending.begin()
+                               + (std::ptrdiff_t) i);
+                callback (
+                    std::make_unique<CapturingPlugin> (
+                        2, std::move (lifecycle),
+                        std::move (description)),
+                    {});
+                return true;
+            }
+
+        return false;
+    }
+
+    bool fail (const juce::String& name)
+    {
+        for (size_t i = 0; i < pending.size(); ++i)
+            if (pending[i].description.name == name)
+            {
+                auto callback =
+                    std::move (pending[i].callback);
+                pending.erase (pending.begin()
+                               + (std::ptrdiff_t) i);
+                callback (nullptr, "falha solicitada pelo teste");
+                return true;
+            }
+
+        return false;
+    }
+
+private:
+    struct Pending
+    {
+        juce::PluginDescription description;
+        PluginCreationCallback callback;
+    };
+
+    void createPluginInstance (
+        const juce::PluginDescription& description,
+        double, int,
+        PluginCreationCallback callback) override
+    {
+        pending.push_back (
+            { description, std::move (callback) });
+    }
+
+    std::vector<Pending> pending;
 };
 
 template <typename Parameter>
@@ -1870,6 +2041,776 @@ void testTransposeLedgerOverflowFailsClosed (
         fixture.plugin->activeVoiceCount() == 0,
         "PANIC explícito após recuperação deve silenciar a nova nota");
 }
+
+void testAsyncPluginCreationIsTwoPhaseAndRejectsStale (
+    TestContext& test)
+{
+    juce::AudioPluginFormatManager manager;
+    auto deferred = std::make_unique<DeferredPluginFormat>();
+    auto* deferredRaw = deferred.get();
+    manager.addFormat (std::move (deferred));
+    juce::KnownPluginList known;
+    auto processor = std::make_unique<TimbresProcessor>();
+    processor->setPluginResources (&known, &manager);
+    processor->prepareToPlay (48000.0, 128);
+
+    const auto makeDescription = [] (
+        const juce::String& name, int uniqueId)
+    {
+        juce::PluginDescription description;
+        description.name = name;
+        description.descriptiveName = name;
+        description.pluginFormatName =
+            DeferredPluginFormat::formatName;
+        description.fileOrIdentifier =
+            "churchdaw.async." + name;
+        description.manufacturerName = "ChurchDAW Tests";
+        description.version = "1";
+        description.uniqueId = uniqueId;
+        description.isInstrument = true;
+        return description;
+    };
+
+    const auto dispatchUntilPending =
+        [deferredRaw] (int expected)
+    {
+        for (int attempt = 0;
+             attempt < 100
+                && deferredRaw->pendingCount() < expected;
+             ++attempt)
+            juce::MessageManager::getInstance()
+                ->runDispatchLoopUntil (2);
+
+        return deferredRaw->pendingCount() == expected;
+    };
+
+    const auto dispatchUntil = [] (const std::function<bool()>& ready)
+    {
+        for (int attempt = 0; attempt < 100 && ! ready(); ++attempt)
+            juce::MessageManager::getInstance()
+                ->runDispatchLoopUntil (2);
+
+        return ready();
+    };
+
+    const auto saveProcessorXml = [&processor]
+    {
+        juce::MemoryBlock state;
+        processor->getStateInformation (state);
+        return juce::AudioProcessor::getXmlFromBinary (
+            state.getData(), (int) state.getSize());
+    };
+
+    const auto findLayer = [] (
+        const juce::XmlElement* root, int layer)
+        -> const juce::XmlElement*
+    {
+        if (root != nullptr)
+            for (const auto* child : root->getChildIterator())
+                if (child->hasTagName ("LAYER")
+                     && child->getIntAttribute ("index", -1) == layer)
+                    return child;
+
+        return nullptr;
+    };
+
+    const auto findInsert = [] (
+        const juce::XmlElement* root, int slot)
+        -> const juce::XmlElement*
+    {
+        if (root != nullptr)
+            for (const auto* child : root->getChildIterator())
+                if (child->hasTagName ("INSERT")
+                     && child->getIntAttribute ("slot", -1) == slot)
+                    return child;
+
+        return nullptr;
+    };
+
+    const auto first = makeDescription ("Async A", 0x4101);
+    auto lifecycleA =
+        std::make_shared<PluginLifecycleState>();
+    int firstCompletion = 0;
+    test.expect (
+        processor->loadInstrumentPlugin (
+            0, first, true, nullptr,
+            [&firstCompletion] (bool loaded, const juce::String&)
+            {
+                firstCompletion += loaded ? 1 : -1;
+            }),
+        "pedido assíncrono inicial deve ser aceito");
+    test.expect (
+        processor->getLayerInstrument (0) == nullptr,
+        "pedido aceito não pode instalar antes do callback");
+    test.expect (
+        dispatchUntilPending (1),
+        "formato mock deve receber pedido sem bloquear a message thread");
+    test.expect (
+        deferredRaw->complete ("Async A", lifecycleA),
+        "callback inicial deve existir");
+    test.expect (
+        processor->getLayerInstrumentName (0) == "Async A"
+         && firstCompletion == 1
+         && lifecycleA->prepareCalls == 1,
+        "primeiro callback deve preparar e instalar o instrumento");
+
+    const auto instrumentStateCallsBeforeFailure =
+        lifecycleA->stateCaptureCalls;
+    lifecycleA->throwOnGetState = true;
+    auto failedInstrumentCapture = saveProcessorXml();
+    const auto* failedInstrumentLayer = findLayer (
+        failedInstrumentCapture.get(), 0);
+    test.expect (
+        failedInstrumentCapture != nullptr
+         && failedInstrumentLayer != nullptr
+         && failedInstrumentLayer->getStringAttribute ("vstId")
+                == first.createIdentifierString()
+         && lifecycleA->stateCaptureCalls
+                == instrumentStateCallsBeforeFailure + 1
+         && processor->consumeLastStateCaptureHadFailure(),
+        "throw do VST/AU deve sinalizar que o ID no snapshot nao e "
+        "uma captura valida silenciosa");
+    test.expect (
+        ! processor->consumeLastStateCaptureHadFailure(),
+        "sinal de falha da captura deve ser consumivel uma unica vez");
+
+    lifecycleA->throwOnGetState = false;
+    auto recoveredInstrumentCapture = saveProcessorXml();
+    test.expect (
+        recoveredInstrumentCapture != nullptr
+         && lifecycleA->stateCaptureCalls
+                == instrumentStateCallsBeforeFailure + 2
+         && ! processor->consumeLastStateCaptureHadFailure(),
+        "nova captura valida deve limpar o resultado da falha anterior");
+
+    const auto stale = makeDescription ("Async B", 0x4201);
+    const auto current = makeDescription ("Async C", 0x4301);
+    const char staleBytes[] = "estado-stale";
+    const char currentBytes[] = "estado-correto";
+    juce::MemoryBlock staleState (
+        staleBytes, sizeof (staleBytes));
+    juce::MemoryBlock currentState (
+        currentBytes, sizeof (currentBytes));
+    auto lifecycleB =
+        std::make_shared<PluginLifecycleState>();
+    auto lifecycleC =
+        std::make_shared<PluginLifecycleState>();
+    int staleCompletion = 0;
+    int currentCompletion = 0;
+
+    test.expect (
+        processor->loadInstrumentPlugin (
+            0, stale, false, &staleState,
+            [&staleCompletion] (bool, const juce::String&)
+            {
+                ++staleCompletion;
+            })
+         && processor->loadInstrumentPlugin (
+                0, current, false, &currentState,
+                [&currentCompletion] (
+                    bool loaded, const juce::String&)
+                {
+                    currentCompletion += loaded ? 1 : -1;
+                }),
+        "rajada B/C deve ser aceita sem remover A");
+    test.expect (
+        processor->getLayerInstrumentName (0) == "Async A"
+         && lifecycleA->releaseCalls == 0,
+        "instrumento A deve continuar tocando enquanto B/C criam");
+
+    juce::PluginDescription pendingInstrumentDescription;
+    auto savedDuringInstrumentLoad = saveProcessorXml();
+    const auto* savedPendingLayer = findLayer (
+        savedDuringInstrumentLoad.get(), 0);
+    test.expect (
+        known.getNumTypes() == 0
+         && processor->getPendingInstrumentDescription (
+                0, pendingInstrumentDescription)
+         && pendingInstrumentDescription.createIdentifierString()
+                == current.createIdentifierString()
+         && savedPendingLayer != nullptr
+         && savedPendingLayer->getStringAttribute ("vstId")
+                == current.createIdentifierString()
+         && savedPendingLayer->getStringAttribute ("vstState")
+                == currentState.toBase64Encoding(),
+        "autosave/cache devem expor C pendente mesmo com KnownPluginList vazio");
+    test.expect (
+        dispatchUntilPending (2),
+        "os dois pedidos devem chegar ao formato assíncrono");
+    test.expect (
+        deferredRaw->complete ("Async B", lifecycleB),
+        "callback B deve existir");
+    test.expect (
+        processor->getLayerInstrumentName (0) == "Async A"
+         && lifecycleB->prepareCalls == 0
+         && lifecycleA->releaseCalls == 0
+         && staleCompletion == 0,
+        "callback stale deve ser ignorado antes de prepare/swap/completion");
+    test.expect (
+        deferredRaw->complete ("Async C", lifecycleC),
+        "callback C deve existir");
+
+    auto* installed = dynamic_cast<CapturingPlugin*> (
+        processor->getLayerInstrument (0));
+    test.expect (
+        installed != nullptr
+         && processor->getLayerInstrumentName (0) == "Async C"
+         && lifecycleC->prepareCalls == 1
+         && lifecycleA->releaseCalls == 1
+         && currentCompletion == 1,
+        "callback atual deve preparar C e fazer swap em duas fases");
+    test.expect (
+        installed != nullptr
+         && installed->getRestoredState() == currentState,
+        "estado pendente deve ser aplicado a C antes do commit");
+
+    const auto failedInstrument =
+        makeDescription ("Async Failure", 0x4401);
+    int instrumentFailureCompletion = 0;
+    test.expect (
+        processor->loadInstrumentPlugin (
+            0, failedInstrument, true, nullptr,
+            [&instrumentFailureCompletion] (
+                bool loaded, const juce::String&)
+            {
+                instrumentFailureCompletion += loaded ? 1 : -1;
+            })
+         && dispatchUntilPending (1)
+         && deferredRaw->fail ("Async Failure"),
+        "falha assíncrona de instrumento deve ser entregue");
+    test.expect (
+        processor->getLayerInstrument (0) == installed
+         && lifecycleC->releaseCalls == 0
+         && instrumentFailureCompletion == -1,
+        "falha de criação deve preservar C sem liberar seu áudio");
+
+    auto savedAfterInteractiveFailure = saveProcessorXml();
+    const auto* layerAfterInteractiveFailure = findLayer (
+        savedAfterInteractiveFailure.get(), 0);
+    juce::PluginDescription clearedPendingDescription;
+    test.expect (
+        ! processor->getPendingInstrumentDescription (
+            0, clearedPendingDescription)
+         && layerAfterInteractiveFailure != nullptr
+         && layerAfterInteractiveFailure->getStringAttribute ("vstId")
+                == current.createIdentifierString(),
+        "falha interativa deve limpar pending e voltar a serializar C instalado");
+
+    // C -> E faz o commit; releaseResources de C inicia D reentrante. O fim de
+    // E não pode limpar D nem chamar a completion antiga. O teste também prova
+    // que o editor recebe o ponteiro ainda vivo antes de release/destruição.
+    const auto reentrantInstrument =
+        makeDescription ("Async D Reentrant", 0x4501);
+    const auto transientInstrument =
+        makeDescription ("Async E Transient", 0x4601);
+    auto lifecycleD =
+        std::make_shared<PluginLifecycleState>();
+    auto lifecycleE =
+        std::make_shared<PluginLifecycleState>();
+    bool retirementSawLiveC = false;
+    bool reentrantInstrumentAccepted = false;
+    int transientCompletion = 0;
+    int reentrantCompletion = 0;
+
+    processor->setHostedPluginWillRetireCallback (
+        [&] (TimbresProcessor::HostedPluginLocation location,
+             int index, juce::AudioPluginInstance* instance)
+        {
+            if (location
+                    == TimbresProcessor::HostedPluginLocation::instrument
+                 && index == 0 && instance == installed)
+                retirementSawLiveC = lifecycleC->releaseCalls == 0
+                                  && lifecycleC->destructorCalls == 0;
+        });
+    lifecycleC->onRelease = [&]
+    {
+        reentrantInstrumentAccepted =
+            processor->loadInstrumentPlugin (
+                0, reentrantInstrument, true, nullptr,
+                [&reentrantCompletion] (
+                    bool loaded, const juce::String&)
+                {
+                    reentrantCompletion += loaded ? 1 : -1;
+                });
+    };
+
+    test.expect (
+        processor->loadInstrumentPlugin (
+            0, transientInstrument, true, nullptr,
+            [&transientCompletion] (
+                bool loaded, const juce::String&)
+            {
+                transientCompletion += loaded ? 1 : -1;
+            })
+         && dispatchUntilPending (1)
+         && deferredRaw->complete (
+                "Async E Transient", lifecycleE),
+        "E deve concluir enquanto C ainda é o instrumento antigo");
+    lifecycleC->onRelease = {};
+    test.expect (
+        retirementSawLiveC
+         && reentrantInstrumentAccepted
+         && lifecycleC->releaseCalls == 1
+         && lifecycleC->destructorCalls == 1
+         && transientCompletion == 0
+         && processor->getLayerInstrumentName (0)
+                == "Async E Transient",
+        "retire deve preceder release e D deve tornar a completion de E stale");
+
+    auto savedDuringReentrantInstrument = saveProcessorXml();
+    const auto* savedReentrantLayer = findLayer (
+        savedDuringReentrantInstrument.get(), 0);
+    test.expect (
+        savedReentrantLayer != nullptr
+         && savedReentrantLayer->getStringAttribute ("vstId")
+                == reentrantInstrument.createIdentifierString()
+         && dispatchUntilPending (1)
+         && deferredRaw->complete (
+                "Async D Reentrant", lifecycleD),
+        "pedido D iniciado no release deve permanecer pendente e concluir");
+    test.expect (
+        processor->getLayerInstrumentName (0)
+                == "Async D Reentrant"
+         && lifecycleE->releaseCalls == 1
+         && lifecycleE->destructorCalls == 1
+         && reentrantCompletion == 1,
+        "D deve substituir E sem perder identidade/completion");
+
+    // Um editor de vendor ainda desmontando bloqueia o commit, mas não perde a
+    // instância criada. Depois do gate, D lança em release e mesmo assim G deve
+    // ficar instalado e reportar sucesso (nunca falso pós-move).
+    const auto gatedInstrument =
+        makeDescription ("Async G Gated", 0x4701);
+    auto lifecycleG =
+        std::make_shared<PluginLifecycleState>();
+    int gatedCompletion = 0;
+    lifecycleD->throwOnRelease = true;
+    test.expect (
+        processor->loadInstrumentPlugin (
+            0, gatedInstrument, true, nullptr,
+            [&gatedCompletion] (bool loaded, const juce::String&)
+            {
+                gatedCompletion += loaded ? 1 : -1;
+            })
+         && dispatchUntilPending (1),
+        "G deve chegar ao formato antes do gate de teardown");
+    processor->beginHostedPluginEditorTeardown();
+    test.expect (
+        deferredRaw->complete ("Async G Gated", lifecycleG)
+         && lifecycleG->prepareCalls == 0
+         && processor->getLayerInstrumentName (0)
+                == "Async D Reentrant",
+        "completion durante teardown não pode preparar/trocar sob o editor");
+    processor->endHostedPluginEditorTeardown();
+    test.expect (
+        dispatchUntil ([&]
+        {
+            return processor->getLayerInstrumentName (0)
+                    == "Async G Gated";
+        })
+         && lifecycleG->prepareCalls == 1
+         && lifecycleD->releaseCalls == 1
+         && lifecycleD->destructorCalls == 1
+         && gatedCompletion == 1,
+        "G deve instalar após teardown apesar da exceção no release de D");
+
+    const auto restoreFailure =
+        makeDescription ("Async Restore Failure", 0x4801);
+    const auto interactiveFailureAfterRestore =
+        makeDescription ("Async Interactive Failure 2", 0x4901);
+    const char restoreFailureBytes[] = "estado-restore-pendente";
+    juce::MemoryBlock restoreFailureState (
+        restoreFailureBytes, sizeof (restoreFailureBytes));
+    int restoreFailureCompletion = 0;
+    test.expect (
+        processor->loadInstrumentPlugin (
+            0, restoreFailure, false, &restoreFailureState,
+            [&restoreFailureCompletion] (
+                bool loaded, const juce::String&)
+            {
+                restoreFailureCompletion += loaded ? 1 : -1;
+            })
+         && dispatchUntilPending (1)
+         && deferredRaw->fail ("Async Restore Failure"),
+        "falha de restore deve ser entregue sem apagar a intenção");
+    auto savedAfterRestoreFailure = saveProcessorXml();
+    const auto* layerAfterRestoreFailure = findLayer (
+        savedAfterRestoreFailure.get(), 0);
+    juce::PluginDescription preservedRestoreDescription;
+    test.expect (
+        restoreFailureCompletion == -1
+         && processor->getPendingInstrumentDescription (
+                0, preservedRestoreDescription)
+         && preservedRestoreDescription.createIdentifierString()
+                == restoreFailure.createIdentifierString()
+         && layerAfterRestoreFailure != nullptr
+         && layerAfterRestoreFailure->getStringAttribute ("vstId")
+                == restoreFailure.createIdentifierString()
+         && layerAfterRestoreFailure->getStringAttribute ("vstState")
+                == restoreFailureState.toBase64Encoding(),
+        "restore falho deve sobreviver no save/cache para autocura");
+
+    test.expect (
+        processor->loadInstrumentPlugin (
+            0, interactiveFailureAfterRestore)
+         && dispatchUntilPending (1)
+         && deferredRaw->fail (
+                "Async Interactive Failure 2"),
+        "novo pedido interativo deve substituir o restore pendente");
+    auto savedAfterSecondInteractiveFailure = saveProcessorXml();
+    const auto* layerAfterSecondInteractiveFailure = findLayer (
+        savedAfterSecondInteractiveFailure.get(), 0);
+    test.expect (
+        ! processor->getPendingInstrumentDescription (
+            0, clearedPendingDescription)
+         && layerAfterSecondInteractiveFailure != nullptr
+         && layerAfterSecondInteractiveFailure->getStringAttribute ("vstId")
+                == gatedInstrument.createIdentifierString(),
+        "falha interativa posterior deve retornar ao G instalado");
+
+    auto insertA = makeDescription ("Insert A", 0x5101);
+    auto insertB = makeDescription ("Insert B", 0x5201);
+    auto insertC = makeDescription ("Insert C", 0x5301);
+    insertA.isInstrument = false;
+    insertB.isInstrument = false;
+    insertC.isInstrument = false;
+    auto insertLifecycleA =
+        std::make_shared<PluginLifecycleState>();
+    auto insertLifecycleB =
+        std::make_shared<PluginLifecycleState>();
+    auto insertLifecycleC =
+        std::make_shared<PluginLifecycleState>();
+
+    test.expect (
+        processor->loadInsert (0, insertA),
+        "pedido do insert A deve ser aceito");
+    test.expect (
+        dispatchUntilPending (1)
+         && deferredRaw->complete (
+                "Insert A", insertLifecycleA),
+        "insert A deve concluir pelo callback assíncrono");
+    auto* firstInsert = processor->getInsert (0);
+    test.expect (
+        firstInsert != nullptr
+         && insertLifecycleA->prepareCalls == 1,
+        "insert A deve estar preparado e instalado");
+
+    const auto insertStateCallsBeforeFailure =
+        insertLifecycleA->stateCaptureCalls;
+    insertLifecycleA->throwOnGetState = true;
+    auto failedInsertCapture = saveProcessorXml();
+    const auto* failedInsertXml = findInsert (
+        failedInsertCapture.get(), 0);
+    test.expect (
+        failedInsertCapture != nullptr
+         && failedInsertXml != nullptr
+         && failedInsertXml->getStringAttribute ("id")
+                == insertA.createIdentifierString()
+         && insertLifecycleA->stateCaptureCalls
+                == insertStateCallsBeforeFailure + 1
+         && processor->consumeLastStateCaptureHadFailure(),
+        "throw do insert deve sinalizar que o ID no snapshot nao e "
+        "uma captura valida silenciosa");
+
+    insertLifecycleA->throwOnGetState = false;
+    auto recoveredInsertCapture = saveProcessorXml();
+    test.expect (
+        recoveredInsertCapture != nullptr
+         && insertLifecycleA->stateCaptureCalls
+                == insertStateCallsBeforeFailure + 2
+         && ! processor->consumeLastStateCaptureHadFailure(),
+        "captura valida posterior do insert deve limpar a falha anterior");
+
+    test.expect (
+        processor->loadInsert (
+            0, insertB, &staleState)
+         && processor->loadInsert (
+                0, insertC, &currentState),
+        "rajada de inserts B/C deve ser aceita");
+    test.expect (
+        processor->getInsert (0) == firstInsert
+         && insertLifecycleA->releaseCalls == 0,
+        "insert A deve permanecer no grafo durante criação B/C");
+
+    juce::MemoryBlock savedDuringInsertLoad;
+    processor->getStateInformation (savedDuringInsertLoad);
+    auto savedXml = juce::AudioProcessor::getXmlFromBinary (
+        savedDuringInsertLoad.getData(),
+        (int) savedDuringInsertLoad.getSize());
+    const juce::XmlElement* savedInsert = nullptr;
+
+    if (savedXml != nullptr)
+        for (const auto* child : savedXml->getChildIterator())
+            if (child->hasTagName ("INSERT")
+                 && child->getIntAttribute ("slot", -1) == 0)
+            {
+                savedInsert = child;
+                break;
+            }
+
+    test.expect (
+        savedInsert != nullptr
+         && savedInsert->getStringAttribute ("id")
+                == insertC.createIdentifierString()
+         && savedInsert->getStringAttribute ("state")
+                == currentState.toBase64Encoding(),
+        "save durante two-phase deve persistir C pendente, não A antigo");
+    test.expect (
+        dispatchUntilPending (2)
+         && deferredRaw->complete (
+                "Insert B", insertLifecycleB),
+        "callback do insert B deve existir");
+    test.expect (
+        processor->getInsert (0) == firstInsert
+         && insertLifecycleB->prepareCalls == 0
+         && insertLifecycleA->releaseCalls == 0,
+        "insert stale B deve ser descartado antes do prepare/swap");
+
+    juce::PluginDescription pendingInsertDescription;
+    test.expect (
+        processor->getPendingInsertDescription (
+            0, pendingInsertDescription)
+         && pendingInsertDescription.createIdentifierString()
+                == insertC.createIdentifierString(),
+        "descrição de C deve sobreviver fora do KnownPluginList durante o scan");
+
+    bool retirementSawLiveInsertA = false;
+    processor->setHostedPluginWillRetireCallback (
+        [&] (TimbresProcessor::HostedPluginLocation location,
+             int index, juce::AudioPluginInstance* instance)
+        {
+            if (location
+                    == TimbresProcessor::HostedPluginLocation::insert
+                 && index == 0 && instance == firstInsert)
+                retirementSawLiveInsertA =
+                    insertLifecycleA->releaseCalls == 0
+                    && insertLifecycleA->destructorCalls == 0;
+        });
+    test.expect (
+        deferredRaw->complete (
+            "Insert C", insertLifecycleC),
+        "callback do insert C deve existir");
+    auto* finalInsert = dynamic_cast<CapturingPlugin*> (
+        processor->getInsert (0));
+    test.expect (
+        finalInsert != nullptr
+         && finalInsert != firstInsert
+         && insertLifecycleC->prepareCalls == 1
+         && insertLifecycleA->releaseCalls == 1
+         && insertLifecycleA->destructorCalls == 1
+         && retirementSawLiveInsertA
+         && finalInsert->getRestoredState() == currentState,
+        "insert C deve fechar editor antes de liberar A e trocar em duas fases");
+
+    const auto failedInsert =
+        makeDescription ("Insert Failure", 0x5401);
+    test.expect (
+        processor->loadInsert (0, failedInsert)
+         && dispatchUntilPending (1)
+         && deferredRaw->fail ("Insert Failure"),
+        "falha assíncrona de insert deve ser entregue");
+    test.expect (
+        processor->getInsert (0) == finalInsert
+         && insertLifecycleC->releaseCalls == 0,
+        "falha de insert deve manter C no grafo");
+
+    // O destrutor de C inicia D enquanto E termina. Assim cobrimos a segunda
+    // fonte real de loop modal (destrutor, além de releaseResources): D precisa
+    // permanecer no pending/save e a completion de E deve ser suprimida.
+    auto reentrantInsert =
+        makeDescription ("Insert D Reentrant", 0x5601);
+    auto transientInsert =
+        makeDescription ("Insert E Transient", 0x5701);
+    reentrantInsert.isInstrument = false;
+    transientInsert.isInstrument = false;
+    auto insertLifecycleD =
+        std::make_shared<PluginLifecycleState>();
+    auto insertLifecycleE =
+        std::make_shared<PluginLifecycleState>();
+    bool reentrantInsertAccepted = false;
+    int reentrantInsertCompletion = 0;
+    int transientInsertCompletion = 0;
+    insertLifecycleC->onDestroy = [&]
+    {
+        reentrantInsertAccepted = processor->loadInsert (
+            0, reentrantInsert, nullptr,
+            [&reentrantInsertCompletion] (
+                bool loaded, const juce::String&)
+            {
+                reentrantInsertCompletion += loaded ? 1 : -1;
+            });
+    };
+
+    test.expect (
+        processor->loadInsert (
+            0, transientInsert, nullptr,
+            [&transientInsertCompletion] (
+                bool loaded, const juce::String&)
+            {
+                transientInsertCompletion += loaded ? 1 : -1;
+            })
+         && dispatchUntilPending (1)
+         && deferredRaw->complete (
+                "Insert E Transient", insertLifecycleE),
+        "insert E deve concluir e destruir C");
+    insertLifecycleC->onDestroy = {};
+    test.expect (
+        reentrantInsertAccepted
+         && insertLifecycleC->releaseCalls == 1
+         && insertLifecycleC->destructorCalls == 1
+         && transientInsertCompletion == 0
+         && processor->getInsert (0) != finalInsert,
+        "pedido D do destrutor deve tornar a completion de E stale");
+
+    auto savedDuringReentrantInsert = saveProcessorXml();
+    const auto* savedReentrantInsert = findInsert (
+        savedDuringReentrantInsert.get(), 0);
+    test.expect (
+        savedReentrantInsert != nullptr
+         && savedReentrantInsert->getStringAttribute ("id")
+                == reentrantInsert.createIdentifierString()
+         && dispatchUntilPending (1)
+         && deferredRaw->complete (
+                "Insert D Reentrant", insertLifecycleD),
+        "insert D iniciado pelo destrutor deve permanecer serializável");
+    test.expect (
+        insertLifecycleE->releaseCalls == 1
+         && insertLifecycleE->destructorCalls == 1
+         && reentrantInsertCompletion == 1,
+        "insert D deve substituir E e concluir apenas o pedido atual");
+
+    // Restore substitutivo sem <INSERT>: não há herança silenciosa do projeto
+    // anterior. Remova todos os nós de insert do próprio estado válido.
+    auto dryRestoreXml = saveProcessorXml();
+
+    if (dryRestoreXml != nullptr)
+    {
+        juce::Array<juce::XmlElement*> insertsToRemove;
+
+        for (auto* child : dryRestoreXml->getChildIterator())
+            if (child->hasTagName ("INSERT"))
+                insertsToRemove.add (child);
+
+        for (auto* child : insertsToRemove)
+            dryRestoreXml->removeChildElement (child, true);
+    }
+
+    juce::MemoryBlock dryRestoreState;
+
+    if (dryRestoreXml != nullptr)
+        juce::AudioProcessor::copyXmlToBinary (
+            *dryRestoreXml, dryRestoreState);
+
+    processor->setHostedPluginWillRetireCallback ({});
+    processor->setStateInformation (
+        dryRestoreState.getData(),
+        (int) dryRestoreState.getSize());
+    test.expect (
+        dryRestoreXml != nullptr
+         && processor->getInsert (0) == nullptr
+         && insertLifecycleD->releaseCalls == 1
+         && insertLifecycleD->destructorCalls == 1,
+        "restore sem INSERT deve descarregar o efeito antigo exatamente uma vez");
+
+    // Um INSERT salvo que nao existe neste host precisa manter a pagina como
+    // restore pendente para o timeout/rollback, sem fingir que ainda ha uma
+    // fabrica em voo. A limpeza explicita encerra esse marcador.
+    juce::XmlElement missingInsertRestore ("TIMBRES2");
+
+    for (int layer = 0; layer < TimbresProcessor::numLayers; ++layer)
+    {
+        auto* layerXml = missingInsertRestore.createNewChildElement (
+            "LAYER");
+        layerXml->setAttribute ("index", layer);
+    }
+
+    auto* missingInsert = missingInsertRestore.createNewChildElement (
+        "INSERT");
+    missingInsert->setAttribute ("slot", 0);
+    missingInsert->setAttribute (
+        "id", "churchdaw.tests.missing-insert");
+    missingInsert->setAttribute ("state", juce::String());
+
+    juce::MemoryBlock missingInsertState;
+    juce::AudioProcessor::copyXmlToBinary (
+        missingInsertRestore, missingInsertState);
+    processor->setStateInformation (
+        missingInsertState.getData(),
+        (int) missingInsertState.getSize());
+    test.expect (
+        processor->getInsert (0) == nullptr
+         && processor->hasPendingStateRestore(),
+        "INSERT ausente deve esvaziar o slot e manter restore pendente");
+
+    processor->unloadInsert (0);
+    test.expect (
+        ! processor->hasPendingStateRestore(),
+        "unload explicito deve encerrar o pending do INSERT ausente");
+
+    const auto cancelledInstrument =
+        makeDescription ("Async Cancel", 0x4501);
+    auto cancelledInstrumentLifecycle =
+        std::make_shared<PluginLifecycleState>();
+    test.expect (
+        processor->loadInstrumentPlugin (
+            0, cancelledInstrument)
+         && dispatchUntilPending (1),
+        "instrumento cancelável deve chegar ao formato");
+    processor->clearInstrumentPlugin (0);
+    test.expect (
+        deferredRaw->complete (
+            "Async Cancel", cancelledInstrumentLifecycle),
+        "callback do instrumento cancelado deve existir");
+    test.expect (
+        processor->getLayerInstrument (0) == nullptr
+         && cancelledInstrumentLifecycle->prepareCalls == 0,
+        "clear deve invalidar callback tardio do instrumento");
+
+    const auto cancelledInsert =
+        makeDescription ("Insert Cancel", 0x5501);
+    auto cancelledInsertLifecycle =
+        std::make_shared<PluginLifecycleState>();
+    test.expect (
+        processor->loadInsert (0, cancelledInsert)
+         && dispatchUntilPending (1),
+        "insert cancelável deve chegar ao formato");
+    processor->unloadInsert (0);
+    test.expect (
+        deferredRaw->complete (
+            "Insert Cancel", cancelledInsertLifecycle),
+        "callback do insert cancelado deve existir");
+    test.expect (
+        processor->getInsert (0) == nullptr
+         && cancelledInsertLifecycle->prepareCalls == 0,
+        "unload deve invalidar callback tardio do insert");
+
+    const auto destroyedPending =
+        makeDescription ("Async Processor Destroyed", 0x5f01);
+    auto destroyedPendingLifecycle =
+        std::make_shared<PluginLifecycleState>();
+    int destroyedPendingCompletion = 0;
+    test.expect (
+        processor->loadInstrumentPlugin (
+            0, destroyedPending, true, nullptr,
+            [&destroyedPendingCompletion] (
+                bool, const juce::String&)
+            {
+                ++destroyedPendingCompletion;
+            })
+         && dispatchUntilPending (1),
+        "callback pendente deve estar retido pelo formato antes do destroy");
+
+    processor.reset();
+    test.expect (
+        deferredRaw->complete (
+            "Async Processor Destroyed",
+            destroyedPendingLifecycle)
+         && destroyedPendingLifecycle->prepareCalls == 0
+         && destroyedPendingLifecycle->releaseCalls == 0
+         && destroyedPendingLifecycle->destructorCalls == 1
+         && destroyedPendingCompletion == 0,
+        "callback pós-destruição deve só destruir candidato sem acessar processor");
+}
 }
 
 int main()
@@ -1900,6 +2841,8 @@ int main()
     testHotLoadPitchCentresStayOnTargetLayer (
         test);
     testPluginLifecycleAndFailureContainment (
+        test);
+    testAsyncPluginCreationIsTwoPhaseAndRejectsStale (
         test);
     testTransposeLedgerOverflowFailsClosed (
         test);

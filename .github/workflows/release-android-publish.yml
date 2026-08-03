@@ -1,0 +1,603 @@
+name: Publicar release comercial Android
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Tag imutavel no formato vMAJOR.MINOR.PATCH
+        required: true
+        type: string
+      expected_commit_sha:
+        description: Commit de 40 hex apontado pela tag e pelo builder Android
+        required: true
+        type: string
+      android_run_id:
+        description: Run ID aprovado de build-android.yml no commit da tag
+        required: true
+        type: string
+      expected_previous_policy_sha256:
+        description: SHA-256 atual de update-policy-v2.json
+        required: true
+        type: string
+      expected_previous_manifest_sha256:
+        description: SHA-256 atual de manifest.json
+        required: true
+        type: string
+      expected_previous_legacy_policy_sha256:
+        description: SHA-256 atual de update-policy.json
+        required: true
+        type: string
+      expected_previous_site_sha256:
+        description: SHA-256 atual de index.html
+        required: true
+        type: string
+      update_message:
+        description: Mensagem curta mostrada no gate Android
+        required: true
+        type: string
+      confirmation:
+        description: Confirme a promocao comercial Android
+        required: true
+        type: choice
+        default: CANCEL
+        options:
+          - CANCEL
+          - PUBLISH
+
+permissions:
+  actions: read
+  contents: read
+
+# O publicador desktop usa deliberadamente o mesmo grupo. HostGator nao
+# oferece compare-and-swap e, portanto, existe um unico escritor global.
+concurrency:
+  group: desktop-production-publish
+  cancel-in-progress: false
+
+jobs:
+  verify-provenance:
+    if: inputs.confirmation == 'PUBLISH'
+    name: Provar tag, run e artefato Android exatos
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      artifact_id: ${{ steps.provenance.outputs.artifact_id }}
+      artifact_digest: ${{ steps.provenance.outputs.artifact_digest }}
+      artifact_size: ${{ steps.provenance.outputs.artifact_size }}
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      EXPECTED_COMMIT: ${{ inputs.expected_commit_sha }}
+      ANDROID_RUN_ID: ${{ inputs.android_run_id }}
+
+    steps:
+      - name: Baixar somente o codigo confiavel do publicador
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validar proveniencia sem confiar em nomes soltos
+        id: provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -Eeuo pipefail
+
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+            || { echo "Tag invalida" >&2; exit 1; }
+          [[ "$EXPECTED_COMMIT" =~ ^[0-9a-fA-F]{40}$ ]] \
+            || { echo "Commit esperado invalido" >&2; exit 1; }
+          [[ "$ANDROID_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ -n "$GH_TOKEN" ]]
+          [[ "$GITHUB_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+
+          expected_commit="$(printf '%s' "$EXPECTED_COMMIT" | tr 'A-F' 'a-f')"
+          head_commit="$(git rev-parse --verify HEAD)"
+          [[ "$head_commit" == "$expected_commit" ]]
+          [[ "$GITHUB_SHA" == "$expected_commit" ]]
+          [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]]
+
+          [[ "$GITHUB_REF" == "refs/tags/$RELEASE_TAG" ]] \
+            || { echo "Despache o publicador pela tag exata" >&2; exit 1; }
+          default_branch="$(gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "repos/$GITHUB_REPOSITORY" --jq '.default_branch')"
+          [[ "$default_branch" =~ ^[A-Za-z0-9._/-]+$ ]]
+          git merge-base --is-ancestor \
+            "$expected_commit" "refs/remotes/origin/$default_branch" \
+            || { echo "Commit da tag nao esta no branch default" >&2; exit 1; }
+
+          local_tag_object="$(git rev-parse --verify "refs/tags/$RELEASE_TAG")"
+          local_tag_commit="$(git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}")"
+          [[ "$local_tag_object" =~ ^[0-9a-fA-F]{40}$ ]]
+          [[ "$local_tag_commit" == "$expected_commit" ]] \
+            || { echo "Tag local nao aponta para o commit esperado" >&2; exit 1; }
+
+          remote_row="$(gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" \
+            --jq '[.ref, .object.type, .object.sha] | @tsv')"
+          IFS=$'\t' read -r remote_ref remote_type remote_sha <<<"$remote_row"
+          [[ "$remote_ref" == "refs/tags/$RELEASE_TAG" ]]
+          [[ "$remote_sha" == "$local_tag_object" ]] \
+            || { echo "Objeto bruto remoto da tag mudou" >&2; exit 1; }
+
+          seen=""
+          depth=0
+          while [[ "$remote_type" == 'tag' ]]; do
+            (( depth < 8 )) || { echo "Cadeia de tags profunda" >&2; exit 1; }
+            [[ " $seen " != *" $remote_sha "* ]] \
+              || { echo "Ciclo na cadeia de tags" >&2; exit 1; }
+            seen="$seen $remote_sha"
+            remote_row="$(gh api \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "repos/$GITHUB_REPOSITORY/git/tags/$remote_sha" \
+              --jq '[.object.type, .object.sha] | @tsv')"
+            IFS=$'\t' read -r remote_type remote_sha <<<"$remote_row"
+            [[ "$remote_sha" =~ ^[0-9a-fA-F]{40}$ ]]
+            (( depth += 1 ))
+          done
+          [[ "$remote_type" == 'commit' && "$remote_sha" == "$expected_commit" ]] \
+            || { echo "Tag remota nao termina no commit esperado" >&2; exit 1; }
+
+          run_row="$(gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$ANDROID_RUN_ID" \
+            --jq '[.id, .status, .conclusion, .event, .head_sha, .head_branch, .path, .run_attempt] | @tsv')"
+          IFS=$'\t' read -r actual_id status conclusion event head_sha \
+            head_branch path attempt <<<"$run_row"
+          [[ "$actual_id" == "$ANDROID_RUN_ID" ]]
+          [[ "$status" == 'completed' && "$conclusion" == 'success' ]]
+          [[ "$event" == 'push' || "$event" == 'workflow_dispatch' ]]
+          [[ "$head_sha" == "$expected_commit" ]]
+          if [[ "$event" == 'workflow_dispatch' ]]; then
+            [[ "$head_branch" == "$RELEASE_TAG" ]] \
+              || { echo "Builder manual nao foi despachado pela tag" >&2; exit 1; }
+          else
+            [[ -z "$head_branch" || "$head_branch" == "$RELEASE_TAG" ]] \
+              || { echo "Builder push nao corresponde a tag" >&2; exit 1; }
+          fi
+          [[ "$path" == '.github/workflows/build-android.yml' ]]
+          [[ "$attempt" =~ ^[1-9][0-9]*$ ]]
+
+          version="${RELEASE_TAG#v}"
+          artifact_name="ChurchDAW-Android-$version-Release"
+          artifact_json="$(gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$ANDROID_RUN_ID/artifacts?per_page=100")"
+          artifact_row="$(python3 -c '
+          import json, re, sys
+          expected = sys.argv[1]
+          data = json.load(sys.stdin)
+          if not isinstance(data.get("total_count"), int) or data["total_count"] > 100:
+              raise SystemExit("artifact count invalido ou paginacao necessaria")
+          found = [item for item in data.get("artifacts", []) if item.get("name") == expected]
+          if len(found) != 1:
+              raise SystemExit(f"esperava um artifact {expected!r}; encontrei {len(found)}")
+          item = found[0]
+          artifact_id = item.get("id")
+          digest = item.get("digest")
+          size = item.get("size_in_bytes")
+          if (not isinstance(artifact_id, int) or artifact_id < 1 or
+                  item.get("expired") is not False or
+                  not isinstance(size, int) or size < 1 or
+                  not isinstance(digest, str) or
+                  not re.fullmatch(r"sha256:[0-9a-fA-F]{64}", digest)):
+              raise SystemExit("metadados do artifact invalidos/expirados")
+          print(f"{artifact_id}\t{digest.lower()}\t{size}")
+          ' "$artifact_name" <<<"$artifact_json")"
+          IFS=$'\t' read -r artifact_id artifact_digest artifact_size \
+            <<<"$artifact_row"
+
+          headers="$(mktemp "$RUNNER_TEMP/churchdaw-artifact-headers.XXXXXX")"
+          archive="$(mktemp "$RUNNER_TEMP/churchdaw-artifact-archive.XXXXXX")"
+          trap 'rm -f "$headers" "$archive"' EXIT
+          curl --disable --silent --show-error --fail \
+            --proto '=https' --tlsv1.2 --max-redirs 0 \
+            --connect-timeout 30 --max-time 900 \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            --dump-header "$headers" --output /dev/null \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id/zip"
+          location="$(python3 - "$headers" <<'PY'
+          import pathlib, sys
+          values = []
+          for line in pathlib.Path(sys.argv[1]).read_text(
+                  encoding="iso-8859-1").splitlines():
+              if line.lower().startswith("location:"):
+                  values.append(line.split(":", 1)[1].strip())
+          if len(values) != 1:
+              raise SystemExit("redirect unico do artifact nao encontrado")
+          print(values[0])
+          PY
+          )"
+          python3 - "$location" <<'PY'
+          import sys
+          from urllib.parse import urlsplit
+          value = urlsplit(sys.argv[1])
+          host = (value.hostname or "").lower()
+          allowed = (
+              host.endswith(".blob.core.windows.net") or
+              host.endswith(".actions.githubusercontent.com")
+          )
+          if (value.scheme != "https" or not allowed or value.username or
+                  value.password or not value.path or not value.query):
+              raise SystemExit("redirect assinado do artifact fora do host permitido")
+          PY
+          curl --disable --silent --show-error --fail \
+            --proto '=https' --tlsv1.2 --max-redirs 0 \
+            --connect-timeout 30 --max-time 900 \
+            --output "$archive" "$location"
+          actual_digest="sha256:$(sha256sum "$archive" | awk '{ print $1 }')"
+          actual_size="$(stat -c '%s' "$archive")"
+          [[ "$actual_digest" == "$artifact_digest" ]] \
+            || { echo "Digest do ZIP Android diverge" >&2; exit 1; }
+          [[ "$actual_size" == "$artifact_size" ]] \
+            || { echo "Tamanho do ZIP Android diverge" >&2; exit 1; }
+
+          printf 'artifact_id=%s\n' "$artifact_id" >>"$GITHUB_OUTPUT"
+          printf 'artifact_digest=%s\n' "$artifact_digest" >>"$GITHUB_OUTPUT"
+          printf 'artifact_size=%s\n' "$artifact_size" >>"$GITHUB_OUTPUT"
+
+  verify-android:
+    needs: verify-provenance
+    name: Revalidar APK Android assinado
+    runs-on: windows-2022
+    timeout-minutes: 20
+    outputs:
+      apk_sha256: ${{ steps.verify.outputs.apk_sha256 }}
+      apk_bytes: ${{ steps.verify.outputs.apk_bytes }}
+      metadata_sha256: ${{ steps.verify.outputs.metadata_sha256 }}
+      certificate_sha256: ${{ steps.verify.outputs.certificate_sha256 }}
+      version_code: ${{ steps.verify.outputs.version_code }}
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      EXPECTED_COMMIT: ${{ inputs.expected_commit_sha }}
+
+    steps:
+      - name: Baixar codigo confiavel dos verificadores
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Baixar artefato do run exato
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.verify-provenance.outputs.artifact_id }}
+          path: candidate-android
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.android_run_id }}
+
+      - name: Verificar APK, metadata, assinatura e ABI novamente
+        id: verify
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version 3.0
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+          $version = $env:RELEASE_TAG.Substring(1)
+          $apkName = "ChurchDAW-$version-signed.apk"
+          $allFiles = @(Get-ChildItem -LiteralPath .\candidate-android `
+            -Recurse -File)
+          $apk = @($allFiles | Where-Object { $_.Name -ceq $apkName })
+          $metadataFile = @($allFiles | Where-Object {
+            $_.Name -ceq 'android-release-metadata.json'
+          })
+          if ($allFiles.Count -ne 2 -or $apk.Count -ne 1 -or
+              $metadataFile.Count -ne 1) {
+            throw 'Artifact Android precisa conter somente APK e metadata unicos'
+          }
+
+          $metadata = Get-Content -LiteralPath $metadataFile[0].FullName `
+            -Raw -Encoding UTF8 | ConvertFrom-Json
+          $expectedFields = @(
+            'package_id', 'version_name', 'version_code', 'abi', 'bytes',
+            'sha256', 'signing_certificate_sha256', 'source_commit')
+          $actualFields = @($metadata.PSObject.Properties.Name)
+          if ($actualFields.Count -ne $expectedFields.Count) {
+            throw 'Metadata Android tem campos inesperados'
+          }
+          foreach ($field in $expectedFields) {
+            if ($actualFields -cnotcontains $field) {
+              throw "Metadata Android sem campo $field"
+            }
+          }
+
+          $apkHash = (Get-FileHash -LiteralPath $apk[0].FullName `
+            -Algorithm SHA256).Hash.ToUpperInvariant()
+          $metadataHash = (Get-FileHash -LiteralPath $metadataFile[0].FullName `
+            -Algorithm SHA256).Hash.ToUpperInvariant()
+          if ([string] $metadata.package_id -cne 'com.churchdaw.app' -or
+              [string] $metadata.version_name -cne $version -or
+              [string] $metadata.abi -cne 'arm64-v8a' -or
+              -not ([string] $metadata.source_commit).Equals(
+                $env:EXPECTED_COMMIT,
+                [StringComparison]::OrdinalIgnoreCase) -or
+              -not ([string] $metadata.sha256).Equals(
+                $apkHash,
+                [StringComparison]::OrdinalIgnoreCase) -or
+              [long] $metadata.bytes -ne [long] $apk[0].Length -or
+              [int] $metadata.version_code -lt 1) {
+            throw 'Metadata Android diverge do APK/tag/commit'
+          }
+
+          $buildTools = Get-ChildItem "$env:ANDROID_HOME\build-tools" -Directory |
+            Sort-Object { try { [version] $_.Name } catch { [version] '0.0' } } `
+              -Descending | Where-Object {
+                (Test-Path (Join-Path $_.FullName 'apksigner.bat')) -and
+                (Test-Path (Join-Path $_.FullName 'aapt.exe'))
+              } | Select-Object -First 1
+          if ($null -eq $buildTools) {
+            throw 'apksigner/aapt nao encontrados no Android SDK do runner'
+          }
+          $signerOutput = @(& (Join-Path $buildTools.FullName 'apksigner.bat') `
+            verify --verbose --print-certs $apk[0].FullName)
+          if ($LASTEXITCODE -ne 0 -or
+              -not ($signerOutput -match
+                'Verified using v2 scheme \(APK Signature Scheme v2\): true')) {
+            throw 'APK nao passou novamente na assinatura v2'
+          }
+          $certLine = $signerOutput | Where-Object {
+            $_ -match '(?:Signer #\d+|V2 Signer): certificate SHA-256 digest:'
+          } | Select-Object -First 1
+          if (-not $certLine -or
+              $certLine -notmatch
+                'certificate SHA-256 digest:\s*([0-9a-fA-F]{64})') {
+            throw 'Fingerprint do certificado APK nao encontrado'
+          }
+          $certificateHash = $Matches[1].ToUpperInvariant()
+          if (-not ([string] $metadata.signing_certificate_sha256).Equals(
+              $certificateHash,
+              [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'Certificado real diverge da metadata'
+          }
+
+          $badging = @(& (Join-Path $buildTools.FullName 'aapt.exe') `
+            dump badging $apk[0].FullName)
+          if ($LASTEXITCODE -ne 0) { throw 'aapt dump badging falhou' }
+          $packageLine = $badging | Where-Object { $_ -like 'package:*' } |
+            Select-Object -First 1
+          if ($packageLine -notmatch "name='com\.churchdaw\.app'" -or
+              $packageLine -notmatch
+                "versionCode='$([regex]::Escape([string] $metadata.version_code))'" -or
+              $packageLine -notmatch
+                "versionName='$([regex]::Escape($version))'") {
+            throw "Badging Android inesperado: $packageLine"
+          }
+
+          $zip = [IO.Compression.ZipFile]::OpenRead($apk[0].FullName)
+          try {
+            $abis = @($zip.Entries | ForEach-Object {
+              if ($_.FullName -match '^lib/([^/]+)/') { $Matches[1] }
+            } | Sort-Object -Unique)
+          }
+          finally { $zip.Dispose() }
+          if ($abis.Count -ne 1 -or $abis[0] -cne 'arm64-v8a') {
+            throw "ABIs Android inesperadas: $($abis -join ', ')"
+          }
+
+          "apk_sha256=$apkHash" >> $env:GITHUB_OUTPUT
+          "apk_bytes=$($apk[0].Length)" >> $env:GITHUB_OUTPUT
+          "metadata_sha256=$metadataHash" >> $env:GITHUB_OUTPUT
+          "certificate_sha256=$certificateHash" >> $env:GITHUB_OUTPUT
+          "version_code=$([int] $metadata.version_code)" >> $env:GITHUB_OUTPUT
+
+      - name: Preservar prova Android
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ChurchDAW-publisher-Android-proof-${{ github.run_id }}
+          path: candidate-android/android-release-metadata.json
+          if-no-files-found: warn
+          retention-days: 30
+
+  publish:
+    needs:
+      - verify-provenance
+      - verify-android
+    name: Promover APK, catalogos e policy v2 por ultimo
+    runs-on: windows-2022
+    timeout-minutes: 90
+    environment: desktop-production
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      EXPECTED_COMMIT: ${{ inputs.expected_commit_sha }}
+      ANDROID_RUN_ID: ${{ inputs.android_run_id }}
+      EXPECTED_PREVIOUS_POLICY_SHA256: ${{ inputs.expected_previous_policy_sha256 }}
+      EXPECTED_PREVIOUS_MANIFEST_SHA256: ${{ inputs.expected_previous_manifest_sha256 }}
+      EXPECTED_PREVIOUS_LEGACY_POLICY_SHA256: ${{ inputs.expected_previous_legacy_policy_sha256 }}
+      EXPECTED_PREVIOUS_SITE_SHA256: ${{ inputs.expected_previous_site_sha256 }}
+      UPDATE_MESSAGE: ${{ inputs.update_message }}
+      POLICY_SERIAL: ${{ vars.ANDROID_POLICY_SERIAL }}
+      MINIMUM_VERSION_CODE: ${{ vars.ANDROID_MINIMUM_VERSION_CODE }}
+      EXPECTED_CERTIFICATE_SHA256: ${{ vars.ANDROID_EXPECTED_CERTIFICATE_SHA256 }}
+      FTPS_PORT: ${{ vars.HOSTGATOR_FTPS_PORT }}
+      REMOTE_ROOT_DIRECTORY: ${{ vars.HOSTGATOR_REMOTE_ROOT }}
+      REMOTE_ANDROID_DIRECTORY: ${{ vars.HOSTGATOR_ANDROID_REMOTE_DIR }}
+      PUBLIC_SITE_URL: ${{ vars.PUBLIC_SITE_URL }}
+      PUBLIC_ANDROID_BASE_URL: ${{ vars.PUBLIC_ANDROID_BASE_URL }}
+      APK_VERIFIED_SHA256: ${{ needs.verify-android.outputs.apk_sha256 }}
+      APK_VERIFIED_BYTES: ${{ needs.verify-android.outputs.apk_bytes }}
+      METADATA_VERIFIED_SHA256: ${{ needs.verify-android.outputs.metadata_sha256 }}
+      CERTIFICATE_VERIFIED_SHA256: ${{ needs.verify-android.outputs.certificate_sha256 }}
+      ANDROID_ARTIFACT_ID: ${{ needs.verify-provenance.outputs.artifact_id }}
+      ANDROID_ARTIFACT_DIGEST: ${{ needs.verify-provenance.outputs.artifact_digest }}
+      ANDROID_ARTIFACT_SIZE: ${{ needs.verify-provenance.outputs.artifact_size }}
+
+    steps:
+      - name: Reservar janela segura de promocao e rollback
+        shell: pwsh
+        run: |
+          $started = [DateTimeOffset]::UtcNow.ToString(
+            'o',
+            [Globalization.CultureInfo]::InvariantCulture)
+          "PUBLISH_JOB_STARTED_AT_UTC=$started" >> $env:GITHUB_ENV
+
+      - name: Baixar codigo confiavel do publicador
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Baixar candidato Android exato
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.verify-provenance.outputs.artifact_id }}
+          path: candidate-android
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.android_run_id }}
+
+      - name: Restaurar segredos somente em arquivos temporarios
+        id: credentials
+        shell: pwsh
+        env:
+          HOSTGATOR_FTPS_HOST: ${{ secrets.HOSTGATOR_FTPS_HOST }}
+          HOSTGATOR_FTPS_USERNAME: ${{ secrets.HOSTGATOR_FTPS_USERNAME }}
+          HOSTGATOR_FTPS_PASSWORD: ${{ secrets.HOSTGATOR_FTPS_PASSWORD }}
+          DESKTOP_UPDATE_PRIVATE_KEY_BASE64: ${{ secrets.DESKTOP_UPDATE_PRIVATE_KEY_BASE64 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($name in @(
+            'HOSTGATOR_FTPS_HOST',
+            'HOSTGATOR_FTPS_USERNAME',
+            'HOSTGATOR_FTPS_PASSWORD',
+            'DESKTOP_UPDATE_PRIVATE_KEY_BASE64'
+          )) {
+            $value = [Environment]::GetEnvironmentVariable($name)
+            if ([string]::IsNullOrWhiteSpace($value) -or
+                $value.IndexOfAny([char[]] "`0`r`n") -ge 0) {
+              throw "Secret obrigatorio ausente ou invalido: $name"
+            }
+          }
+          if ($env:HOSTGATOR_FTPS_HOST -notmatch '^[A-Za-z0-9.-]+$') {
+            throw 'HOSTGATOR_FTPS_HOST invalido'
+          }
+          foreach ($credential in @(
+            $env:HOSTGATOR_FTPS_USERNAME,
+            $env:HOSTGATOR_FTPS_PASSWORD
+          )) {
+            if ($credential -notmatch '^[A-Za-z0-9@._%+=,:;-]{1,512}$') {
+              throw 'Credencial FTPS contem caractere inseguro para netrc'
+            }
+          }
+
+          $privateKey = Join-Path $env:RUNNER_TEMP `
+            'churchdaw-android-policy-private.pem'
+          $netrc = Join-Path $env:RUNNER_TEMP 'churchdaw-hostgator-android.netrc'
+          foreach ($path in @($privateKey, $netrc)) {
+            if (Test-Path -LiteralPath $path) {
+              throw "Arquivo temporario ja existe: $path"
+            }
+          }
+          $keyBytes = [Convert]::FromBase64String(
+            $env:DESKTOP_UPDATE_PRIVATE_KEY_BASE64)
+          $keyText = [Text.Encoding]::ASCII.GetString($keyBytes)
+          if ($keyBytes.Length -lt 1024 -or
+              $keyText -notmatch '-----BEGIN (?:RSA )?PRIVATE KEY-----') {
+            throw 'Chave privada da policy tem formato inesperado'
+          }
+          [IO.File]::WriteAllBytes($privateKey, $keyBytes)
+          $netrcText = "machine $($env:HOSTGATOR_FTPS_HOST)`n" +
+            "login $($env:HOSTGATOR_FTPS_USERNAME)`n" +
+            "password $($env:HOSTGATOR_FTPS_PASSWORD)`n"
+          [IO.File]::WriteAllText(
+            $netrc,
+            $netrcText,
+            [Text.UTF8Encoding]::new($false))
+          & icacls.exe $privateKey /inheritance:r `
+            /grant:r "$env:USERNAME`:(R,W)" | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'Falha ao restringir ACL da chave' }
+          & icacls.exe $netrc /inheritance:r `
+            /grant:r "$env:USERNAME`:(R,W)" | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'Falha ao restringir ACL do netrc' }
+          "private_key=$privateKey" >> $env:GITHUB_OUTPUT
+          "netrc=$netrc" >> $env:GITHUB_OUTPUT
+
+      - name: Promover APK, site, manifestos e policy v2 por ultimo
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HOSTGATOR_FTPS_HOST: ${{ secrets.HOSTGATOR_FTPS_HOST }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($name in @(
+            'POLICY_SERIAL', 'MINIMUM_VERSION_CODE',
+            'EXPECTED_CERTIFICATE_SHA256', 'FTPS_PORT',
+            'REMOTE_ROOT_DIRECTORY', 'REMOTE_ANDROID_DIRECTORY',
+            'PUBLIC_SITE_URL', 'PUBLIC_ANDROID_BASE_URL',
+            'HOSTGATOR_FTPS_HOST', 'APK_VERIFIED_SHA256',
+            'APK_VERIFIED_BYTES', 'METADATA_VERIFIED_SHA256',
+            'CERTIFICATE_VERIFIED_SHA256', 'ANDROID_ARTIFACT_ID',
+            'ANDROID_ARTIFACT_DIGEST', 'ANDROID_ARTIFACT_SIZE'
+          )) {
+            if ([string]::IsNullOrWhiteSpace(
+                [Environment]::GetEnvironmentVariable($name))) {
+              throw "Variable protegida ausente: $name"
+            }
+          }
+          if (-not $env:CERTIFICATE_VERIFIED_SHA256.Equals(
+              $env:EXPECTED_CERTIFICATE_SHA256,
+              [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'Certificado verificado diverge do pin protegido'
+          }
+
+          .\Packaging\PublishAndroidRelease.ps1 `
+            -AndroidArtifactRoot .\candidate-android `
+            -ReleaseTag $env:RELEASE_TAG `
+            -SourceCommit $env:EXPECTED_COMMIT `
+            -AndroidRunId ([long] $env:ANDROID_RUN_ID) `
+            -AndroidArtifactId ([long] $env:ANDROID_ARTIFACT_ID) `
+            -AndroidArtifactDigest $env:ANDROID_ARTIFACT_DIGEST `
+            -AndroidArtifactArchiveBytes ([long] $env:ANDROID_ARTIFACT_SIZE) `
+            -ExpectedPreviousPolicySha256 $env:EXPECTED_PREVIOUS_POLICY_SHA256 `
+            -ExpectedPreviousManifestSha256 $env:EXPECTED_PREVIOUS_MANIFEST_SHA256 `
+            -ExpectedPreviousLegacyPolicySha256 $env:EXPECTED_PREVIOUS_LEGACY_POLICY_SHA256 `
+            -ExpectedPreviousSiteSha256 $env:EXPECTED_PREVIOUS_SITE_SHA256 `
+            -PolicySerial ([int] $env:POLICY_SERIAL) `
+            -MinimumVersionCode ([int] $env:MINIMUM_VERSION_CODE) `
+            -UpdateMessage $env:UPDATE_MESSAGE `
+            -PrivateKey '${{ steps.credentials.outputs.private_key }}' `
+            -ExpectedSigningCertificateSha256 $env:EXPECTED_CERTIFICATE_SHA256 `
+            -FtpsHost $env:HOSTGATOR_FTPS_HOST `
+            -FtpsPort ([int] $env:FTPS_PORT) `
+            -NetrcPath '${{ steps.credentials.outputs.netrc }}' `
+            -RemoteRootDirectory $env:REMOTE_ROOT_DIRECTORY `
+            -RemoteAndroidDirectory $env:REMOTE_ANDROID_DIRECTORY `
+            -PublicSiteUrl $env:PUBLIC_SITE_URL `
+            -PublicAndroidBaseUrl $env:PUBLIC_ANDROID_BASE_URL `
+            -SiteIndex .\Packaging\SiteProduction\index.html `
+            -AuditOutputDirectory .\android-promotion-audit `
+            -VerifiedApkSha256 $env:APK_VERIFIED_SHA256 `
+            -VerifiedApkBytes ([long] $env:APK_VERIFIED_BYTES) `
+            -VerifiedMetadataSha256 $env:METADATA_VERIFIED_SHA256
+
+      - name: Remover credenciais temporarias
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($path in @(
+            (Join-Path $env:RUNNER_TEMP 'churchdaw-android-policy-private.pem'),
+            (Join-Path $env:RUNNER_TEMP 'churchdaw-hostgator-android.netrc')
+          )) {
+            if (Test-Path -LiteralPath $path -PathType Leaf) {
+              Remove-Item -LiteralPath $path -Force
+            }
+          }
+
+      - name: Preservar auditoria e backups da promocao
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ChurchDAW-Android-promotion-audit-${{ github.run_id }}-${{ github.run_attempt }}
+          path: android-promotion-audit/
+          if-no-files-found: warn
+          retention-days: 90

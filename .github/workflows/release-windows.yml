@@ -1,0 +1,363 @@
+name: Release comercial Windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Tag imutavel no formato vMAJOR.MINOR.PATCH
+        required: true
+        type: string
+      confirmation:
+        description: Confirme que esta e uma release comercial
+        required: true
+        type: choice
+        default: CANCEL
+        options:
+          - CANCEL
+          - RELEASE
+
+permissions:
+  contents: read
+
+concurrency:
+  group: churchdaw-windows-commercial-release
+  cancel-in-progress: false
+
+jobs:
+  release-windows:
+    if: inputs.confirmation == 'RELEASE'
+    name: Compilar, assinar e verificar
+    runs-on: windows-2022
+    timeout-minutes: 120
+    environment: windows-production
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      POLICY_SERIAL: ${{ vars.WINDOWS_POLICY_SERIAL }}
+      MINIMUM_VERSION_CODE: ${{ vars.WINDOWS_MINIMUM_VERSION_CODE }}
+
+    steps:
+      - name: Baixar exatamente a tag solicitada
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.release_tag }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Provar tag, versao e arvore imutaveis
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:RELEASE_TAG -notmatch '^v([0-9]+\.[0-9]+\.[0-9]+)$') {
+            throw "Tag invalida: $env:RELEASE_TAG"
+          }
+          if ($env:GITHUB_REF -cne "refs/tags/$env:RELEASE_TAG") {
+            throw 'Execute o workflow a partir da mesma tag informada'
+          }
+
+          $headOutput = @(& git rev-parse --verify HEAD)
+          if ($LASTEXITCODE -ne 0 -or $headOutput.Count -ne 1) {
+            throw 'Nao foi possivel resolver HEAD de forma unica'
+          }
+          $headCommit = ([string] $headOutput[0]).Trim()
+          if ($headCommit -notmatch '^[0-9a-fA-F]{40}$' -or
+              $env:GITHUB_SHA -notmatch '^[0-9a-fA-F]{40}$' -or
+              -not $headCommit.Equals(
+                $env:GITHUB_SHA,
+                [StringComparison]::OrdinalIgnoreCase)) {
+            throw "HEAD diverge de GITHUB_SHA: HEAD=$headCommit"
+          }
+
+          $tagOutput = @(& git rev-parse --verify `
+            "refs/tags/$($env:RELEASE_TAG)^{commit}")
+          if ($LASTEXITCODE -ne 0 -or $tagOutput.Count -ne 1) {
+            throw "Tag nao encontrada: $env:RELEASE_TAG"
+          }
+          $tagCommit = ([string] $tagOutput[0]).Trim()
+          if ($tagCommit -notmatch '^[0-9a-fA-F]{40}$' -or
+              -not $headCommit.Equals(
+                $tagCommit,
+                [StringComparison]::OrdinalIgnoreCase)) {
+            throw "HEAD nao corresponde exatamente a $env:RELEASE_TAG"
+          }
+
+          $mainOutput = @(& git rev-parse --verify `
+            'refs/remotes/origin/main^{commit}')
+          if ($LASTEXITCODE -ne 0 -or $mainOutput.Count -ne 1) {
+            throw 'Nao foi possivel resolver origin/main'
+          }
+          $mainCommit = ([string] $mainOutput[0]).Trim()
+          if ($mainCommit -notmatch '^[0-9a-fA-F]{40}$') {
+            throw 'origin/main nao resolveu para um commit valido'
+          }
+          & git merge-base --is-ancestor $headCommit $mainCommit
+          if ($LASTEXITCODE -ne 0) {
+            throw 'A tag nao pertence ao historico aprovado de origin/main'
+          }
+
+          $cmake = [IO.File]::ReadAllText(
+            (Join-Path $env:GITHUB_WORKSPACE 'CMakeLists.txt'))
+          $versionMatch = [regex]::Match(
+            $cmake,
+            '(?m)^\s*project\(MinhaDAW\s+VERSION\s+([0-9]+\.[0-9]+\.[0-9]+)\s*\)')
+          if (-not $versionMatch.Success -or
+              "v$($versionMatch.Groups[1].Value)" -cne $env:RELEASE_TAG) {
+            throw 'A versao do CMake nao corresponde a tag solicitada'
+          }
+
+          $dirty = @(& git status --porcelain=v1 --untracked-files=all)
+          if ($LASTEXITCODE -ne 0 -or $dirty.Count -ne 0) {
+            throw "Checkout nao esta limpo: $($dirty -join '; ')"
+          }
+          $buildDir = Join-Path $env:RUNNER_TEMP 'churchdaw-windows-release'
+          $outputDir = Join-Path $env:GITHUB_WORKSPACE 'release-windows'
+          foreach ($path in @($buildDir, $outputDir)) {
+            if (Test-Path -LiteralPath $path) {
+              throw "Diretorio de release ja existe: $path"
+            }
+          }
+
+      - name: Restaurar credenciais em arquivos temporarios
+        shell: pwsh
+        env:
+          WINDOWS_SIGNING_PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_PFX_BASE64 }}
+          DESKTOP_UPDATE_PRIVATE_KEY_BASE64: ${{ secrets.DESKTOP_UPDATE_PRIVATE_KEY_BASE64 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($name in @(
+            'WINDOWS_SIGNING_PFX_BASE64',
+            'DESKTOP_UPDATE_PRIVATE_KEY_BASE64'
+          )) {
+            if ([string]::IsNullOrWhiteSpace(
+                [Environment]::GetEnvironmentVariable($name))) {
+              throw "Secret obrigatorio ausente: $name"
+            }
+          }
+          $pfxPath = Join-Path $env:RUNNER_TEMP `
+            'churchdaw-windows-signing.pfx'
+          $privateKeyPath = Join-Path $env:RUNNER_TEMP `
+            'churchdaw-update-policy-private.pem'
+          $previousPolicyPath = Join-Path $env:RUNNER_TEMP `
+            'previous-update-policy-v1.json'
+          foreach ($path in @(
+            $pfxPath,
+            $privateKeyPath,
+            $previousPolicyPath
+          )) {
+            if (Test-Path -LiteralPath $path) {
+              throw "Arquivo temporario ja existe: $path"
+            }
+          }
+
+          $pfxBytes = [Convert]::FromBase64String(
+            $env:WINDOWS_SIGNING_PFX_BASE64)
+          if ($pfxBytes.Length -lt 1024) {
+            throw 'PFX decodificado e pequeno demais'
+          }
+          [IO.File]::WriteAllBytes($pfxPath, $pfxBytes)
+
+          $keyBytes = [Convert]::FromBase64String(
+            $env:DESKTOP_UPDATE_PRIVATE_KEY_BASE64)
+          $keyText = [Text.Encoding]::ASCII.GetString($keyBytes)
+          if ($keyBytes.Length -lt 1024 -or
+              $keyText -notmatch '-----BEGIN (?:RSA )?PRIVATE KEY-----') {
+            throw 'Chave privada da politica tem formato inesperado'
+          }
+          [IO.File]::WriteAllBytes($privateKeyPath, $keyBytes)
+
+          Invoke-WebRequest `
+            -Uri 'https://churchdaw.com/app/desktop/update-policy-v1.json' `
+            -OutFile $previousPolicyPath
+          $previous = Get-Item -LiteralPath $previousPolicyPath
+          if ($previous.Length -lt 256) {
+            throw 'Politica publica anterior esta vazia ou truncada'
+          }
+          $previousSha = (Get-FileHash -LiteralPath $previous.FullName `
+            -Algorithm SHA256).Hash
+          Write-Host "SHA-256 da politica anterior: $previousSha"
+
+      - name: Executar pipeline comercial fail-closed
+        shell: pwsh
+        env:
+          WINDOWS_SIGNING_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PFX_PASSWORD }}
+          WINDOWS_EXPECTED_PUBLISHER: ${{ secrets.WINDOWS_EXPECTED_PUBLISHER }}
+          WINDOWS_EXPECTED_THUMBPRINT: ${{ secrets.WINDOWS_EXPECTED_THUMBPRINT }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($name in @(
+            'WINDOWS_SIGNING_PFX_PASSWORD',
+            'WINDOWS_EXPECTED_PUBLISHER',
+            'WINDOWS_EXPECTED_THUMBPRINT'
+          )) {
+            if ([string]::IsNullOrWhiteSpace(
+                [Environment]::GetEnvironmentVariable($name))) {
+              throw "Secret obrigatorio ausente: $name"
+            }
+          }
+          if ($env:POLICY_SERIAL -notmatch '^[1-9][0-9]*$') {
+            throw 'Variable WINDOWS_POLICY_SERIAL ausente ou invalida'
+          }
+          if ($env:MINIMUM_VERSION_CODE -notmatch '^[1-9][0-9]*$') {
+            throw 'Variable WINDOWS_MINIMUM_VERSION_CODE ausente ou invalida'
+          }
+
+          $buildDir = Join-Path $env:RUNNER_TEMP 'churchdaw-windows-release'
+          $outputDir = Join-Path $env:GITHUB_WORKSPACE 'release-windows'
+          $pfxPath = Join-Path $env:RUNNER_TEMP `
+            'churchdaw-windows-signing.pfx'
+          $privateKeyPath = Join-Path $env:RUNNER_TEMP `
+            'churchdaw-update-policy-private.pem'
+          $previousPolicyPath = Join-Path $env:RUNNER_TEMP `
+            'previous-update-policy-v1.json'
+
+          $releaseArguments = @{
+            ReleaseMode = 'Commercial'
+            PolicySerial = [int] $env:POLICY_SERIAL
+            MinimumVersionCode = [int] $env:MINIMUM_VERSION_CODE
+            UpdatePolicyPrivateKey = $privateKeyPath
+            PreviousPolicy = $previousPolicyPath
+            PfxPath = $pfxPath
+            PfxPassword = $env:WINDOWS_SIGNING_PFX_PASSWORD
+            ExpectedPublisher = $env:WINDOWS_EXPECTED_PUBLISHER
+            ExpectedSignerThumbprints = @(
+              $env:WINDOWS_EXPECTED_THUMBPRINT)
+            BuildDir = $buildDir
+            OutputDir = $outputDir
+            MinimumFreeSpaceGiB = 10
+            KeepBuildDirectory = $true
+          }
+          & .\Packaging\BuildDesktopRelease.ps1 @releaseArguments
+
+      - name: Remover credenciais temporarias
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($path in @(
+            (Join-Path $env:RUNNER_TEMP 'churchdaw-windows-signing.pfx'),
+            (Join-Path $env:RUNNER_TEMP 'churchdaw-update-policy-private.pem'),
+            (Join-Path $env:RUNNER_TEMP 'previous-update-policy-v1.json')
+          )) {
+            if (Test-Path -LiteralPath $path -PathType Leaf) {
+              Remove-Item -LiteralPath $path -Force
+            }
+          }
+
+      - name: Publicar logs de auditoria
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ChurchDAW-Windows-release-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/churchdaw-windows-release/release-logs/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Revalidar tag remota antes de publicar candidato
+        if: success()
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:GH_TOKEN)) {
+            throw 'github.token nao foi disponibilizado'
+          }
+          if ($env:GITHUB_REPOSITORY -notmatch `
+                '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' -or
+              $env:RELEASE_TAG -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') {
+            throw 'Repositorio ou tag invalido na revalidacao remota'
+          }
+
+          function Invoke-GitHubApiJson {
+            param([Parameter(Mandatory = $true)][string] $Endpoint)
+
+            $responseLines = @(& gh api --method GET `
+              -H 'Accept: application/vnd.github+json' `
+              -H 'X-GitHub-Api-Version: 2022-11-28' `
+              $Endpoint)
+            if ($LASTEXITCODE -ne 0 -or $responseLines.Count -eq 0) {
+              throw "GitHub API falhou: $Endpoint"
+            }
+            try {
+              return (($responseLines -join "`n") | ConvertFrom-Json)
+            }
+            catch {
+              throw "Resposta JSON invalida da GitHub API: $Endpoint"
+            }
+          }
+
+          $expectedRef = "refs/tags/$env:RELEASE_TAG"
+          $remoteRef = Invoke-GitHubApiJson `
+            "repos/$env:GITHUB_REPOSITORY/git/ref/tags/$env:RELEASE_TAG"
+          if ([string] $remoteRef.ref -cne $expectedRef) {
+            throw "Referencia remota inesperada: $($remoteRef.ref)"
+          }
+
+          $localRefOutput = @(& git rev-parse --verify $expectedRef)
+          if ($LASTEXITCODE -ne 0 -or $localRefOutput.Count -ne 1) {
+            throw 'Nao foi possivel resolver o objeto local da tag'
+          }
+          $localRefSha = ([string] $localRefOutput[0]).Trim()
+          $remoteType = [string] $remoteRef.object.type
+          $remoteSha = [string] $remoteRef.object.sha
+          if ($localRefSha -notmatch '^[0-9a-fA-F]{40}$' -or
+              $remoteSha -notmatch '^[0-9a-fA-F]{40}$' -or
+              -not $localRefSha.Equals(
+                $remoteSha,
+                [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'O objeto remoto da tag mudou durante o release'
+          }
+
+          $seen = @{}
+          for ($depth = 0; $remoteType -ceq 'tag'; ++$depth) {
+            if ($depth -ge 8 -or $seen.ContainsKey($remoteSha)) {
+              throw 'Cadeia de tags anotadas invalida ou profunda demais'
+            }
+            $seen[$remoteSha] = $true
+            $tagObject = Invoke-GitHubApiJson `
+              "repos/$env:GITHUB_REPOSITORY/git/tags/$remoteSha"
+            $remoteType = [string] $tagObject.object.type
+            $remoteSha = [string] $tagObject.object.sha
+            if ($remoteSha -notmatch '^[0-9a-fA-F]{40}$') {
+              throw 'Objeto apontado pela tag anotada tem SHA invalido'
+            }
+          }
+          if ($remoteType -cne 'commit') {
+            throw "A tag remota aponta para objeto $remoteType, nao commit"
+          }
+
+          $headOutput = @(& git rev-parse --verify HEAD)
+          if ($LASTEXITCODE -ne 0 -or $headOutput.Count -ne 1) {
+            throw 'Nao foi possivel revalidar HEAD'
+          }
+          $headCommit = ([string] $headOutput[0]).Trim()
+          foreach ($expected in @($headCommit, $env:GITHUB_SHA)) {
+            if ($expected -notmatch '^[0-9a-fA-F]{40}$' -or
+                -not $remoteSha.Equals(
+                  $expected,
+                  [StringComparison]::OrdinalIgnoreCase)) {
+              throw 'O commit remoto da tag diverge do candidato construido'
+            }
+          }
+
+          $mainRef = Invoke-GitHubApiJson `
+            "repos/$env:GITHUB_REPOSITORY/git/ref/heads/main"
+          $mainSha = [string] $mainRef.object.sha
+          if ([string] $mainRef.ref -cne 'refs/heads/main' -or
+              [string] $mainRef.object.type -cne 'commit' -or
+              $mainSha -notmatch '^[0-9a-fA-F]{40}$') {
+            throw 'Referencia remota main invalida'
+          }
+          $comparison = Invoke-GitHubApiJson `
+            "repos/$env:GITHUB_REPOSITORY/compare/$headCommit...$mainSha"
+          if ([string] $comparison.status -cnotin @('identical', 'ahead')) {
+            throw 'O commit da tag deixou de pertencer ao historico de main'
+          }
+          Write-Host "Tag remota $remoteSha confirmada em main $mainSha"
+
+      - name: Publicar candidato comercial assinado
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ChurchDAW-Windows-${{ inputs.release_tag }}-signed
+          path: release-windows/
+          if-no-files-found: error
+          retention-days: 30

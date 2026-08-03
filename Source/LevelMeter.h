@@ -37,7 +37,9 @@ public:
        #if CHURCHDAW_UI_BISECT
         // experimento: medidores congelados, para medir quanto eles custam
        #elif JUCE_ANDROID || JUCE_IOS
-        startTimerHz (15);
+        // 10 Hz: ainda le fluido no palco e devolve CPU ao audio (era 15/30).
+        // Sem voice limit — so menos pintura na message thread.
+        startTimerHz (10);
        #else
         startTimerHz (30);
        #endif
@@ -55,6 +57,10 @@ public:
     // mostra "L" / "R" embaixo de cada barra (so faz sentido em medidor estereo)
     void setChannelLabels (bool shouldShow) { channelLabels = shouldShow; repaint(); }
 
+    // No master, alem do peak-hold grafico, mostra o pico numerico de cada lado.
+    // Nos meters de canal isto permanece desligado para conservar a grade enxuta.
+    void setPeakReadout (bool shouldShow) { peakReadout = shouldShow; repaint(); }
+
     // avisa o nivel exibido (0..1) a cada quadro. Serve pra acender o card do
     // canal sem criar um segundo timer nem um segundo leitor do nivel (o
     // readAndResetLayerLevel do processador ZERA a cada leitura: so pode ter um).
@@ -68,8 +74,15 @@ public:
         if (channelLabels && channels == 2)
             labelRow = bounds.removeFromBottom (13.0f);
 
-        g.setColour (juce::Colour (0xff15171b));
+        juce::Rectangle<float> peakRow;
+        if (peakReadout && channels == 2)
+            peakRow = bounds.removeFromBottom (17.0f);
+
+        // Fundo um pouco mais escuro + moldura sutil: o meter se destaca do card.
+        g.setColour (juce::Colour (0xff0e1014));
         g.fillRoundedRectangle (bounds, 5.0f);
+        g.setColour (juce::Colours::white.withAlpha (0.06f));
+        g.drawRoundedRectangle (bounds.reduced (0.5f), 5.0f, 1.0f);
 
         // luz de clip DENTRO da moldura, como tampa do medidor: flutuando acima
         // com um vao ela lia como um elemento vermelho perdido/cortado
@@ -86,12 +99,44 @@ public:
                 g.drawRoundedRectangle (clipArea.expanded (1.5f), 4.0f, 1.5f);
             }
 
+            g.setColour (clipSticky ? juce::Colours::white
+                                    : juce::Colours::white.withAlpha (0.34f));
+            g.setFont (juce::Font (juce::FontOptions (7.5f, juce::Font::bold))
+                           .withExtraKerningFactor (0.08f));
+            g.drawText ("CLIP", clipArea.toNearestInt(),
+                        juce::Justification::centred, false);
+
             bounds.removeFromTop (1.0f);
         }
 
         auto meterArea = bounds.reduced (channels == 1 ? 3.0f : 5.0f);
         const float gap = channels == 1 ? 0.0f : 4.0f;
         const float barWidth = (meterArea.getWidth() - gap * (float) (channels - 1)) / (float) channels;
+
+        if (! peakRow.isEmpty())
+        {
+            const auto mono = juce::Font (juce::FontOptions (
+                juce::Font::getDefaultMonospacedFontName(), 9.0f,
+                juce::Font::bold));
+            g.setFont (mono);
+
+            for (int ch = 0; ch < channels; ++ch)
+            {
+                auto cell = juce::Rectangle<float> (
+                    meterArea.getX() + (float) ch * (barWidth + gap),
+                    peakRow.getY(), barWidth, peakRow.getHeight());
+                const float db = peakDb[ch];
+                const auto value = db <= minDb + 0.5f
+                    ? juce::String::fromUTF8 ("\xe2\x88\x92\xe2\x88\x9e")
+                    : (db >= 0.0f ? "+" : juce::String())
+                        + juce::String (db, 1);
+
+                g.setColour (db >= -0.05f ? NordLookAndFeel::redClip()
+                                          : juce::Colours::white.withAlpha (0.72f));
+                g.drawFittedText (value, cell.toNearestInt(),
+                                  juce::Justification::centred, 1, 0.72f);
+            }
+        }
 
         for (int ch = 0; ch < channels; ++ch)
         {
@@ -103,7 +148,9 @@ public:
             // dos -6 e dos -3 dBFS fica no mesmo lugar em todos os canais, e o
             // musico aprende a posicao em vez de julgar o tom da cor.
             const float lvl = displayDb[ch];
-            const float segH = 3.0f, segGap = 1.0f, step = segH + segGap;
+            // Segmentos um pouco mais altos: meter le de longe no palco.
+            const float segH = barArea.getWidth() >= 10.0f ? 3.6f : 3.0f;
+            const float segGap = 1.0f, step = segH + segGap;
             const int numSeg = juce::jmax (4, (int) ((barArea.getHeight() + segGap) / step));
 
             for (int i = 0; i < numSeg; ++i)
@@ -291,7 +338,12 @@ private:
             for (int ch = 0; ch < channels; ++ch)
                 top = juce::jmax (top, dbToProportion (displayDb[ch]));
 
-            onLevel (top);
+            // Nao acorda ActivityBar a cada tick se o nivel mal mudou.
+            if (std::abs (top - lastOnLevel) > 0.04f || (top < 0.02f && lastOnLevel > 0.02f))
+            {
+                lastOnLevel = top;
+                onLevel (top);
+            }
         }
     }
 
@@ -305,9 +357,11 @@ private:
     int peakHoldFrames[2] { 0, 0 };
     bool clipSticky = false;
     bool channelLabels = false;
+    bool peakReadout = false;
     // Nasce true: medidor recem-construido (re-dock do editor) tambem encontra
     // acumulo de quando nao existia consumidor -- o primeiro tick sempre drena
     bool wasHidden = true;
+    float lastOnLevel = -1.0f;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (LevelMeter)
 };

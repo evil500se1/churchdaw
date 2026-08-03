@@ -65,18 +65,28 @@ public:
     // dono -- conferido no log do aparelho, que mostrou os nomes reais.
     static bool isDawPort (const juce::String& name)
     {
-        // Os nomes acima sao os do Windows. No Android a porta vem do nome da
-        // INTERFACE USB, e o aparelho publica "Launchkey MK4 61 MIDI Int" --
-        // nenhum dos padroes do Windows casa, entao a porta DAW passava batido,
-        // entrava como teclado comum e ainda deixava o LaunchkeyControl sem
-        // dono da porta (dai o "porta DAW ainda nao disponivel" no log).
-        // Conferido em 30/07/2026 no TANK 3 via dumpsys midi.
+        // "MIDI Int" e "MIDI2" FORAM REMOVIDOS DAQUI (01/08/2026).
+        //
+        // Eles entraram na 1.5.4 e causaram a regressao do Android em que o app
+        // "parou de reconhecer o MIDI". O motivo e estrutural: no Android o
+        // juce::MidiDeviceInfo::name nao e o nome da PORTA, e sim
+        // nome-do-APARELHO + " " + nome-do-bloco
+        // (juce_MidiDeviceListConnectionBroadcaster.cpp, buildName). Entao
+        // qualquer trecho que exista no nome do APARELHO casa em TODAS as
+        // portas dele.
+        //
+        // "MIDI Int" e abreviacao de MIDI *Interface* — o nome da interface USB
+        // do teclado, que aparece no nome do aparelho. Ou seja: era o padrao da
+        // porta do TECLADO, nao da porta DAW (esta se anuncia como DAW ou
+        // InControl). Com ele na lista, as duas portas eram desligadas e nao
+        // sobrava nenhuma entrada — o chip do cabecalho mostrava "Nenhum".
+        //
+        // Os padroes que sobraram dependem todos de indice de porta ou do
+        // termo "DAW", entao nao podem casar com o aparelho inteiro.
         return name.containsIgnoreCase ("Launchkey")
                 && (name.containsIgnoreCase ("MIDIIN2") || name.containsIgnoreCase ("MIDIOUT2")
                      || name.containsIgnoreCase ("DAW")
-                     || name.containsIgnoreCase ("Port 2")
-                     || name.containsIgnoreCase ("MIDI Int")
-                     || name.containsIgnoreCase ("MIDI2"));
+                     || name.containsIgnoreCase ("Port 2"));
     }
 
     //== Visor =================================================================

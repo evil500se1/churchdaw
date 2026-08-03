@@ -20,12 +20,11 @@ int main (int argc, char** argv)
             "uso: probe <update-policy-v2.json> <manifest.json> <unix-time>");
 
     const juce::String officialApkUrl =
-        "https://churchdaw.com/app/android/ChurchDAW-1.5.0.apk";
+        "https://churchdaw.com/app/android/ChurchDAW-1.5.0-signed.apk";
     if (! ChurchDAWServices::isSafeWebsiteUpdateUrl (officialApkUrl))
         return fail ("URL oficial do APK foi rejeitada");
-    if (! ChurchDAWServices::isSafeWebsiteUpdateUrl (
-            "https://churchdaw.com/app/android/"
-            "ChurchDAW-1.5.0-signed.apk")
+    if (ChurchDAWServices::isSafeWebsiteUpdateUrl (
+            "https://churchdaw.com/app/android/ChurchDAW-1.5.0.apk")
         || ChurchDAWServices::isSafeWebsiteUpdateUrl (
             officialApkUrl + "?arquivo=outro")
         || ChurchDAWServices::isSafeWebsiteUpdateUrl (
@@ -58,7 +57,7 @@ int main (int argc, char** argv)
         ChurchDAWServices::currentVersionCode + 1;
     futurePolicy.playStoreUrl =
         "https://churchdaw.com/app/android/"
-        "ChurchDAW-9.9.9.apk";
+        "ChurchDAW-9.9.9-signed.apk";
 
     if (ChurchDAWServices::requiredUpdateDownloadUrl (
             futurePolicy, futurePolicy.latestVersionCode)
@@ -71,6 +70,77 @@ int main (int argc, char** argv)
             futurePolicy, futurePolicy.latestVersionCode)
             != ChurchDAWServices::defaultPlayStoreUrl)
         return fail ("gate aceitou URL externa como download obrigatorio");
+
+    using UpdateDecision =
+        ChurchDAWServices::AndroidUpdatePromptDecision;
+
+    futurePolicy.minimumVersionCode =
+        ChurchDAWServices::currentVersionCode - 1;
+    futurePolicy.playStoreUrl =
+        "https://churchdaw.com/app/android/ChurchDAW-9.9.9-signed.apk";
+
+    if (ChurchDAWServices::decideAndroidUpdatePrompt (
+            futurePolicy, ChurchDAWServices::currentVersionCode,
+            futurePolicy.minimumVersionCode)
+        != UpdateDecision::optionalUpdate)
+        return fail ("policy assinada futura nao gerou oferta opcional");
+
+    auto candidate = futurePolicy;
+    candidate.cryptographicallyVerified = false;
+    if (ChurchDAWServices::decideAndroidUpdatePrompt (
+            candidate, ChurchDAWServices::currentVersionCode,
+            candidate.minimumVersionCode)
+        != UpdateDecision::noPrompt)
+        return fail ("policy sem assinatura gerou oferta opcional");
+
+    candidate = futurePolicy;
+    candidate.valid = false;
+    if (ChurchDAWServices::decideAndroidUpdatePrompt (
+            candidate, ChurchDAWServices::currentVersionCode,
+            candidate.minimumVersionCode)
+        != UpdateDecision::noPrompt)
+        return fail ("falha de rede/cache invalido bloqueou a inicializacao");
+
+    candidate = futurePolicy;
+    candidate.playStoreUrl =
+        "https://example.com/app/android/ChurchDAW-9.9.9-signed.apk";
+    if (ChurchDAWServices::decideAndroidUpdatePrompt (
+            candidate, ChurchDAWServices::currentVersionCode,
+            candidate.minimumVersionCode)
+        != UpdateDecision::noPrompt)
+        return fail ("URL externa gerou oferta opcional");
+
+    candidate = futurePolicy;
+    candidate.latestVersionCode = ChurchDAWServices::currentVersionCode;
+    if (ChurchDAWServices::decideAndroidUpdatePrompt (
+            candidate, ChurchDAWServices::currentVersionCode,
+            candidate.minimumVersionCode)
+        != UpdateDecision::noPrompt)
+        return fail ("versao atual gerou oferta opcional");
+
+    candidate = futurePolicy;
+    candidate.minimumVersionCode =
+        ChurchDAWServices::currentVersionCode + 1;
+    if (ChurchDAWServices::decideAndroidUpdatePrompt (
+            candidate, ChurchDAWServices::currentVersionCode,
+            candidate.minimumVersionCode)
+        != UpdateDecision::requiredUpdate)
+        return fail ("versao abaixo do piso nao preservou gate obrigatorio");
+
+    candidate.valid = false;
+    if (ChurchDAWServices::decideAndroidUpdatePrompt (
+            candidate, ChurchDAWServices::currentVersionCode,
+            candidate.minimumVersionCode)
+        != UpdateDecision::requiredUpdate)
+        return fail ("falha de rede apagou piso obrigatorio ja confirmado");
+
+    candidate = futurePolicy;
+    candidate.minimumVersionCode =
+        ChurchDAWServices::currentVersionCode + 1;
+    if (ChurchDAWServices::decideAndroidUpdatePrompt (
+            candidate, ChurchDAWServices::currentVersionCode, 1)
+        != UpdateDecision::noPrompt)
+        return fail ("policy com minimo futuro nao armado virou oferta opcional");
 
     const auto policyFile = juce::File (juce::String::fromUTF8 (argv[1]));
     const auto manifestFile = juce::File (juce::String::fromUTF8 (argv[2]));
@@ -137,6 +207,43 @@ int main (int argc, char** argv)
     if (! installedPackOk)
         return fail (
             "marker local valido nao reconstruiu a biblioteca instalada");
+
+    // O Pad das builds antigas ficava em Libraries/pad-continuo/Pads,
+    // enquanto o catalogo atual declara install_folder=Pads. O card precisa
+    // consultar o pai legado (onde esta o marker), sem mudar o destino de uma
+    // futura reparacao/atualizacao.
+    const auto legacyPadFolder = fixtureRoot.getChildFile ("pad-continuo");
+    const auto legacyPadSamples = legacyPadFolder.getChildFile ("Pads");
+
+    if (legacyPadSamples.createDirectory().failed()
+         || ! legacyPadSamples.getChildFile ("pad_C.wav")
+                .replaceWithData ("x", 1))
+        return fail ("nao foi possivel criar fixture legada do Pad");
+
+    auto padMarker = std::make_unique<juce::DynamicObject>();
+    padMarker->setProperty ("schema_version", 1);
+    padMarker->setProperty ("id", "pad-continuo");
+    padMarker->setProperty ("name", "Pad Continuo");
+    padMarker->setProperty ("version", 1);
+    padMarker->setProperty ("version_name", "1.0");
+    padMarker->setProperty ("installed_bytes", 7);
+
+    if (! legacyPadFolder.getChildFile (".churchdaw-library.json")
+             .replaceWithText (juce::JSON::toString (
+                 juce::var (padMarker.release()), true)))
+        return fail ("nao foi possivel gravar marker legado do Pad");
+
+    ChurchDAWServices::LibraryPack catalogPad;
+    catalogPad.id = "pad-continuo";
+    catalogPad.installFolder = "Pads";
+    catalogPad.version = 1;
+
+    if (catalogPad.detectedInstalledFolderAt (fixtureRoot) != legacyPadFolder
+         || ChurchDAWServices::validLibraryMarkerVersion (
+                catalogPad.detectedInstalledFolderAt (fixtureRoot), catalogPad.id) != 1)
+        return fail ("catalogo nao reconheceu a instalacao legada do Pad");
+
+    fixtureRoot.deleteRecursively();
 
     std::cout << "PASS: politica serial " << policy.policySerial
               << ", catalogo vinculado e "

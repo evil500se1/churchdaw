@@ -885,9 +885,16 @@ bool operatingSystemTrustsInstaller (const juce::File& installer, juce::String& 
     // O Gatekeeper e quem decide de verdade no macOS -- perguntamos a ele em vez
     // de reimplementar a regra. "--type install" e a avaliacao usada para
     // instaladores e imagens de disco.
+    // "--verbose" NAO e enfeite: sem ele o spctl imprime apenas
+    // "<caminho>: rejected", e a linha "source=..." — a unica que diz SE a
+    // recusa foi por falta de assinatura ou por assinatura quebrada — nunca
+    // aparece. O ramo de tolerancia abaixo procura exatamente esse texto,
+    // entao sem verbose ele jamais casava e todo DMG ad-hoc virava
+    // "Gatekeeper recusou o instalador". Medido no Mac em 31/07/2026:
+    // com --verbose=4 a saida traz "source=no usable signature".
     juce::ChildProcess assess;
     juce::StringArray command { "/usr/sbin/spctl", "--assess", "--type", "install",
-                                installer.getFullPathName() };
+                                "--verbose=4", installer.getFullPathName() };
 
     if (! assess.start (command, juce::ChildProcess::wantStdOut | juce::ChildProcess::wantStdErr))
     {

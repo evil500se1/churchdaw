@@ -433,7 +433,13 @@ static inline bool hasARAExtension ([[maybe_unused]] AudioUnit audioUnit)
 
 struct AudioUnitDeleter
 {
-    void operator() (AudioUnit au) const { AudioComponentInstanceDispose (au); }
+    void operator() (AudioUnit au) const
+    {
+        PluginHostDiagnostics::ScopedCall dispose (
+            "unload", "AU AudioComponentInstanceDispose", false);
+        const auto result = AudioComponentInstanceDispose (au);
+        dispose.finish (result == noErr, result);
+    }
 };
 
 using AudioUnitUniquePtr = std::unique_ptr<std::remove_pointer_t<AudioUnit>, AudioUnitDeleter>;
@@ -485,18 +491,33 @@ static void createAudioUnit (VersionedAudioComponent versionedComponent, AudioUn
 {
     if (versionedComponent.isAUv3)
     {
+        const auto started = Time::getMillisecondCounter();
+        PluginHostDiagnostics::report (
+            PluginHostDiagnostics::EventKind::begin,
+            "creation", "AU AudioComponentInstantiate(AUv3)",
+            true, 0, true);
+
         AudioComponentInstantiate (versionedComponent.audioComponent,
                                    kAudioComponentInstantiation_LoadOutOfProcess,
                                    ^(AudioComponentInstance audioUnit, OSStatus err)
                                    {
+                                       PluginHostDiagnostics::report (
+                                           PluginHostDiagnostics::EventKind::end,
+                                           "creation", "AU AudioComponentInstantiate(AUv3)",
+                                           err == noErr && audioUnit != nullptr,
+                                           err, true,
+                                           (int64) (Time::getMillisecondCounter() - started));
                                        callback (audioUnit, err);
                                    });
 
         return;
     }
 
-    AudioComponentInstance audioUnit;
+    AudioComponentInstance audioUnit = nullptr;
+    PluginHostDiagnostics::ScopedCall create (
+        "creation", "AU AudioComponentInstanceNew", true);
     auto err = AudioComponentInstanceNew (versionedComponent.audioComponent, &audioUnit);
+    create.finish (err == noErr && audioUnit != nullptr, err);
     callback (err != noErr ? nullptr : audioUnit, err);
 }
 
@@ -530,12 +551,26 @@ static AudioComponentResult getAudioComponent (AudioUnitPluginFormatHeadless& fo
         return AudioComponentResult { errMessage };
     }
 
-    if ((auComponent = AudioComponentFindNext (nullptr, &componentDesc)) == nullptr)
+    PluginHostDiagnostics::ScopedCall findComponent (
+        "factory", "AU AudioComponentFindNext", true, desc.fileOrIdentifier);
+    auComponent = AudioComponentFindNext (nullptr, &componentDesc);
+    findComponent.finish (auComponent != nullptr, auComponent != nullptr ? 0 : -1,
+                          desc.fileOrIdentifier);
+
+    if (auComponent == nullptr)
     {
         return AudioComponentResult { errMessage };
     }
 
-    if (AudioComponentGetDescription (auComponent, &componentDesc) != noErr)
+    PluginHostDiagnostics::ScopedCall getDescription (
+        "factory", "AU AudioComponentGetDescription", true,
+        desc.fileOrIdentifier);
+    const auto descriptionResult = AudioComponentGetDescription (auComponent,
+                                                                 &componentDesc);
+    getDescription.finish (descriptionResult == noErr, descriptionResult,
+                           desc.fileOrIdentifier);
+
+    if (descriptionResult != noErr)
     {
         return AudioComponentResult { errMessage };
     }
@@ -894,12 +929,17 @@ public:
         if (prepared)
             releaseResources();
 
-        AudioComponentInstanceDispose (audioUnit);
+        PluginHostDiagnostics::ScopedCall dispose (
+            "unload", "AU AudioComponentInstanceDispose", false, pluginName);
+        const auto disposeResult = AudioComponentInstanceDispose (audioUnit);
+        dispose.finish (disposeResult == noErr, disposeResult, pluginName);
         audioUnit = nullptr;
     }
 
     bool initialise (double rate, int blockSize)
     {
+        PluginHostDiagnostics::ScopedCall initialiseInstance (
+            "initialize", "AU host instance initialise", true, pluginName);
         producesMidiMessages = canProduceMidiOutput();
         setRateAndBufferSizeDetails (rate, blockSize);
         setLatencySamples (0);
@@ -907,6 +947,7 @@ public:
         setPluginCallbacks();
         createEventListener();
 
+        initialiseInstance.finish (true, noErr, pluginName);
         return true;
     }
 
@@ -1280,7 +1321,13 @@ public:
 
             prepared = [&]
             {
-                if (AudioUnitInitialize (audioUnit) != noErr)
+                PluginHostDiagnostics::ScopedCall initialiseAudioUnit (
+                    "activate", "AU AudioUnitInitialize", true, pluginName);
+                const auto initialiseResult = AudioUnitInitialize (audioUnit);
+                initialiseAudioUnit.finish (initialiseResult == noErr,
+                                            initialiseResult, pluginName);
+
+                if (initialiseResult != noErr)
                     return false;
 
                 if (! haveParameterList)
@@ -1288,7 +1335,11 @@ public:
 
                 if (! syncBusLayouts (getBusesLayout(), true, ignore))
                 {
-                    AudioUnitUninitialize (audioUnit);
+                    PluginHostDiagnostics::ScopedCall uninitialiseAudioUnit (
+                        "unload", "AU AudioUnitUninitialize(after layout failure)",
+                        false, pluginName);
+                    const auto result = AudioUnitUninitialize (audioUnit);
+                    uninitialiseAudioUnit.finish (result == noErr, result, pluginName);
                     return false;
                 }
 
@@ -1311,7 +1362,10 @@ public:
         {
             resetBuses();
             AudioUnitReset (audioUnit, kAudioUnitScope_Global, 0);
-            AudioUnitUninitialize (audioUnit);
+            PluginHostDiagnostics::ScopedCall uninitialiseAudioUnit (
+                "unload", "AU AudioUnitUninitialize", false, pluginName);
+            const auto result = AudioUnitUninitialize (audioUnit);
+            uninitialiseAudioUnit.finish (result == noErr, result, pluginName);
 
             outputBufferList.clear();
             prepared = false;

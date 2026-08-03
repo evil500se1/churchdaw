@@ -103,6 +103,17 @@ public:
     /** Returns true if there's currently a scan in progress. */
     bool isScanning() const noexcept;
 
+    /** Returns and clears whether the most recently completed scan was
+        explicitly cancelled by the user. This lets hosts that queue multiple
+        formats cancel the whole batch rather than immediately starting the
+        next format. */
+    bool consumeLastScanWasCancelled() noexcept;
+
+    /** Returns and clears whether the most recently completed scan was unable
+        to reach a conclusive result because the custom scanner itself could
+        not launch, communicate, or parse its protocol. */
+    bool consumeLastScanWasInconclusive() noexcept;
+
     /** Removes the plugins currently selected in the table. */
     void removeSelectedPlugins();
 
@@ -132,6 +143,8 @@ private:
     PropertiesFile* propertiesToUse;
     String dialogTitle, dialogText;
     bool allowAsync;
+    bool lastScanWasCancelled = false;
+    bool lastScanWasInconclusive = false;
     int numThreads;
 
     class TableModel;
@@ -142,7 +155,7 @@ private:
 
     ScopedMessageBox messageBox;
 
-    void scanFinished (const StringArray&, const std::vector<String>&);
+    void scanFinished (const StringArray&, const std::vector<String>&, bool wasCancelled);
     void updateList();
     void removeMissingPlugins();
     void removePluginItem (int index);

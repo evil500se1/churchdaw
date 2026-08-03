@@ -14,25 +14,133 @@ public:
     // solto espalhado pelos paint(). Trocar um token aqui muda o app inteiro.
     //==============================================================================
 
-    // ---- superficies ----
-    static juce::Colour bgApp()          { return juce::Colour (0xff101216); }   // fundo geral
-    static juce::Colour bgCard()         { return juce::Colour (0xff1a1e24); }   // painel/card
-    static juce::Colour bgCardSel()      { return juce::Colour (0xff242932); }   // card selecionado
-    static juce::Colour bgControl()      { return juce::Colour (0xff22272f); }   // campos/controles
-    static juce::Colour borderDefault()  { return juce::Colour (0xff343a45); }
+    // ---- superficies (grafite quente, OLED premium) ----
+    static juce::Colour bgApp()          { return juce::Colour (0xff0c0e12); }   // fundo geral
+    static juce::Colour bgAppLift()      { return juce::Colour (0xff141820); }   // vinheta clara
+    static juce::Colour bgCard()         { return juce::Colour (0xff171b22); }   // painel/card
+    static juce::Colour bgCardHi()       { return juce::Colour (0xff1f242e); }   // topo do glass
+    static juce::Colour bgCardSel()      { return juce::Colour (0xff262c38); }   // card selecionado
+    static juce::Colour bgControl()      { return juce::Colour (0xff1e242d); }   // campos/controles
+    static juce::Colour bgControlHi()    { return juce::Colour (0xff2a313c); }
+    static juce::Colour borderDefault()  { return juce::Colour (0xff3a4250); }
+    static juce::Colour borderSoft()     { return juce::Colour (0xff2a303a); }
+    static juce::Colour hairline()       { return juce::Colours::white.withAlpha (0.065f); }
 
     // ---- texto ----
-    static juce::Colour txtPrimary()     { return juce::Colour (0xfff4f6f8); }
-    static juce::Colour txtSecondary()   { return juce::Colour (0xffa9afb8); }
-    static juce::Colour txtDisabled()    { return juce::Colour (0xff707680); }
+    static juce::Colour txtPrimary()     { return juce::Colour (0xfff5f7fa); }
+    static juce::Colour txtSecondary()   { return juce::Colour (0xffa8b0bc); }
+    static juce::Colour txtDisabled()    { return juce::Colour (0xff6c7480); }
 
     // ---- acento e status ----
     static juce::Colour nordRed()        { return juce::Colour (0xffe91845); }   // acento global
-    static juce::Colour nordRedBright()  { return juce::Colour (0xffff2a58); }   // hover/destaque
+    static juce::Colour nordRedBright()  { return juce::Colour (0xffff2f5c); }   // hover/destaque
     static juce::Colour nordRedDark()    { return juce::Colour (0xff9c0f2e); }
-    static juce::Colour amberSolo()      { return juce::Colour (0xfff9a825); }   // solo/atencao
-    static juce::Colour greenOk()        { return juce::Colour (0xff55c878); }   // status normal
+    static juce::Colour amberSolo()      { return juce::Colour (0xffffb020); }   // solo/atencao
+    static juce::Colour greenOk()        { return juce::Colour (0xff4fd68a); }   // status normal
     static juce::Colour redClip()        { return juce::Colour (0xffff1744); }   // erro/clip
+
+    // Fundo do app com vinheta vertical (profundidade de console).
+    static void fillAppBackground (juce::Graphics& g, juce::Rectangle<float> area)
+    {
+        g.setGradientFill (juce::ColourGradient (bgAppLift(), area.getCentreX(), area.getY(),
+                                                 bgApp(), area.getCentreX(), area.getBottom(), false));
+        g.fillRect (area);
+
+        // Vinheta lateral sutil — “palco no escuro”.
+        g.setGradientFill (juce::ColourGradient (juce::Colours::black.withAlpha (0.28f),
+                                                 area.getX(), area.getCentreY(),
+                                                 juce::Colours::transparentBlack,
+                                                 area.getX() + area.getWidth() * 0.12f,
+                                                 area.getCentreY(), false));
+        g.fillRect (area);
+        g.setGradientFill (juce::ColourGradient (juce::Colours::black.withAlpha (0.28f),
+                                                 area.getRight(), area.getCentreY(),
+                                                 juce::Colours::transparentBlack,
+                                                 area.getRight() - area.getWidth() * 0.12f,
+                                                 area.getCentreY(), false));
+        g.fillRect (area);
+    }
+
+    // Card de vidro fosco — linguagem desktop Win/Mac:
+    // grafite neutro, vermelho so na barra fina de topo / estados criticos.
+    // (O modo palco Android estava com halo vermelho grosso e parecia extravagante.)
+    static void drawGlassCard (juce::Graphics& g, juce::Rectangle<float> card,
+                               float radius = radiusCard,
+                               bool selected = false,
+                               juce::Colour accent = {},
+                               bool empty = false,
+                               bool master = false)
+    {
+        if (card.isEmpty())
+            return;
+
+        {
+            juce::Path sp;
+            sp.addRoundedRectangle (card, radius);
+            // Android software renderer: sombra barata. Visual quase igual.
+           #if JUCE_ANDROID || JUCE_IOS
+            juce::DropShadow (juce::Colours::black.withAlpha (selected ? 0.40f : 0.30f),
+                              selected ? 6 : 4,
+                              { 0, selected ? 2 : 1 }).drawForPath (g, sp);
+           #else
+            juce::DropShadow (juce::Colours::black.withAlpha (selected ? 0.48f : 0.38f),
+                              selected ? 12 : 10,
+                              { 0, selected ? 3 : 2 }).drawForPath (g, sp);
+           #endif
+        }
+
+        juce::Colour top, bot;
+        if      (master)   { top = juce::Colour (0xff262b34); bot = juce::Colour (0xff161920); }
+        else if (selected) { top = juce::Colour (0xff282d36); bot = juce::Colour (0xff191c22); }
+        else if (empty)    { top = juce::Colour (0xff15181e); bot = juce::Colour (0xff0e1014); }
+        else               { top = juce::Colour (0xff1e222a); bot = juce::Colour (0xff14171c); }
+
+        g.setGradientFill (juce::ColourGradient (top, card.getX(), card.getY(),
+                                                 bot, card.getX(), card.getBottom(), false));
+        g.fillRoundedRectangle (card, radius);
+
+        // Specular topo discreto (vidro fosco, nao neon).
+        if (! empty)
+        {
+            g.setColour (juce::Colours::white.withAlpha (selected ? 0.07f : 0.045f));
+            g.drawLine (card.getX() + 10.0f, card.getY() + 1.0f,
+                        card.getRight() - 10.0f, card.getY() + 1.0f, 1.0f);
+        }
+
+        if (selected)
+        {
+            // Selecao = moldura clara (Win/Mac). Vermelho gritando era so no Android.
+            g.setColour (juce::Colours::white.withAlpha (0.18f));
+            g.drawRoundedRectangle (card, radius, 1.5f);
+        }
+        else if (empty)
+        {
+            g.setColour (borderSoft().withAlpha (0.70f));
+            g.drawRoundedRectangle (card, radius, 1.0f);
+        }
+        else if (master)
+        {
+            // Master: contorno grafite + fio vermelho bem fino (desktop).
+            g.setColour (borderDefault().withAlpha (0.65f));
+            g.drawRoundedRectangle (card, radius, 1.15f);
+            g.setColour (nordRed().withAlpha (0.28f));
+            g.drawRoundedRectangle (card.reduced (0.5f), radius, 1.0f);
+        }
+        else
+        {
+            g.setColour (borderDefault().withAlpha (0.50f));
+            g.drawRoundedRectangle (card, radius, 1.0f);
+        }
+
+        // Barra de acento no topo: categoria (ou vermelho so no master).
+        auto bar = card.reduced (12.0f, 0.0f).removeFromTop (8.0f).withTrimmedTop (5.5f)
+                       .withHeight (master ? 3.0f : 2.4f);
+        g.setColour (empty ? txtDisabled().withAlpha (0.22f)
+                    : master ? nordRed().withAlpha (0.90f)
+                    : accent.isTransparent() ? nordRed().withAlpha (0.55f)
+                                             : accent.withAlpha (0.90f));
+        g.fillRoundedRectangle (bar, 1.2f);
+    }
 
     // ---- cor por categoria de instrumento (apoio, nunca protagonista) ----
     static juce::Colour catPiano()       { return juce::Colour (0xff5b8a9a); }
@@ -168,11 +276,10 @@ public:
     static constexpr int meterMasterW = 23;  // medidor do master
 
     // ---- raio de canto: TRES escalas, nao cinco ----
-    // Antes havia card=10, botao=6, combo=5, chip=7, medidor=3 na mesma tela.
-    // O olho nao le o numero, mas sente a bagunca.
-    static constexpr float radiusControl = 4.0f;   // botoes, combos, chips
-    static constexpr float radiusCard    = 8.0f;   // cards de canal
-    static constexpr float radiusPanel   = 12.0f;  // paineis e visores
+    // Premium: um pouco mais generoso no card/painel (vidro, nao tijolo).
+    static constexpr float radiusControl = 6.0f;   // botoes, combos, chips
+    static constexpr float radiusCard    = 10.0f;  // cards de canal
+    static constexpr float radiusPanel   = 14.0f;  // paineis e visores
 
     // LEDs do painel. Nas fotos: VERDE nas escadas de nivel dos faders, VERMELHO
     // nas drawbars do orgao, AMBAR nos ON/OFF de camada.
@@ -282,51 +389,81 @@ public:
         const float r = radiusControl;
        #endif
 
+        // PANIC em contorno: emergencia legivel sem roubar o master fader.
+        if (button.getComponentID() == "panicOutline")
+        {
+            auto fill = juce::Colour (0xff1a1014);
+            if (shouldDrawButtonAsDown)             fill = fill.brighter (0.18f);
+            else if (shouldDrawButtonAsHighlighted) fill = fill.brighter (0.10f);
+
+            g.setColour (juce::Colours::black.withAlpha (0.35f));
+            g.fillRoundedRectangle (bounds.translated (0.0f, 1.0f), r);
+            g.setColour (fill);
+            g.fillRoundedRectangle (bounds, r);
+            g.setColour (nordRedBright().withAlpha (shouldDrawButtonAsDown ? 1.0f : 0.90f));
+            g.drawRoundedRectangle (bounds, r, 1.8f);
+            if (shouldDrawButtonAsHighlighted || shouldDrawButtonAsDown)
+            {
+                g.setColour (nordRed().withAlpha (0.22f));
+                g.drawRoundedRectangle (bounds.expanded (1.5f), r + 1.5f, 2.0f);
+            }
+            return;
+        }
+
         auto base = backgroundColour;
 
         // botao "fantasma" (fundo transparente): so um contorno sutil, sem chapa
         if (base.isTransparent())
         {
-            g.setColour (juce::Colours::white.withAlpha (shouldDrawButtonAsHighlighted ? 0.16f : 0.09f));
-            g.drawRoundedRectangle (bounds, r, 1.0f);
+            g.setColour (juce::Colours::white.withAlpha (shouldDrawButtonAsHighlighted ? 0.18f : 0.10f));
+            g.drawRoundedRectangle (bounds, r, 1.15f);
             return;
         }
 
-        // (o tratamento "chapa preta + LED redondo ao lado" saiu daqui: em botao
-        // pequeno o pontinho virava sujeira e o estado ficava MENOS claro que a
-        // chapa inteira acesa)
-
-        // Antes qualquer clique pintava o botao de VERMELHO — o vermelho deixava de
-        // significar "ativo". Agora clicar so escurece; vermelho fica reservado pro
-        // estado ligado (buttonOnColourId).
+        // Clicar so escurece; cor saturada fica pro estado LIGADO.
         if (shouldDrawButtonAsDown)             base = base.darker (0.28f);
-        else if (shouldDrawButtonAsHighlighted) base = base.brighter (0.14f);
+        else if (shouldDrawButtonAsHighlighted) base = base.brighter (0.12f);
 
         const bool accent = base.getSaturation() > 0.30f;
 
-        g.setColour (juce::Colours::black.withAlpha (0.25f));
-        g.fillRoundedRectangle (bounds.translated (0.0f, 1.0f), r);
+        g.setColour (juce::Colours::black.withAlpha (0.32f));
+        g.fillRoundedRectangle (bounds.translated (0.0f, 1.5f), r);
 
-        g.setGradientFill (juce::ColourGradient (base.brighter (0.10f), 0.0f, bounds.getY(),
-                                                 base.darker (0.16f), 0.0f, bounds.getBottom(), false));
+        // Vidro: highlight no topo, sombra embaixo.
+        g.setGradientFill (juce::ColourGradient (base.brighter (accent ? 0.16f : 0.12f),
+                                                 0.0f, bounds.getY(),
+                                                 base.darker (0.18f),
+                                                 0.0f, bounds.getBottom(), false));
         g.fillRoundedRectangle (bounds, r);
 
-        g.setColour (juce::Colours::white.withAlpha (0.07f));   // brilho de 1px no topo
-        g.drawLine (bounds.getX() + 5.0f, bounds.getY() + 1.0f, bounds.getRight() - 5.0f, bounds.getY() + 1.0f, 1.0f);
+        g.setColour (juce::Colours::white.withAlpha (accent ? 0.12f : 0.08f));
+        g.drawLine (bounds.getX() + 6.0f, bounds.getY() + 1.0f,
+                    bounds.getRight() - 6.0f, bounds.getY() + 1.0f, 1.1f);
 
-        g.setColour (accent ? base.brighter (0.45f).withAlpha (0.7f) : panelOutline());
-        g.drawRoundedRectangle (bounds, r, 1.0f);
+        g.setColour (accent ? base.brighter (0.50f).withAlpha (0.75f)
+                            : borderDefault().withAlpha (0.75f));
+        g.drawRoundedRectangle (bounds, r, 1.05f);
 
-       #if JUCE_ANDROID || JUCE_IOS
-        // HALO nos botoes de acento (PANIC, pagina ativa, toggles ligados):
-        // no OLED do palco a luz difusa em volta e o que diz "isto esta ACESO"
-        // de relance -- e a assinatura dos instrumentos de verdade.
+       #if ! JUCE_ANDROID && ! JUCE_IOS
+        // Estado ativo de console: chapa acetinada + trilho inferior curto.
+        // A forma continua legivel mesmo sob luz forte sem recorrer a glow neon.
         if (accent)
         {
-            g.setColour (base.withAlpha (0.30f));
-            g.drawRoundedRectangle (bounds.expanded (1.8f), r + 1.8f, 2.4f);
-            g.setColour (base.withAlpha (0.12f));
-            g.drawRoundedRectangle (bounds.expanded (3.6f), r + 3.6f, 2.4f);
+            auto rail = bounds.reduced (8.0f, 0.0f)
+                              .removeFromBottom (3.0f)
+                              .withTrimmedBottom (0.8f);
+            g.setColour (base.brighter (0.62f).withAlpha (0.92f));
+            g.fillRoundedRectangle (rail, 1.1f);
+        }
+       #endif
+
+       #if JUCE_ANDROID || JUCE_IOS
+        // Halo curto nos acentos (ON). Antes era glow duplo generoso e o
+        // modo palco virava "mar de vermelho" vs desktop Win/Mac.
+        if (accent)
+        {
+            g.setColour (base.withAlpha (0.18f));
+            g.drawRoundedRectangle (bounds.expanded (1.2f), r + 1.2f, 1.6f);
         }
        #endif
     }
@@ -541,8 +678,12 @@ public:
         }
 
         // Calha LARGA: com 6px o fader lia como "um risco vermelho na tela".
-        // Console de verdade tem sulco fresado — ~14px, com sombra interna.
+        // Console de verdade tem sulco fresado — ~14-18px, com sombra interna.
+       #if JUCE_ANDROID || JUCE_IOS
+        const float trackW = juce::jlimit (12.0f, 18.0f, (float) width * 0.38f);
+       #else
         const float trackW = juce::jlimit (10.0f, 16.0f, (float) width * 0.34f);
+       #endif
         auto track = juce::Rectangle<float> ((float) x + (float) width * 0.5f - trackW * 0.5f,
                                              (float) y, trackW, (float) height);
         const float trackR = trackW * 0.5f;
@@ -578,9 +719,14 @@ public:
             }
         }
 
-        // cap de console: mais largo que a calha, com ranhuras de aderencia
+        // cap de console: mais largo e alto no touch (dedo no tablet).
+       #if JUCE_ANDROID || JUCE_IOS
+        const float capW = juce::jlimit (28.0f, 46.0f, (float) width * 0.88f);
+        const float capH = 26.0f;
+       #else
         const float capW = juce::jlimit (24.0f, 40.0f, (float) width * 0.82f);
         const float capH = 22.0f;
+       #endif
         auto cap = juce::Rectangle<float> (track.getCentreX() - capW * 0.5f,
                                            sliderPos - capH * 0.5f, capW, capH);
 
@@ -712,10 +858,40 @@ public:
     // NEUTRO (disciplina de vermelho: a setinha deixa de ser vermelha).
     // O combo mostra o PRESET -- a informacao que muda. Depois de rebaixar a
     // categoria a rotulo de apoio, ele passa a ser o texto principal do card.
+    juce::Font getTextButtonFont (juce::TextButton& button,
+                                  int buttonHeight) override
+    {
+        float height = juce::jlimit (9.0f, 15.0f,
+                                     (float) buttonHeight * 0.55f);
+
+        // As tres acoes no rodape de cada strip tem ~32 px. A fonte padrao
+        // desktop era grande demais e transformava LOOP/ORGAO em reticencias.
+       #if ! JUCE_ANDROID && ! JUCE_IOS
+        if (button.getWidth() < 44)
+            height = juce::jmin (height, 9.5f);
+        else if (button.getWidth() < 64)
+            height = juce::jmin (height, 11.0f);
+       #endif
+
+        return juce::Font (juce::FontOptions (height, juce::Font::bold));
+    }
+
     juce::Font getComboBoxFont (juce::ComboBox& box) override
     {
-        return juce::Font (juce::FontOptions (juce::jlimit (13.0f, 16.0f, (float) box.getHeight() * 0.52f),
-                                              juce::Font::bold));
+        // Preset e o heroi do card: fonte sobe com a altura do chip (modo palco ~42).
+        float height = juce::jlimit (13.0f, 18.0f,
+                                     (float) box.getHeight() * 0.48f);
+
+        // Presets e slots de FX precisam caber completos na mesa de oito
+        // canais. No editor focado, onde ha largura, a fonte volta ao teto.
+       #if ! JUCE_ANDROID && ! JUCE_IOS
+        if (box.getWidth() < 96)
+            height = juce::jmin (height, 10.5f);
+        else if (box.getWidth() < 126)
+            height = juce::jmin (height, 12.5f);
+       #endif
+
+        return juce::Font (juce::FontOptions (height, juce::Font::bold));
     }
 
     // Balao de valor do knob, na mesma linguagem do visor de programa: vidro
@@ -745,47 +921,81 @@ public:
     void drawComboBox (juce::Graphics& g, int width, int height, bool,
                        int, int, int, int, juce::ComboBox& box) override
     {
-        // MINI-VISOR, nao caixa de formulario. Num painel de instrumento o nome do
-        // preset aparece atras de vidro escuro embutido, com o mesmo vocabulario do
-        // visor grande de programa -- nao numa chapa clara com bordinha de app.
+        // MINI-VISOR premium: rebaixo, vidro, chevron de marca.
         auto bounds = juce::Rectangle<float> (0.0f, 0.0f, (float) width, (float) height).reduced (0.5f);
 
        #if JUCE_ANDROID || JUCE_IOS
-        // mesmo criterio dos chips: raio proporcional. O combo e o componente
-        // mais tocado do celular (troca de preset) e era o que mais parecia
-        // "caixa de formulario".
-        const float r = juce::jmin (10.0f, bounds.getHeight() * 0.24f);
+        const float r = juce::jmin (12.0f, bounds.getHeight() * 0.28f);
        #else
         const float r = radiusControl;
        #endif
 
-        // rebaixo: sombra INTERNA no topo faz o vidro parecer afundado na chapa
-        g.setColour (juce::Colour (0xff0b0c0e));
+        // Sombra externa leve.
+        g.setColour (juce::Colours::black.withAlpha (0.35f));
+        g.fillRoundedRectangle (bounds.translated (0.0f, 1.5f), r);
+
+        // Rebaixo interno.
+        g.setColour (juce::Colour (0xff07080a));
         g.fillRoundedRectangle (bounds, r);
 
-        g.setGradientFill (juce::ColourGradient (juce::Colour (0xff17191d), 0.0f, bounds.getY(),
-                                                 juce::Colour (0xff0c0d10), 0.0f, bounds.getBottom(), false));
-        g.fillRoundedRectangle (bounds.reduced (1.0f), r - 1.0f);
+        g.setGradientFill (juce::ColourGradient (juce::Colour (0xff1a1e26), 0.0f, bounds.getY(),
+                                                 juce::Colour (0xff0c0e12), 0.0f, bounds.getBottom(), false));
+        g.fillRoundedRectangle (bounds.reduced (1.0f), juce::jmax (1.0f, r - 1.0f));
 
-        g.setColour (juce::Colours::black.withAlpha (0.75f));
-        g.drawLine (bounds.getX() + 4.0f, bounds.getY() + 1.2f, bounds.getRight() - 4.0f, bounds.getY() + 1.2f, 1.4f);
+        // Aresta superior escura = afundado.
+        g.setColour (juce::Colours::black.withAlpha (0.70f));
+        g.drawLine (bounds.getX() + 5.0f, bounds.getY() + 1.2f,
+                    bounds.getRight() - 5.0f, bounds.getY() + 1.2f, 1.3f);
 
-        // luz na aresta de BAIXO: assinatura otica de peca embutida
-        g.setColour (juce::Colours::white.withAlpha (0.09f));
-        g.drawLine (bounds.getX() + 4.0f, bounds.getBottom() - 1.0f,
-                    bounds.getRight() - 4.0f, bounds.getBottom() - 1.0f, 1.0f);
+        // Luz inferior.
+        g.setColour (juce::Colours::white.withAlpha (0.08f));
+        g.drawLine (bounds.getX() + 5.0f, bounds.getBottom() - 1.1f,
+                    bounds.getRight() - 5.0f, bounds.getBottom() - 1.1f, 1.0f);
 
-        g.setColour (box.hasKeyboardFocus (true) ? nordRedBright().withAlpha (0.75f)
-                                                 : juce::Colours::black.withAlpha (0.85f));
-        g.drawRoundedRectangle (bounds, r, 1.2f);
+        const bool focus = box.hasKeyboardFocus (true);
+        g.setColour (focus ? nordRedBright().withAlpha (0.80f)
+                           : borderDefault().withAlpha (0.55f));
+        g.drawRoundedRectangle (bounds, r, focus ? 1.5f : 1.15f);
 
-        // chevron VERMELHO: e o unico ponto de cor, e sinaliza "isto se abre"
-        const float cx = (float) width - 14.0f, cy = (float) height * 0.5f;
+        // Chevron em pill sutil a direita.
+        const float cx = (float) width - juce::jmax (15.0f, (float) height * 0.40f);
+        const float cy = (float) height * 0.5f;
+        auto pill = juce::Rectangle<float> (cx - 10.0f, cy - 9.0f, 20.0f, 18.0f);
+        g.setColour (juce::Colours::white.withAlpha (0.04f));
+        g.fillRoundedRectangle (pill, 5.0f);
+
+        const float arm = juce::jlimit (4.0f, 6.0f, (float) height * 0.14f);
         juce::Path caret;
-        caret.startNewSubPath (cx - 4.0f, cy - 2.5f);
-        caret.lineTo (cx, cy + 2.5f);
-        caret.lineTo (cx + 4.0f, cy - 2.5f);
-        g.setColour (nordRedBright().withAlpha (0.9f));
-        g.strokePath (caret, juce::PathStrokeType (1.9f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+        caret.startNewSubPath (cx - arm, cy - arm * 0.55f);
+        caret.lineTo (cx, cy + arm * 0.55f);
+        caret.lineTo (cx + arm, cy - arm * 0.55f);
+        g.setColour (nordRedBright().withAlpha (0.95f));
+        g.strokePath (caret, juce::PathStrokeType (
+            juce::jlimit (2.0f, 2.5f, (float) height * 0.065f),
+            juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+    }
+
+    void drawScrollbar (juce::Graphics& g, juce::ScrollBar& bar, int x, int y, int width, int height,
+                        bool isScrollbarVertical, int thumbStartPosition, int thumbSize,
+                        bool isMouseOver, bool isMouseDown) override
+    {
+        juce::ignoreUnused (bar, isMouseOver);
+
+        auto track = juce::Rectangle<float> ((float) x, (float) y, (float) width, (float) height);
+        g.setColour (juce::Colour (0xff12151a));
+        g.fillRoundedRectangle (track.reduced (isScrollbarVertical ? 2.0f : 0.0f,
+                                               isScrollbarVertical ? 0.0f : 2.0f), 4.0f);
+
+        juce::Rectangle<float> thumb;
+        if (isScrollbarVertical)
+            thumb = { track.getX() + 2.0f, (float) thumbStartPosition,
+                      juce::jmax (4.0f, track.getWidth() - 4.0f), (float) thumbSize };
+        else
+            thumb = { (float) thumbStartPosition, track.getY() + 2.0f,
+                      (float) thumbSize, juce::jmax (4.0f, track.getHeight() - 4.0f) };
+
+        auto col = juce::Colour (isMouseDown ? 0xff5a6270 : 0xff454c58);
+        g.setColour (col);
+        g.fillRoundedRectangle (thumb.reduced (0.5f), 4.0f);
     }
 };

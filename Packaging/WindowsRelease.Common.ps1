@@ -88,11 +88,17 @@ function Assert-ChurchDAWDesktopPolicyArtifactSet {
         [long] $WindowsInstallerBytes,
         [Parameter(Mandatory = $true)]
         [long] $MacInstallerBytes,
-        [switch] $AllowCurrentVersionPolicyWithoutInstaller
+        [switch] $AllowCurrentVersionPolicyWithoutInstaller,
+        [switch] $AllowRollbackPolicyWithoutInstaller
     )
 
     $hasInstaller = $WindowsInstallerBytes -gt 0 -or
                     $MacInstallerBytes -gt 0
+
+    if ($AllowCurrentVersionPolicyWithoutInstaller -and
+        $AllowRollbackPolicyWithoutInstaller) {
+        throw 'Somente uma excecao de policy sem instalador pode ser usada'
+    }
 
     if ($AllowCurrentVersionPolicyWithoutInstaller) {
         if ($ReleaseMode -ne 'Commercial') {
@@ -109,6 +115,19 @@ function Assert-ChurchDAWDesktopPolicyArtifactSet {
         }
 
         return 'current-version-policy-only'
+    }
+
+    if ($AllowRollbackPolicyWithoutInstaller) {
+        if ($ReleaseMode -ne 'Commercial') {
+            throw ('-AllowRollbackPolicyWithoutInstaller existe somente ' +
+                   'para -ReleaseMode Commercial')
+        }
+        if ($hasInstaller) {
+            throw ('-AllowRollbackPolicyWithoutInstaller nao pode ser usado ' +
+                   'quando ha instalador')
+        }
+
+        return 'rollback-policy-only'
     }
 
     if (-not $hasInstaller) {

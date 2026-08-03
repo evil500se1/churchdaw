@@ -7,6 +7,8 @@
 #if JUCE_ANDROID
  #include <jni.h>
  #include <juce_core/native/juce_JNIHelpers_android.h>
+#elif JUCE_IOS
+ #include "IOSPolicySignatureVerifier.h"
 #elif JUCE_WINDOWS || JUCE_MAC
  // Verificador RS256 nativo: no desktop nao existe JNI para chamar o
  // ChurchDAWSignedPolicyVerifier.java. Mesma chave, mesmo algoritmo.
@@ -32,8 +34,8 @@
 //==============================================================================
 namespace ChurchDAWServices
 {
-    inline constexpr int currentVersionCode = 10;
-    inline constexpr const char* currentVersionName = "1.5.4";
+    inline constexpr int currentVersionCode = 14;
+    inline constexpr const char* currentVersionName = "1.5.8";
     inline constexpr const char* packageId = "com.churchdaw.app";
     inline constexpr const char* updatePolicyUrl =
         "https://churchdaw.com/app/android/update-policy-v2.json";
@@ -42,8 +44,14 @@ namespace ChurchDAWServices
     inline constexpr const char* manifestUrl = "https://churchdaw.com/app/android/manifest.json";
     inline constexpr const char* fallbackManifestUrl =
         "https://www.churchdaw.com/app/android/manifest.json";
+    // URL de escape usada quando a policy nao carrega (celular sem internet no
+    // domingo, policy vencida). Ela TEM de terminar em "-signed.apk": a ponte
+    // Java exige isso em ChurchDAWUpdateBridge.isOfficialApkUrl e devolve false
+    // sem nem tentar abrir. Com o nome sem "-signed" o botao "Atualizar" ficava
+    // morto e, no gate obrigatorio, o cliente ficava preso — foi o que
+    // aconteceu em 31/07/2026.
     inline constexpr const char* defaultPlayStoreUrl =
-        "https://churchdaw.com/app/android/ChurchDAW-1.5.4.apk";
+        "https://churchdaw.com/app/android/ChurchDAW-1.5.8-signed.apk";
     inline constexpr int maximumUpdatePolicyBytes = 32 * 1024;
     inline constexpr int maximumSignedPolicyPayloadBytes = 24 * 1024;
     inline constexpr int maximumVersionNameCharacters = 48;
@@ -270,16 +278,13 @@ namespace ChurchDAWServices
             "https://churchdaw.com/app/android/ChurchDAW-";
 
         if (! text.startsWith (prefix) || text.length() > 320
-             || ! text.endsWith (".apk")
+             || ! text.endsWith ("-signed.apk")
              || text.containsAnyOf ("?#\r\n"))
             return false;
 
         auto name = text.fromFirstOccurrenceOf (prefix, false, false)
                         .dropLastCharacters (
-                            (int) juce::String (".apk").length());
-        if (name.endsWith ("-signed"))
-            name = name.dropLastCharacters (
-                (int) juce::String ("-signed").length());
+                            (int) juce::String ("-signed.apk").length());
 
         return isSafeUpdateVersionName (name);
     }
@@ -832,6 +837,35 @@ namespace ChurchDAWServices
             return AppPaths::managedLibrariesFolder().getChildFile (installFolder);
         }
 
+        // O catalogo atual instala o Pad em Libraries/Pads. Builds antigas
+        // usaram Libraries/pad-continuo/Pads e deixaram o marker no diretorio
+        // pai. O player ja reconhece esse layout; a loja precisa consultar o
+        // mesmo local para nao oferecer download de algo que esta instalado.
+        // O destino de novas instalacoes continua sendo installedFolder().
+        juce::File detectedInstalledFolderAt (const juce::File& librariesRoot) const
+        {
+            const auto canonical = librariesRoot.getChildFile (installFolder);
+
+            if (canonical.exists())
+                return canonical;
+
+            if (id == "pad-continuo")
+            {
+                const auto legacy =
+                    librariesRoot.getChildFile (id);
+
+                if (legacy.isDirectory())
+                    return legacy;
+            }
+
+            return canonical;
+        }
+
+        juce::File detectedInstalledFolder() const
+        {
+            return detectedInstalledFolderAt (AppPaths::managedLibrariesFolder());
+        }
+
         juce::File markerFile() const
         {
             return installedFolder().getChildFile (".churchdaw-library.json");
@@ -840,7 +874,7 @@ namespace ChurchDAWServices
         int installedVersion() const
         {
             if (const auto managedVersion = validLibraryMarkerVersion (
-                    installedFolder(), id);
+                    detectedInstalledFolder(), id);
                 managedVersion > 0)
                 return managedVersion;
 
@@ -1334,6 +1368,37 @@ namespace ChurchDAWServices
         bool valid = false;
     };
 
+    enum class AndroidUpdatePromptDecision
+    {
+        noPrompt,
+        optionalUpdate,
+        requiredUpdate
+    };
+
+    // Decisao pura compartilhada pela UI e pelo probe de distribuicao. O piso
+    // efetivo pode vir de uma policy assinada aceita anteriormente; por isso o
+    // gate obrigatorio continua valendo mesmo quando a consulta atual falha.
+    // A oferta opcional, ao contrario, exige a policy atual/cacheada completa,
+    // criptograficamente verificada e com URL oficial valida.
+    inline AndroidUpdatePromptDecision decideAndroidUpdatePrompt (
+        const UpdatePolicy& policy,
+        int installedVersionCode,
+        int effectiveMinimum)
+    {
+        if (installedVersionCode < effectiveMinimum)
+            return AndroidUpdatePromptDecision::requiredUpdate;
+
+        if (installedVersionCode < 1
+             || ! policy.valid
+             || ! policy.cryptographicallyVerified
+             || policy.minimumVersionCode > installedVersionCode
+             || policy.latestVersionCode <= installedVersionCode
+             || ! isSafeWebsiteUpdateUrl (policy.playStoreUrl))
+            return AndroidUpdatePromptDecision::noPrompt;
+
+        return AndroidUpdatePromptDecision::optionalUpdate;
+    }
+
     inline juce::String requiredUpdateDownloadUrl (
         const UpdatePolicy& policy,
         int effectiveMinimum)
@@ -1371,8 +1436,31 @@ namespace ChurchDAWServices
 
         const LibraryPack* starterPack() const
         {
+            // Culto offline primeiro: pack leve (Pad) permite tocar sem baixar
+            // o Church Live de ~12 GB e sem Wi-Fi no domingo.
+            auto isOfflineCulto = [] (const LibraryPack& pack)
+            {
+                return pack.id.equalsIgnoreCase ("pad-continuo")
+                    || pack.id.equalsIgnoreCase ("culto-offline")
+                    || pack.id.equalsIgnoreCase ("culto-offline-v1");
+            };
+
+            for (const auto& pack : libraries)
+                if (pack.included && pack.canDownload() && isOfflineCulto (pack))
+                    return &pack;
+
+            for (const auto& pack : libraries)
+                if (pack.included && pack.featured && pack.canDownload()
+                     && ! pack.id.equalsIgnoreCase ("church-live"))
+                    return &pack;
+
             for (const auto& pack : libraries)
                 if (pack.included && pack.featured)
+                    return &pack;
+
+            for (const auto& pack : libraries)
+                if (pack.included && pack.canDownload()
+                     && ! pack.id.equalsIgnoreCase ("church-live"))
                     return &pack;
 
             for (const auto& pack : libraries)
@@ -1603,6 +1691,11 @@ namespace ChurchDAWServices
 
         env->DeleteLocalRef (clazz);
         return ok && verified;
+       #elif JUCE_IOS
+        // O iOS nao possui a bridge Java do Android nem compila o updater
+        // desktop. A mesma chave publica e validada pelo Security.framework.
+        return ChurchDAWIOSPolicy::verifySignedPolicyEnvelope (
+            payloadBase64, signatureBase64, keyId);
        #elif JUCE_WINDOWS || JUCE_MAC
         // Sem isto o desktop nunca obtem um catalog_sha256 confiavel, e
         // checkRemoteManifest() aborta com "Catalogo bloqueado" antes mesmo de
@@ -2328,15 +2421,13 @@ namespace ChurchDAWServices
             juce::URL::InputStreamOptions (
                 juce::URL::ParameterHandling::inAddress)
                 .withConnectionTimeoutMs (timeoutMs)
-                // O host de fallback (www.churchdaw.com) responde 301 para o
-                // apex — com zero redirects o fallback NUNCA funcionou, e o
-                // app mostrava "nao foi possivel validar o catalogo" sempre
-                // que o endpoint principal falhava. Medido no CI do macOS em
-                // 30/07: "HTTP 301: Manifesto nao corresponde ao SHA-256".
-                // Seguir ate 2 saltos e seguro aqui porque o conteudo so e
-                // aceito se casar com o SHA-256 da policy assinada em RSA:
-                // um redirecionamento hostil nao consegue forjar o catalogo.
-                .withNumRedirectsToFollow (2)
+                // Requisicoes de catalogo podem levar o bearer da biblioteca.
+                // Nao siga redirects: a assinatura protege a integridade do
+                // JSON, mas nao impediria o cabecalho Authorization de ser
+                // encaminhado ao destino de um redirect. O endpoint www que
+                // hoje responde 301 continua sendo apenas uma tentativa de
+                // fallback; o endpoint apex acima serve o JSON diretamente.
+                .withNumRedirectsToFollow (0)
                 .withResponseHeaders (&responseHeaders)
                 .withStatusCode (&response.statusCode)
                 .withExtraHeaders (
@@ -2804,6 +2895,8 @@ namespace ChurchDAWServices
 
     inline bool startWebsiteUpdate (const juce::String& updateUrl)
     {
+        if (! isSafeWebsiteUpdateUrl (updateUrl))
+            return false;
        
 #if JUCE_ANDROID
         auto* env = juce::getEnv();
@@ -2849,8 +2942,8 @@ namespace ChurchDAWServices
         }
        #endif
 
-        // O gate permanece dentro do ChurchDAW. Se o navegador/JNI nao estiver
-        // disponivel, o cliente continua bloqueado e pode tentar novamente.
+        // O chamador decide se a tela e obrigatoria ou opcional. Falhar ao
+        // entregar o Intent nunca abre uma URL alternativa nem muda esse estado.
         return false;
     }
 
@@ -4109,7 +4202,10 @@ namespace ChurchDAWServices
                 auto input = std::make_shared<juce::WebInputStream> (
                     juce::URL (downloadPart.downloadUrl), false);
                 input->withConnectionTimeout (12000)
-                     .withNumRedirectsToFollow (3)
+                     // O download pode carregar Authorization. A URL ja foi
+                     // validada como oficial; seguir um redirect sem revalidar
+                     // o host poderia vazar o bearer para outro destino.
+                     .withNumRedirectsToFollow (0)
                      .withExtraHeaders (headers);
                 ActiveDownloadRegistration activeDownload (*this, input);
 

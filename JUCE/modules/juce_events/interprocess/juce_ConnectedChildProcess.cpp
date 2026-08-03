@@ -166,7 +166,8 @@ bool ChildProcessCoordinator::sendMessageToWorker (const MemoryBlock& mb)
 bool ChildProcessCoordinator::launchWorkerProcess (const File& executable, const String& commandLineUniqueID,
                                                    int timeoutMs, int streamFlags)
 {
-    killWorkerProcess();
+    if (! killWorkerProcessAndWait())
+        return false;
 
     auto pipeName = "p" + String::toHexString (Random().nextInt64());
 
@@ -199,6 +200,10 @@ bool ChildProcessCoordinator::launchWorkerProcess (const File& executable, const
         }
 
         connection.reset();
+
+        // A process that started but never connected is still our
+        // responsibility. Do not leave it behind after a launch failure.
+        killWorkerProcessAndWait();
     }
 
     return false;
@@ -206,14 +211,52 @@ bool ChildProcessCoordinator::launchWorkerProcess (const File& executable, const
 
 void ChildProcessCoordinator::killWorkerProcess()
 {
+    ignoreUnused (killWorkerProcessAndWait());
+}
+
+bool ChildProcessCoordinator::killWorkerProcessAndWait (int gracefulShutdownTimeoutMs,
+                                                         int forcedKillTimeoutMs)
+{
     if (connection != nullptr)
     {
-        sendMessageToWorker ({ killMessage, specialMessageSize });
+        // Once the worker has exited, sending through the server-side named
+        // pipe may wait for a new client for the full IPC timeout. There is no
+        // process left to receive a graceful-shutdown request in that case, so
+        // close the connection directly instead.
+        if (childProcess != nullptr && childProcess->isRunning())
+            sendMessageToWorker ({ killMessage, specialMessageSize });
+
         connection->disconnect();
         connection.reset();
     }
 
+    if (childProcess == nullptr)
+        return true;
+
+    const auto process = childProcess;
+    const auto gracefulWait = jmax (0, gracefulShutdownTimeoutMs);
+    const auto forcedWait = jmax (0, forcedKillTimeoutMs);
+
+    if (! process->waitForProcessToFinish (gracefulWait))
+    {
+        // kill() may race with a process that exited immediately after the
+        // graceful wait. Treat that race as success only after isRunning()
+        // confirms the exit; otherwise preserve the handle and fail closed.
+        if (! process->kill() && process->isRunning())
+            return false;
+
+        if (! process->waitForProcessToFinish (forcedWait))
+            return false;
+    }
+
     childProcess.reset();
+    return true;
+}
+
+bool ChildProcessCoordinator::isWorkerProcessRunning() const
+{
+    const auto process = childProcess;
+    return process != nullptr && process->isRunning();
 }
 
 //==============================================================================

@@ -232,6 +232,47 @@ struct ProgrammaticToneListener final
 
 bool runChannelControlStateProbe()
 {
+    // Matriz pura de roteamento para os oito canais de palco. O predicado de
+    // SOLO e o mesmo usado por prepareToPlay/renderVoices; o restante explicita
+    // a precedencia de ON, MUTE e SOLO sem depender de timbre ou hardware.
+    struct RoutingMaskCase
+    {
+        juce::uint32 enabled;
+        juce::uint32 muted;
+        juce::uint32 solo;
+        juce::uint32 expectedAudible;
+    };
+
+    constexpr juce::uint32 loadedEight = 0x00ffu;
+    constexpr juce::uint32 allLayerBits =
+        (juce::uint32 (1) << TimbresProcessor::numLayers) - 1u;
+    constexpr std::array<RoutingMaskCase, 8> routingMatrix {{
+        { 0x00ffu, 0x0000u, 0x0000u, 0x00ffu }, // baseline
+        { 0x00ffu, 0x0000u, 0x0001u, 0x0001u }, // SOLO C1
+        { 0x00ffu, 0x0000u, 0x0005u, 0x0005u }, // SOLO C1+C3
+        { 0x00ffu, 0x0001u, 0x0005u, 0x0004u }, // MUTE vence SOLO C1
+        { 0x00fdu, 0x0000u, 0x0000u, 0x00fdu }, // C2 desligado
+        { 0x00ffu, 0x0000u, 0x2000u, 0x00ffu }, // SOLO fantasma C14
+        { 0x00ffu, 0x0000u, 0x2001u, 0x0001u }, // SOLO C1 + fantasma
+        { 0x00ffu, 0x0000u, 0x0000u, 0x00ffu }  // limpar todos os SOLOS
+    }};
+
+    for (const auto& state : routingMatrix)
+    {
+        const bool hasAnySolo =
+            TimbresProcessor::hasAnySoloInMasks (
+                loadedEight, state.solo);
+        const auto audible = loadedEight
+                           & state.enabled
+                           & ~state.muted
+                           & (hasAnySolo
+                                  ? state.solo
+                                  : allLayerBits);
+
+        if (audible != state.expectedAudible)
+            return false;
+    }
+
     // TimbresProcessor is a production AudioProcessor owned on the heap by the
     // graph. Keep the probe faithful to that ownership: several simultaneous
     // stack instances can exceed the default Windows test-process stack now
@@ -262,6 +303,20 @@ bool runChannelControlStateProbe()
                         parameter);
                 identified != nullptr && identified->paramID == parameterId)
                 return dynamic_cast<juce::AudioParameterInt*> (parameter);
+
+        return nullptr;
+    };
+
+    const auto findBoolParameter = [] (
+        TimbresProcessor& processor,
+        const juce::String& parameterId) -> juce::AudioParameterBool*
+    {
+        for (auto* parameter : processor.getParameters())
+            if (auto* identified =
+                    dynamic_cast<juce::AudioProcessorParameterWithID*> (
+                        parameter);
+                identified != nullptr && identified->paramID == parameterId)
+                return dynamic_cast<juce::AudioParameterBool*> (parameter);
 
         return nullptr;
     };
@@ -321,11 +376,59 @@ bool runChannelControlStateProbe()
 
     *sourceChannelTranspose = -4;
     *sourceGlobalTranspose = 5;
+    auto* sourceSolo = findBoolParameter (*source, "solo0");
+
+    if (sourceSolo == nullptr)
+        return false;
+
+    *sourceSolo = true;
 
     juce::MemoryBlock state;
     source->getStateInformation (state);
 
     if (state.isEmpty())
+        return false;
+
+    // SOLO e uma escuta temporaria: nao pode atravessar save/load nem
+    // sobreviver quando o canal que o possuia e removido.
+    auto soloStateXml = juce::AudioProcessor::getXmlFromBinary (
+        state.getData(), (int) state.getSize());
+
+    if (soloStateXml == nullptr)
+        return false;
+
+    bool serializedSoloWasOff = false;
+
+    forEachXmlChildElementWithTagName (
+        *soloStateXml, layer, "LAYER")
+        if (layer->getIntAttribute ("index", -1) == 0)
+        {
+            serializedSoloWasOff =
+                ! layer->getBoolAttribute ("solo", true);
+            // Simula setup legado/macOS salvo com o bit temporario ligado.
+            layer->setAttribute ("solo", true);
+            break;
+        }
+
+    if (! serializedSoloWasOff)
+        return false;
+
+    juce::MemoryBlock legacySoloState;
+    juce::AudioProcessor::copyXmlToBinary (
+        *soloStateXml, legacySoloState);
+    auto legacySoloRestored = std::make_unique<TimbresProcessor>();
+    legacySoloRestored->setStateInformation (
+        legacySoloState.getData(), (int) legacySoloState.getSize());
+
+    if (auto* restoredSolo = findBoolParameter (
+            *legacySoloRestored, "solo0");
+        restoredSolo == nullptr || restoredSolo->get())
+        return false;
+
+    *sourceSolo = true;
+    source->clearLayer (0);
+
+    if (sourceSolo->get())
         return false;
 
     auto restored = std::make_unique<TimbresProcessor>();
@@ -353,6 +456,42 @@ bool runChannelControlStateProbe()
         && findIntParameter (*restored, "transp0")->get() == -4;
 
     if (! currentStateOk)
+        return false;
+
+    // Uma pagina de cena que referencia plugin ainda indisponivel nao pode ser
+    // declarada pronta pela metade. O alvo fica pendente para autocura; uma
+    // limpeza/substituicao explicita encerra corretamente essa pendencia.
+    auto missingPluginXml = juce::AudioProcessor::getXmlFromBinary (
+        state.getData(), (int) state.getSize());
+
+    if (missingPluginXml == nullptr)
+        return false;
+
+    forEachXmlChildElementWithTagName (
+        *missingPluginXml, layer, "LAYER")
+        if (layer->getIntAttribute ("index", -1) == 0)
+        {
+            layer->setAttribute (
+                "vstId", "missing-scene-plugin-identifier");
+            layer->setAttribute ("vstState", "");
+            layer->setAttribute ("timbre", "");
+            break;
+        }
+
+    juce::MemoryBlock missingPluginState;
+    juce::AudioProcessor::copyXmlToBinary (
+        *missingPluginXml, missingPluginState);
+    auto pendingScenePage = std::make_unique<TimbresProcessor>();
+    pendingScenePage->setStateInformation (
+        missingPluginState.getData(),
+        (int) missingPluginState.getSize());
+
+    if (! pendingScenePage->hasPendingStateRestore())
+        return false;
+
+    pendingScenePage->clearLayer (0);
+
+    if (pendingScenePage->hasPendingStateRestore())
         return false;
 
     // Uma LAYER ausente representa canal vazio, nao "deixe os controles do
@@ -1383,11 +1522,22 @@ bool runChurchOrganLayerIntegrationProbe()
     // blocos, enquanto o medidor pós-SOLO prova qual camada chegou à saída.
     {
         currentGate = "five-layer setup";
-        constexpr int layerCount =
-            TimbresProcessor::numLayers;
+        // O probe usa cinco camadas com valores escritos a mao (familia,
+        // idade, expressao, tom, canal MIDI e nota por camada). Ele NAO
+        // acompanha numLayers: quando a mesa passou de 5 para 14 canais
+        // em 31/07/2026, amarrar layerCount a numLayers deixaria nove
+        // conjuntos de dados zerados e o teste passaria a medir silencio.
+        // Cinco camadas independentes ja provam o que este probe alega —
+        // isolamento de estado e de saida entre camadas.
+        constexpr int layerCount = 5;
         static_assert (
-            layerCount == 5,
-            "O probe cobre exatamente as cinco camadas do ChurchDAW");
+            TimbresProcessor::numLayers >= layerCount,
+            "O ChurchDAW precisa de pelo menos cinco camadas para este probe");
+        static_assert (
+            TimbresProcessor::numLayers > layerCount,
+            "O probe de SOLO fantasma precisa de pelo menos um canal vazio");
+        constexpr int emptyLayerIndex =
+            TimbresProcessor::numLayers - 1;
 
         const std::array<Family, layerCount> families {{
             Family::tonewheel,
@@ -1544,6 +1694,12 @@ bool runChurchOrganLayerIntegrationProbe()
 
         std::array<juce::AudioParameterBool*,
                    layerCount> soloParameters {};
+        auto* emptyLayerSolo = findBoolParameter (
+            *multilayer,
+            "solo" + juce::String (emptyLayerIndex));
+
+        if (emptyLayerSolo == nullptr)
+            return false;
 
         for (int targetLayer = 0;
              targetLayer < layerCount;
@@ -1698,6 +1854,109 @@ bool runChurchOrganLayerIntegrationProbe()
 
             return false;
         };
+
+        // Regressao macOS/estado legado: SOLO num slot sem identidade nao pode
+        // ligar o modo global e calar os instrumentos carregados. O teste passa
+        // pelo prepareToPlay E pelo render, cobrindo as duas copias historicas
+        // do calculo. O ultimo canal permanece vazio de proposito.
+        currentGate = "empty-layer solo isolation";
+
+        for (int loadedLayer = 0;
+             loadedLayer < layerCount;
+             ++loadedLayer)
+            if (! multilayer->isLayerLoaded (loadedLayer))
+                return false;
+
+        if (multilayer->isLayerLoaded (emptyLayerIndex))
+            return false;
+
+        *emptyLayerSolo = true;
+
+        if (multilayer->hasAnyLoadedSolo())
+            return false;
+
+        multilayer->prepareToPlay (
+            sampleRate, blockSizes.back());
+
+        for (int currentLayer = 0;
+             currentLayer < layerCount;
+             ++currentLayer)
+            expectedSamples[currentLayer] =
+                multilayer
+                    ->getLayerChurchOrganProcessor (
+                        currentLayer)
+                    ->diagnostics().renderedSamples;
+
+        multilayer->panic();
+        juce::MidiBuffer ghostCleanupMidi;
+        AudioStats ghostCleanupStats;
+
+        if (! processObserved (
+                blockSizes.front(), ghostCleanupMidi,
+                ghostCleanupStats)
+             || ! drainMultilayerNotes())
+            return false;
+
+        for (int currentLayer = 0;
+             currentLayer < layerCount;
+             ++currentLayer)
+        {
+            float left = 0.0f;
+            float right = 0.0f;
+            multilayer->readAndResetLayerLevels (
+                currentLayer, left, right);
+        }
+
+        AudioStats ghostSoloStats;
+
+        for (std::size_t block = 0;
+             block < blockSizes.size();
+             ++block)
+        {
+            const int numSamples = blockSizes[block];
+            juce::MidiBuffer midi;
+
+            if (block == 0)
+                midi.addEvent (
+                    juce::MidiMessage::noteOn (
+                        midiChannels[0], baseNotes[0],
+                        static_cast<juce::uint8> (112)),
+                    0);
+
+            if (block + 1 == blockSizes.size())
+                midi.addEvent (
+                    juce::MidiMessage::noteOff (
+                        midiChannels[0], baseNotes[0]),
+                    numSamples - 1);
+
+            if (! processObserved (
+                    numSamples, midi, ghostSoloStats))
+                return false;
+        }
+
+        if (ghostSoloStats.peak <= 1.0e-5f
+             || ghostSoloStats.sumSquares <= 1.0e-8
+             || ghostSoloStats.valueCount == 0)
+            return false;
+
+        bool heardLoadedLayer = false;
+
+        for (int currentLayer = 0;
+             currentLayer < layerCount;
+             ++currentLayer)
+        {
+            float left = 0.0f;
+            float right = 0.0f;
+            multilayer->readAndResetLayerLevels (
+                currentLayer, left, right);
+            heardLoadedLayer = heardLoadedLayer
+                            || juce::jmax (left, right) > 1.0e-5f;
+        }
+
+        if (! heardLoadedLayer)
+            return false;
+
+        *emptyLayerSolo = false;
 
         for (int targetLayer = 0;
              targetLayer < layerCount;
@@ -2183,8 +2442,15 @@ bool runChurchOrganLayerIntegrationProbe()
              || multilayerXml == nullptr)
             return false;
 
+        // O estado salvo cobre TODOS os canais da mesa, nao apenas os
+        // cinco que este probe carregou: o app grava um <LAYER> por
+        // canal (14 desde 31/07/2026), e os vazios precisam estar la —
+        // sem eles um projeto salvo perderia os canais ainda nao usados.
+        // Dimensionar por layerCount fazia o teste reprovar justamente o
+        // formato correto ("stateLayerCount != 5").
+        constexpr int totalCanais = TimbresProcessor::numLayers;
         std::array<const juce::XmlElement*,
-                   layerCount> stateLayers {};
+                   totalCanais> stateLayers {};
         int stateLayerCount = 0;
 
         forEachXmlChildElementWithTagName (
@@ -2196,7 +2462,7 @@ bool runChurchOrganLayerIntegrationProbe()
                     "index", -1);
 
             if (! juce::isPositiveAndBelow (
-                    stateLayer, layerCount)
+                    stateLayer, totalCanais)
                  || stateLayers[stateLayer]
                         != nullptr)
                 return false;
@@ -2204,7 +2470,7 @@ bool runChurchOrganLayerIntegrationProbe()
             stateLayers[stateLayer] = candidate;
         }
 
-        if (stateLayerCount != layerCount)
+        if (stateLayerCount != totalCanais)
             return false;
 
         const juce::Identifier stateType {
@@ -3779,6 +4045,92 @@ bool runPerTimbreRecallProbe()
         && close (processor->getLayerMidEqParam (0)->get(), -3.5f)
         && close (processor->getLayerHighEqParam (0)->get(), 1.75f);
 }
+
+bool runAsyncPluginLoadStateProbe()
+{
+    ChurchDAWPluginLoading::RequestGeneration generation;
+    const auto first = generation.begin();
+
+    if (! generation.isCurrent (first))
+        return false;
+
+    const auto second = generation.begin();
+
+    if (generation.isCurrent (first)
+         || ! generation.isCurrent (second))
+        return false;
+
+    int committedValue = 0;
+
+    if (generation.commitIfCurrent (
+            first, [&committedValue]
+            {
+                committedValue = 1;
+            })
+         || committedValue != 0)
+        return false;
+
+    if (! generation.commitIfCurrent (
+            second, [&committedValue]
+            {
+                committedValue = 2;
+            })
+         || committedValue != 2)
+        return false;
+
+    generation.cancel();
+
+    if (generation.isCurrent (second))
+        return false;
+
+    juce::PluginDescription kontaktAu;
+    kontaktAu.name = "Kontakt 8";
+    kontaktAu.pluginFormatName = "AudioUnit";
+    kontaktAu.manufacturerName = "Native Instruments";
+    kontaktAu.fileOrIdentifier = "AudioUnit:Kontakt";
+    kontaktAu.uniqueId = 101;
+
+    auto kontaktVst = kontaktAu;
+    kontaktVst.pluginFormatName = "VST3";
+    kontaktVst.fileOrIdentifier = "VST3:Kontakt";
+    kontaktVst.uniqueId = 102;
+
+    juce::PluginDescription bigSky;
+    bigSky.name = "BigSky";
+    bigSky.pluginFormatName = "VST3";
+    bigSky.manufacturerName = "Strymon";
+    bigSky.fileOrIdentifier = "VST3:BigSky";
+    bigSky.uniqueId = 103;
+
+    juce::Array<juce::PluginDescription> choices {
+        kontaktAu, bigSky, kontaktVst
+    };
+
+    const auto auLabel = ChurchDAWPluginLoading::displayName (
+        kontaktAu, choices);
+    const auto vstLabel = ChurchDAWPluginLoading::displayName (
+        kontaktVst, choices);
+
+    if (! auLabel.contains ("AudioUnit")
+         || ! auLabel.contains ("Native Instruments")
+         || ! vstLabel.contains ("VST3")
+         || ChurchDAWPluginLoading::displayName (
+                bigSky, choices) != "BigSky")
+        return false;
+
+    const auto selectedIdentifier =
+        kontaktAu.createIdentifierString();
+    choices.move (0, choices.size() - 1);
+
+    const int restoredIndex =
+        ChurchDAWPluginLoading::findChoiceByIdentifier (
+            choices, selectedIdentifier);
+
+    return juce::isPositiveAndBelow (
+               restoredIndex, choices.size())
+        && choices.getReference (restoredIndex)
+               .pluginFormatName == "AudioUnit";
+}
 }
 
 int main (int argc, char* argv[])
@@ -3788,6 +4140,12 @@ int main (int argc, char* argv[])
     if (argc == 2
          && juce::String::fromUTF8 (argv[1]) == "--controls-only")
     {
+        if (! runAsyncPluginLoadStateProbe())
+        {
+            std::cerr << "Geracao assincrona ou identidade/rotulo de plugin falhou\n";
+            return 1;
+        }
+
         if (! runChannelControlStateProbe())
         {
             std::cerr << "Attack/Release/EQ/Rotary falharam no estado salvo ou migrado\n";

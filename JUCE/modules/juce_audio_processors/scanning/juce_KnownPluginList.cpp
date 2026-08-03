@@ -153,6 +153,11 @@ void KnownPluginList::setCustomScanner (std::unique_ptr<CustomScanner> newScanne
         scanner = std::move (newScanner);
 }
 
+bool KnownPluginList::consumeLastScanWasInconclusive()
+{
+    return scanner != nullptr && scanner->consumeLastScanWasInconclusive();
+}
+
 bool KnownPluginList::scanAndAddFile (const String& fileOrIdentifier,
                                       const bool dontRescanIfAlreadyInList,
                                       OwnedArray<PluginDescription>& typesFound,
@@ -184,6 +189,40 @@ bool KnownPluginList::scanAndAddFile (const String& fileOrIdentifier,
 
     if (blacklist.contains (fileOrIdentifier))
         return false;
+
+    // A rescan is a proof of the plug-in as it exists now. Remove descriptions
+    // from the previous scan before entering third-party code, so a timeout,
+    // architecture mismatch, or clean initialisation failure cannot leave an
+    // obsolete version selectable. A successful scan adds the current
+    // descriptions back below.
+    bool removedStaleDescription = false;
+
+    {
+        ScopedLock lock (typesArrayLock);
+        const auto formatName = format.getName();
+        const File candidate { fileOrIdentifier };
+        const bool candidateIsVST3Bundle =
+            formatName == "VST3" && candidate.isDirectory();
+
+        for (int i = types.size(); --i >= 0;)
+        {
+            const auto& description = types.getReference (i);
+            const bool sameCandidate =
+                description.fileOrIdentifier == fileOrIdentifier
+                || (candidateIsVST3Bundle
+                     && File (description.fileOrIdentifier)
+                            .isAChildOf (candidate));
+
+            if (description.pluginFormatName == formatName && sameCandidate)
+            {
+                types.remove (i);
+                removedStaleDescription = true;
+            }
+        }
+    }
+
+    if (removedStaleDescription)
+        sendChangeMessage();
 
     OwnedArray<PluginDescription> found;
 
@@ -259,13 +298,23 @@ void KnownPluginList::scanFinished()
         scanner->scanFinished();
 }
 
-const StringArray& KnownPluginList::getBlacklistedFiles() const
+StringArray KnownPluginList::getBlacklistedFiles() const
 {
+    const ScopedLock lock (scanLock);
     return blacklist;
+}
+
+bool KnownPluginList::isBlacklisted (const String& pluginID,
+                                     bool ignoreCase) const
+{
+    const ScopedLock lock (scanLock);
+    return blacklist.contains (pluginID, ignoreCase);
 }
 
 void KnownPluginList::addToBlacklist (const String& pluginID)
 {
+    const ScopedLock lock (scanLock);
+
     if (! blacklist.contains (pluginID))
     {
         blacklist.add (pluginID);
@@ -275,6 +324,7 @@ void KnownPluginList::addToBlacklist (const String& pluginID)
 
 void KnownPluginList::removeFromBlacklist (const String& pluginID)
 {
+    const ScopedLock lock (scanLock);
     const int index = blacklist.indexOf (pluginID);
 
     if (index >= 0)
@@ -286,6 +336,8 @@ void KnownPluginList::removeFromBlacklist (const String& pluginID)
 
 void KnownPluginList::clearBlacklistedFiles()
 {
+    const ScopedLock lock (scanLock);
+
     if (blacklist.size() > 0)
     {
         blacklist.clear();
@@ -371,15 +423,28 @@ void KnownPluginList::sort (const SortMethod method, bool forwards)
 std::unique_ptr<XmlElement> KnownPluginList::createXml() const
 {
     auto e = std::make_unique<XmlElement> ("KNOWNPLUGINS");
+    Array<PluginDescription> typesSnapshot;
+    StringArray blacklistSnapshot;
 
     {
         ScopedLock lock (typesArrayLock);
-
-        for (int i = types.size(); --i >= 0;)
-            e->prependChildElement (types.getUnchecked (i).createXml().release());
+        typesSnapshot = types;
     }
 
-    for (auto& b : blacklist)
+    // O scanner pode acrescentar uma falha na blacklist enquanto a message
+    // thread persiste a lista em resposta ao candidato anterior. Copiar sob o
+    // lock evita iterar um StringArray que o worker esta realocando. Os locks
+    // ficam em escopos separados para nao introduzir inversao com o scan.
+    {
+        ScopedLock lock (scanLock);
+        blacklistSnapshot = blacklist;
+    }
+
+    for (int i = typesSnapshot.size(); --i >= 0;)
+        e->prependChildElement (
+            typesSnapshot.getUnchecked (i).createXml().release());
+
+    for (auto& b : blacklistSnapshot)
         e->createNewChildElement ("BLACKLISTED")->setAttribute ("id", b);
 
     return e;
@@ -622,6 +687,11 @@ KnownPluginList::CustomScanner::CustomScanner() {}
 KnownPluginList::CustomScanner::~CustomScanner() {}
 
 void KnownPluginList::CustomScanner::scanFinished() {}
+
+bool KnownPluginList::CustomScanner::consumeLastScanWasInconclusive()
+{
+    return false;
+}
 
 bool KnownPluginList::CustomScanner::shouldExit() const noexcept
 {

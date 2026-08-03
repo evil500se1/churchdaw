@@ -143,6 +143,23 @@ private:
 class ScannerSuperprocess final : private juce::ChildProcessCoordinator
 {
 public:
+    // PARAR O PIPE ANTES DE DESTRUIR OS MEMBROS.
+    //
+    // Sem este destrutor a ordem era: corpo vazio -> destroi mutex/condvar ->
+    // so entao ~ChildProcessCoordinator mata a thread do pipe. Entre os dois
+    // ultimos passos a thread do pipe ainda esta viva, e um
+    // handleMessageFromWorker/handleConnectionLost travaria um std::mutex JA
+    // DESTRUIDO.
+    //
+    // Isso era inofensivo enquanto tudo acontecia serializado na thread de
+    // mensagens. Passou a ser corrida de verdade quando a varredura foi para
+    // um ThreadPool (allowAsync), porque "superprocess = nullptr" abaixo roda
+    // na thread do pool enquanto os callbacks chegam pela thread do pipe.
+    ~ScannerSuperprocess() override
+    {
+        killWorkerProcess();
+    }
+
     ScannerSuperprocess()
     {
         launchWorkerProcess (
@@ -203,6 +220,61 @@ private:
 };
 
 //==============================================================================
+/** Componente de sistema da Apple que nao serve para nada aqui.
+
+    O macOS registra dezenas de Audio Units proprios — mixers, panners,
+    conversores de formato, unidades de saida. Nenhum deles e instrumento
+    ou efeito que um musico va usar no ChurchDAW, e sao justamente os que
+    quebram a varredura: o Mac de um cliente parou em "AUVectorPanner" a
+    0% em 31/07/2026, com "aufx,rvb2,appl" e "aumx,mxmx,appl" ja marcados
+    como "falhou ao iniciar" logo acima. Cada um desses custa ate 90 s de
+    prazo antes de ser descartado, e o cliente ve o app travado.
+
+    O filtro e conservador de proposito: so descarta as CATEGORIAS de
+    sistema. Audio Units da Apple que fazem som de verdade (DLSMusicDevice,
+    AUSampler, que aparecem como "Synths"/"MusicDevices") continuam sendo
+    varridos normalmente.
+*/
+inline bool ehAudioUnitDeSistema (const juce::String& fileOrIdentifier)
+{
+    if (! fileOrIdentifier.startsWithIgnoreCase ("AudioUnit:"))
+        return false;
+
+    // So vale para componentes da propria Apple: o fabricante e o ultimo
+    // campo do identificador ("AudioUnit:Mixers/aumx,mxmx,appl").
+    if (! fileOrIdentifier.endsWithIgnoreCase (",appl"))
+        return false;
+
+    // CATEGORIAS INTEIRAS que nao servem para tocar: mixers e panners de
+    // sistema (AUMixer3D, AUMatrixMixer, AUVectorPanner...). "Synths/" fica
+    // de fora de proposito — e onde vivem o DLSMusicDevice e o AUSampler,
+    // que tocam nota de verdade.
+    for (const auto* categoria : { "AudioUnit:Mixers/", "AudioUnit:Panners/" })
+        if (fileOrIdentifier.startsWithIgnoreCase (categoria))
+            return true;
+
+    // EM "Effects/" E "Generators/" O CORTE E POR SUBTIPO, NAO PELA CATEGORIA.
+    //
+    // Banir "Effects/" inteiro era desproporcional: aquela categoria guarda
+    // AUNBandEQ, AUDynamicsProcessor e AUPeakLimiter — que numa igreja sem
+    // nenhum plugin pago sao o UNICO equalizador, compressor e limitador
+    // disponiveis no Mac. O que travava era um componente especifico
+    // (aufx,rvb2 = AUMatrixReverb, visto no Mac do cliente em 31/07).
+    //
+    // Aqui ficam so os que abrem rede, motor de fala ou tocam arquivo — os
+    // candidatos classicos a travar a varredura, e sem uso ao vivo.
+    for (const auto* subtipo : { "aufx,rvb2,",   // AUMatrixReverb: o que travou
+                                 "augn,ttsp,",   // AUSpeechSynthesis (fala)
+                                 "augn,nrcv,",   // AUNetReceive (rede)
+                                 "augn,nsnd,",   // AUNetSend (rede)
+                                 "augn,sspl,",   // AUScheduledSoundPlayer
+                                 "augn,afpl," }) // AUAudioFilePlayer
+        if (fileOrIdentifier.containsIgnoreCase (subtipo))
+            return true;
+
+    return false;
+}
+
 /** Liga a lista de plugins ao processo filho. */
 class ChurchDAWPluginScanner final : public juce::KnownPluginList::CustomScanner
 {
@@ -213,6 +285,26 @@ public:
                              juce::OwnedArray<juce::PluginDescription>& result,
                              const juce::String& fileOrIdentifier) override
     {
+        if (ehAudioUnitDeSistema (fileOrIdentifier))
+        {
+            juce::Logger::writeToLog ("PLUGINS: " + fileOrIdentifier
+                                      + " e componente de sistema da Apple — ignorado");
+
+            // "false" e o retorno CERTO aqui, apesar de parecer erro.
+            //
+            // KnownPluginList::scanAndAddFile chama addToBlacklist quando o
+            // scanner devolve false (juce_KnownPluginList.cpp:195-196), e o
+            // PluginDirectoryScanner so acusa "falhou ao carregar" para quem
+            // NAO esta na blacklist (juce_PluginDirectoryScanner.cpp:119-120).
+            //
+            // Devolver "true" com a lista vazia — que era o que estava aqui —
+            // produzia o oposto do pretendido: os componentes da Apple caiam
+            // no alerta "estes pareciam plugins, mas nao carregaram" ao fim de
+            // TODA varredura, e ainda eram revarridos toda vez, porque nada
+            // ficava registrado.
+            return false;
+        }
+
         if (addPluginDescriptions (format.getName(), fileOrIdentifier, result))
             return true;
 

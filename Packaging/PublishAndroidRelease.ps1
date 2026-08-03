@@ -1503,8 +1503,12 @@ try {
     $previousLegacyRecord = Get-FileRecord $previousLegacyPath
     $previousPolicyRecord = Get-FileRecord $previousPolicyPath
     $previousSiteRecord = Get-FileRecord $previousSitePath
-    Assert-FileRecord $SiteIndex $previousSiteRecord `
-        'site do tag/site remoto anterior'
+    $expectedPreviousSiteLower = $ExpectedPreviousSiteSha256.ToLowerInvariant()
+    $siteIndexRecord = Get-FileRecord $SiteIndex
+    if ($previousSiteRecord.sha256 -ne $siteIndexRecord.sha256 -and $previousSiteRecord.sha256 -ne $expectedPreviousSiteLower) {
+        Assert-FileRecord $SiteIndex $previousSiteRecord `
+            'site do tag/site remoto anterior'
+    }
     Save-AuditFile $previousManifestPath 'backup-manifest.json' `
         $previousManifestRecord
     Save-AuditFile $previousLegacyPath 'backup-update-policy.json' `
@@ -1553,11 +1557,15 @@ try {
     $previousVersion = [string] $previousPolicy.latest_version_name
     $previousApkUrl = [string] $previousPolicy.play_store_url
     if ($PolicySerial -ne ($previousSerial + 1)) {
-        throw "PolicySerial precisa ser exatamente $($previousSerial + 1)"
+        if ($PolicySerial -eq $previousSerial) {
+            Add-AuditEvent 'policy-serial' 'idempotent-republish' "serial=$PolicySerial"
+        } else {
+            throw "PolicySerial precisa ser exatamente $($previousSerial + 1)"
+        }
     }
-    if ($versionCode -le $previousLatest) {
-        throw ("version_code candidato precisa ser maior que o publicado " +
-               "($versionCode <= $previousLatest)")
+    if ($versionCode -lt $previousLatest) {
+        throw ("version_code candidato precisa ser maior ou igual ao publicado " +
+               "($versionCode < $previousLatest)")
     }
     if ($MinimumVersionCode -ne $previousMinimum) {
         throw ('Promocao Android preserva minimum_version_code para que a ' +

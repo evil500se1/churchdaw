@@ -788,6 +788,15 @@ function Download-FtpsFile {
     }
 }
 
+function Format-FtpsRemotePath {
+    param([string] $RemoteDirectory, [string] $Name)
+
+    if ($RemoteDirectory -eq '/') {
+        return "/$Name"
+    }
+    return "$RemoteDirectory/$Name"
+}
+
 function Invoke-FtpsQuote {
     param([string] $RemoteDirectory, [string[]] $Commands, [string] $Label)
 
@@ -795,8 +804,7 @@ function Invoke-FtpsQuote {
         '--disable', '--silent', '--show-error', '--fail',
         '--connect-timeout', '30', '--max-time', '60',
         '--insecure', '--ssl-reqd', '--tlsv1.2', '--ftp-pasv',
-        '--netrc-file', $NetrcPath,
-        '--quote', "CWD $RemoteDirectory"
+        '--netrc-file', $NetrcPath
     )
     foreach ($command in $Commands) {
         $arguments += @('--quote', $command)
@@ -810,7 +818,9 @@ function Rename-FtpsFile {
 
     Assert-SafeRemoteName $From 'origem do rename FTPS'
     Assert-SafeRemoteName $To 'destino do rename FTPS'
-    Invoke-FtpsQuote $RemoteDirectory @("RNFR $From", "RNTO $To") `
+    $fromPath = Format-FtpsRemotePath $RemoteDirectory $From
+    $toPath = Format-FtpsRemotePath $RemoteDirectory $To
+    Invoke-FtpsQuote $RemoteDirectory @("RNFR $fromPath", "RNTO $toPath") `
         "rename $From -> $To"
 }
 
@@ -819,7 +829,8 @@ function Remove-FtpsFile {
 
     Assert-SafeRemoteName $Name 'nome FTPS para remocao'
     if (Test-FtpsFileExists $RemoteDirectory $Name) {
-        Invoke-FtpsQuote $RemoteDirectory @("DELE $Name") "limpar $Name"
+        $path = Format-FtpsRemotePath $RemoteDirectory $Name
+        Invoke-FtpsQuote $RemoteDirectory @("DELE $path") "limpar $Name"
     }
 }
 

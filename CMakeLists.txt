@@ -726,6 +726,7 @@ if(CHURCHDAW_BUILD_AUDIO_TESTS AND NOT ANDROID AND NOT IOS)
     target_link_libraries(ChurchDAWTimbreLoadStressTests
         PRIVATE
             ChurchAssets
+            juce::juce_cryptography
             juce::juce_dsp
             juce::juce_audio_utils
             juce::juce_audio_processors
@@ -778,6 +779,7 @@ if(CHURCHDAW_BUILD_AUDIO_TESTS AND NOT ANDROID AND NOT IOS)
         ChurchDAWHostedInstrumentMidiRoutingTests
         PRIVATE
             ChurchAssets
+            juce::juce_cryptography
             juce::juce_dsp
             juce::juce_audio_utils
             juce::juce_audio_processors

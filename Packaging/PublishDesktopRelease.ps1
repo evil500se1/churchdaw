@@ -472,14 +472,14 @@ function Get-FtpsNames {
         ForEach-Object {
             $line = ([string] $_).Trim()
             if (-not [string]::IsNullOrWhiteSpace($line)) {
-                [IO.Path]::GetFileName($line)
+                $token = ($line -split '\s+')[-1]
+                $clean = ($token -split '[/\\/]')[-1].Trim()
+                if ($clean -ne '.' -and $clean -ne '..') {
+                    $clean
+                }
             }
         } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-    $uniqueNames = @($names | Sort-Object -Unique -CaseSensitive)
-    if ($names.Count -ne $uniqueNames.Count) {
-        throw "Listagem FTPS duplicada/ambigua: $RemoteDirectory"
-    }
-    return $names
+    return @($names | Sort-Object -Unique)
 }
 
 function Test-FtpsFileExists {
@@ -487,7 +487,7 @@ function Test-FtpsFileExists {
 
     Assert-SafeRemoteName $Name 'nome FTPS'
     return @((Get-FtpsNames $RemoteDirectory) |
-        Where-Object { $_.Equals($Name, [StringComparison]::Ordinal) }).Count -eq 1
+        Where-Object { $_.Equals($Name, [StringComparison]::OrdinalIgnoreCase) }).Count -ge 1
 }
 
 function Upload-FtpsFile {

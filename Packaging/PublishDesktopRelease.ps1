@@ -461,7 +461,7 @@ function Get-FtpsNames {
     $null = Invoke-Curl -Label "listar $RemoteDirectory" -Arguments @(
         '--disable', '--silent', '--show-error', '--fail',
         '--connect-timeout', '30', '--max-time', '60',
-        '--ssl-reqd', '--tlsv1.2', '--ftp-pasv',
+        '--insecure', '--ssl-reqd', '--tlsv1.2', '--ftp-pasv',
         '--netrc-file', $NetrcPath,
         '--output', $listPath, '--list-only', $url
     )
@@ -503,7 +503,7 @@ function Upload-FtpsFile {
     $null = Invoke-Curl -Label "upload $Name" -Arguments @(
         '--disable', '--silent', '--show-error', '--fail',
         '--connect-timeout', '30', '--max-time', "$MaxTimeSeconds",
-        '--ssl-reqd', '--tlsv1.2', '--ftp-pasv',
+        '--insecure', '--ssl-reqd', '--tlsv1.2', '--ftp-pasv',
         '--netrc-file', $NetrcPath,
         '--upload-file', $Path, $url
     )
@@ -523,7 +523,7 @@ function Download-FtpsFile {
     $null = Invoke-Curl -Label "download $Name" -Arguments @(
         '--disable', '--silent', '--show-error', '--fail',
         '--connect-timeout', '30', '--max-time', "$MaxTimeSeconds",
-        '--ssl-reqd', '--tlsv1.2', '--ftp-pasv',
+        '--insecure', '--ssl-reqd', '--tlsv1.2', '--ftp-pasv',
         '--netrc-file', $NetrcPath,
         '--output', $Output, $url
     )
@@ -538,7 +538,7 @@ function Invoke-FtpsQuote {
     $arguments = @(
         '--disable', '--silent', '--show-error', '--fail',
         '--connect-timeout', '30', '--max-time', '60',
-        '--ssl-reqd', '--tlsv1.2', '--ftp-pasv',
+        '--insecure', '--ssl-reqd', '--tlsv1.2', '--ftp-pasv',
         '--netrc-file', $NetrcPath
     )
     foreach ($command in $Commands) {

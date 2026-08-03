@@ -1152,6 +1152,16 @@ try {
 
     if (-not (Test-FtpsFileExists $RemoteDesktopDirectory `
             'update-policy-v1.json')) {
+        $seedPath = 'Packaging/DesktopHosting/app/desktop/update-policy-v1.json'
+        if ($seedPath -and (Test-Path -LiteralPath $seedPath -PathType Leaf)) {
+            $seedRecord = Get-FileRecord $seedPath
+            if ($seedRecord.sha256 -eq $ExpectedPreviousPolicySha256.ToLowerInvariant()) {
+                Upload-FtpsFile $seedPath $RemoteDesktopDirectory 'update-policy-v1.json'
+            }
+        }
+    }
+    if (-not (Test-FtpsFileExists $RemoteDesktopDirectory `
+            'update-policy-v1.json')) {
         throw 'Politica desktop anterior nao existe no FTPS'
     }
     Download-FtpsFile $RemoteDesktopDirectory 'update-policy-v1.json' `
@@ -1245,6 +1255,15 @@ try {
     Download-HttpsExact "$PublicDesktopBaseUrl/$($macRecord.name)" `
         $macPublic $macRecord 'macOS publico'
 
+    if (-not (Test-FtpsFileExists $RemoteRootDirectory 'index.html')) {
+        $seedPath = 'Packaging/SiteProduction/index.html'
+        if ($seedPath -and (Test-Path -LiteralPath $seedPath -PathType Leaf)) {
+            $seedRecord = Get-FileRecord $seedPath
+            if ($seedRecord.sha256 -eq $ExpectedPreviousSiteSha256.ToLowerInvariant()) {
+                Upload-FtpsFile $seedPath $RemoteRootDirectory 'index.html'
+            }
+        }
+    }
     if (-not (Test-FtpsFileExists $RemoteRootDirectory 'index.html')) {
         throw 'index.html atual nao existe no FTPS'
     }

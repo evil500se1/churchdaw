@@ -1,0 +1,47 @@
+name: Inspecionar chave de upload Android
+
+# Roda no push desta branch. Objetivo unico: descobrir QUAL certificado esta
+# guardado no secret ANDROID_UPLOAD_KEYSTORE_BASE64, para saber se ele ainda
+# serve para publicar na Play.
+#
+# SEGURANCA: este repositorio e PUBLICO, entao os logs do Actions tambem sao.
+# Este workflow imprime SOMENTE a impressao digital do certificado -- que ja e
+# informacao publica (aparece na Play Console e no manifest do site). O
+# keystore e as senhas nunca sao ecoados, e o arquivo e apagado ao final.
+
+on:
+  push:
+    branches: [recuperar-chaves]
+
+jobs:
+  inspecionar:
+    runs-on: ubuntu-latest
+    environment: android-production
+    steps:
+      - name: Decodificar keystore e ler apenas as impressoes digitais
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_UPLOAD_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_UPLOAD_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_UPLOAD_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${KEYSTORE_B64:-}" ]; then
+            echo "SECRET AUSENTE: ANDROID_UPLOAD_KEYSTORE_BASE64"
+            exit 1
+          fi
+
+          printf '%s' "$KEYSTORE_B64" | tr -d '\n' | base64 -d > /tmp/upload.jks
+          echo "keystore decodificado: $(stat -c%s /tmp/upload.jks) bytes"
+
+          # -list sem -v ja traz a SHA-256; filtramos para nao vazar mais nada.
+          keytool -list -v -keystore /tmp/upload.jks \
+                  -storepass "$STORE_PASSWORD" 2>/dev/null \
+            | grep -E "Alias name|SHA256:|Valid from|Owner:" \
+            | sed 's/^[[:space:]]*//'
+
+          rm -f /tmp/upload.jks
+
+      - name: Comparar com o certificado que a Play espera
+        run: |
+          echo "esperado pela variavel do repo: ${{ vars.ANDROID_EXPECTED_CERTIFICATE_SHA256 }}"

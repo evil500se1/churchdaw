@@ -9,9 +9,11 @@ name: Inspecionar chave de upload Android
 # informacao publica (aparece na Play Console e no manifest do site). O
 # keystore e as senhas nunca sao ecoados, e o arquivo e apagado ao final.
 
+# A politica do environment android-production so libera os secrets para TAGS
+# que comecam com "v". Por isso o gatilho e por tag, nao por branch.
 on:
   push:
-    branches: [recuperar-chaves]
+    tags: ['v0.0.0-inspecao*']
 
 jobs:
   inspecionar:

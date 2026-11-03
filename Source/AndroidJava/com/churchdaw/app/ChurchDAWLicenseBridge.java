@@ -389,7 +389,8 @@ public final class ChurchDAWLicenseBridge {
                 "churchdaw.com".equalsIgnoreCase(host)
                 || "www.churchdaw.com".equalsIgnoreCase(host);
             final boolean acceptedPath =
-                "/app/android/update-policy-v2.json".equals(path)
+                "/app/android/update-policy-v3.json".equals(path)
+                || "/app/android/update-policy-v2.json".equals(path)
                 || "/app/android/manifest.json".equals(path);
             if (!"https".equalsIgnoreCase(url.getProtocol())
                     || !acceptedHost

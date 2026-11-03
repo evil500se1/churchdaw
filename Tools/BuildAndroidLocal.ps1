@@ -107,36 +107,61 @@ try {
     [xml] $projectXml = [Text.Encoding]::UTF8.GetString($originalJucerBytes)
     $versionName = [string] $projectXml.JUCERPROJECT.version
 
-    $localKeystore = Join-Path $AndroidHome 'churchdaw-local-dev.jks'
-    if (-not (Test-Path -LiteralPath $localKeystore)) {
-        Write-Host '==> Criando chave persistente de teste local (churchdaw-local-dev.jks)...'
-        & (Join-Path $JavaHome 'bin\keytool.exe') -genkeypair -noprompt `
-            -keystore $localKeystore `
-            -storepass churchdawlocal -keypass churchdawlocal `
-            -alias churchdawdev -keyalg RSA -keysize 2048 -validity 10000 `
-            -dname 'CN=ChurchDAW Local Dev,O=ChurchDAW,C=BR'
-        if ($LASTEXITCODE -ne 0) {
-            throw 'Falha ao gerar keystore local de desenvolvimento'
-        }
-    }
+    $commercialKeystore = Join-Path $env:USERPROFILE 'ChurchDAW-Secrets\churchdaw-upload-2026-11.jks'
+    $commercialCredXml  = Join-Path $env:USERPROFILE 'ChurchDAW-Secrets\churchdaw-upload-2026-11.credential.xml'
+    $useCommercialKey   = (Test-Path -LiteralPath $commercialKeystore) -and (Test-Path -LiteralPath $commercialCredXml)
 
     $distDir = Join-Path $projectRoot 'dist'
     New-Item -ItemType Directory -Force -Path $distDir | Out-Null
     $alignedApk = Join-Path $env:TEMP 'churchdaw-local-aligned.apk'
-    $finalApk = Join-Path $distDir "ChurchDAW-$versionName-Android-arm64-local.apk"
+    $finalApk = if ($useCommercialKey) {
+        Join-Path $distDir "ChurchDAW-$versionName-signed.apk"
+    } else {
+        Join-Path $distDir "ChurchDAW-$versionName-Android-arm64-local.apk"
+    }
 
     $buildTools = Join-Path $AndroidHome 'build-tools\36.0.0'
     & (Join-Path $buildTools 'zipalign.exe') -f -p 4 $unsignedApk.FullName $alignedApk
     if ($LASTEXITCODE -ne 0) { throw "zipalign falhou ($LASTEXITCODE)" }
 
-    & (Join-Path $buildTools 'apksigner.bat') sign `
-        --ks $localKeystore `
-        --ks-pass pass:churchdawlocal `
-        --ks-key-alias churchdawdev `
-        --key-pass pass:churchdawlocal `
-        --out $finalApk `
-        $alignedApk
-    if ($LASTEXITCODE -ne 0) { throw "apksigner sign falhou ($LASTEXITCODE)" }
+    if ($useCommercialKey) {
+        Write-Host '==> Assinando APK oficial com churchdaw-upload-2026-11.jks...'
+        $cred = Import-Clixml -LiteralPath $commercialCredXml
+        $env:CHURCHDAW_KS_PASS = $cred.GetNetworkCredential().Password
+        try {
+            & (Join-Path $buildTools 'apksigner.bat') sign `
+                --ks $commercialKeystore `
+                --ks-pass env:CHURCHDAW_KS_PASS `
+                --ks-key-alias $cred.UserName `
+                --key-pass env:CHURCHDAW_KS_PASS `
+                --out $finalApk `
+                $alignedApk
+            if ($LASTEXITCODE -ne 0) { throw "apksigner sign comercial falhou ($LASTEXITCODE)" }
+        } finally {
+            Remove-Item Env:\CHURCHDAW_KS_PASS -ErrorAction SilentlyContinue
+        }
+    } else {
+        $localKeystore = Join-Path $AndroidHome 'churchdaw-local-dev.jks'
+        if (-not (Test-Path -LiteralPath $localKeystore)) {
+            Write-Host '==> Criando chave persistente de teste local (churchdaw-local-dev.jks)...'
+            & (Join-Path $JavaHome 'bin\keytool.exe') -genkeypair -noprompt `
+                -keystore $localKeystore `
+                -storepass churchdawlocal -keypass churchdawlocal `
+                -alias churchdawdev -keyalg RSA -keysize 2048 -validity 10000 `
+                -dname 'CN=ChurchDAW Local Dev,O=ChurchDAW,C=BR'
+            if ($LASTEXITCODE -ne 0) {
+                throw 'Falha ao gerar keystore local de desenvolvimento'
+            }
+        }
+        & (Join-Path $buildTools 'apksigner.bat') sign `
+            --ks $localKeystore `
+            --ks-pass pass:churchdawlocal `
+            --ks-key-alias churchdawdev `
+            --key-pass pass:churchdawlocal `
+            --out $finalApk `
+            $alignedApk
+        if ($LASTEXITCODE -ne 0) { throw "apksigner sign falhou ($LASTEXITCODE)" }
+    }
 
     Remove-Item -LiteralPath $alignedApk -Force -ErrorAction SilentlyContinue
 

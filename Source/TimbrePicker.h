@@ -232,7 +232,7 @@ public:
         if (const auto* display = juce::Desktop::getInstance().getDisplays()
                                       .getDisplayForRect (parent.getScreenBounds()))
         {
-            const auto screenSafe = display->safeAreaInsets.trimmedRectangle (parent.getScreenBounds());
+            const auto screenSafe = display->safeAreaInsets.subtractedFrom (parent.getScreenBounds());
             const auto localSafe = parent.getLocalArea (nullptr, screenSafe).getIntersection (safe);
             if (! localSafe.isEmpty())
                 safe = localSafe;

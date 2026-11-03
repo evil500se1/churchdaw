@@ -17418,7 +17418,7 @@ public:
        #if JUCE_IOS || JUCE_ANDROID
         if (const auto* display = juce::Desktop::getInstance().getDisplays().getPrimaryDisplay())
         {
-            const auto safe = display->safeAreaInsets.trimmedRectangle (display->userArea).reduced (6);
+            const auto safe = display->safeAreaInsets.subtractedFrom (display->userArea).reduced (6);
             const int w = juce::jmin (getWidth(), safe.getWidth());
             const int h = juce::jmin (getHeight(), safe.getHeight());
             setBounds (safe.withSizeKeepingCentre (w, h));

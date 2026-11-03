@@ -43,9 +43,9 @@ namespace ChurchDAWServices
     inline constexpr const char* currentVersionName = "1.6.35";
     inline constexpr const char* packageId = "com.churchdaw.app";
     inline constexpr const char* updatePolicyUrl =
-        "https://churchdaw.com/app/android/update-policy-v2.json";
+        "https://churchdaw.com/app/android/update-policy-v3.json";
     inline constexpr const char* fallbackUpdatePolicyUrl =
-        "https://churchdaw.com/app/android/update-policy-v2.json?retry=1";
+        "https://churchdaw.com/app/android/update-policy-v3.json?retry=1";
     inline constexpr const char* manifestUrl = "https://churchdaw.com/app/android/manifest.json";
     inline constexpr const char* fallbackManifestUrl =
         "https://churchdaw.com/app/android/manifest.json?retry=1";
@@ -1993,7 +1993,8 @@ namespace ChurchDAWServices
              || envelopeSchema != 2
              || algorithm != "SHA256withRSA"
              || (keyId != "churchdaw-update-2026-01"
-                 && keyId != "churchdaw-update-2026-08")
+                 && keyId != "churchdaw-update-2026-08"
+                 && keyId != "churchdaw-update-2026-11")
              || payloadBase64.isEmpty()
              || payloadBase64.length() > maximumSignedPolicyPayloadBytes * 2
              || signatureBase64.length() != 512

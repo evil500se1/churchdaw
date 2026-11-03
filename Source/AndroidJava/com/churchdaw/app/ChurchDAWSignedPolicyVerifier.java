@@ -16,6 +16,7 @@ import java.security.spec.X509EncodedKeySpec;
  * uma atualizacao obrigatoria.
  */
 public final class ChurchDAWSignedPolicyVerifier {
+    public static final String KEY_ID_2026_11 = "churchdaw-update-2026-11";
     public static final String KEY_ID = "churchdaw-update-2026-08";
     public static final String KEY_ID_ANTERIOR = "churchdaw-update-2026-01";
     private static final int MAX_PAYLOAD_BYTES = 24 * 1024;
@@ -36,13 +37,18 @@ public final class ChurchDAWSignedPolicyVerifier {
     private static final String PUBLIC_KEY_DER_BASE64_2026_08 =
         "MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEAv5ZtiPbh+xhdk9POqWX7VQcCKzOcFXfxFLYUnFkClzc3ErmIVbkY4hBsbfHUwKhEiUdbCRTzNiOn7Y6hGX6iuN5FtPPqhcecXPbxWaSyP2x6Ukk2ThKov8Y9i1eo7y7zltVOlHVcDp8kqsQNobWUS93gONE33xha0uriF6Mhge5EHXGbEfBLSDLYojm46dqwDrQpE7VPfV1hPETTWBlU3oLqs1mAhkD5tAXEVPOfmkVR35ZxPyycdvUp62x2TwNY/sflHcDls0Jtg/SrH91sUJtUkY6wnWzK7RXlLCJyQ5aC1oPBICZSVb0n07xDj1Use3Rr7hQAi91cDL2GKQN1X3MJ7Go9NgENvPB19kSZDDQt62WRMF1fQNDVWtxDc0kMy6qVWwTv/jCc9X+YMyQ/M9ebkkYSjdgpioVms1jfBN/vMHn+qLalo1zL2EHjOS+JncHZhEbvxYsOAmRdvKZpxWntvdPCqvvlJg+r6+JuluYf3p29+vp7jKCbW2TeXjD3AgMBAAE=";
 
+    // Chave publicada com a rotacao 2026-11 (update-policy-v3.json).
+    private static final String PUBLIC_KEY_DER_BASE64_2026_11 =
+        "MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEAtPuym7becfl2i5m2CB3AoDc4ydpGzYmmjDlEOUcyBHQK4QWXTeI8l9G9EHVBfSxDIDNBHGVMicVVyxof2w6aflo+cK9jFL5s4EZz60xfVSfYlOjeLjxWXmbxPAWl1HVEotJtP4DGFcwek5MBT2LV/mg82+9pa9oyzF6MiRsGdfg74dz9dxAPvpsnXAMIAyPIcgf5zAaIh+UkNwwhaPYD6ntOhmCfgE7t1ZBLv4FZvP/10SvqsyKlDEKbd8rr9/eAcxupWlZzepyI7MxRDF5/o30OXcPiMHfs1PVx7bd2w9Y53Nvx6CfkcJ503zQHyBOy+G4wQCrUNOkFLMa4sktIJnOuTt3fz5WgJi/3fTi7t6xwhs6G/kV0bWOIClW3zdwdq+mzyFl7bQxrAAn94c2WsBUSdSnT/PqyYAf0JUxuAk/0tDLqGp/phKPyTQZ/hG1O11hLBLUfunavMSkPosob+FviNpBjTrAbX0DMwakTGGN3clcf9cxn9D/h7oVgevKVAgMBAAE=";
+
     private ChurchDAWSignedPolicyVerifier() {}
 
     public static boolean verify(
             String payloadBase64, String signatureBase64, String keyId) {
+        final boolean is202611Key = KEY_ID_2026_11.equals(keyId);
         final boolean isCurrentKey = KEY_ID.equals(keyId);
         final boolean isPreviousKey = KEY_ID_ANTERIOR.equals(keyId);
-        if ((!isCurrentKey && !isPreviousKey)
+        if ((!is202611Key && !isCurrentKey && !isPreviousKey)
                 || payloadBase64 == null
                 || signatureBase64 == null
                 || payloadBase64.length() > MAX_PAYLOAD_BYTES * 2
@@ -69,9 +75,11 @@ public final class ChurchDAWSignedPolicyVerifier {
                 return false;
             }
 
-            final String publicKeyBase64 = isCurrentKey
-                ? PUBLIC_KEY_DER_BASE64_2026_08
-                : PUBLIC_KEY_DER_BASE64;
+            final String publicKeyBase64 = is202611Key
+                ? PUBLIC_KEY_DER_BASE64_2026_11
+                : (isCurrentKey
+                    ? PUBLIC_KEY_DER_BASE64_2026_08
+                    : PUBLIC_KEY_DER_BASE64);
             final byte[] publicKeyBytes =
                 Base64.decode(publicKeyBase64, Base64.NO_WRAP);
             final PublicKey publicKey = KeyFactory.getInstance("RSA")

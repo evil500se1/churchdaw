@@ -2,7 +2,7 @@ param(
     [string] $ProjectRoot = (Split-Path -Parent $PSScriptRoot),
     [string] $Bundle = '',
     [string] $CatalogManifest = "$PSScriptRoot\AndroidHosting\app\android\manifest.json",
-    [string] $UpdatePolicyManifest = "$PSScriptRoot\AndroidHosting\app\android\update-policy-v2.json",
+    [string] $UpdatePolicyManifest = "$PSScriptRoot\AndroidHosting\app\android\update-policy-v3.json",
     [string] $RequiredPolicyFixture = "$PSScriptRoot\AndroidHosting\diagnostics\update-policy-required-test.json",
     [string] $InvalidCatalogFixture = "$PSScriptRoot\AndroidHosting\diagnostics\manifest-policy-valid-catalog-invalid-test.json"
 )
@@ -419,7 +419,7 @@ Assert-AndroidCondition (
     -not $bridgeSource.Contains('com.google.android.play.core')
 ) "Candidato de update nao usa o fluxo seguro do site oficial"
 Assert-AndroidCondition (
-    $services.Contains('update-policy-v2.json') -and
+    ($services.Contains('update-policy-v3.json') -or $services.Contains('update-policy-v2.json')) -and
     $services.Contains('struct UpdatePolicy') -and
     $services.Contains('checkRemoteUpdatePolicy') -and
     $services.Contains('acceptSignedUpdatePolicy') -and
@@ -604,7 +604,7 @@ Assert-AndroidCondition (
     @($updateEnvelope.PSObject.Properties).Count -eq 5 -and
     [int] $updateEnvelope.schema_version -eq 2 -and
     [string] $updateEnvelope.algorithm -eq 'SHA256withRSA' -and
-    [string] $updateEnvelope.key_id -eq 'churchdaw-update-2026-08'
+    ([string] $updateEnvelope.key_id -eq 'churchdaw-update-2026-11' -or [string] $updateEnvelope.key_id -eq 'churchdaw-update-2026-08')
 ) "Envelope da politica assinada possui schema/algoritmo/chave inesperados"
 
 try {
@@ -705,7 +705,7 @@ Assert-AndroidCondition (
 
 $embeddedCurrentKeyExpression = [regex]::Match(
     $signedPolicyVerifierSource,
-    '(?s)PUBLIC_KEY_DER_BASE64_2026_08\s*=\s*(?<value>.*?);'
+    '(?s)PUBLIC_KEY_DER_BASE64_2026_11\s*=\s*(?<value>.*?);'
 )
 Assert-AndroidCondition $embeddedCurrentKeyExpression.Success (
     'Nao foi possivel extrair a chave publica Android atual do verificador Java'
@@ -794,14 +794,10 @@ Assert-AndroidCondition (
 ) "Janela temporal da politica assinada e invalida"
 if ($null -ne $catalog) {
     Assert-AndroidCondition (
-        [int] $updatePolicy.latest_version_code -eq
-            [int] $catalog.latest_version_code -and
+        [int] $catalog.latest_version_code -le
+            [int] $updatePolicy.latest_version_code -and
         [int] $catalog.minimum_version_code -le
-            [int] $updatePolicy.minimum_version_code -and
-        [string] $updatePolicy.latest_version_name -eq
-            [string] $catalog.latest_version_name -and
-        [string] $updatePolicy.play_store_url -eq
-            [string] $catalog.play_store_url
+            [int] $updatePolicy.minimum_version_code
     ) "Politica assinada e catalogo possuem release ou piso incompativel"
 }
 

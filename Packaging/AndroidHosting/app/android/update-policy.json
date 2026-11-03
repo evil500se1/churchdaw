@@ -1,9 +1,9 @@
 {
     "schema_version":  1,
     "package_id":  "com.churchdaw.app",
-    "latest_version_code":  10626,
+    "latest_version_code":  10642,
     "minimum_version_code":  10623,
-    "latest_version_name":  "1.6.27",
-    "update_message":  "Atualize para a versao 1.6.27: seus mapeamentos MIDI de teclado e plugins agora ficam gravados com protecao total e nunca mais se perdem.",
-    "play_store_url":  "https://churchdaw.com/app/android/ChurchDAW-1.6.27-signed.apk"
+    "latest_version_name":  "1.6.35",
+    "update_message":  "Atualize para o ChurchDAW 1.6.35: novo motor de audio Oboe anti-travamento, menor uso de RAM e interface touch otimizada.",
+    "play_store_url":  "https://churchdaw.com/app/android/ChurchDAW-1.6.35-signed.apk"
 }

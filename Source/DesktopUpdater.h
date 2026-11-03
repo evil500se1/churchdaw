@@ -90,6 +90,7 @@ inline juce::File updaterTestStateFile()
 
 inline constexpr const char* policyKeyId      = "churchdaw-update-2026-01";
 inline constexpr const char* policyKeyIdCurrent = "churchdaw-update-2026-08";
+inline constexpr const char* policyKeyId202611  = "churchdaw-update-2026-11";
 inline constexpr const char* policyAlgorithm  = "SHA256withRSA";
 inline constexpr const char* productId        = "com.churchdaw.app";
 

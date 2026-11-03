@@ -191,7 +191,8 @@ int main (int argc, char* argv[])
     const juce::MemoryBlock signature (decodedSignature.getData(), decodedSignature.getDataSize());
 
     check (keyId == "churchdaw-update-2026-01"
-               || keyId == "churchdaw-update-2026-08",
+               || keyId == "churchdaw-update-2026-08"
+               || keyId == "churchdaw-update-2026-11",
            "A0 key_id do vetor confere", keyId);
     check (signature.getSize() == 384, "A0 assinatura tem 384 bytes (RSA-3072)",
            juce::String ((int) signature.getSize()));

@@ -211,6 +211,10 @@ bool verifyUpdateRs256Signature (const juce::MemoryBlock& message,
         return verifyUpdateRs256SignatureWithKey (
             message, signature, updatePolicyPublicKeyDerBase64_2026_08, error);
 
+    if (keyId == juce::String (policyKeyId202611))
+        return verifyUpdateRs256SignatureWithKey (
+            message, signature, updatePolicyPublicKeyDerBase64_2026_11, error);
+
     error = "Chave publica de atualizacao desconhecida";
     return false;
 }
@@ -388,6 +392,8 @@ bool verifySignedPolicyEnvelope (const juce::String& payloadBase64,
         publicKeyBase64 = updatePolicyPublicKeyDerBase64;
     else if (keyId == juce::String (policyKeyIdCurrent))
         publicKeyBase64 = updatePolicyPublicKeyDerBase64_2026_08;
+    else if (keyId == juce::String (policyKeyId202611))
+        publicKeyBase64 = updatePolicyPublicKeyDerBase64_2026_11;
     else
         return false;
 
@@ -453,7 +459,8 @@ bool parseSignedPolicy (const juce::String& envelopeJson,
          || envelopeSchema != 1
          || algorithm != juce::String (policyAlgorithm)
          || (keyId != juce::String (policyKeyId)
-             && keyId != juce::String (policyKeyIdCurrent))
+             && keyId != juce::String (policyKeyIdCurrent)
+             && keyId != juce::String (policyKeyId202611))
          || payloadBase64.isEmpty()
          || payloadBase64.length() > maximumPayloadBytes * 2
          || payloadBase64.length() % 4 != 0
@@ -479,9 +486,11 @@ bool parseSignedPolicy (const juce::String& envelopeJson,
     const juce::MemoryBlock message  (decodedPayload.getData(), decodedPayload.getDataSize());
     const juce::MemoryBlock signature (decodedSignature.getData(), decodedSignature.getDataSize());
 
-    const auto* publicKeyBase64 = keyId == juce::String (policyKeyIdCurrent)
-        ? updatePolicyPublicKeyDerBase64_2026_08
-        : updatePolicyPublicKeyDerBase64;
+    const auto* publicKeyBase64 = keyId == juce::String (policyKeyId202611)
+        ? updatePolicyPublicKeyDerBase64_2026_11
+        : (keyId == juce::String (policyKeyIdCurrent)
+            ? updatePolicyPublicKeyDerBase64_2026_08
+            : updatePolicyPublicKeyDerBase64);
 
     if (! verifyUpdateRs256SignatureWithKey (message, signature,
                                               publicKeyBase64, error))

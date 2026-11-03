@@ -10,6 +10,7 @@ namespace
 {
 constexpr const char* policyKeyId202601 = "churchdaw-update-2026-01";
 constexpr const char* policyKeyId202608 = "churchdaw-update-2026-08";
+constexpr const char* policyKeyId202611 = "churchdaw-update-2026-11";
 constexpr int maximumPayloadBytes = 24 * 1024;
 constexpr int signatureBytes = 384; // RSA-3072
 
@@ -182,6 +183,9 @@ bool verifySignedPolicyEnvelope (const juce::String& payloadBase64,
     else if (keyId == policyKeyId202608)
         publicKeyBase64 =
             ChurchDAWDesktopUpdate::updatePolicyPublicKeyDerBase64_2026_08;
+    else if (keyId == policyKeyId202611)
+        publicKeyBase64 =
+            ChurchDAWDesktopUpdate::updatePolicyPublicKeyDerBase64_2026_11;
 
     if (publicKeyBase64 == nullptr
          || payloadBase64.isEmpty()

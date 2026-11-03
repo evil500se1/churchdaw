@@ -140,8 +140,12 @@ try {
 
     Remove-Item -LiteralPath $alignedApk -Force -ErrorAction SilentlyContinue
 
-    & (Join-Path $buildTools 'apksigner.bat') verify --verbose $finalApk | Select-Object -First 8
-    if ($LASTEXITCODE -ne 0) { throw "apksigner verify falhou ($LASTEXITCODE)" }
+    $verifyOut = & (Join-Path $buildTools 'apksigner.bat') verify --verbose $finalApk 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host ($verifyOut | Out-String)
+        throw "apksigner verify falhou ($LASTEXITCODE)"
+    }
+    $verifyOut | Select-Object -First 8 | ForEach-Object { Write-Host $_ }
 
     $apkSizeMb = [Math]::Round((Get-Item -LiteralPath $finalApk).Length / 1MB, 2)
     Write-Host ("`nAPK_ANDROID_PRONTO ({0:n0}s, {1} MB): {2}" -f $sw.Elapsed.TotalSeconds, $apkSizeMb, $finalApk)

@@ -198,6 +198,10 @@ public:
         }
     }
 
+    void cancel() noexcept { requestStop(); }
+    double getProgress() const noexcept { return progress; }
+    String getCurrentPlugin() const { return pluginBeingScanned; }
+
 private:
     enum Flags
     {
@@ -367,13 +371,16 @@ private:
             propertiesToUse->saveIfNeeded();
         }
 
-        progressWindow.addButton (TRANS ("Cancel"), 0, KeyPress (KeyPress::escapeKey));
-        progressWindow.addProgressBarComponent (progress);
-        progressWindow.enterModalState (true, ModalCallbackFunction::create ([weakSelf] (auto)
+        if (! owner.useIntegratedScanProgress)
         {
-            if (const auto strong = weakSelf.lock())
-                strong->requestStop();
-        }));
+            progressWindow.addButton (TRANS ("Cancel"), 0, KeyPress (KeyPress::escapeKey));
+            progressWindow.addProgressBarComponent (progress);
+            progressWindow.enterModalState (true, ModalCallbackFunction::create ([weakSelf] (auto)
+            {
+                if (const auto strong = weakSelf.lock())
+                    strong->requestStop();
+            }));
+        }
 
         if (numThreads > 0)
         {
@@ -433,7 +440,7 @@ private:
 
         if ((flags & finished) != 0)
             finishedScan();
-        else
+        else if (! owner.useIntegratedScanProgress)
             progressWindow.setMessage (TRANS ("Testing") + ":\n\n" + pluginBeingScanned);
     }
 
@@ -793,6 +800,28 @@ bool PluginListComponent::consumeLastScanWasInconclusive() noexcept
     const bool result = lastScanWasInconclusive;
     lastScanWasInconclusive = false;
     return result;
+}
+
+void PluginListComponent::setUseIntegratedScanProgress (bool shouldUse) noexcept
+{
+    useIntegratedScanProgress = shouldUse;
+}
+
+void PluginListComponent::cancelScan() noexcept
+{
+    if (currentScanner != nullptr)
+        currentScanner->cancel();
+}
+
+double PluginListComponent::getScanProgress() const noexcept
+{
+    return currentScanner != nullptr ? currentScanner->getProgress() : 0.0;
+}
+
+String PluginListComponent::getCurrentlyScannedPlugin() const
+{
+    return currentScanner != nullptr ? currentScanner->getCurrentPlugin()
+                                     : String();
 }
 
 void PluginListComponent::scanFinished (const StringArray& failedFiles,

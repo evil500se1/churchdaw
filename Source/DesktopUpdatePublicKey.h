@@ -5,10 +5,9 @@
 //==============================================================================
 // Chave PUBLICA que autoriza uma atualizacao obrigatoria no desktop.
 //
-// E a MESMA chave do Android (ChurchDAWSignedPolicyVerifier.java, key_id
-// "churchdaw-update-2026-01"). Deliberadamente a mesma: uma unica chave privada
-// para guardar, um unico script de assinatura, e uma policy que nao pode ser
-// valida em uma plataforma e invalida em outra.
+// E a mesma familia de chaves do Android (ChurchDAWSignedPolicyVerifier.java).
+// O key_id assinado seleciona a chave 2026-01 ou a rotacao 2026-08; qualquer
+// outro identificador e rejeitado.
 //
 // NAO confundir com a chave de LICENCA (DesktopLicensePublicKey.h, key_id
 // "churchdaw-2026-01"). Sao papeis diferentes: aquela diz quem pode usar, esta
@@ -32,4 +31,9 @@ inline const char* const updatePolicyPublicKeyDerBase64 =
     "1TPNezQydX5sowLwGX8LOUcM/BumKM9NMGEd8dOB5BHqJlA9KWThRANkjcudhYSr"
     "gJbRWvM9ZOgMknOl18+Q0F+/XWSjfMWzBzDdggmZY69MfgQXVGkW5X0RrS1o+GA3"
     "T/949ToRXGhcRzKmXgmiQwPl8b6K2oA4tO2l9w9X/Y7xAgMBAAE=";
+
+// Rotacao 2026-08. A chave anterior acima continua valida para politicas
+// antigas; o key_id assinado escolhe explicitamente qual chave usar.
+inline const char* const updatePolicyPublicKeyDerBase64_2026_08 =
+    "MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEAv5ZtiPbh+xhdk9POqWX7VQcCKzOcFXfxFLYUnFkClzc3ErmIVbkY4hBsbfHUwKhEiUdbCRTzNiOn7Y6hGX6iuN5FtPPqhcecXPbxWaSyP2x6Ukk2ThKov8Y9i1eo7y7zltVOlHVcDp8kqsQNobWUS93gONE33xha0uriF6Mhge5EHXGbEfBLSDLYojm46dqwDrQpE7VPfV1hPETTWBlU3oLqs1mAhkD5tAXEVPOfmkVR35ZxPyycdvUp62x2TwNY/sflHcDls0Jtg/SrH91sUJtUkY6wnWzK7RXlLCJyQ5aC1oPBICZSVb0n07xDj1Use3Rr7hQAi91cDL2GKQN1X3MJ7Go9NgENvPB19kSZDDQt62WRMF1fQNDVWtxDc0kMy6qVWwTv/jCc9X+YMyQ/M9ebkkYSjdgpioVms1jfBN/vMHn+qLalo1zL2EHjOS+JncHZhEbvxYsOAmRdvKZpxWntvdPCqvvlJg+r6+JuluYf3p29+vp7jKCbW2TeXjD3AgMBAAE=";
 }

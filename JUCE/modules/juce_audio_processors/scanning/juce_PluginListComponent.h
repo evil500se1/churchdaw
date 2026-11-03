@@ -114,6 +114,17 @@ public:
         not launch, communicate, or parse its protocol. */
     bool consumeLastScanWasInconclusive() noexcept;
 
+    /** Uses the host component for progress instead of opening JUCE's extra
+        modal progress window. The scan remains asynchronous. */
+    void setUseIntegratedScanProgress (bool shouldUse) noexcept;
+
+    /** Requests cancellation of the current asynchronous scan. */
+    void cancelScan() noexcept;
+
+    /** Progress and current item for a host-provided scan UI. */
+    double getScanProgress() const noexcept;
+    String getCurrentlyScannedPlugin() const;
+
     /** Removes the plugins currently selected in the table. */
     void removeSelectedPlugins();
 
@@ -145,6 +156,7 @@ private:
     bool allowAsync;
     bool lastScanWasCancelled = false;
     bool lastScanWasInconclusive = false;
+    bool useIntegratedScanProgress = false;
     int numThreads;
 
     class TableModel;

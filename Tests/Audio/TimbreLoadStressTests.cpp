@@ -11,6 +11,8 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
+#include <cstring>
 #include <iostream>
 #include <memory>
 #include <thread>
@@ -104,6 +106,166 @@ juce::Array<juce::File> collectSamples (const juce::File& directory,
     return files;
 }
 
+bool runStreamerWindowContinuityProbe (
+    SampleStreamer& streamer,
+    SampleStreamer::VoiceStream& voice,
+    const std::shared_ptr<const SampleStreamer::Source>& source)
+{
+    constexpr juce::int64 preloadEnd = 48000;
+    constexpr int wideSpan = 12000;
+
+    if (source == nullptr
+         || source->totalSamples < preloadEnd + SampleStreamer::windowSamples)
+        return false;
+
+    const auto waitForAcquire = [&] (juce::int64 pos, int needed)
+    {
+        const auto deadline = std::chrono::steady_clock::now()
+                            + std::chrono::seconds (5);
+
+        while (std::chrono::steady_clock::now() < deadline)
+        {
+            const float* left = nullptr;
+            const float* right = nullptr;
+            int offset = 0;
+            SampleStreamer::VoiceStream::ReadAccess access;
+
+            if (voice.acquire (pos, needed, left, right, offset, access))
+                return true;
+
+            streamer.wake();
+            juce::Thread::sleep (1);
+        }
+
+        return false;
+    };
+
+    const auto hasWindowAt = [&] (juce::int64 start)
+    {
+        const int generation = voice.generation.load (std::memory_order_acquire);
+
+        for (int i = 0; i < 2; ++i)
+        {
+            int expected = 0;
+
+            if (! voice.windowAccess[i].compare_exchange_strong (
+                    expected, 1, std::memory_order_acquire,
+                    std::memory_order_relaxed))
+                continue;
+
+            const bool matches = voice.winGen[i] == generation
+                              && voice.winValid[i] > 0
+                              && voice.winStart[i] == start;
+            voice.releaseWindow (i);
+
+            if (matches)
+                return true;
+        }
+
+        return false;
+    };
+
+    const auto waitForWindowAt = [&] (juce::int64 start)
+    {
+        const auto deadline = std::chrono::steady_clock::now()
+                            + std::chrono::seconds (5);
+
+        while (std::chrono::steady_clock::now() < deadline)
+        {
+            if (hasWindowAt (start))
+                return true;
+
+            streamer.wake();
+            juce::Thread::sleep (1);
+        }
+
+        return false;
+    };
+
+    // A primeira janela deve recuar pelo span REAL. O codigo antigo recuava
+    // sempre 8196 e nao cobria [preloadEnd-wideSpan, preloadEnd).
+    voice.restart (source.get());
+
+    if (! voice.requestFirstWindow (preloadEnd, wideSpan))
+        return false;
+
+    streamer.wake();
+
+    if (! waitForAcquire (preloadEnd - wideSpan, wideSpan))
+        return false;
+
+    // Reproduz a sobrescrita entre callbacks: A esta tocando, B ja contem a
+    // continuacao com overlap antigo, e um bloco maior pede outra B. O worker
+    // deve substituir B, nunca A, mesmo depois de ReadAccess liberar A.
+    voice.restart (source.get());
+
+    if (! voice.request (0))
+        return false;
+
+    streamer.wake();
+
+    {
+        const auto deadline = std::chrono::steady_clock::now()
+                            + std::chrono::seconds (5);
+        bool requestedContinuation = false;
+
+        while (std::chrono::steady_clock::now() < deadline)
+        {
+            const float* left = nullptr;
+            const float* right = nullptr;
+            int offset = 0;
+            SampleStreamer::VoiceStream::ReadAccess access;
+
+            if (voice.acquire (1000, 512, left, right, offset, access))
+            {
+                voice.prefetch (1000, access);
+                requestedContinuation = true;
+                break;
+            }
+
+            streamer.wake();
+            juce::Thread::sleep (1);
+        }
+
+        if (! requestedContinuation)
+            return false;
+    }
+
+    constexpr juce::int64 oldContinuation =
+        SampleStreamer::windowSamples - SampleStreamer::windowOverlap;
+
+    streamer.wake();
+
+    if (! waitForWindowAt (oldContinuation))
+        return false;
+
+    {
+        const float* left = nullptr;
+        const float* right = nullptr;
+        int offset = 0;
+        SampleStreamer::VoiceStream::ReadAccess access;
+
+        if (! voice.acquire (1000, wideSpan,
+                             left, right, offset, access))
+            return false;
+
+        voice.prefetch (1000, access);
+    }
+
+    constexpr juce::int64 widenedContinuation =
+        SampleStreamer::windowSamples - wideSpan;
+
+    streamer.wake();
+
+    if (! waitForWindowAt (widenedContinuation))
+        return false;
+
+    constexpr juce::int64 nextBlockPosition = 1000 + wideSpan - 4;
+    const bool preserved = waitForAcquire (nextBlockPosition, wideSpan);
+    voice.stop();
+    return preserved;
+}
+
 bool runStreamerGenerationStress (const juce::Array<juce::File>& files)
 {
     if (files.size() < 2)
@@ -158,7 +320,7 @@ bool runStreamerGenerationStress (const juce::Array<juce::File>& files)
     // (com tolerancia float) para detectar janela velha com geracao nova.
     for (int i = 0; i < 100; ++i)
     {
-        voice.restart ((i & 1) == 0 ? sourceA : sourceB);
+        voice.restart (((i & 1) == 0 ? sourceA : sourceB).get());
         voice.request (testStart);
         streamer.wake();
 
@@ -166,7 +328,7 @@ bool runStreamerGenerationStress (const juce::Array<juce::File>& files)
             juce::Thread::yield();
     }
 
-    voice.restart (sourceB);
+    voice.restart (sourceB.get());
     voice.request (testStart);
     streamer.wake();
 
@@ -191,8 +353,11 @@ bool runStreamerGenerationStress (const juce::Array<juce::File>& files)
                      || std::abs (right[offset + i] - expectedRight[i]) > 1.0e-6f)
                     return false;
 
+            access.reset();
+            const bool continuityOk = runStreamerWindowContinuityProbe (
+                streamer, voice, sourceB);
             voice.stop();
-            return true;
+            return continuityOk;
         }
 
         streamer.wake();
@@ -367,6 +532,24 @@ bool runChannelControlStateProbe()
     *source->getLayerRotaryModeParam (0) =
         ChurchDAWRotary::Speaker::fastMode;
     *source->getLayerRotaryAmountParam (0) = 0.77f;
+    *source->getLayerNordFilterOnParam (0) = true;
+    *source->getLayerNordFilterTypeParam (0) =
+        ChurchDAWNordSample::bandPass;
+    *source->getLayerNordFilterCutoffParam (0) = 1700.0f;
+    *source->getLayerNordFilterResonanceParam (0) = 0.42f;
+    *source->getLayerNordFilterKeyTrackParam (0) = 2;
+    *source->getLayerNordFilterDriveParam (0) = 3;
+    *source->getLayerNordFilterBrightParam (0) = true;
+    *source->getLayerNordFilterEnvAmountParam (0) = -0.37f;
+    *source->getLayerNordFilterEnvAttackParam (0) = 0.123f;
+    *source->getLayerNordFilterEnvDecayParam (0) = 2.45f;
+    *source->getLayerNordFilterEnvReleaseParam (0) = 3.67f;
+    *source->getLayerNordFilterVelocityParam (0) = true;
+    *source->getLayerNordAmpEqOnParam (0) = true;
+    *source->getLayerNordAmpEqBassParam (0) = -12.5f;
+    *source->getLayerNordAmpEqMidParam (0) = 7.25f;
+    *source->getLayerNordAmpEqMidHzParam (0) = 2440.0f;
+    *source->getLayerNordAmpEqTrebleParam (0) = 4.5f;
     auto* sourceChannelTranspose = findIntParameter (*source, "transp0");
     auto* sourceGlobalTranspose = dynamic_cast<juce::AudioParameterInt*> (
         source->getGlobalTranspParam());
@@ -377,11 +560,13 @@ bool runChannelControlStateProbe()
     *sourceChannelTranspose = -4;
     *sourceGlobalTranspose = 5;
     auto* sourceSolo = findBoolParameter (*source, "solo0");
+    auto* sourceLoop = findBoolParameter (*source, "loop0");
 
-    if (sourceSolo == nullptr)
+    if (sourceSolo == nullptr || sourceLoop == nullptr)
         return false;
 
     *sourceSolo = true;
+    *sourceLoop = true;   // tombstone legado deve ser salvo/restaurado como false
 
     juce::MemoryBlock state;
     source->getStateInformation (state);
@@ -398,6 +583,7 @@ bool runChannelControlStateProbe()
         return false;
 
     bool serializedSoloWasOff = false;
+    bool serializedLoopWasOff = false;
 
     forEachXmlChildElementWithTagName (
         *soloStateXml, layer, "LAYER")
@@ -405,12 +591,15 @@ bool runChannelControlStateProbe()
         {
             serializedSoloWasOff =
                 ! layer->getBoolAttribute ("solo", true);
+            serializedLoopWasOff =
+                ! layer->getBoolAttribute ("loop", true);
             // Simula setup legado/macOS salvo com o bit temporario ligado.
             layer->setAttribute ("solo", true);
+            layer->setAttribute ("loop", true);
             break;
         }
 
-    if (! serializedSoloWasOff)
+    if (! serializedSoloWasOff || ! serializedLoopWasOff)
         return false;
 
     juce::MemoryBlock legacySoloState;
@@ -423,6 +612,11 @@ bool runChannelControlStateProbe()
     if (auto* restoredSolo = findBoolParameter (
             *legacySoloRestored, "solo0");
         restoredSolo == nullptr || restoredSolo->get())
+        return false;
+
+    if (auto* restoredLoop = findBoolParameter (
+            *legacySoloRestored, "loop0");
+        restoredLoop == nullptr || restoredLoop->get())
         return false;
 
     *sourceSolo = true;
@@ -453,7 +647,27 @@ bool runChannelControlStateProbe()
         && dynamic_cast<juce::AudioParameterInt*> (
                restored->getGlobalTranspParam())->get() == 5
         && findIntParameter (*restored, "transp0") != nullptr
-        && findIntParameter (*restored, "transp0")->get() == -4;
+        && findIntParameter (*restored, "transp0")->get() == -4
+        && findBoolParameter (*restored, "loop0") != nullptr
+        && ! findBoolParameter (*restored, "loop0")->get()
+        && restored->getLayerNordFilterOnParam (0)->get()
+        && restored->getLayerNordFilterTypeParam (0)->getIndex()
+              == ChurchDAWNordSample::bandPass
+        && close (restored->getLayerNordFilterCutoffParam (0)->get(), 1700.0f)
+        && close (restored->getLayerNordFilterResonanceParam (0)->get(), 0.42f)
+        && restored->getLayerNordFilterKeyTrackParam (0)->getIndex() == 2
+        && restored->getLayerNordFilterDriveParam (0)->getIndex() == 3
+        && restored->getLayerNordFilterBrightParam (0)->get()
+        && close (restored->getLayerNordFilterEnvAmountParam (0)->get(), -0.37f)
+        && close (restored->getLayerNordFilterEnvAttackParam (0)->get(), 0.123f)
+        && close (restored->getLayerNordFilterEnvDecayParam (0)->get(), 2.45f)
+        && close (restored->getLayerNordFilterEnvReleaseParam (0)->get(), 3.67f)
+        && restored->getLayerNordFilterVelocityParam (0)->get()
+        && restored->getLayerNordAmpEqOnParam (0)->get()
+        && close (restored->getLayerNordAmpEqBassParam (0)->get(), -12.5f)
+        && close (restored->getLayerNordAmpEqMidParam (0)->get(), 7.25f)
+        && close (restored->getLayerNordAmpEqMidHzParam (0)->get(), 2440.0f)
+        && close (restored->getLayerNordAmpEqTrebleParam (0)->get(), 4.5f);
 
     if (! currentStateOk)
         return false;
@@ -566,6 +780,23 @@ bool runChannelControlStateProbe()
     profile->setAttribute (
         "rotMode", ChurchDAWRotary::Speaker::stopMode);
     profile->setAttribute ("rotAmt", 0.0);
+    profile->setAttribute ("nfOn", true);
+    profile->setAttribute ("nfType", ChurchDAWNordSample::lpM);
+    profile->setAttribute ("nfCut", 1320.0);
+    profile->setAttribute ("nfRes", 0.58);
+    profile->setAttribute ("nfTrack", 3);
+    profile->setAttribute ("nfDrive", 2);
+    profile->setAttribute ("nfBright", true);
+    profile->setAttribute ("nfEnvAmt", 0.44);
+    profile->setAttribute ("nfEnvA", 0.082);
+    profile->setAttribute ("nfEnvD", 1.75);
+    profile->setAttribute ("nfEnvR", 2.25);
+    profile->setAttribute ("nfVel", true);
+    profile->setAttribute ("nEqOn", true);
+    profile->setAttribute ("nEqBass", -9.0);
+    profile->setAttribute ("nEqMid", 6.5);
+    profile->setAttribute ("nEqMidHz", 1777.0);
+    profile->setAttribute ("nEqTreble", 3.25);
 
     juce::MemoryBlock profileState;
     juce::AudioProcessor::copyXmlToBinary (*profileXml, profileState);
@@ -579,7 +810,7 @@ bool runChannelControlStateProbe()
         profileRoundTrip.getData(), (int) profileRoundTrip.getSize());
 
     if (roundTripXml == nullptr
-         || roundTripXml->getIntAttribute ("toneSchema", 0) != 3)
+         || roundTripXml->getIntAttribute ("toneSchema", 0) != 4)
         return false;
 
     const juce::XmlElement* roundTripProfile = nullptr;
@@ -611,7 +842,35 @@ bool runChannelControlStateProbe()
                     "eqMid"), -2.0f)
          || ! close (
                 (float) roundTripProfile->getDoubleAttribute (
-                    "eqHigh"), 1.25f))
+                    "eqHigh"), 1.25f)
+         || ! roundTripProfile->getBoolAttribute ("nfOn", false)
+         || roundTripProfile->getIntAttribute ("nfType", -1)
+                != ChurchDAWNordSample::lpM
+         || ! close ((float) roundTripProfile->getDoubleAttribute (
+                "nfCut"), 1320.0f)
+         || ! close ((float) roundTripProfile->getDoubleAttribute (
+                "nfRes"), 0.58f)
+         || roundTripProfile->getIntAttribute ("nfTrack", -1) != 3
+         || roundTripProfile->getIntAttribute ("nfDrive", -1) != 2
+         || ! roundTripProfile->getBoolAttribute ("nfBright", false)
+         || ! close ((float) roundTripProfile->getDoubleAttribute (
+                "nfEnvAmt"), 0.44f)
+         || ! close ((float) roundTripProfile->getDoubleAttribute (
+                "nfEnvA"), 0.082f)
+         || ! close ((float) roundTripProfile->getDoubleAttribute (
+                "nfEnvD"), 1.75f)
+         || ! close ((float) roundTripProfile->getDoubleAttribute (
+                "nfEnvR"), 2.25f)
+         || ! roundTripProfile->getBoolAttribute ("nfVel", false)
+         || ! roundTripProfile->getBoolAttribute ("nEqOn", false)
+         || ! close ((float) roundTripProfile->getDoubleAttribute (
+                "nEqBass"), -9.0f)
+         || ! close ((float) roundTripProfile->getDoubleAttribute (
+                "nEqMid"), 6.5f)
+         || ! close ((float) roundTripProfile->getDoubleAttribute (
+                "nEqMidHz"), 1777.0f)
+         || ! close ((float) roundTripProfile->getDoubleAttribute (
+                "nEqTreble"), 3.25f))
         return false;
 
     // Sessao criada antes do Rotary nao pode ligar Leslie so porque o app foi
@@ -634,6 +893,23 @@ bool runChannelControlStateProbe()
         layer->removeAttribute ("mid");
         layer->removeAttribute ("rotMode");
         layer->removeAttribute ("rotAmt");
+        layer->removeAttribute ("nfOn");
+        layer->removeAttribute ("nfType");
+        layer->removeAttribute ("nfCut");
+        layer->removeAttribute ("nfRes");
+        layer->removeAttribute ("nfTrack");
+        layer->removeAttribute ("nfDrive");
+        layer->removeAttribute ("nfBright");
+        layer->removeAttribute ("nfEnvAmt");
+        layer->removeAttribute ("nfEnvA");
+        layer->removeAttribute ("nfEnvD");
+        layer->removeAttribute ("nfEnvR");
+        layer->removeAttribute ("nfVel");
+        layer->removeAttribute ("nEqOn");
+        layer->removeAttribute ("nEqBass");
+        layer->removeAttribute ("nEqMid");
+        layer->removeAttribute ("nEqMidHz");
+        layer->removeAttribute ("nEqTreble");
         layer->setAttribute ("transp", -9);
     }
     legacyXml->removeAttribute ("toneSchema");
@@ -654,6 +930,11 @@ bool runChannelControlStateProbe()
          || ! close (legacyRestored->getLayerLowEqParam (0)->get(), 0.0f)
          || ! close (legacyRestored->getLayerMidEqParam (0)->get(), 0.0f)
          || ! close (legacyRestored->getLayerHighEqParam (0)->get(), 0.0f)
+         || legacyRestored->getLayerNordFilterOnParam (0)->get()
+         || legacyRestored->getLayerNordFilterTypeParam (0)->getIndex()
+                != ChurchDAWNordSample::lp24
+         || ! close (legacyRestored->getLayerNordFilterCutoffParam (0)->get(), 18000.0f)
+         || legacyRestored->getLayerNordAmpEqOnParam (0)->get()
          || dynamic_cast<juce::AudioParameterInt*> (
                 legacyRestored->getGlobalTranspParam()) == nullptr
          || dynamic_cast<juce::AudioParameterInt*> (
@@ -675,7 +956,7 @@ bool runChannelControlStateProbe()
     juce::XmlElement oldestXml ("TIMBRES");
     oldestXml.setAttribute ("transpose", 0);
     oldestXml.setAttribute ("gain", 1.0);
-    oldestXml.setAttribute ("loop", false);
+    oldestXml.setAttribute ("loop", true);
     oldestXml.setAttribute ("timbre", "");
     juce::MemoryBlock oldestState;
     juce::AudioProcessor::copyXmlToBinary (oldestXml, oldestState);
@@ -695,7 +976,9 @@ bool runChannelControlStateProbe()
          || ! close (oldestRestored->getLayerReleaseParam (1)->get(), 0.55f)
          || ! close (oldestRestored->getLayerLowEqParam (1)->get(), 0.0f)
          || ! close (oldestRestored->getLayerMidEqParam (1)->get(), 0.0f)
-         || ! close (oldestRestored->getLayerHighEqParam (1)->get(), 0.0f))
+         || ! close (oldestRestored->getLayerHighEqParam (1)->get(), 0.0f)
+         || findBoolParameter (*oldestRestored, "loop0") == nullptr
+         || findBoolParameter (*oldestRestored, "loop0")->get())
         return false;
 
     // Um timbre novo preserva o preset historico de pad (HPF 0,32), mas deixa
@@ -745,6 +1028,96 @@ bool runChannelControlStateProbe()
                 invalidRestored->getLayerRotaryAmountParam (0)->get(),
                 1.0f))
         return false;
+
+    // Apagar a cena ATIVA precisa produzir uma pagina realmente vazia em
+    // todos os canais. clearLayer() sozinho preserva controles de proposito;
+    // a operacao explicita de cena deve, alem de remover o timbre, deixar o
+    // fader em -inf, canal OFF e ENV/FX/transpose neutros.
+    auto emptyScene = std::make_unique<TimbresProcessor>();
+
+    for (int layer = 0; layer < TimbresProcessor::numLayers; ++layer)
+    {
+        emptyScene->getLayerVolParam (layer)->setValueNotifyingHost (0.83f);
+        emptyScene->getLayerOnParam (layer)->setValueNotifyingHost (1.0f);
+        *emptyScene->getLayerMuteParam (layer) = true;
+        *emptyScene->getLayerSoloParam (layer) = true;
+        *emptyScene->getLayerTransposeParam (layer) = 7;
+        *emptyScene->getLayerOctaveParam (layer) = -2;
+        emptyScene->getLayerCompParam (layer)->setValueNotifyingHost (0.74f);
+        *emptyScene->getLayerDelayParam (layer) = 0.68f;
+        *emptyScene->getLayerAttackParam (layer) = 1.2f;
+        *emptyScene->getLayerReleaseParam (layer) = 9.0f;
+        *emptyScene->getLayerLowCutParam (layer) = 0.45f;
+        *emptyScene->getLayerHighCutParam (layer) = 0.35f;
+        *emptyScene->getLayerLowEqParam (layer) = 6.0f;
+        *emptyScene->getLayerMidEqParam (layer) = -5.0f;
+        *emptyScene->getLayerHighEqParam (layer) = 4.0f;
+        *emptyScene->getLayerReverbSendParam (layer) = 0.91f;
+        *emptyScene->getLayerRotaryModeParam (layer) =
+            ChurchDAWRotary::Speaker::fastMode;
+        *emptyScene->getLayerRotaryAmountParam (layer) = 0.88f;
+        *emptyScene->getLayerNordFilterOnParam (layer) = true;
+        *emptyScene->getLayerNordFilterTypeParam (layer) =
+            ChurchDAWNordSample::highPass;
+        *emptyScene->getLayerNordFilterCutoffParam (layer) = 3200.0f;
+        *emptyScene->getLayerNordFilterResonanceParam (layer) = 0.91f;
+        *emptyScene->getLayerNordFilterKeyTrackParam (layer) = 3;
+        *emptyScene->getLayerNordFilterDriveParam (layer) = 3;
+        *emptyScene->getLayerNordFilterBrightParam (layer) = true;
+        *emptyScene->getLayerNordFilterEnvAmountParam (layer) = 0.8f;
+        *emptyScene->getLayerNordFilterEnvAttackParam (layer) = 1.2f;
+        *emptyScene->getLayerNordFilterEnvDecayParam (layer) = 2.3f;
+        *emptyScene->getLayerNordFilterEnvReleaseParam (layer) = 4.5f;
+        *emptyScene->getLayerNordFilterVelocityParam (layer) = true;
+        *emptyScene->getLayerNordAmpEqOnParam (layer) = true;
+        *emptyScene->getLayerNordAmpEqBassParam (layer) = 12.0f;
+        *emptyScene->getLayerNordAmpEqMidParam (layer) = -11.0f;
+        *emptyScene->getLayerNordAmpEqMidHzParam (layer) = 6400.0f;
+        *emptyScene->getLayerNordAmpEqTrebleParam (layer) = 9.0f;
+
+        emptyScene->clearLayer (layer);
+        emptyScene->resetClearedLayerForEmptyScene (layer);
+
+        if (! close (emptyScene->getLayerVolParam (layer)->getValue(), 0.0f)
+             || emptyScene->getLayerOnParam (layer)->getValue() > 0.5f
+             || emptyScene->getLayerMuteParam (layer)->get()
+             || emptyScene->getLayerSoloParam (layer)->get()
+             || emptyScene->getLayerTransposeParam (layer)->get() != 0
+             || emptyScene->getLayerOctaveParam (layer)->get() != 0
+             || ! close (emptyScene->getLayerCompParam (layer)->getValue(), 0.0f)
+             || ! close (emptyScene->getLayerDelayParam (layer)->get(), 0.0f)
+             || ! close (emptyScene->getLayerAttackParam (layer)->get(), 0.003f)
+             || ! close (emptyScene->getLayerReleaseParam (layer)->get(), 0.55f)
+             || ! close (emptyScene->getLayerLowCutParam (layer)->get(), 0.0f)
+             || ! close (emptyScene->getLayerHighCutParam (layer)->get(), 0.0f)
+             || ! close (emptyScene->getLayerLowEqParam (layer)->get(), 0.0f)
+             || ! close (emptyScene->getLayerMidEqParam (layer)->get(), 0.0f)
+             || ! close (emptyScene->getLayerHighEqParam (layer)->get(), 0.0f)
+             || ! close (emptyScene->getLayerReverbSendParam (layer)->get(), 0.0f)
+             || emptyScene->getLayerRotaryModeParam (layer)->getIndex()
+                    != ChurchDAWRotary::Speaker::stopMode
+             || ! close (emptyScene->getLayerRotaryAmountParam (layer)->get(), 0.0f)
+             || emptyScene->getLayerNordFilterOnParam (layer)->get()
+             || emptyScene->getLayerNordFilterTypeParam (layer)->getIndex()
+                    != ChurchDAWNordSample::lp24
+             || ! close (emptyScene->getLayerNordFilterCutoffParam (layer)->get(), 18000.0f)
+             || ! close (emptyScene->getLayerNordFilterResonanceParam (layer)->get(), 0.0f)
+             || emptyScene->getLayerNordFilterKeyTrackParam (layer)->getIndex() != 0
+             || emptyScene->getLayerNordFilterDriveParam (layer)->getIndex() != 0
+             || emptyScene->getLayerNordFilterBrightParam (layer)->get()
+             || ! close (emptyScene->getLayerNordFilterEnvAmountParam (layer)->get(), 0.0f)
+             || ! close (emptyScene->getLayerNordFilterEnvAttackParam (layer)->get(), 0.001f)
+             || ! close (emptyScene->getLayerNordFilterEnvDecayParam (layer)->get(), 10.0f)
+             || ! close (emptyScene->getLayerNordFilterEnvReleaseParam (layer)->get(), 0.55f)
+             || emptyScene->getLayerNordFilterVelocityParam (layer)->get()
+             || emptyScene->getLayerNordAmpEqOnParam (layer)->get()
+             || ! close (emptyScene->getLayerNordAmpEqBassParam (layer)->get(), 0.0f)
+             || ! close (emptyScene->getLayerNordAmpEqMidParam (layer)->get(), 0.0f)
+             || ! close (emptyScene->getLayerNordAmpEqMidHzParam (layer)->get(), 850.0f)
+             || ! close (emptyScene->getLayerNordAmpEqTrebleParam (layer)->get(), 0.0f)
+             || emptyScene->getLayerTimbre (layer).isNotEmpty())
+            return false;
+    }
 
     // Autosave concorrente com ajustes programaticos nao pode deadlockar nem
     // produzir XML truncado. O lock transacional cobre identidade + ENV/EQ.
@@ -809,6 +1182,1641 @@ bool writeProbeWav (const juce::File& file, float frequency)
 
     return writer->writeFromAudioSampleBuffer (
         audio, 0, audio.getNumSamples());
+}
+
+bool runParallelNativeRenderParityProbe()
+{
+    constexpr double sampleRate = 48000.0;
+    constexpr int blockSize = 256;
+    constexpr int notesPerLayer = 16;
+
+    const auto temp = juce::File::getSpecialLocation (
+                          juce::File::tempDirectory)
+                          .getNonexistentChildFile (
+                              "churchdaw-parallel-render-parity", {}, false);
+
+    if (temp.createDirectory().failed())
+        return false;
+
+    const juce::ScopeGuard cleanup { [&temp]
+    {
+        temp.deleteRecursively (false);
+    } };
+    const auto sample = temp.getChildFile ("C3.wav");
+
+    if (! writeProbeWav (sample, 733.0f))
+        return false;
+
+    TimbresProcessor::TimbreEntry entry;
+    entry.label = "__Parallel Native Parity__";
+    entry.library = "Probe Pack";
+    entry.category = "PADS";
+    entry.files.add (sample);
+
+    const auto prepare = [&] (TimbresProcessor& processor, bool parallel)
+    {
+        processor.setParallelVoiceRenderingForTest (parallel);
+        processor.prepareToPlay (sampleRate, blockSize);
+        std::atomic<size_t> memoryPeak { 0 };
+
+        for (int layer = 0; layer < 2; ++layer)
+        {
+            processor.loadTimbreIntoLayer (layer, entry, false);
+
+            if (! dispatchUntilLoaded (processor, memoryPeak, 10)
+                 || processor.getLayerTimbre (layer) != entry.label)
+                return false;
+
+            *processor.getLayerAttackParam (layer) = 0.001f;
+            *processor.getLayerReleaseParam (layer) = 0.08f;
+            *processor.getLayerLowEqParam (layer) = 0.0f;
+            *processor.getLayerMidEqParam (layer) = 0.0f;
+            *processor.getLayerHighEqParam (layer) = 0.0f;
+            *processor.getLayerRotaryModeParam (layer) =
+                ChurchDAWRotary::Speaker::stopMode;
+            *processor.getLayerRotaryAmountParam (layer) = 0.0f;
+            *processor.getLayerReverbSendParam (layer) = 0.0f;
+
+            auto* volume = dynamic_cast<juce::AudioParameterFloat*> (
+                processor.getLayerVolParam (layer));
+            auto* compressor = dynamic_cast<juce::AudioParameterFloat*> (
+                processor.getLayerCompParam (layer));
+
+            if (volume == nullptr || compressor == nullptr)
+                return false;
+
+            *volume = 1.0f;
+            *compressor = 0.0f;
+        }
+
+        juce::AudioBuffer<float> settle (2, blockSize);
+        juce::MidiBuffer emptyMidi;
+
+        for (int block = 0; block < 8; ++block)
+        {
+            settle.clear();
+            processor.processBlock (settle, emptyMidi);
+        }
+
+        return true;
+    };
+
+    auto serial = std::make_unique<TimbresProcessor>();
+    auto parallel = std::make_unique<TimbresProcessor>();
+
+    if (! prepare (*serial, false) || ! prepare (*parallel, true))
+        return false;
+
+    juce::AudioBuffer<float> serialAudio (2, blockSize);
+    juce::AudioBuffer<float> parallelAudio (2, blockSize);
+
+    for (int block = 0; block < 18; ++block)
+    {
+        juce::MidiBuffer serialMidi;
+        juce::MidiBuffer parallelMidi;
+
+        if (block == 0)
+            for (int note = 0; note < notesPerLayer; ++note)
+            {
+                const auto message = juce::MidiMessage::noteOn (
+                    1, 36 + note * 3, (juce::uint8) (96 + note % 24));
+                serialMidi.addEvent (message, 0);
+                parallelMidi.addEvent (message, 0);
+            }
+        else if (block == 8)
+            for (int note = 0; note < notesPerLayer; ++note)
+            {
+                const auto message = juce::MidiMessage::noteOff (
+                    1, 36 + note * 3);
+                serialMidi.addEvent (message, 73);
+                parallelMidi.addEvent (message, 73);
+            }
+
+        serialAudio.clear();
+        parallelAudio.clear();
+        serial->processBlock (serialAudio, serialMidi);
+        parallel->processBlock (parallelAudio, parallelMidi);
+
+        if (block == 0
+             && parallel->getParallelVoiceRenderCountForTest() == 0)
+            std::cerr << "PARALLEL_PARITY_BLOCK0 worker_ready="
+                      << parallel->isParallelVoiceRenderWorkerReadyForTest()
+                      << " layer0="
+                      << parallel->getActiveVoiceCountInLayerForTest (0)
+                      << " layer1="
+                      << parallel->getActiveVoiceCountInLayerForTest (1)
+                      << '\n';
+
+        for (int channel = 0; channel < 2; ++channel)
+            if (std::memcmp (
+                    serialAudio.getReadPointer (channel),
+                    parallelAudio.getReadPointer (channel),
+                    (std::size_t) blockSize * sizeof (float)) != 0)
+            {
+                std::cerr << "PARALLEL_PARITY_DIFF block=" << block
+                          << " channel=" << channel
+                          << " serial_count="
+                          << serial->getParallelVoiceRenderCountForTest()
+                          << " parallel_count="
+                          << parallel->getParallelVoiceRenderCountForTest()
+                          << '\n';
+                return false;
+            }
+    }
+
+    const auto serialCount = serial->getParallelVoiceRenderCountForTest();
+    const auto parallelCount = parallel->getParallelVoiceRenderCountForTest();
+
+    if (serialCount != 0 || parallelCount == 0)
+        std::cerr << "PARALLEL_PARITY_NOT_EXERCISED serial_count="
+                  << serialCount << " parallel_count=" << parallelCount << '\n';
+
+    return serialCount == 0 && parallelCount > 0;
+}
+
+struct NativeAntiAliasMetrics
+{
+    double aliasBeforeDb = 0.0;
+    double aliasAfterDb = 0.0;
+    double aliasReductionDb = 0.0;
+    double passbandChangeDb = 0.0;
+    juce::uint32 streamMisses = 0;
+};
+
+bool writeAntiAliasProbeWav (const juce::File& file,
+                             juce::AudioBuffer<float>& reference)
+{
+    constexpr int sourceSamples = 180000;
+    constexpr double sampleRate = 48000.0;
+    constexpr double passFrequency = 3000.0;
+    constexpr double rejectedFrequency = 18000.0;
+
+    reference.setSize (1, sourceSamples);
+
+    for (int i = 0; i < sourceSamples; ++i)
+    {
+        const double time = (double) i / sampleRate;
+        reference.setSample (
+            0, i,
+            (float) (0.18 * std::sin (
+                         juce::MathConstants<double>::twoPi
+                         * passFrequency * time)
+                     + 0.18 * std::sin (
+                         juce::MathConstants<double>::twoPi
+                         * rejectedFrequency * time)));
+    }
+
+    auto output = file.createOutputStream();
+
+    if (output == nullptr)
+        return false;
+
+    auto* rawOutput = output.release();
+    juce::WavAudioFormat wav;
+    std::unique_ptr<juce::AudioFormatWriter> writer (
+        wav.createWriterFor (
+            rawOutput, sampleRate, 1, 24, {}, 0));
+
+    if (writer == nullptr)
+    {
+        delete rawOutput;
+        return false;
+    }
+
+    return writer->writeFromAudioSampleBuffer (
+        reference, 0, reference.getNumSamples());
+}
+
+double measuredToneAmplitude (const float* signal, int startSample,
+                              int numSamples, double frequency,
+                              double sampleRate)
+{
+    double real = 0.0;
+    double imaginary = 0.0;
+
+    for (int i = 0; i < numSamples; ++i)
+    {
+        const double phase =
+            juce::MathConstants<double>::twoPi * frequency
+            * (double) (startSample + i) / sampleRate;
+        const double sample = signal[startSample + i];
+        real += sample * std::cos (phase);
+        imaginary -= sample * std::sin (phase);
+    }
+
+    return 2.0 * std::hypot (real, imaginary) / (double) numSamples;
+}
+
+bool runNativeAntiAliasProbe (NativeAntiAliasMetrics& metrics)
+{
+    constexpr double sampleRate = 48000.0;
+    constexpr int blockSize = 256;
+    constexpr int analysisStart = 52000;
+    constexpr int analysisSamples = 16384;
+    constexpr int renderSamples = analysisStart + analysisSamples;
+
+    const auto temp = juce::File::getSpecialLocation (
+                          juce::File::tempDirectory)
+                          .getNonexistentChildFile (
+                              "churchdaw-native-antialias-probe", {}, false);
+
+    if (temp.createDirectory().failed())
+        return false;
+
+    const juce::ScopeGuard cleanup { [&temp]
+    {
+        temp.deleteRecursively (false);
+    } };
+
+    const auto sample = temp.getChildFile (
+        "AntiAlias-C3-V127.wav");
+    juce::AudioBuffer<float> source;
+
+    if (! writeAntiAliasProbeWav (sample, source))
+        return false;
+
+    // Nao dependa da convencao textual de oitavas do parser nesta sonda: fixa
+    // C central em MIDI 60 para que MIDI 72 seja exatamente ratio=2.
+    const auto map = temp.getChildFile ("churchdaw-timbre.json");
+    const juce::String mapJson = R"json({
+  "schema": 1,
+  "zones": [
+    { "file": "AntiAlias-C3-V127.wav", "root": 60,
+      "keyLo": 0, "keyHi": 127 }
+  ]
+})json";
+
+    if (! map.replaceWithText (mapJson))
+        return false;
+
+    TimbresProcessor::TimbreEntry entry;
+    entry.label = "__Native Anti Alias__";
+    entry.library = "Probe Pack";
+    entry.category = "TEST";
+    entry.files.add (sample);
+
+    const auto renderNote = [&] (int midiNote,
+                                 juce::AudioBuffer<float>& captured,
+                                 juce::uint32& streamMisses)
+    {
+        auto processor = std::make_unique<TimbresProcessor>();
+        processor->prepareToPlay (sampleRate, blockSize);
+        processor->loadTimbreIntoLayer (0, entry, true);
+        std::atomic<size_t> memoryPeak { 0 };
+
+        if (! dispatchUntilLoaded (*processor, memoryPeak, 10)
+             || processor->getLayerTimbre (0) != entry.label)
+            return false;
+
+        // Cadeia neutra: a sonda deve medir o resampler, nao EQ/rotary/delay.
+        processor->applyFactoryTimbreShape (
+            0, entry.label, entry.category, false);
+        *processor->getLayerAttackParam (0) = 0.001f;
+        *processor->getLayerReleaseParam (0) = 0.05f;
+        *processor->getLayerLowEqParam (0) = 0.0f;
+        *processor->getLayerMidEqParam (0) = 0.0f;
+        *processor->getLayerHighEqParam (0) = 0.0f;
+        *processor->getLayerRotaryModeParam (0) =
+            ChurchDAWRotary::Speaker::stopMode;
+        *processor->getLayerRotaryAmountParam (0) = 0.0f;
+        *processor->getLayerReverbSendParam (0) = 0.0f;
+
+        if (auto* volume = dynamic_cast<juce::AudioParameterFloat*> (
+                processor->getLayerVolParam (0)))
+            *volume = 1.0f;
+        else
+            return false;
+
+        if (auto* compressor = dynamic_cast<juce::AudioParameterFloat*> (
+                processor->getLayerCompParam (0)))
+            *compressor = 0.0f;
+        else
+            return false;
+
+        for (auto* parameter : processor->getParameters())
+        {
+            auto* identified =
+                dynamic_cast<juce::AudioProcessorParameterWithID*> (
+                    parameter);
+
+            if (identified == nullptr)
+                continue;
+
+            if (identified->paramID == "lcut0"
+                 || identified->paramID == "hcut0"
+                 || identified->paramID == "dly0")
+            {
+                if (auto* value =
+                        dynamic_cast<juce::AudioParameterFloat*> (
+                            parameter))
+                    *value = 0.0f;
+            }
+            else if (identified->paramID == "aeq0")
+            {
+                if (auto* value =
+                        dynamic_cast<juce::AudioParameterBool*> (
+                            parameter))
+                    *value = false;
+            }
+        }
+
+        juce::AudioBuffer<float> audio (2, blockSize);
+        juce::MidiBuffer midi;
+
+        // Deixa todos os smoothers da cadeia neutra chegarem ao alvo.
+        for (int block = 0; block < 16; ++block)
+        {
+            audio.clear();
+            midi.clear();
+            processor->processBlock (audio, midi);
+        }
+
+        captured.setSize (1, renderSamples);
+        captured.clear();
+
+        for (int rendered = 0; rendered < renderSamples;
+             rendered += blockSize)
+        {
+            audio.clear();
+            midi.clear();
+
+            if (rendered == 0)
+                midi.addEvent (
+                    juce::MidiMessage::noteOn (
+                        1, midiNote, (juce::uint8) 127), 0);
+
+            processor->processBlock (audio, midi);
+
+            const int valid = juce::jmin (
+                blockSize, renderSamples - rendered);
+            captured.copyFrom (
+                0, rendered, audio, 0, 0, valid);
+
+            // O ratio=2 cruza o preload e exercita a emenda das duas janelas.
+            std::this_thread::sleep_for (
+                std::chrono::milliseconds (3));
+        }
+
+        streamMisses = processor->getStreamMissCount();
+        return true;
+    };
+
+    juce::AudioBuffer<float> unityOutput;
+    juce::AudioBuffer<float> downsampledOutput;
+    juce::uint32 unityMisses = 0;
+    juce::uint32 downsampledMisses = 0;
+
+    if (! renderNote (60, unityOutput, unityMisses)
+         || ! renderNote (72, downsampledOutput, downsampledMisses))
+        return false;
+
+    // Referencia BEFORE: o renderer antigo em ratio=2 lia exatamente cada
+    // segunda amostra. A senoide fonte de 18 kHz reaparece em 12 kHz com a
+    // mesma energia, enquanto 3 kHz vira o sinal util de 6 kHz.
+    juce::AudioBuffer<float> legacyDownsampled (1, renderSamples);
+
+    for (int i = 0; i < renderSamples; ++i)
+        legacyDownsampled.setSample (
+            0, i, source.getSample (0, i * 2));
+
+    const double legacyPass = measuredToneAmplitude (
+        legacyDownsampled.getReadPointer (0), analysisStart,
+        analysisSamples, 6000.0, sampleRate);
+    const double legacyAlias = measuredToneAmplitude (
+        legacyDownsampled.getReadPointer (0), analysisStart,
+        analysisSamples, 12000.0, sampleRate);
+    const double afterPass = measuredToneAmplitude (
+        downsampledOutput.getReadPointer (0), analysisStart,
+        analysisSamples, 6000.0, sampleRate);
+    const double afterAlias = measuredToneAmplitude (
+        downsampledOutput.getReadPointer (0), analysisStart,
+        analysisSamples, 12000.0, sampleRate);
+    const double unityPass = measuredToneAmplitude (
+        unityOutput.getReadPointer (0), analysisStart,
+        analysisSamples, 3000.0, sampleRate);
+
+    constexpr double floorEnergy = 1.0e-30;
+    const double beforeRatio =
+        (legacyAlias * legacyAlias + floorEnergy)
+        / (legacyPass * legacyPass + floorEnergy);
+    const double afterRatio =
+        (afterAlias * afterAlias + floorEnergy)
+        / (afterPass * afterPass + floorEnergy);
+
+    metrics.aliasBeforeDb = 10.0 * std::log10 (beforeRatio);
+    metrics.aliasAfterDb = 10.0 * std::log10 (afterRatio);
+    metrics.aliasReductionDb =
+        metrics.aliasBeforeDb - metrics.aliasAfterDb;
+    metrics.passbandChangeDb = 20.0 * std::log10 (
+        (afterPass + 1.0e-15) / (unityPass + 1.0e-15));
+    metrics.streamMisses = unityMisses + downsampledMisses;
+
+    return std::isfinite (metrics.aliasBeforeDb)
+        && std::isfinite (metrics.aliasAfterDb)
+        && std::isfinite (metrics.passbandChangeDb)
+        && metrics.aliasBeforeDb > -1.0
+        && metrics.aliasBeforeDb < 1.0
+        && metrics.aliasReductionDb >= 24.0
+        && metrics.aliasAfterDb <= -24.0
+        && metrics.passbandChangeDb >= -1.5
+        && metrics.passbandChangeDb <= 1.0
+        && afterPass > 0.01
+        && metrics.streamMisses == 0;
+}
+
+bool writeShortDelayBurstWav (const juce::File& file)
+{
+    auto output = file.createOutputStream();
+
+    if (output == nullptr)
+        return false;
+
+    auto* rawOutput = output.release();
+    juce::WavAudioFormat wav;
+    std::unique_ptr<juce::AudioFormatWriter> writer (
+        wav.createWriterFor (
+            rawOutput, 48000.0, 1, 16, {}, 0));
+
+    if (writer == nullptr)
+    {
+        delete rawOutput;
+        return false;
+    }
+
+    juce::AudioBuffer<float> audio (1, 512);
+
+    for (int i = 0; i < audio.getNumSamples(); ++i)
+    {
+        const float envelope = std::sin (
+            juce::MathConstants<float>::pi
+            * (float) i / (float) (audio.getNumSamples() - 1));
+        audio.setSample (
+            0, i,
+            0.45f * envelope
+                * std::sin (
+                    juce::MathConstants<float>::twoPi
+                    * 997.0f * (float) i / 48000.0f));
+    }
+
+    return writer->writeFromAudioSampleBuffer (
+        audio, 0, audio.getNumSamples());
+}
+
+bool runNativeKeyDepthProbe()
+{
+    const auto temp = juce::File::getSpecialLocation (
+                          juce::File::tempDirectory)
+                          .getNonexistentChildFile (
+                              "churchdaw-native-logical-press-probe",
+                              {}, false);
+
+    if (temp.createDirectory().failed())
+        return false;
+
+    const juce::ScopeGuard cleanup { [&temp]
+    {
+        temp.deleteRecursively (false);
+    } };
+    const auto sampleA = temp.getChildFile ("Press-A-C3.wav");
+    const auto sampleB = temp.getChildFile ("Press-B-C3.wav");
+
+    if (! writeProbeWav (sampleA, 440.0f)
+         || ! writeProbeWav (sampleB, 660.0f))
+        return false;
+
+    TimbresProcessor::TimbreEntry entryA;
+    entryA.label = "__Native Logical Press A__";
+    entryA.library = "Probe Pack";
+    entryA.category = "PIANOS";
+    entryA.files.add (sampleA);
+
+    auto entryB = entryA;
+    entryB.label = "__Native Logical Press B__";
+    entryB.files.clear();
+    entryB.files.add (sampleB);
+
+    auto processor = std::make_unique<TimbresProcessor>();
+    processor->prepareToPlay (48000.0, 256);
+    processor->loadTimbreIntoLayer (0, entryA, true);
+    std::atomic<size_t> memoryPeak { 0 };
+
+    if (! dispatchUntilLoaded (*processor, memoryPeak, 10)
+         || processor->getLayerTimbre (0) != entryA.label)
+        return false;
+
+    juce::AudioBuffer<float> audio (2, 256);
+    juce::MidiBuffer midi;
+
+    const auto process = [&]
+    {
+        audio.clear();
+        processor->processBlock (audio, midi);
+        midi.clear();
+    };
+
+    // Dois note-ons iguais no mesmo canal representam duas pressoes logicas e
+    // duas geracoes de voz. O primeiro NoteOff consome a geracao FIFO mais
+    // antiga sem soltar a segunda.
+    midi.addEvent (juce::MidiMessage::noteOn (
+                       1, 60, (juce::uint8) 100), 0);
+    midi.addEvent (juce::MidiMessage::noteOn (
+                       1, 60, (juce::uint8) 110), 8);
+    process();
+
+    const auto first = processor->getNativeLogicalPressIdForTest (60, 1, 0);
+    const auto second = processor->getNativeLogicalPressIdForTest (60, 1, 1);
+
+    if (first == 0 || second <= first
+         || processor->getPhysicalKeyDepthForTest (60, 1) != 2
+         || processor->getNativeLogicalPressCountForTest (60, 1) != 2
+         || processor->getNativePressedVoiceCountForTest (first) != 1
+         || processor->getNativePressedVoiceCountForTest (second) != 1)
+        return false;
+
+    midi.addEvent (juce::MidiMessage::noteOff (1, 60), 64);
+    process();
+
+    if (processor->getPhysicalKeyDepthForTest (60, 1) != 1
+         || processor->getNativeLogicalPressCountForTest (60, 1) != 1
+         || processor->getNativeLogicalPressIdForTest (60, 1, 0) != second
+         || processor->getNativePressedVoiceCountForTest (first) != 0
+         || processor->getNativeReleasedVoiceCountForTest (first) != 1
+         || processor->getNativePressedVoiceCountForTest (second) != 1)
+        return false;
+
+    // Outro canal e independente; o segundo Off do canal 1 nao apaga o canal 2.
+    midi.addEvent (juce::MidiMessage::noteOn (
+                       2, 60, (juce::uint8) 100), 0);
+    midi.addEvent (juce::MidiMessage::noteOff (1, 60), 32);
+    process();
+
+    if (processor->getPhysicalKeyDepthForTest (60, 1) != 0
+         || processor->getPhysicalKeyDepthForTest (60, 2) != 1
+         || processor->getNativeLogicalPressCountForTest (60, 1) != 0
+         || processor->getNativeLogicalPressCountForTest (60, 2) != 1
+         || processor->getNativeReleasedVoiceCountForTest (second) != 1)
+        return false;
+
+    midi.addEvent (juce::MidiMessage::allSoundOff (2), 0);
+    process();
+
+    if (processor->getPhysicalKeyDepthForTest (60, 1) != 0
+         || processor->getPhysicalKeyDepthForTest (60, 2) != 0
+         || processor->getNativeLogicalPressCountForTest (60, 2) != 0)
+        return false;
+
+    // Com sustain, cada Off move somente sua propria geracao para pedal-held;
+    // levantar o pedal libera ambas, ainda identificaveis separadamente.
+    midi.addEvent (juce::MidiMessage::controllerEvent (1, 64, 127), 0);
+    midi.addEvent (juce::MidiMessage::noteOn (
+                       1, 60, (juce::uint8) 96), 8);
+    midi.addEvent (juce::MidiMessage::noteOn (
+                       1, 60, (juce::uint8) 112), 16);
+    process();
+
+    const auto pedalFirst =
+        processor->getNativeLogicalPressIdForTest (60, 1, 0);
+    const auto pedalSecond =
+        processor->getNativeLogicalPressIdForTest (60, 1, 1);
+
+    if (pedalFirst == 0 || pedalSecond <= pedalFirst)
+        return false;
+
+    midi.addEvent (juce::MidiMessage::noteOff (1, 60), 0);
+    process();
+
+    if (processor->getNativePedalHeldVoiceCountForTest (pedalFirst) != 1
+         || processor->getNativePressedVoiceCountForTest (pedalSecond) != 1
+         || processor->getNativeLogicalPressCountForTest (60, 1) != 1)
+        return false;
+
+    midi.addEvent (juce::MidiMessage::noteOff (1, 60), 0);
+    process();
+
+    if (processor->getNativePedalHeldVoiceCountForTest (pedalFirst) != 1
+         || processor->getNativePedalHeldVoiceCountForTest (pedalSecond) != 1
+         || processor->getNativeLogicalPressCountForTest (60, 1) != 0
+         || processor->getPhysicalKeyDepthForTest (60, 1) != 0)
+        return false;
+
+    midi.addEvent (juce::MidiMessage::controllerEvent (1, 64, 0), 0);
+    process();
+
+    if (processor->getNativePedalHeldVoiceCountForTest (pedalFirst) != 0
+         || processor->getNativePedalHeldVoiceCountForTest (pedalSecond) != 0
+         || processor->getNativeReleasedVoiceCountForTest (pedalFirst) != 1
+         || processor->getNativeReleasedVoiceCountForTest (pedalSecond) != 1)
+        return false;
+
+    midi.addEvent (juce::MidiMessage::allSoundOff (1), 0);
+    process();
+
+    // A identidade da pressao deve sobreviver ao hot-reload. Um NoteOff antigo
+    // libera a voz recriada, nunca uma geracao posterior por coincidencia.
+    midi.addEvent (juce::MidiMessage::noteOn (
+                       1, 60, (juce::uint8) 105), 0);
+    process();
+    const auto reloadPress =
+        processor->getNativeLogicalPressIdForTest (60, 1, 0);
+
+    if (reloadPress == 0
+         || processor->getNativePressedVoiceCountForTest (reloadPress) != 1)
+        return false;
+
+    processor->loadTimbreIntoLayer (0, entryB, false);
+
+    if (! dispatchUntilLoaded (*processor, memoryPeak, 10)
+         || processor->getLayerTimbre (0) != entryB.label
+         || processor->getNativeLogicalPressIdForTest (60, 1, 0)
+                != reloadPress
+         || processor->getNativePressedVoiceCountForTest (reloadPress) != 1)
+        return false;
+
+    midi.addEvent (juce::MidiMessage::noteOff (1, 60), 0);
+    process();
+
+    if (processor->getPhysicalKeyDepthForTest (60, 1) != 0
+         || processor->getNativeLogicalPressCountForTest (60, 1) != 0
+         || processor->getNativePressedVoiceCountForTest (reloadPress) != 0
+         || processor->getNativeReleasedVoiceCountForTest (reloadPress) < 1)
+        return false;
+
+    // Defesa contra notas presas: Note-Off duplicado ou orfão não pode
+    // corromper depth nem prender vozes
+    midi.addEvent (juce::MidiMessage::noteOff (1, 60), 0);
+    process();
+
+    if (processor->getPhysicalKeyDepthForTest (60, 1) != 0
+         || processor->getNativeLogicalPressCountForTest (60, 1) != 0)
+        return false;
+
+    // Defesa contra notas presas: pedal de sustain com tecla já solta
+    // garante liberação completa ao soltar o pedal
+    midi.addEvent (juce::MidiMessage::controllerEvent (1, 64, 127), 0);
+    midi.addEvent (juce::MidiMessage::noteOn (1, 65, (juce::uint8) 100), 10);
+    midi.addEvent (juce::MidiMessage::noteOff (1, 65), 20);
+    process();
+
+    if (processor->getPhysicalKeyDepthForTest (65, 1) != 0
+         || processor->getNativeLogicalPressCountForTest (65, 1) != 0)
+        return false;
+
+    // Ao soltar o pedal de sustain, todas as vozes remanescentes devem ser liberadas
+    midi.addEvent (juce::MidiMessage::controllerEvent (1, 64, 0), 0);
+    process();
+
+    return processor->getPhysicalKeyDepthForTest (65, 1) == 0
+        && processor->getNativeLogicalPressCountForTest (65, 1) == 0;
+}
+
+bool runNativeSampleAccurateMidiProbe()
+{
+    constexpr int blockSize = 256;
+    constexpr int noteOnOffset = 40;
+    constexpr int noteOffOffset = 170;
+    constexpr int pedalOnOffset = 80;
+    constexpr int pedalNoteOffOffset = 130;
+    constexpr int pedalOffOffset = 200;
+    constexpr int allOffOffset = 220;
+
+    const auto temp = juce::File::getSpecialLocation (
+                          juce::File::tempDirectory)
+                          .getNonexistentChildFile (
+                              "churchdaw-native-midi-offset-probe",
+                              {}, false);
+
+    if (temp.createDirectory().failed())
+        return false;
+
+    const juce::ScopeGuard cleanup { [&temp]
+    {
+        temp.deleteRecursively (false);
+    } };
+    const auto sample = temp.getChildFile ("C3.wav");
+
+    if (! writeProbeWav (sample, 997.0f))
+        return false;
+
+    TimbresProcessor::TimbreEntry entry;
+    entry.label = "__Native Sample Accurate MIDI__";
+    entry.library = "Probe Pack";
+    entry.category = "PADS";
+    entry.files.add (sample);
+
+    enum class Case
+    {
+        held,
+        noteOff,
+        pedal,
+        allOff,
+        sameSampleAllOff
+    };
+
+    const auto render = [&] (Case which,
+                             juce::AudioBuffer<float>& result)
+    {
+        auto processor = std::make_unique<TimbresProcessor>();
+        processor->prepareToPlay (48000.0, blockSize);
+        processor->loadTimbreIntoLayer (0, entry, true);
+        std::atomic<size_t> memoryPeak { 0 };
+
+        if (! dispatchUntilLoaded (*processor, memoryPeak, 10)
+             || processor->getLayerTimbre (0) != entry.label)
+            return false;
+
+        *processor->getLayerAttackParam (0) = 0.001f;
+        *processor->getLayerReleaseParam (0) = 0.05f;
+
+        juce::AudioBuffer<float> settle (2, blockSize);
+        juce::MidiBuffer midi;
+
+        // Iguala os smoothers dos canais antes da comparacao; nenhum evento
+        // MIDI e usado nesse pre-roll e portanto nenhuma voz e criada.
+        for (int block = 0; block < 6; ++block)
+        {
+            settle.clear();
+            midi.clear();
+            processor->processBlock (settle, midi);
+        }
+
+        result.setSize (2, blockSize);
+        result.clear();
+        midi.clear();
+
+        const int onOffset = which == Case::sameSampleAllOff
+                                 ? 100 : noteOnOffset;
+        midi.addEvent (
+            juce::MidiMessage::noteOn (
+                1, 60, (juce::uint8) 127),
+            onOffset);
+
+        if (which == Case::noteOff)
+            midi.addEvent (
+                juce::MidiMessage::noteOff (1, 60),
+                noteOffOffset);
+        else if (which == Case::pedal)
+        {
+            midi.addEvent (
+                juce::MidiMessage::controllerEvent (
+                    1, 64, 127),
+                pedalOnOffset);
+            midi.addEvent (
+                juce::MidiMessage::noteOff (1, 60),
+                pedalNoteOffOffset);
+            midi.addEvent (
+                juce::MidiMessage::controllerEvent (
+                    1, 64, 0),
+                pedalOffOffset);
+        }
+        else if (which == Case::allOff)
+            midi.addEvent (
+                juce::MidiMessage::allSoundOff (1),
+                allOffOffset);
+        else if (which == Case::sameSampleAllOff)
+            midi.addEvent (
+                juce::MidiMessage::allSoundOff (1),
+                onOffset);
+
+        processor->processBlock (result, midi);
+        return true;
+    };
+
+    juce::AudioBuffer<float> held;
+    juce::AudioBuffer<float> noteReleased;
+    juce::AudioBuffer<float> pedalReleased;
+    juce::AudioBuffer<float> allOff;
+    juce::AudioBuffer<float> sameSampleAllOff;
+
+    if (! render (Case::held, held)
+         || ! render (Case::noteOff, noteReleased)
+         || ! render (Case::pedal, pedalReleased)
+         || ! render (Case::allOff, allOff)
+         || ! render (Case::sameSampleAllOff, sameSampleAllOff))
+        return false;
+
+    const auto maxAbs = [] (const juce::AudioBuffer<float>& audio,
+                            int start, int end)
+    {
+        float peak = 0.0f;
+
+        for (int channel = 0; channel < audio.getNumChannels(); ++channel)
+            for (int sampleIndex = start; sampleIndex < end; ++sampleIndex)
+                peak = juce::jmax (
+                    peak,
+                    std::abs (audio.getSample (channel, sampleIndex)));
+
+        return peak;
+    };
+
+    const auto maxDifference = [] (
+        const juce::AudioBuffer<float>& a,
+        const juce::AudioBuffer<float>& b,
+        int start, int end)
+    {
+        float peak = 0.0f;
+
+        for (int channel = 0; channel < a.getNumChannels(); ++channel)
+            for (int sampleIndex = start; sampleIndex < end; ++sampleIndex)
+                peak = juce::jmax (
+                    peak,
+                    std::abs (a.getSample (channel, sampleIndex)
+                              - b.getSample (channel, sampleIndex)));
+
+        return peak;
+    };
+
+    const auto firstDifference = [] (
+        const juce::AudioBuffer<float>& a,
+        const juce::AudioBuffer<float>& b,
+        float epsilon)
+    {
+        for (int sampleIndex = 0;
+             sampleIndex < a.getNumSamples();
+             ++sampleIndex)
+            for (int channel = 0;
+                 channel < a.getNumChannels();
+                 ++channel)
+                if (std::abs (a.getSample (channel, sampleIndex)
+                              - b.getSample (channel, sampleIndex))
+                     > epsilon)
+                    return sampleIndex;
+
+        return -1;
+    };
+
+    // A nota nao pode existir antes do offset e precisa produzir sinal real
+    // durante o intervalo em que a tecla esta fisicamente pressionada.
+    if (maxAbs (noteReleased, 0, noteOnOffset) > 1.0e-8f
+         || maxAbs (noteReleased, noteOnOffset + 48,
+                    noteOffOffset) < 1.0e-4f)
+        return false;
+
+    // NOTE OFF nao pode alterar uma unica amostra anterior a sua fronteira.
+    // Depois dela, a versao liberada precisa divergir da nota ainda segurada.
+    const int noteOffFirstDifference = firstDifference (
+        held, noteReleased, 1.0e-7f);
+
+    if (maxDifference (held, noteReleased, 0, noteOffOffset)
+            > 1.0e-7f
+         || noteOffFirstDifference < noteOffOffset
+         || maxDifference (held, noteReleased,
+                           noteOffOffset, blockSize) < 1.0e-5f)
+        return false;
+
+    // O note-off sob CC64 permanece identico a tecla segurada; a cauda so
+    // comeca quando o pedal sobe no offset 200.
+    const int pedalFirstDifference = firstDifference (
+        held, pedalReleased, 1.0e-7f);
+
+    if (maxDifference (held, pedalReleased, 0, pedalOffOffset)
+            > 1.0e-7f
+         || pedalFirstDifference < pedalOffOffset
+         || maxDifference (held, pedalReleased,
+                           pedalOffOffset, blockSize) < 1.0e-5f)
+        return false;
+
+    // ALL SOUND OFF tambem e uma fronteira temporal: o audio anterior fica
+    // intacto e apenas o declique posterior pode divergir.
+    const int allOffFirstDifference = firstDifference (
+        held, allOff, 1.0e-7f);
+
+    if (maxDifference (held, allOff, 0, allOffOffset)
+            > 1.0e-7f
+         || allOffFirstDifference < allOffOffset
+         || maxDifference (held, allOff,
+                           allOffOffset, blockSize) < 1.0e-5f)
+        return false;
+
+    // O guard central ordena eventos comuns antes de ALL OFF no mesmo sample.
+    // Como nao houve intervalo renderizavel entre eles, o bloco deve ser mudo.
+    return maxAbs (sameSampleAllOff, 0, blockSize) <= 1.0e-8f;
+}
+
+bool writeIgnoredLoopMarkerWav (const juce::File& file,
+                                int postMarkerStart = 30000,
+                                bool hardTail = false)
+{
+    auto output = file.createOutputStream();
+
+    if (output == nullptr)
+        return false;
+
+    juce::StringPairArray metadata;
+    metadata.set ("MidiUnityNote", "60");
+    metadata.set ("NumSampleLoops", "1");
+    metadata.set ("Loop0Identifier", "0");
+    metadata.set ("Loop0Type", "0");
+    metadata.set ("Loop0Start", "12000");
+    metadata.set ("Loop0End", "24000");
+    metadata.set ("Loop0Fraction", "0");
+    metadata.set ("Loop0PlayCount", "0");
+
+    auto* rawOutput = output.release();
+    juce::WavAudioFormat wav;
+    std::unique_ptr<juce::AudioFormatWriter> writer (
+        wav.createWriterFor (
+            rawOutput, 48000.0, 1, 16, metadata, 0));
+
+    if (writer == nullptr)
+    {
+        delete rawOutput;
+        return false;
+    }
+
+    constexpr int totalSamples = 72000;   // 1,5 s: maior que o preload de 0,75 s
+    juce::AudioBuffer<float> audio (1, totalSamples);
+
+    for (int i = 0; i < totalSamples; ++i)
+    {
+        const float frequency = i < postMarkerStart ? 440.0f : 997.0f;
+        const float fadeIn = juce::jlimit (0.0f, 1.0f, (float) i / 64.0f);
+        audio.setSample (
+            0, i,
+            hardTail && i >= postMarkerStart
+                ? 0.8f
+                : 0.2f * fadeIn * std::sin (
+                    juce::MathConstants<float>::twoPi
+                    * frequency * (float) i / 48000.0f));
+    }
+
+    const bool wrote = writer->writeFromAudioSampleBuffer (
+        audio, 0, audio.getNumSamples());
+    writer.reset();
+
+    if (! wrote)
+        return false;
+
+    auto input = file.createInputStream();
+    std::unique_ptr<juce::AudioFormatReader> reader (
+        wav.createReaderFor (input.release(), true));
+
+    return reader != nullptr
+        && reader->metadataValues.getValue (
+               "NumSampleLoops", "0").getIntValue() == 1
+        && reader->metadataValues.getValue (
+               "Loop0Start", "-1").getIntValue() == 12000
+        && reader->metadataValues.getValue (
+               "Loop0End", "-1").getIntValue() == 24000;
+}
+
+bool runIgnoredLoopMarkerPlaybackProbe()
+{
+    const auto temp = juce::File::getSpecialLocation (
+                          juce::File::tempDirectory)
+                          .getNonexistentChildFile (
+                              "churchdaw-no-timbre-loop-probe", {}, false);
+
+    if (temp.createDirectory().failed())
+        return false;
+
+    const juce::ScopeGuard cleanup { [&temp]
+    {
+        temp.deleteRecursively (false);
+    } };
+    const auto sample = temp.getChildFile ("C3.wav");
+
+    if (! writeIgnoredLoopMarkerWav (sample))
+        return false;
+
+    auto processor = std::make_unique<TimbresProcessor>();
+    processor->prepareToPlay (48000.0, 256);
+
+    TimbresProcessor::TimbreEntry entry;
+    entry.label = "__Ignored Loop Marker__";
+    entry.library = "Probe Pack";
+    entry.category = "PADS";
+    entry.files.add (sample);
+    processor->loadTimbreIntoLayer (0, entry, true);
+    std::atomic<size_t> memoryPeak { 0 };
+
+    if (! dispatchUntilLoaded (*processor, memoryPeak, 10)
+         || processor->getLayerTimbre (0) != entry.label
+         || ! processor->isFirstZoneStreamedForTest (0)
+         || processor->getFirstZoneResidentSamplesForTest (0) > 37000
+         || processor->getFirstZoneTotalSamplesForTest (0) < 71000)
+        return false;
+
+    const auto parameterById = [&processor] (const juce::String& id)
+        -> juce::AudioProcessorParameterWithID*
+    {
+        for (auto* parameter : processor->getParameters())
+            if (auto* identified =
+                    dynamic_cast<juce::AudioProcessorParameterWithID*> (
+                        parameter);
+                identified != nullptr && identified->paramID == id)
+                return identified;
+
+        return nullptr;
+    };
+
+    auto* legacyLoop = parameterById ("loop0");
+    auto* reverb = parameterById ("rvb0");
+    auto* compressor = parameterById ("comp0");
+    auto* delay = parameterById ("dly0");
+    auto* lowCut = parameterById ("lcut0");
+
+    if (legacyLoop == nullptr || reverb == nullptr
+         || compressor == nullptr || delay == nullptr || lowCut == nullptr
+         || std::abs (reverb->getValue()) > 1.0e-6f
+         || std::abs (compressor->getValue()) > 1.0e-6f
+         || std::abs (delay->getValue()) > 1.0e-6f)
+        return false;
+
+    // Prova forte: mesmo uma automacao antiga tentando ligar o tombstone nao
+    // pode alterar playback. Os demais ajustes deixam a analise espectral seca.
+    legacyLoop->setValueNotifyingHost (1.0f);
+    reverb->setValueNotifyingHost (0.0f);
+    compressor->setValueNotifyingHost (0.0f);
+    lowCut->setValueNotifyingHost (0.0f);
+
+    constexpr int blockSize = 256;
+    constexpr int totalRenderSamples = 86400;   // 1,8 s
+    constexpr int analysisStart = 40800;        // 0,85 s
+    constexpr int analysisEnd = 55200;          // 1,15 s
+    constexpr int tailStart = 79200;             // 1,65 s
+    juce::AudioBuffer<float> audio (2, blockSize);
+    juce::MidiBuffer midi;
+    double cos440 = 0.0, sin440 = 0.0;
+    double cos997 = 0.0, sin997 = 0.0;
+    double tailSquares = 0.0;
+    std::uint64_t tailCount = 0;
+
+    for (int rendered = 0; rendered < totalRenderSamples;
+         rendered += blockSize)
+    {
+        audio.clear();
+        midi.clear();
+
+        if (rendered == 0)
+            midi.addEvent (
+                juce::MidiMessage::noteOn (
+                    1, 60, (juce::uint8) 110), 0);
+
+        processor->processBlock (audio, midi);
+
+        const int valid = juce::jmin (
+            blockSize, totalRenderSamples - rendered);
+
+        for (int i = 0; i < valid; ++i)
+        {
+            const int sampleIndex = rendered + i;
+            const double value = audio.getSample (0, i);
+
+            if (! std::isfinite (value))
+                return false;
+
+            if (sampleIndex >= analysisStart
+                 && sampleIndex < analysisEnd)
+            {
+                const double phase440 =
+                    juce::MathConstants<double>::twoPi
+                    * 440.0 * (double) sampleIndex / 48000.0;
+                const double phase997 =
+                    juce::MathConstants<double>::twoPi
+                    * 997.0 * (double) sampleIndex / 48000.0;
+                cos440 += value * std::cos (phase440);
+                sin440 += value * std::sin (phase440);
+                cos997 += value * std::cos (phase997);
+                sin997 += value * std::sin (phase997);
+            }
+
+            if (sampleIndex >= tailStart)
+            {
+                tailSquares += value * value;
+                ++tailCount;
+            }
+        }
+
+        // A thread de streaming precisa receber o mesmo tempo que teria no app;
+        // assim um miss de disco e defeito real, nao artefato do render offline.
+        std::this_thread::sleep_for (std::chrono::milliseconds (6));
+    }
+
+    const double energy440 = cos440 * cos440 + sin440 * sin440;
+    const double energy997 = cos997 * cos997 + sin997 * sin997;
+    const double tailRms = tailCount > 0
+                             ? std::sqrt (
+                                   tailSquares / (double) tailCount)
+                             : 1.0;
+
+    return legacyLoop->getValue() > 0.5f
+        && energy997 > 1.0e-4
+        && energy997 > energy440 * 16.0
+        && processor->getActiveVoiceCount() == 0
+        && processor->getStreamMissCount() == 0
+        && tailRms < 1.0e-7;
+}
+
+bool runExplicitSidecarLoopPlaybackProbe()
+{
+    const auto temp = juce::File::getSpecialLocation (
+                          juce::File::tempDirectory)
+                          .getNonexistentChildFile (
+                              "churchdaw-explicit-loop-probe", {}, false);
+
+    if (temp.createDirectory().failed())
+        return false;
+
+    const juce::ScopeGuard cleanup { [&temp]
+    {
+        temp.deleteRecursively (false);
+    } };
+    const auto sample = temp.getChildFile ("C3.wav");
+
+    // A cauda fisica comeca exatamente em loopEnd e e deliberadamente muito
+    // diferente do loop. Assim o teste tambem detecta a Hermite consultando
+    // loopEnd/loopEnd+1 em vez dos dois guardas copiados de loopStart.
+    if (! writeIgnoredLoopMarkerWav (sample, 24000, true))
+        return false;
+
+    const auto map = temp.getChildFile ("churchdaw-timbre.json");
+    const juce::String mapJson = R"json({
+  "schema": 1,
+  "tone": {
+    "profileRevision": 1,
+    "volumeLinear": 1.0,
+    "octave": 0,
+    "attackSeconds": 0.001,
+    "releaseSeconds": 0.05,
+    "lowCut": 0.0,
+    "highCut": 0.0,
+    "eqLowDb": 0.0,
+    "eqMidDb": 0.0,
+    "eqHighDb": 0.0,
+    "compressor": 0.0,
+    "delay": 0.0,
+    "reverbSend": 0.0,
+    "autoEq": false,
+    "rotaryMode": "stop",
+    "rotaryAmount": 0.0
+  },
+  "zones": [
+    {
+      "file": "C3.wav",
+      "root": 60,
+      "keyLo": 0,
+      "keyHi": 127,
+      "sourceLoop": {
+        "sourceLoops": true,
+        "startFrame": 12000,
+        "endFrame": 24000,
+        "playback": true
+      }
+    }
+  ]
+})json";
+
+    if (! map.replaceWithText (mapJson))
+        return false;
+
+    auto processor = std::make_unique<TimbresProcessor>();
+    processor->prepareToPlay (48000.0, 256);
+
+    TimbresProcessor::TimbreEntry entry;
+    entry.label = "__Explicit Sidecar Loop__";
+    entry.library = "Probe Pack";
+    entry.category = "PADS";
+    entry.files.add (sample);
+    processor->loadTimbreIntoLayer (0, entry, true);
+    std::atomic<size_t> memoryPeak { 0 };
+
+    if (! dispatchUntilLoaded (*processor, memoryPeak, 10)
+         || processor->getLayerTimbre (0) != entry.label
+         || processor->isFirstZoneStreamedForTest (0)
+         || processor->getFirstZoneResidentSamplesForTest (0) < 71000)
+        return false;
+
+    const int loopStart = processor->getZoneLoopStartForTest (0, 61);
+    const int loopEnd = processor->getZoneLoopEndForTest (0, 61);
+
+    if (loopStart < 11900 || loopStart > 12000
+         || loopEnd - loopStart != 12000)
+        return false;
+
+    constexpr int blockSize = 256;
+    constexpr int heldSamples = 67200; // 1,4 s: varias voltas e alem do WAV
+    juce::AudioBuffer<float> audio (2, blockSize);
+    juce::MidiBuffer midi;
+    double lateSquares = 0.0;
+    std::uint64_t lateCount = 0;
+    float previous = 0.0f;
+    float maxAdjacent = 0.0f;
+    bool havePrevious = false;
+
+    for (int rendered = 0; rendered < heldSamples; rendered += blockSize)
+    {
+        audio.clear();
+        midi.clear();
+
+        // Um semitom acima da root obriga a Hermite a atravessar a fronteira.
+        if (rendered == 0)
+            midi.addEvent (
+                juce::MidiMessage::noteOn (
+                    1, 61, (juce::uint8) 110), 0);
+
+        processor->processBlock (audio, midi);
+        const int valid = juce::jmin (
+            blockSize, heldSamples - rendered);
+
+        for (int i = 0; i < valid; ++i)
+        {
+            const float value = audio.getSample (0, i);
+
+            if (! std::isfinite (value))
+                return false;
+
+            if (havePrevious)
+                maxAdjacent = juce::jmax (
+                    maxAdjacent, std::abs (value - previous));
+
+            previous = value;
+            havePrevious = true;
+
+            if (rendered + i >= 57600)
+            {
+                lateSquares += (double) value * (double) value;
+                ++lateCount;
+            }
+        }
+    }
+
+    const double lateRms = lateCount > 0
+                             ? std::sqrt (lateSquares / (double) lateCount)
+                             : 0.0;
+
+    if (processor->getActiveVoiceCount() == 0
+         || processor->getStreamMissCount() != 0
+         || lateRms < 1.0e-3
+         || maxAdjacent > 0.04f)
+        return false;
+
+    // A voz loopada continua obedecendo ao note-off/release normal.
+    for (int rendered = 0; rendered < 48000; rendered += blockSize)
+    {
+        audio.clear();
+        midi.clear();
+
+        if (rendered == 0)
+            midi.addEvent (
+                juce::MidiMessage::noteOff (1, 61), 0);
+
+        processor->processBlock (audio, midi);
+    }
+
+    return processor->getActiveVoiceCount() == 0
+        && processor->getStreamMissCount() == 0;
+}
+
+bool runEvenRootBoundaryProbe()
+{
+    const auto temp = juce::File::getSpecialLocation (
+                          juce::File::tempDirectory)
+                          .getNonexistentChildFile (
+                              "churchdaw-even-root-boundary-probe", {}, false);
+
+    if (temp.createDirectory().failed())
+        return false;
+
+    const juce::ScopeGuard cleanup { [&temp]
+    {
+        temp.deleteRecursively (false);
+    } };
+
+    constexpr std::array<const char*, 9> names {
+        "Map-C1-V127-0008.wav", "Map-F#1-V127-0007.wav",
+        "Map-C2-V127-0006.wav", "Map-F#2-V127-0005.wav",
+        "Map-C3-V127-0004.wav", "Map-F#3-V127-0003.wav",
+        "Map-C4-V127-0002.wav", "Map-F#4-V127-0001.wav",
+        "Map-C5-V127-0000.wav"
+    };
+
+    TimbresProcessor::TimbreEntry entry;
+    entry.label = "__Even Root Boundary__";
+    entry.library = "Probe Pack";
+    entry.category = "PADS";
+
+    for (std::size_t i = 0; i < names.size(); ++i)
+    {
+        const auto sample = temp.getChildFile (names[i]);
+
+        if (! writeProbeWav (sample, 180.0f + (float) i * 37.0f))
+            return false;
+
+        entry.files.add (sample);
+    }
+
+    const auto map = temp.getChildFile ("churchdaw-timbre.json");
+    const juce::String mapJson = R"json({
+  "schema": 1,
+  "tone": {
+    "profileRevision": 7,
+    "volumeLinear": 0.61,
+    "octave": -2,
+    "attackSeconds": 0.021,
+    "releaseSeconds": 2.34,
+    "lowCut": 0.73,
+    "highCut": 0.41,
+    "eqLowDb": -6.0,
+    "eqMidDb": -4.0,
+    "eqHighDb": 2.0,
+    "compressor": 0.27,
+    "delay": 0.18,
+    "reverbSend": 0.36,
+    "autoEq": false,
+    "rotaryMode": "stop",
+    "rotaryAmount": 0.0
+  },
+  "zones": [
+    { "file": "Map-C1-V127-0008.wav",  "root": 36, "keyLo": 17, "keyHi": 38 },
+    { "file": "Map-F#1-V127-0007.wav", "root": 42, "keyLo": 39, "keyHi": 44 },
+    { "file": "Map-C2-V127-0006.wav",  "root": 48, "keyLo": 45, "keyHi": 50 },
+    { "file": "Map-F#2-V127-0005.wav", "root": 54, "keyLo": 51, "keyHi": 56 },
+    { "file": "Map-C3-V127-0004.wav",  "root": 60, "keyLo": 57, "keyHi": 62 },
+    { "file": "Map-F#3-V127-0003.wav", "root": 66, "keyLo": 63, "keyHi": 68 },
+    { "file": "Map-C4-V127-0002.wav",  "root": 72, "keyLo": 69, "keyHi": 74 },
+    { "file": "Map-F#4-V127-0001.wav", "root": 78, "keyLo": 75, "keyHi": 80 },
+    { "file": "Map-C5-V127-0000.wav",  "root": 84, "keyLo": 81, "keyHi": 108 }
+  ]
+})json";
+
+    if (! map.replaceWithText (mapJson))
+        return false;
+
+    auto processor = std::make_unique<TimbresProcessor>();
+    processor->prepareToPlay (48000.0, 256);
+    processor->loadTimbreIntoLayer (0, entry, true);
+    std::atomic<size_t> memoryPeak { 0 };
+
+    if (! dispatchUntilLoaded (*processor, memoryPeak, 10)
+         || processor->getLayerTimbre (0) != entry.label)
+        return false;
+
+    // A tone sidecar may describe envelope/EQ, but never owns the channel
+    // octave. Legacy pad sidecars with octave=-2 must open at the neutral
+    // channel setting; the musician changes this knob explicitly if wanted.
+    if (processor->getLayerOctaveParam (0) == nullptr
+         || processor->getLayerOctaveParam (0)->get() != 0)
+        return false;
+
+    // O Nord entrega a metade exata ao root de cima quando a distancia entre
+    // roots e par. Antes, MIDI 57 ainda escolhia F#2 (root 54); o arquivo era
+    // transposto +3 em vez de C3 (root 60) transposto -3, mudando o timbre.
+    constexpr std::array<std::pair<int, int>, 10> expected {{
+        { 38, 36 }, { 39, 42 }, { 44, 42 }, { 45, 48 },
+        { 56, 54 }, { 57, 60 }, { 62, 60 }, { 63, 66 },
+        { 80, 78 }, { 81, 84 }
+    }};
+
+    for (const auto [note, expectedRoot] : expected)
+        if (processor->getZoneRootNoteForTest (0, note) != expectedRoot)
+        {
+            return false;
+        }
+
+    // Varre o MIDI inteiro, nao apenas as fronteiras exemplares. Isto protege
+    // buracos, sobreposicoes e uma zona esticada acidentalmente alem do Nord.
+    constexpr std::array<std::array<int, 3>, 9> expectedZones {{
+        {{ 17, 38, 36 }}, {{ 39, 44, 42 }}, {{ 45, 50, 48 }},
+        {{ 51, 56, 54 }}, {{ 57, 62, 60 }}, {{ 63, 68, 66 }},
+        {{ 69, 74, 72 }}, {{ 75, 80, 78 }}, {{ 81, 108, 84 }}
+    }};
+
+    for (int note = 0; note < 128; ++note)
+    {
+        int expectedRoot = -1;
+
+        for (const auto& zone : expectedZones)
+            if (note >= zone[0] && note <= zone[1])
+            {
+                expectedRoot = zone[2];
+                break;
+            }
+
+        if (processor->getZoneRootNoteForTest (0, note) != expectedRoot)
+        {
+            return false;
+        }
+    }
+
+    // As pontas tambem pertencem ao mapa autoral. Sem o sidecar C5 era
+    // esticada ate 127 (mais de 3,5 oitavas nesta taxa), fonte de aliasing.
+    if (processor->getZoneRootNoteForTest (0, 16) != -1
+         || processor->getZoneRootNoteForTest (0, 17) != 36
+         || processor->getZoneRootNoteForTest (0, 108) != 84
+         || processor->getZoneRootNoteForTest (0, 109) != -1)
+        return false;
+
+
+    const auto findFloatParameter = [] (
+        TimbresProcessor& owner,
+        const juce::String& parameterId) -> juce::AudioParameterFloat*
+    {
+        for (auto* parameter : owner.getParameters())
+            if (auto* identified =
+                    dynamic_cast<juce::AudioProcessorParameterWithID*> (
+                        parameter);
+                identified != nullptr && identified->paramID == parameterId)
+                return dynamic_cast<juce::AudioParameterFloat*> (parameter);
+
+        return nullptr;
+    };
+
+    const auto close = [] (float actual, float expected)
+    {
+        return std::isfinite (actual)
+            && std::abs (actual - expected) <= 0.0001f;
+    };
+
+    const auto* lowCut = findFloatParameter (*processor, "lcut0");
+    const auto* highCut = findFloatParameter (*processor, "hcut0");
+    const auto* compressor = findFloatParameter (*processor, "comp0");
+    const auto* delay = findFloatParameter (*processor, "dly0");
+
+    if (lowCut == nullptr || highCut == nullptr
+         || compressor == nullptr || delay == nullptr
+         || ! close (dynamic_cast<juce::AudioParameterFloat*> (
+                         processor->getLayerVolParam (0))->get(), 0.61f)
+         || processor->getLayerOctaveParam (0)->get() != 0
+         || ! close (processor->getLayerAttackParam (0)->get(), 0.021f)
+         || ! close (processor->getLayerReleaseParam (0)->get(), 2.34f)
+         || ! close (lowCut->get(), 0.73f)
+         || ! close (highCut->get(), 0.41f)
+         || ! close (processor->getLayerLowEqParam (0)->get(), -6.0f)
+         || ! close (processor->getLayerMidEqParam (0)->get(), -4.0f)
+         || ! close (processor->getLayerHighEqParam (0)->get(), 2.0f)
+         || ! close (compressor->get(), 0.27f)
+         || ! close (delay->get(), 0.18f)
+         || ! close (processor->getLayerReverbSendParam (0)->get(), 0.36f)
+         || processor->getLayerRotaryModeParam (0)->getIndex()
+                != ChurchDAWRotary::Speaker::stopMode
+         || ! close (processor->getLayerRotaryAmountParam (0)->get(), 0.0f))
+        return false;
+
+    juce::MemoryBlock profiledState;
+    processor->getStateInformation (profiledState);
+    const auto profiledXml =
+        juce::AudioProcessor::getXmlFromBinary (
+            profiledState.getData(),
+            (int) profiledState.getSize());
+    bool savedProfileRevision = false;
+
+    if (profiledXml != nullptr)
+        forEachXmlChildElementWithTagName (
+            *profiledXml, layer, "LAYER")
+            if (layer->getIntAttribute ("index", -1) == 0)
+                savedProfileRevision =
+                    layer->getIntAttribute (
+                        "toneProfileRevision", 0) == 7;
+
+    if (! savedProfileRevision)
+        return false;
+
+    return true;
+}
+
+bool runIdleDelayTailGainProbe()
+{
+    constexpr int blockSize = 256;
+    constexpr int delaySamples = (int) (0.38 * 48000.0);
+    constexpr int windowSamples = 900;
+    constexpr int renderSamples = delaySamples * 3 + windowSamples;
+
+    const auto temp = juce::File::getSpecialLocation (
+                          juce::File::tempDirectory)
+                          .getNonexistentChildFile (
+                              "churchdaw-idle-delay-tail-probe", {}, false);
+
+    if (temp.createDirectory().failed())
+        return false;
+
+    const juce::ScopeGuard cleanup { [&temp]
+    {
+        temp.deleteRecursively (false);
+    } };
+
+    const auto sample = temp.getChildFile (
+        "Delay-C3-V127.wav");
+
+    if (! writeShortDelayBurstWav (sample))
+        return false;
+
+    TimbresProcessor::TimbreEntry entry;
+    entry.label = "__Idle Delay Tail__";
+    entry.library = "Probe Pack";
+    entry.category = "PIANOS";
+    entry.files.add (sample);
+
+    const auto findFloatParameter = [] (
+        TimbresProcessor& owner,
+        const juce::String& parameterId) -> juce::AudioParameterFloat*
+    {
+        for (auto* parameter : owner.getParameters())
+            if (auto* identified =
+                    dynamic_cast<juce::AudioProcessorParameterWithID*> (
+                        parameter);
+                identified != nullptr && identified->paramID == parameterId)
+                return dynamic_cast<juce::AudioParameterFloat*> (parameter);
+
+        return nullptr;
+    };
+
+    const auto render = [&] (float amount,
+                             std::array<float, 3>& peaks)
+    {
+        auto processor = std::make_unique<TimbresProcessor>();
+        processor->prepareToPlay (48000.0, blockSize);
+        processor->loadTimbreIntoLayer (0, entry, true);
+        std::atomic<size_t> memoryPeak { 0 };
+
+        if (! dispatchUntilLoaded (*processor, memoryPeak, 10))
+            return false;
+
+        auto* delay = findFloatParameter (*processor, "dly0");
+
+        if (delay == nullptr)
+            return false;
+
+        *delay = amount;
+        *processor->getLayerAttackParam (0) = 0.001f;
+        *processor->getLayerReleaseParam (0) = 0.05f;
+        *processor->getLayerReverbSendParam (0) = 0.0f;
+
+        juce::AudioBuffer<float> audio (2, blockSize);
+        juce::MidiBuffer midi;
+
+        // Deixa os smoothers chegarem ao alvo sem preencher a linha de delay.
+        for (int block = 0; block < 190; ++block)
+        {
+            audio.clear();
+            midi.clear();
+            processor->processBlock (audio, midi);
+        }
+
+        peaks.fill (0.0f);
+
+        for (int rendered = 0; rendered < renderSamples;
+             rendered += blockSize)
+        {
+            audio.clear();
+            midi.clear();
+
+            if (rendered == 0)
+                midi.addEvent (
+                    juce::MidiMessage::noteOn (
+                        1, 60, (juce::uint8) 127), 0);
+
+            processor->processBlock (audio, midi);
+
+            for (int s = 0; s < blockSize; ++s)
+            {
+                const int absolute = rendered + s;
+
+                for (int echo = 0; echo < 3; ++echo)
+                {
+                    const int begin = delaySamples * (echo + 1);
+
+                    if (absolute >= begin
+                         && absolute < begin + windowSamples)
+                        peaks[(std::size_t) echo] = juce::jmax (
+                            peaks[(std::size_t) echo],
+                            std::abs (audio.getSample (0, s)),
+                            std::abs (audio.getSample (1, s)));
+                }
+            }
+        }
+
+        return true;
+    };
+
+    std::array<float, 3> low {}, high {};
+
+    if (! render (0.10f, low) || ! render (0.50f, high))
+        return false;
+
+    for (std::size_t echo = 0; echo < low.size(); ++echo)
+    {
+        if (low[echo] <= 1.0e-6f || high[echo] <= 1.0e-6f)
+            return false;
+
+        const float amountRatio = high[echo] / low[echo];
+
+        if (amountRatio < 4.7f || amountRatio > 5.3f)
+            return false;
+    }
+
+    // O segundo eco ja cai depois do limiar ocioso de 0,6 s. Ele deve manter
+    // o feedback de 0,32 e a dose do knob, nao saltar para wet=1 nem sumir.
+    for (const auto& peaks : { low, high })
+    {
+        const float feedback12 = peaks[1] / peaks[0];
+        const float feedback23 = peaks[2] / peaks[1];
+
+        if (feedback12 < 0.27f || feedback12 > 0.37f
+             || feedback23 < 0.27f || feedback23 > 0.37f)
+            return false;
+    }
+
+    return true;
 }
 
 bool runChurchOrganLayerIntegrationProbe()
@@ -3516,6 +5524,101 @@ NativeFamilyLevel renderNativeFamilyLevel (
     return result;
 }
 
+bool runNativeSourceMetadataGainProbe()
+{
+    constexpr double sourceGain = 1.716853141784668; // Astralis.nsmp4
+    const auto temp = juce::File::getSpecialLocation (
+                          juce::File::tempDirectory)
+                          .getNonexistentChildFile (
+                              "churchdaw-source-metadata-gain-probe",
+                              {}, false);
+
+    if (temp.createDirectory().failed())
+        return false;
+
+    const juce::ScopeGuard cleanup { [&temp]
+    {
+        temp.deleteRecursively (false);
+    } };
+    const auto neutralDir = temp.getChildFile ("Neutral");
+    const auto gainedDir = temp.getChildFile ("Gained");
+    const auto bakedDir = temp.getChildFile ("AlreadyApplied");
+
+    if (neutralDir.createDirectory().failed()
+         || gainedDir.createDirectory().failed()
+         || bakedDir.createDirectory().failed())
+        return false;
+
+    const auto neutralSample = neutralDir.getChildFile ("C3.wav");
+    const auto gainedSample = gainedDir.getChildFile ("C3.wav");
+    const auto bakedSample = bakedDir.getChildFile ("C3.wav");
+
+    if (! writeProbeWav (neutralSample, 261.625565f)
+         || ! writeProbeWav (gainedSample, 261.625565f)
+         || ! writeProbeWav (bakedSample, 261.625565f))
+        return false;
+
+    const auto sidecar = [] (double gain, bool applied)
+    {
+        return juce::String (R"json({
+  "schema": 1,
+  "globalGain": {
+    "linear": )json")
+            + juce::String (gain, 12)
+            + juce::String (R"json(,
+    "appliedToPcm": )json")
+            + (applied ? "true" : "false")
+            + R"json(
+  },
+  "globalDetune": {
+    "cents": 0.0,
+    "appliedToPcm": false
+  },
+  "zones": [
+    { "file": "C3.wav", "root": 60,
+      "keyLo": 0, "keyHi": 127, "velLo": 0, "velHi": 127 }
+  ]
+})json";
+    };
+
+    if (! gainedDir.getChildFile ("churchdaw-timbre.json")
+             .replaceWithText (sidecar (sourceGain, false))
+         || ! bakedDir.getChildFile ("churchdaw-timbre.json")
+                 .replaceWithText (sidecar (sourceGain, true)))
+        return false;
+
+    const auto neutral = renderNativeFamilyLevel (
+        neutralSample, "PIANOS", 1);
+    const auto gained = renderNativeFamilyLevel (
+        gainedSample, "PIANOS", 1);
+    const auto alreadyApplied = renderNativeFamilyLevel (
+        bakedSample, "PIANOS", 1);
+
+    if (! neutral.ok || ! gained.ok || ! alreadyApplied.ok
+         || neutral.rms <= 0.0 || neutral.peak <= 0.0f)
+        return false;
+
+    const double rmsRatio = gained.rms / neutral.rms;
+    const double peakRatio = (double) gained.peak / (double) neutral.peak;
+    const double bakedRmsRatio = alreadyApplied.rms / neutral.rms;
+    const double bakedPeakRatio =
+        (double) alreadyApplied.peak / (double) neutral.peak;
+
+    const bool passed = std::abs (rmsRatio - sourceGain) < 0.002
+        && std::abs (peakRatio - sourceGain) < 0.002
+        && std::abs (bakedRmsRatio - 1.0) < 0.002
+        && std::abs (bakedPeakRatio - 1.0) < 0.002;
+
+    if (passed)
+        std::cout << "NATIVE_SOURCE_METADATA_GAIN_OK"
+                  << " source_gain=" << sourceGain
+                  << " rms_ratio=" << rmsRatio
+                  << " peak_ratio=" << peakRatio
+                  << " applied_pcm_ratio=" << bakedRmsRatio << "\n";
+
+    return passed;
+}
+
 bool runNativeFamilyGainMatrix()
 {
     if (std::abs (
@@ -3620,6 +5723,37 @@ bool waitForLibraryScan (TimbresProcessor& processor,
         juce::MessageManager::getInstance()->runDispatchLoopUntil (10);
 
     return processor.hasScannedLibrary();
+}
+
+bool runSidecarCategoryDiscoveryProbe()
+{
+    const auto temp = juce::File::getSpecialLocation (
+                          juce::File::tempDirectory)
+                          .getNonexistentChildFile (
+                              "churchdaw-sidecar-category-probe",
+                              {}, false);
+
+    if (temp.createDirectory().failed())
+        return false;
+
+    const juce::ScopeGuard cleanup { [&temp]
+    {
+        temp.deleteRecursively (false);
+    } };
+
+    if (! writeProbeWav (
+            temp.getChildFile ("Sanfona-C3-V127-0000.wav"),
+            261.625565f)
+         || ! temp.getChildFile ("churchdaw-timbre.json")
+                  .replaceWithText (
+                      R"json({"schema":1,"name":"Sanfona","category":"ORGAOS"})json"))
+        return false;
+
+    const auto entries = TimbresProcessor::scanTimbres (temp);
+
+    return entries.size() == 1
+        && entries.getReference (0).label == "Sanfona"
+        && entries.getReference (0).category == "ORGAOS";
 }
 
 bool runCatalogAndLegacyOrganRestoreProbe()
@@ -4133,9 +6267,298 @@ bool runAsyncPluginLoadStateProbe()
 }
 }
 
+//==============================================================================
+// CONTINUIDADE ENTRE CAMADAS DE VELOCITY (reclamacao de cliente, set/2026:
+// "da pra ouvir no PA a troca de camadas"). Toca a MESMA nota de velocity 1 a
+// 127 com a cadeia neutra, mede o RMS dos primeiros 0,5 s da saida real do
+// motor e compara o maior degrau entre velocities vizinhas com o casamento de
+// nivel desligado (comportamento antigo) e ligado.
+//
+// Uso: ChurchDAWTimbreLoadStressTests --velocity-continuity <pasta> <prefixo> [nota ...]
+static bool neutraliseLayerZero (TimbresProcessor& processor,
+                                 const TimbresProcessor::TimbreEntry& entry)
+{
+    processor.applyFactoryTimbreShape (0, entry.label, entry.category, false);
+    *processor.getLayerAttackParam (0) = 0.001f;
+    *processor.getLayerReleaseParam (0) = 0.05f;
+    *processor.getLayerLowEqParam (0) = 0.0f;
+    *processor.getLayerMidEqParam (0) = 0.0f;
+    *processor.getLayerHighEqParam (0) = 0.0f;
+    *processor.getLayerRotaryModeParam (0) = ChurchDAWRotary::Speaker::stopMode;
+    *processor.getLayerRotaryAmountParam (0) = 0.0f;
+    *processor.getLayerReverbSendParam (0) = 0.0f;
+
+    auto* volume = dynamic_cast<juce::AudioParameterFloat*> (processor.getLayerVolParam (0));
+    auto* compressor = dynamic_cast<juce::AudioParameterFloat*> (processor.getLayerCompParam (0));
+    if (volume == nullptr || compressor == nullptr)
+        return false;
+    *volume = 1.0f;
+    *compressor = 0.0f;
+
+    for (auto* parameter : processor.getParameters())
+        if (auto* identified = dynamic_cast<juce::AudioProcessorParameterWithID*> (parameter))
+        {
+            if (identified->paramID == "lcut0" || identified->paramID == "hcut0" || identified->paramID == "dly0")
+            {
+                if (auto* value = dynamic_cast<juce::AudioParameterFloat*> (parameter)) *value = 0.0f;
+            }
+            else if (identified->paramID == "aeq0")
+            {
+                if (auto* value = dynamic_cast<juce::AudioParameterBool*> (parameter)) *value = false;
+            }
+        }
+    return true;
+}
+
+static std::array<float, 128> sweepVelocities (TimbresProcessor& processor, int midiNote,
+                                               double sampleRate, int blockSize)
+{
+    std::array<float, 128> levelDb {};
+    const int measureSamples = (int) (0.5 * sampleRate) / blockSize * blockSize;
+    const int tailSamples = (int) (0.4 * sampleRate) / blockSize * blockSize;
+    juce::AudioBuffer<float> audio (2, blockSize);
+    juce::MidiBuffer midi;
+
+    for (int velocity = 1; velocity <= 127; ++velocity)
+    {
+        double energy = 0.0;
+        juce::int64 counted = 0;
+
+        for (int rendered = 0; rendered < measureSamples + tailSamples; rendered += blockSize)
+        {
+            audio.clear();
+            midi.clear();
+            if (rendered == 0)
+                midi.addEvent (juce::MidiMessage::noteOn (1, midiNote, (juce::uint8) velocity), 0);
+            if (rendered == measureSamples)
+                midi.addEvent (juce::MidiMessage::noteOff (1, midiNote), 0);
+            processor.processBlock (audio, midi);
+
+            if (rendered < measureSamples)
+                for (int channel = 0; channel < audio.getNumChannels(); ++channel)
+                {
+                    const float* samples = audio.getReadPointer (channel);
+                    for (int i = 0; i < blockSize; ++i)
+                        energy += (double) samples[i] * samples[i];
+                    counted += blockSize;
+                }
+        }
+
+        levelDb[(size_t) velocity] = (float) (10.0 * std::log10 (
+            std::max (1.0e-14, energy / (double) std::max<juce::int64> (1, counted))));
+    }
+    return levelDb;
+}
+
+static int runVelocityContinuityProbe (const juce::File& directory, const juce::String& prefix,
+                                       juce::Array<int> notes)
+{
+    const auto files = collectSamples (directory, prefix);
+    if (files.size() < 2)
+    {
+        std::cerr << "Biblioteca/prefixo invalido: " << files.size() << " samples\n";
+        return 3;
+    }
+
+    TimbresProcessor::TimbreEntry entry;
+    entry.label = prefix;
+    entry.library = "Velocity Probe";
+    entry.category = "PIANOS";
+    entry.files = files;
+
+    constexpr double sampleRate = 48000.0;
+    constexpr int blockSize = 256;
+    TimbresProcessor processor;
+    processor.prepareToPlay (sampleRate, blockSize);
+    processor.loadTimbreIntoLayer (0, entry, true);
+    std::atomic<size_t> peak { 0 };
+
+    if (! dispatchUntilLoaded (processor, peak, 180) || processor.getLayerTimbre (0) != entry.label)
+    {
+        std::cerr << "Timbre nao carregou\n";
+        return 4;
+    }
+    if (! neutraliseLayerZero (processor, entry))
+        return 5;
+
+    juce::AudioBuffer<float> warm (2, blockSize);
+    juce::MidiBuffer none;
+    for (int block = 0; block < 32; ++block) { warm.clear(); processor.processBlock (warm, none); }
+
+    if (notes.isEmpty())
+        notes = { 48, 60, 72 };
+
+    bool improved = true;
+    for (const int note : notes)
+    {
+        float worst[2] {}, median[2] {};
+        int audible[2] {};
+        for (const bool matched : { false, true })
+        {
+            churchDAWLayerLevelMatchingForTests.store (matched);
+            const auto level = sweepVelocities (processor, note, sampleRate, blockSize);
+            std::vector<float> steps;
+            for (int v = 2; v <= 127; ++v)
+                steps.push_back (level[(size_t) v] - level[(size_t) v - 1]);
+            std::vector<float> sorted (steps);
+            std::sort (sorted.begin(), sorted.end());
+            const int index = matched ? 1 : 0;
+            worst[index] = sorted.back();
+            median[index] = sorted[sorted.size() / 2];
+            audible[index] = (int) std::count_if (steps.begin(), steps.end(),
+                                                  [] (float s) { return std::abs (s) > 1.0f; });
+            std::cout << "VELOCITY_SWEEP note=" << note << (matched ? " casado" : " antigo ")
+                      << " v1=" << level[1] << "dB v64=" << level[64] << "dB v127=" << level[127]
+                      << "dB faixa=" << (level[127] - level[1]) << "dB maior_degrau=" << worst[index]
+                      << "dB degrau_mediano=" << median[index] << "dB degraus>1dB=" << audible[index];
+            std::cout << " em:";
+            for (int v = 2; v <= 127; ++v)
+            {
+                const float s = level[(size_t) v] - level[(size_t) v - 1];
+                if (std::abs (s) > 1.0f)
+                    std::cout << ' ' << (v - 1) << "->" << v << '(' << juce::String (s, 1) << ')';
+            }
+            std::cout << '\n';
+        }
+        // Timbre de camada unica sai identico (nada a casar): "nao piorou" basta.
+        improved = improved && worst[1] <= worst[0] + 0.01f && audible[1] <= audible[0];
+    }
+
+    churchDAWLayerLevelMatchingForTests.store (true);
+    std::cout << (improved ? "VELOCITY_CONTINUITY_OK\n" : "VELOCITY_CONTINUITY_REGRESSION\n");
+    return improved ? 0 : 1;
+}
+
+// Todos os timbres que o app enxerga (mesma varredura das Bibliotecas): para
+// cada um, quantas trocas de camada audiveis (>1 dB, ignorando a base v1-4 da
+// curva) existem com o casamento desligado e ligado.
+static int runVelocityContinuityAllProbe()
+{
+    const auto entries = TimbresProcessor::scanAllLibraries (nullptr, false);
+    if (entries.isEmpty())
+    {
+        std::cerr << "Nenhum timbre encontrado nas bibliotecas\n";
+        return 3;
+    }
+
+    constexpr double sampleRate = 48000.0;
+    constexpr int blockSize = 256;
+    bool ok = true;
+
+    for (const auto& entry : entries)
+    {
+        TimbresProcessor processor;
+        processor.prepareToPlay (sampleRate, blockSize);
+        processor.loadTimbreIntoLayer (0, entry, true);
+        std::atomic<size_t> peak { 0 };
+
+        if (! dispatchUntilLoaded (processor, peak, 180) || processor.getLayerTimbre (0) != entry.label
+             || ! neutraliseLayerZero (processor, entry))
+        {
+            std::cout << "TIMBRE \"" << entry.label << "\" nao carregou\n";
+            continue;
+        }
+
+        juce::AudioBuffer<float> warm (2, blockSize);
+        juce::MidiBuffer none;
+        for (int block = 0; block < 32; ++block) { warm.clear(); processor.processBlock (warm, none); }
+
+        int jumps[2] {};
+        float worst[2] {};
+        int measuredNotes = 0;
+        for (const int note : { 48, 60, 72 })
+        {
+            bool audibleNote = false;
+            for (const bool matched : { false, true })
+            {
+                churchDAWLayerLevelMatchingForTests.store (matched);
+                const auto level = sweepVelocities (processor, note, sampleRate, blockSize);
+                if (level[127] < -90.0f) continue;          // nota fora da regiao do timbre
+                audibleNote = true;
+                const int index = matched ? 1 : 0;
+                for (int v = 6; v <= 127; ++v)               // v1-5: base da curva, igual nos dois
+                {
+                    const float step = level[(size_t) v] - level[(size_t) v - 1];
+                    worst[index] = std::max (worst[index], step);
+                    if (step > 1.0f) ++jumps[index];
+                }
+            }
+            if (audibleNote) ++measuredNotes;
+        }
+        churchDAWLayerLevelMatchingForTests.store (true);
+
+        const bool noWorse = worst[1] <= worst[0] + 0.01f && jumps[1] <= jumps[0];
+        ok = ok && noWorse;
+        std::cout << "TIMBRE \"" << entry.label << "\" [" << entry.category << "] notas=" << measuredNotes
+                  << " trocas_audiveis antes=" << jumps[0] << " depois=" << jumps[1]
+                  << " maior_degrau antes=" << juce::String (worst[0], 2) << "dB depois="
+                  << juce::String (worst[1], 2) << "dB" << (noWorse ? "" : "  <-- PIOROU") << '\n';
+    }
+
+    std::cout << (ok ? "VELOCITY_CONTINUITY_ALL_OK\n" : "VELOCITY_CONTINUITY_ALL_REGRESSION\n");
+    return ok ? 0 : 1;
+}
+
 int main (int argc, char* argv[])
 {
     juce::ScopedJuceInitialiser_GUI juce;
+
+    if (argc == 2 && juce::String::fromUTF8 (argv[1]) == "--velocity-continuity-all")
+        return runVelocityContinuityAllProbe();
+
+    if (argc >= 4 && juce::String::fromUTF8 (argv[1]) == "--velocity-continuity")
+    {
+        juce::Array<int> notes;
+        for (int i = 4; i < argc; ++i)
+            notes.add (juce::String (argv[i]).getIntValue());
+        return runVelocityContinuityProbe (juce::File (juce::String::fromUTF8 (argv[2])),
+                                           juce::String::fromUTF8 (argv[3]).trim(), notes);
+    }
+
+    if (argc == 2
+         && juce::String::fromUTF8 (argv[1]) == "--anti-alias-only")
+    {
+        NativeAntiAliasMetrics metrics;
+        const bool passed = runNativeAntiAliasProbe (metrics);
+
+        std::cout << "NATIVE_ANTIALIAS"
+                  << " alias_before_db=" << metrics.aliasBeforeDb
+                  << " alias_after_db=" << metrics.aliasAfterDb
+                  << " reduction_db=" << metrics.aliasReductionDb
+                  << " passband_change_db=" << metrics.passbandChangeDb
+                  << " stream_misses=" << metrics.streamMisses << '\n';
+
+        if (! passed)
+        {
+            std::cerr << "Resampler nativo nao suprimiu alias antes da decimacao ou perdeu passband\n";
+            return 1;
+        }
+
+        return 0;
+    }
+
+    if (argc == 3
+         && juce::String::fromUTF8 (argv[1]) == "--stream-window-only")
+    {
+        const juce::File sample (juce::String::fromUTF8 (argv[2]));
+        juce::Array<juce::File> files;
+
+        if (sample.existsAsFile())
+        {
+            files.add (sample);
+            files.add (sample);
+        }
+
+        if (! runStreamerGenerationStress (files))
+        {
+            std::cerr << "Primeira janela/continuidade entre callbacks falhou\n";
+            return 1;
+        }
+
+        std::cout << "STREAM_WINDOW_CONTINUITY_OK"
+                  << " first_span=12000 preserved_between_callbacks=true\n";
+        return 0;
+    }
 
     if (argc == 2
          && juce::String::fromUTF8 (argv[1]) == "--controls-only")
@@ -4148,13 +6571,84 @@ int main (int argc, char* argv[])
 
         if (! runChannelControlStateProbe())
         {
-            std::cerr << "Attack/Release/EQ/Rotary falharam no estado salvo ou migrado\n";
+            std::cerr << "Controles/cena vazia falharam no estado salvo, migrado ou zerado\n";
             return 1;
         }
+
+        if (! runNativeKeyDepthProbe())
+        {
+            std::cerr << "Profundidade de note-on repetido cortou a tecla antes do ultimo note-off\n";
+            return 1;
+        }
+
+        if (! runNativeSampleAccurateMidiProbe())
+        {
+            std::cerr << "Sampler nativo antecipou NOTE ON/OFF, CC64 ou ALL OFF dentro do bloco\n";
+            return 1;
+        }
+
+        std::cout << "NATIVE_SAMPLE_ACCURATE_MIDI_OK"
+                  << " note_on=40 note_off=170"
+                  << " pedal_off=200 all_off=220\n";
+
+        if (! runParallelNativeRenderParityProbe())
+        {
+            std::cerr << "Render paralelo por camada divergiu do serial ou nao foi ativado\n";
+            return 1;
+        }
+
+        std::cout << "PARALLEL_NATIVE_RENDER_BIT_EXACT_OK layers=2 voices=32\n";
+
+        NativeAntiAliasMetrics antiAliasMetrics;
+
+        if (! runNativeAntiAliasProbe (antiAliasMetrics))
+        {
+            std::cerr << "Resampler nativo nao suprimiu alias antes da decimacao ou perdeu passband\n";
+            return 1;
+        }
+
+        std::cout << "NATIVE_ANTIALIAS_OK"
+                  << " alias_before_db=" << antiAliasMetrics.aliasBeforeDb
+                  << " alias_after_db=" << antiAliasMetrics.aliasAfterDb
+                  << " reduction_db=" << antiAliasMetrics.aliasReductionDb
+                  << " passband_change_db=" << antiAliasMetrics.passbandChangeDb
+                  << " stream_misses=" << antiAliasMetrics.streamMisses << '\n';
+
+        if (! runIgnoredLoopMarkerPlaybackProbe())
+        {
+            std::cerr << "Loop legado alterou playback, RAM/streaming ou fim natural do sample\n";
+            return 1;
+        }
+
+        if (! runExplicitSidecarLoopPlaybackProbe())
+        {
+            std::cerr << "Loop explicito do sidecar cortou, estalou ou leu a cauda fisica\n";
+            return 1;
+        }
+
+        if (! runEvenRootBoundaryProbe())
+        {
+            std::cerr << "Fronteira entre roots pares escolheu a amostra errada\n";
+            return 1;
+        }
+
+        if (! runIdleDelayTailGainProbe())
+        {
+            std::cerr << "Cauda ociosa do delay mudou dose, feedback ou foi cortada\n";
+            return 1;
+        }
+
+        std::cout << "IDLE_DELAY_TAIL_OK amount_ratio=5 feedback=0.32\n";
 
         if (! runPerTimbreRecallProbe())
         {
             std::cerr << "Memoria A-B-A por timbre falhou na troca/restauracao real\n";
+            return 1;
+        }
+
+        if (! runSidecarCategoryDiscoveryProbe())
+        {
+            std::cerr << "Categoria declarada no sidecar nao entrou no seletor\n";
             return 1;
         }
 
@@ -4167,6 +6661,12 @@ int main (int argc, char* argv[])
         if (! runChurchOrganLayerIntegrationProbe())
         {
             std::cerr << "Integracao Church Organ falhou em blocos variaveis, estado, memoria ou trim\n";
+            return 1;
+        }
+
+        if (! runNativeSourceMetadataGainProbe())
+        {
+            std::cerr << "Ganho global da fonte NSMP foi ignorado, limitado pelo fader ou aplicado duas vezes\n";
             return 1;
         }
 

@@ -35,7 +35,7 @@
 namespace juce
 {
 
-static bool tryAllocTexture (int w, int h, GLenum type)
+static bool tryAllocTexture (int w, int h, GLenum type, int* allocatedWidth = nullptr, int* allocatedHeight = nullptr)
 {
     JUCE_CHECK_OPENGL_ERROR
 
@@ -55,7 +55,11 @@ static bool tryAllocTexture (int w, int h, GLenum type)
         const GLenum error = glGetError();
 
         if (error == GL_NO_ERROR)
+        {
+            if (allocatedWidth != nullptr) *allocatedWidth = testWidth;
+            if (allocatedHeight != nullptr) *allocatedHeight = testHeight;
             return true;
+        }
     }
 
     return false;

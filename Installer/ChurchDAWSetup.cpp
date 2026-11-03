@@ -112,9 +112,10 @@ bool createFolders (const std::wstring& path)
 // O payload e o proprio ChurchDAW.exe, embutido como recurso RCDATA. Fica
 // dentro da imagem PE, portanto entra no calculo da assinatura Authenticode --
 // ao contrario de dados anexados no fim do arquivo, assinar cobre o payload.
-bool writePayload (const std::wstring& destination)
+// id=1 ChurchDAW.exe.
+bool writeRcDataResource (int resourceId, const std::wstring& destination)
 {
-    HRSRC found = FindResourceW (nullptr, MAKEINTRESOURCEW (1), RT_RCDATA);
+    HRSRC found = FindResourceW (nullptr, MAKEINTRESOURCEW (resourceId), RT_RCDATA);
 
     if (found == nullptr)
         return false;
@@ -145,6 +146,11 @@ bool writePayload (const std::wstring& destination)
         DeleteFileW (destination.c_str());
 
     return ok;
+}
+
+bool writePayload (const std::wstring& destination)
+{
+    return writeRcDataResource (1, destination);
 }
 
 // Troca o executavel mesmo que a versao antiga ainda esteja viva.

@@ -34,19 +34,6 @@ if ($providedToken === ''
     $reply(404, ['ok' => false]);
 }
 
-$input = json_decode((string) file_get_contents('php://input'), true);
-$action = is_array($input) ? (string) ($input['action'] ?? '') : '';
-if ($action === 'cleanup') {
-    $path = __FILE__;
-    if (!@unlink($path)) {
-        $reply(500, ['ok' => false, 'error' => 'CLEANUP_FAILED']);
-    }
-    $reply(200, ['ok' => true, 'removed' => true]);
-}
-if ($action !== 'activate') {
-    $reply(400, ['ok' => false, 'error' => 'INVALID_ACTION']);
-}
-
 $release = '__RELEASE__';
 $home = dirname(__DIR__);
 $accountHome = $home . '/churchdaw';
@@ -55,6 +42,271 @@ $sharedConfig = $accountHome . '/shared/config/local.php';
 $releaseConfig = $releaseRoot . '/config/local.php';
 $publicRoot = __DIR__;
 $stagedPublic = $accountHome . '/deploy-public';
+
+$action = (string) ($_SERVER['HTTP_X_CHURCHDAW_ACTION'] ?? '');
+if ($action === '') {
+    $input = json_decode((string) file_get_contents('php://input'), true);
+    $action = is_array($input) ? (string) ($input['action'] ?? '') : '';
+}
+if ($action === 'cleanup') {
+    $path = __FILE__;
+    if (!@unlink($path)) {
+        $reply(500, ['ok' => false, 'error' => 'CLEANUP_FAILED']);
+    }
+    $reply(200, ['ok' => true, 'removed' => true]);
+}
+
+$removeTree = static function (string $root): void {
+    if (!is_dir($root)) {
+        return;
+    }
+    $iterator = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator(
+            $root,
+            FilesystemIterator::SKIP_DOTS
+        ),
+        RecursiveIteratorIterator::CHILD_FIRST
+    );
+    foreach ($iterator as $entry) {
+        $path = $entry->getPathname();
+        $entry->isDir() && !$entry->isLink() ? @rmdir($path) : @unlink($path);
+    }
+    @rmdir($root);
+};
+
+if ($action === 'stage' || $action === 'stage-file') {
+    if (!class_exists(ZipArchive::class)
+        || !preg_match('/^[A-Za-z0-9._-]{1,64}$/', $release)
+        || is_dir($releaseRoot)) {
+        $reply(409, ['ok' => false, 'error' => 'STAGE_NOT_AVAILABLE']);
+    }
+    $expectedHash = strtolower((string) ($action === 'stage-file'
+        ? ($input['archive_sha256'] ?? '')
+        : ($_SERVER['HTTP_X_CHURCHDAW_ARCHIVE_SHA256'] ?? '')));
+    if (!preg_match('/^[a-f0-9]{64}$/', $expectedHash)) {
+        $reply(400, ['ok' => false, 'error' => 'ARCHIVE_HASH_REQUIRED']);
+    }
+    if (!is_dir($accountHome)
+        && !mkdir($accountHome, 0750, true)
+        && !is_dir($accountHome)) {
+        $reply(500, ['ok' => false, 'error' => 'ACCOUNT_HOME_FAILED']);
+    }
+    $archive = $accountHome . '/.upload-' . $release . '-'
+        . bin2hex(random_bytes(8)) . '.zip';
+    if ($action === 'stage-file') {
+        $encryptedName = (string) ($input['encrypted_name'] ?? '');
+        $iv = base64_decode((string) ($input['iv'] ?? ''), true);
+        $mac = base64_decode((string) ($input['mac'] ?? ''), true);
+        if (!preg_match('/^churchdaw-stage-[a-f0-9]{24}\.bin$/', $encryptedName)
+            || !is_string($iv) || strlen($iv) !== 16
+            || !is_string($mac) || strlen($mac) !== 32) {
+            $reply(400, ['ok' => false, 'error' => 'ENCRYPTED_ARCHIVE_INVALID']);
+        }
+        $encryptedPath = $publicRoot . '/' . $encryptedName;
+        $ciphertext = is_file($encryptedPath)
+            ? file_get_contents($encryptedPath, false, null, 0, 8 * 1024 * 1024 + 1)
+            : false;
+        @unlink($encryptedPath);
+        $encryptionKey = hash_hmac('sha256', 'archive-encryption', $providedToken, true);
+        $macKey = hash_hmac('sha256', 'archive-authentication', $providedToken, true);
+        if (!is_string($ciphertext)
+            || strlen($ciphertext) > 8 * 1024 * 1024
+            || !hash_equals($mac, hash_hmac('sha256', $iv . $ciphertext, $macKey, true))) {
+            $reply(400, ['ok' => false, 'error' => 'ENCRYPTED_ARCHIVE_AUTH_FAILED']);
+        }
+        $plaintext = openssl_decrypt(
+            $ciphertext,
+            'aes-256-cbc',
+            $encryptionKey,
+            OPENSSL_RAW_DATA,
+            $iv
+        );
+        if (!is_string($plaintext)
+            || file_put_contents($archive, $plaintext, LOCK_EX) !== strlen($plaintext)) {
+            @unlink($archive);
+            $reply(400, ['ok' => false, 'error' => 'ENCRYPTED_ARCHIVE_DECRYPT_FAILED']);
+        }
+        $bytes = strlen($plaintext);
+        sodium_memzero($plaintext);
+        sodium_memzero($encryptionKey);
+        sodium_memzero($macKey);
+        unset($ciphertext);
+    } else {
+        $inputStream = fopen('php://input', 'rb');
+        $outputStream = fopen($archive, 'xb');
+        if (!is_resource($inputStream) || !is_resource($outputStream)) {
+            $reply(500, ['ok' => false, 'error' => 'UPLOAD_OPEN_FAILED']);
+        }
+        $bytes = stream_copy_to_stream(
+            $inputStream,
+            $outputStream,
+            8 * 1024 * 1024 + 1
+        );
+        fclose($inputStream);
+        fclose($outputStream);
+    }
+    if (!is_int($bytes) || $bytes < 1024 || $bytes > 8 * 1024 * 1024
+        || !hash_equals($expectedHash, hash_file('sha256', $archive))) {
+        @unlink($archive);
+        $reply(400, ['ok' => false, 'error' => 'ARCHIVE_INVALID']);
+    }
+
+    $stageRoot = $accountHome . '/.stage-' . $release . '-'
+        . bin2hex(random_bytes(8));
+    $zip = new ZipArchive();
+    try {
+        if ($zip->open($archive) !== true
+            || (!mkdir($stageRoot, 0750, true) && !is_dir($stageRoot))) {
+            throw new RuntimeException('Nao foi possivel abrir o pacote.');
+        }
+        $releasePrefix = 'churchdaw/releases/' . $release . '/';
+        $allowedExact = [
+            'churchdaw/shared/keys/churchdaw-license-private.pem',
+            'churchdaw/deploy-public/account-assets.htaccess',
+            'churchdaw/deploy-public/churchdaw-account.php',
+            'churchdaw/deploy-public/churchdaw-routes.htaccess',
+        ];
+        for ($index = 0; $index < $zip->numFiles; ++$index) {
+            $archiveName = $zip->getNameIndex($index);
+            if (!is_string($archiveName) || $archiveName === ''
+                || str_contains($archiveName, "\0")) {
+                throw new RuntimeException('Caminho inseguro no pacote.');
+            }
+            // Compress-Archive do Windows grava separadores de caminho como
+            // barras invertidas. Canonicalize antes de aplicar a allowlist e
+            // as protecoes contra Zip Slip.
+            $name = str_replace('\\', '/', $archiveName);
+            if (str_starts_with($name, '/')
+                || preg_match('~(^|/)\.\.(/|$)~', $name)) {
+                throw new RuntimeException('Caminho inseguro no pacote.');
+            }
+            $isDirectory = str_ends_with($name, '/');
+            $allowed = str_starts_with($name, $releasePrefix)
+                || in_array(rtrim($name, '/'), $allowedExact, true)
+                || ($isDirectory && (
+                    str_starts_with($releasePrefix, $name)
+                    || str_starts_with('churchdaw/shared/keys/', $name)
+                    || str_starts_with('churchdaw/deploy-public/', $name)
+                ));
+            if (!$allowed) {
+                continue;
+            }
+            $stat = $zip->statIndex($index);
+            $mode = is_array($stat)
+                ? (((int) ($stat['external_attributes'] ?? 0)) >> 16)
+                : 0;
+            if (($mode & 0170000) === 0120000) {
+                throw new RuntimeException('Link simbolico recusado no pacote.');
+            }
+            $destination = $stageRoot . '/' . $name;
+            if ($isDirectory) {
+                if (!is_dir($destination)
+                    && !mkdir($destination, 0750, true)
+                    && !is_dir($destination)) {
+                    throw new RuntimeException('Falha ao criar diretorio temporario.');
+                }
+                continue;
+            }
+            $directory = dirname($destination);
+            if (!is_dir($directory)
+                && !mkdir($directory, 0750, true)
+                && !is_dir($directory)) {
+                throw new RuntimeException('Falha ao criar pasta temporaria.');
+            }
+            $source = $zip->getStream($archiveName);
+            $target = fopen($destination, 'xb');
+            if (!is_resource($source) || !is_resource($target)
+                || stream_copy_to_stream($source, $target) === false) {
+                throw new RuntimeException('Falha ao extrair arquivo.');
+            }
+            fclose($source);
+            fclose($target);
+            chmod($destination, 0640);
+        }
+        $zip->close();
+
+        $stagedRelease = $stageRoot . '/' . $releasePrefix;
+        $stagedRelease = rtrim($stagedRelease, '/');
+        if (!is_file($stagedRelease . '/src/autoload.php')
+            || !is_file($stagedRelease . '/config/local.php')
+            || !is_file($stagedRelease . '/migrations/016_woovi_checkout_plans.sql')) {
+            throw new RuntimeException('Release incompleta no pacote.');
+        }
+        $releasesRoot = dirname($releaseRoot);
+        if (!is_dir($releasesRoot)
+            && !mkdir($releasesRoot, 0750, true)
+            && !is_dir($releasesRoot)) {
+            throw new RuntimeException('Falha ao criar pasta de releases.');
+        }
+        if (!rename($stagedRelease, $releaseRoot)) {
+            throw new RuntimeException('Falha ao promover release privada.');
+        }
+        chmod($releaseRoot . '/config/local.php', 0600);
+
+        $stagedKey = $stageRoot
+            . '/churchdaw/shared/keys/churchdaw-license-private.pem';
+        $sharedKey = $accountHome
+            . '/shared/keys/churchdaw-license-private.pem';
+        if (!is_file($stagedKey)) {
+            throw new RuntimeException('Chave de assinatura ausente.');
+        }
+        if (is_file($sharedKey)) {
+            if (!hash_equals(hash_file('sha256', $stagedKey), hash_file('sha256', $sharedKey))) {
+                throw new RuntimeException('Chave de assinatura divergente.');
+            }
+        } else {
+            if (!is_dir(dirname($sharedKey))) {
+                mkdir(dirname($sharedKey), 0750, true);
+            }
+            if (!rename($stagedKey, $sharedKey)) {
+                throw new RuntimeException('Falha ao instalar chave de assinatura.');
+            }
+        }
+        chmod($sharedKey, 0600);
+
+        $publicSource = $stageRoot . '/churchdaw/deploy-public';
+        if (!is_dir($stagedPublic)) {
+            mkdir($stagedPublic, 0750, true);
+        }
+        foreach ($allowedExact as $allowedFile) {
+            if (!str_starts_with($allowedFile, 'churchdaw/deploy-public/')) {
+                continue;
+            }
+            $name = basename($allowedFile);
+            $source = $publicSource . '/' . $name;
+            $temporary = $stagedPublic . '/.' . $name . '.next-'
+                . bin2hex(random_bytes(6));
+            if (!is_file($source) || !copy($source, $temporary)
+                || !rename($temporary, $stagedPublic . '/' . $name)) {
+                @unlink($temporary);
+                throw new RuntimeException('Falha ao preparar overlay publico.');
+            }
+        }
+        $removeTree($stageRoot);
+        @unlink($archive);
+        $reply(200, [
+            'ok' => true,
+            'release' => $release,
+            'staged' => true,
+            'archive_sha256' => $expectedHash,
+        ]);
+    } catch (Throwable $error) {
+        if ($zip->status === ZipArchive::ER_OK) {
+            $zip->close();
+        }
+        $removeTree($stageRoot);
+        @unlink($archive);
+        error_log('ChurchDAW stage failed: ' . $error->getMessage());
+        $reply(500, [
+            'ok' => false,
+            'error' => 'STAGE_FAILED',
+            'message' => $error->getMessage(),
+        ]);
+    }
+}
+if ($action !== 'activate') {
+    $reply(400, ['ok' => false, 'error' => 'INVALID_ACTION']);
+}
 
 $hardenPrivateTree = static function (string $root): void {
     if (!is_dir($root)) {
@@ -121,29 +373,27 @@ try {
     if (!preg_match('/^[A-Za-z0-9._-]{1,64}$/', $release)
         || !is_dir($releaseRoot)
         || !is_file($releaseRoot . '/src/autoload.php')
-        || !is_file($sharedConfig)) {
+        || (!is_file($releaseConfig) && !is_file($sharedConfig))) {
         throw new RuntimeException('Release privada incompleta.');
     }
 
-    $configDirectory = dirname($releaseConfig);
-    if (!is_dir($configDirectory)
-        && !mkdir($configDirectory, 0750, true)
-        && !is_dir($configDirectory)) {
-        throw new RuntimeException('Nao foi possivel criar config da release.');
-    }
-    if (file_exists($releaseConfig) || is_link($releaseConfig)) {
-        if (!is_link($releaseConfig) || realpath($releaseConfig) !== realpath($sharedConfig)) {
-            throw new RuntimeException('Config da release ja existe com destino inesperado.');
+    if (is_link($releaseConfig)) {
+        if (!is_file($sharedConfig)
+            || realpath($releaseConfig) !== realpath($sharedConfig)) {
+            throw new RuntimeException('Link de configuracao inesperado.');
         }
-    } elseif (!symlink($sharedConfig, $releaseConfig)) {
-        throw new RuntimeException('Hospedagem recusou o link simbolico do config.');
+    } elseif (!is_file($releaseConfig)) {
+        throw new RuntimeException('Configuracao da release ausente.');
     }
+    chmod($releaseConfig, 0600);
 
     require $releaseRoot . '/src/autoload.php';
     $config = Config::load($releaseRoot);
     $config->assertRuntimeReady();
+    $checkoutEnabled = $config->bool('checkout.enabled');
     if (!hash_equals($release, $config->string('app.release'))
-        || $config->bool('checkout.enabled')) {
+        || ($checkoutEnabled
+            && $config->string('checkout.provider') !== 'woovi')) {
         throw new RuntimeException('Preflight da release recusado.');
     }
 
@@ -285,7 +535,7 @@ try {
     $reply(200, [
         'ok' => true,
         'release' => $release,
-        'checkout_enabled' => false,
+        'checkout_enabled' => $checkoutEnabled,
         'database' => $isMariaDb ? 'MariaDB ' . $parsedVersion : 'MySQL ' . $parsedVersion,
         'migrations' => $applied,
         'assets_sha256' => [

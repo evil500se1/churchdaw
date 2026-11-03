@@ -1,0 +1,173 @@
+name: CI Android (arm64 nao distribuivel)
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-android-ci:
+    name: Compilar e auditar APK Android arm64 (CI)
+    runs-on: windows-2022
+    timeout-minutes: 75
+    env:
+      GRADLE_OPTS: -Xmx4096m -Dfile.encoding=UTF-8
+
+    steps:
+      - name: Baixar codigo
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Configurar Java 21
+        uses: actions/setup-java@d7793b545071e98d581d3bf084a51c3213318a07 # v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Configurar cache do Gradle
+        uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4
+
+      - name: Instalar Android SDK e NDK exigidos pelo JUCE
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sdkManager = Get-ChildItem "$env:ANDROID_HOME\cmdline-tools" -Recurse `
+            -Filter sdkmanager.bat | Select-Object -First 1
+          if ($null -eq $sdkManager) {
+            throw 'sdkmanager.bat nao foi encontrado no runner'
+          }
+          & $sdkManager.FullName `
+            'platforms;android-36' `
+            'build-tools;36.0.0' `
+            'ndk;28.1.13356709'
+          if ($LASTEXITCODE -ne 0) {
+            throw "sdkmanager terminou com codigo $LASTEXITCODE"
+          }
+
+      - name: Regenerar projeto Android e sincronizar recursos
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          .\Packaging\ApplyAndroidOpenGLCompatibility.ps1 -ProjectRoot $PWD
+          $projucer = Start-Process -FilePath .\JUCE\Projucer.exe `
+            -ArgumentList @('--resave', (Resolve-Path .\ChurchDAW.jucer).Path) `
+            -WindowStyle Hidden -Wait -PassThru
+          if ($projucer.ExitCode -ne 0) {
+            throw "Projucer terminou com codigo $($projucer.ExitCode)"
+          }
+
+          $source = (Resolve-Path .\Packaging\AndroidResources).Path
+          $target = Join-Path $PWD 'Builds\Android\app\src\main\res'
+          Get-ChildItem -LiteralPath $source -Recurse -File | ForEach-Object {
+            $relative = $_.FullName.Substring($source.Length).TrimStart('\', '/')
+            $destination = Join-Path $target $relative
+            New-Item -ItemType Directory -Force `
+              -Path (Split-Path -Parent $destination) | Out-Null
+            Copy-Item -LiteralPath $_.FullName -Destination $destination -Force
+          }
+
+          $escapedSdk = $env:ANDROID_HOME.Replace('\', '\\').Replace(':', '\:')
+          Set-Content -LiteralPath .\Builds\Android\local.properties `
+            -Value "sdk.dir=$escapedSdk" -Encoding Ascii
+
+      - name: Auditar configuracao Android e lineage
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          .\Packaging\AssertAndroidBuildConfiguration.ps1 -ProjectRoot $PWD
+          if ($LASTEXITCODE -ne 0) {
+            throw "Auditoria Android terminou com codigo $LASTEXITCODE"
+          }
+          .\Packaging\TestAndroidSigningMigration.ps1
+          if ($LASTEXITCODE -ne 0) {
+            throw "Auditoria da lineage terminou com codigo $LASTEXITCODE"
+          }
+
+      - name: Compilar APK Release arm64 sem chave comercial
+        shell: pwsh
+        working-directory: Builds/Android
+        run: |
+          $ErrorActionPreference = 'Stop'
+          .\gradlew.bat clean lintRelease_Release assembleRelease_Release `
+            --no-daemon --max-workers=2 --console=plain --stacktrace
+          if ($LASTEXITCODE -ne 0) {
+            throw "Gradle terminou com codigo $LASTEXITCODE"
+          }
+
+      - name: Validar ABI arm64 e empacotar APK de teste CI
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+          $unsignedApk = Get-ChildItem -Path .\Builds\Android\app\build\outputs\apk\release_\release `
+            -Filter '*.apk' | Select-Object -First 1
+          if ($null -eq $unsignedApk) {
+            throw 'APK Release arm64 nao foi gerado pelo Gradle'
+          }
+
+          $zip = [System.IO.Compression.ZipFile]::OpenRead($unsignedApk.FullName)
+          try {
+            foreach ($entryName in @(
+              'AndroidManifest.xml',
+              'classes.dex',
+              'lib/arm64-v8a/libjuce_jni.so'
+            )) {
+              if ($null -eq $zip.GetEntry($entryName)) {
+                throw "Entrada obrigatoria ausente no APK Android: $entryName"
+              }
+            }
+          } finally {
+            $zip.Dispose()
+          }
+
+          $buildTools = Join-Path $env:ANDROID_HOME 'build-tools\36.0.0'
+          $zipalign = Join-Path $buildTools 'zipalign.exe'
+          $apksigner = Join-Path $buildTools 'apksigner.bat'
+
+          $ciKeystore = Join-Path $env:RUNNER_TEMP 'churchdaw-ci-ephemeral.jks'
+          & keytool -genkeypair -noprompt `
+            -keystore $ciKeystore `
+            -storepass android -keypass android `
+            -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 30 `
+            -dname 'CN=ChurchDAW CI Ephemeral,O=ChurchDAW,C=BR'
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Falha ao gerar chave efemera de teste para CI'
+          }
+
+          New-Item -ItemType Directory -Force .\dist-ci | Out-Null
+          $alignedApk = Join-Path $env:RUNNER_TEMP 'app-aligned.apk'
+          $ciApk = Join-Path $PWD 'dist-ci\ChurchDAW-Android-CI-Test-arm64.apk'
+
+          & $zipalign -f -p 4 $unsignedApk.FullName $alignedApk
+          if ($LASTEXITCODE -ne 0) {
+            throw "zipalign falhou com codigo $LASTEXITCODE"
+          }
+
+          & $apksigner sign `
+            --ks $ciKeystore `
+            --ks-pass pass:android `
+            --ks-key-alias androiddebugkey `
+            --key-pass pass:android `
+            --out $ciApk `
+            $alignedApk
+          if ($LASTEXITCODE -ne 0) {
+            throw "apksigner falhou com codigo $LASTEXITCODE"
+          }
+
+          Remove-Item -LiteralPath $ciKeystore -Force -ErrorAction SilentlyContinue
+
+      - name: Publicar APK de teste CI (nao distribuivel)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ChurchDAW-Android-CI-Test-arm64
+          path: dist-ci/ChurchDAW-Android-CI-Test-arm64.apk
+          if-no-files-found: error
+          retention-days: 14

@@ -371,6 +371,9 @@ public:
 private:
     void timerCallback() override
     {
+        if (! isShowing() || getWidth() <= 0 || getHeight() <= 0)
+            return;
+
         bool dirty = false;
 
         // repinta SO quando o acorde muda de nome -- e raro (poucas vezes por

@@ -74,7 +74,7 @@ esac
 
 for tool in bash cmake codesign cp ctest ditto file git hdiutil lipo openssl \
             otool plutil python3 security shasum spctl stat sw_vers vtool \
-            xcodebuild xcrun; do
+            xcodebuild xcrun strings; do
     require_command "$tool"
 done
 [[ -x /usr/libexec/PlistBuddy ]] || fail "PlistBuddy ausente"
@@ -298,7 +298,11 @@ cmake -S "$repo_root" -B "$build_dir" \
     -DCHURCHDAW_BUILD_UPDATE_TESTS=ON \
     -DCHURCHDAW_LICENSE_ALLOW_HTTP_LOCALHOST=OFF \
     -DCHURCHDAW_UPDATE_ALLOW_LOCALHOST=OFF \
+    -DCHURCHDAW_UPDATE_REQUIRE_OS_SIGNATURE=ON \
     2>&1 | tee "$logs_dir/cmake-configure.log"
+grep -Fxq 'CHURCHDAW_UPDATE_REQUIRE_OS_SIGNATURE:BOOL=ON' \
+    "$build_dir/CMakeCache.txt" \
+    || fail "build comercial nao exige assinatura do sistema no auto-update"
 cmake --build "$build_dir" --config Release --parallel 3 \
     2>&1 | tee "$logs_dir/cmake-build.log"
 
@@ -321,6 +325,10 @@ plist="$app/Contents/Info.plist"
 entitlements="$repo_root/Packaging/ChurchDAW.entitlements"
 [[ -d "$app" ]] || fail "bundle nao encontrado: $app"
 [[ -x "$executable" ]] || fail "executavel nao encontrado: $executable"
+if strings "$executable" \
+    | grep -F '[update] DMG sem assinatura do sistema; aceito' >/dev/null; then
+    fail "binario comercial contem o ramo que aceita DMG sem assinatura"
+fi
 [[ -s "$plist" ]] || fail "Info.plist ausente"
 [[ -s "$entitlements" ]] || fail "entitlements ausente"
 plutil -lint "$plist"
@@ -474,8 +482,11 @@ import sys
 with open(sys.argv[1], "rb") as handle:
     actual = plistlib.load(handle)
 expected = {
+    "com.apple.security.cs.allow-jit": True,
+    "com.apple.security.cs.allow-unsigned-executable-memory": True,
     "com.apple.security.cs.disable-library-validation": True,
     "com.apple.security.device.audio-input": True,
+    "com.apple.security.device.camera": True,
 }
 if actual != expected:
     raise SystemExit(f"entitlements assinados divergentes: {actual!r}")

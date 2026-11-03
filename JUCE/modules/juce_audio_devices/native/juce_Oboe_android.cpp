@@ -569,23 +569,28 @@ private:
             // mesmo trabalho cabe folgado.
             //
             // MODIFICACAO NA COPIA LOCAL DO JUCE. Se um dia atualizarem o JUCE,
-            // esta linha precisa ser reaplicada.
-            // DESLIGADO -- esta linha causou uma regressao grave.
+            // este bloco precisa ser reaplicado.
             //
-            // Ela de fato faz o AAudio entregar blocos maiores, e isso reduzia o
-            // custo fixo do grafo (188 chamadas por segundo -> 47). MAS a rajada
-            // nativa do aparelho e 256 e a capacidade do stream, 2048: pedir
-            // blocos de 1024 deixa margem de apenas DOIS blocos. O audio tocava
-            // 2 a 4 segundos, a margem esvaziava e o stream morria em silencio --
-            // com o app continuando a produzir normalmente, medidores mexendo e
-            // ZERO blocos perdidos do nosso lado. No AudioFlinger:
-            // "1 Tracks of which 0 are active", underruns de 34 para 1611.
+            // REATIVADO (2026-08-11), desta vez COMPLETO. A primeira tentativa
+            // (so setFramesPerCallback) morreu porque a capacidade ficou no
+            // default (2048): blocos de 1024 deixavam margem de DOIS blocos, a
+            // margem esvaziava e o stream morria em silencio. O ingrediente
+            // que faltava e a capacidade explicita de 4x o bloco: com ela o
+            // track legacy tem folga real para jitter de agendamento.
             //
-            // E a medicao que motivou a linha era da build DEBUG (-O0). Na
-            // release o custo fixo e 3x menor, entao o ganho nao compensa o
-            // risco. Se um dia valer a pena revisitar, tera que vir junto com
-            // setBufferCapacityInFrames bem maior -- nao sozinha.
-            juce::ignoreUnused (newBufferSize);
+            // Sem este bloco o AAudio entrega SEMPRE a rajada nativa (256
+            // quadros aqui = 5,3 ms de prazo), independente do buffer pedido:
+            // "2048" so engordava o colchao. Medido no aparelho (debug): media
+            // de 252% do prazo em IDLE com blocos de 256 — todo callback
+            // estourado. O custo fixo do grafo (15 slots, camadas, master) se
+            // paga 188 vezes/s em vez de 23. Com o bloco seguindo o tamanho
+            // pedido, o mesmo trabalho cabe com folga e o seletor de buffer
+            // do app passa a significar o que promete.
+            if (newBufferSize > 0)
+            {
+                builder.setFramesPerCallback (newBufferSize);
+                builder.setBufferCapacityInFrames (jmax (newBufferSize * 4, (int32) 2048));
+            }
 
            #if JUCE_USE_ANDROID_OBOE_STABILIZED_CALLBACK
             if (newCallback != nullptr)
@@ -614,8 +619,14 @@ private:
 
             if (stream != nullptr && newBufferSize != 0)
             {
-                JUCE_OBOE_LOG ("Setting the bufferSizeInFrames to " + String (newBufferSize));
-                stream->setBufferSizeInFrames (newBufferSize);
+                const auto capacity = jmax (newBufferSize, stream->getBufferCapacityInFrames());
+                const auto burst = jmax ((int32) 1, stream->getFramesPerBurst());
+                const auto targetActiveFrames = jmin (capacity, jmax (newBufferSize * 2, burst * 3));
+                JUCE_OBOE_LOG ("Setting the bufferSizeInFrames to " + String (targetActiveFrames)
+                               + " (callback=" + String (newBufferSize)
+                               + ", burst=" + String (burst)
+                               + ", capacity=" + String (capacity) + ")");
+                stream->setBufferSizeInFrames (targetActiveFrames);
             }
 
             JUCE_OBOE_LOG (String ("Stream details:")

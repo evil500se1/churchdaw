@@ -432,8 +432,12 @@ namespace churchorgan
         std::atomic<std::uint32_t> transistorProfile_ { 0 };
         std::array<AtomicFloat, transistorTabCount>
             transistorTabs_ {};
-        std::atomic<std::uint32_t> transistorVibratoEnabled_ { 1 };
-        AtomicFloat transistorVibratoDepth_ { 0.55f };
+        std::atomic<std::uint32_t> transistorVibratoEnabled_ {
+            transistorDefaultVibratoEnabled ? 1u : 0u
+        };
+        AtomicFloat transistorVibratoDepth_ {
+            transistorDefaultVibratoDepth
+        };
         AtomicFloat transistorDrive_ { 0.18f };
         AtomicFloat transistorStereoWidth_ { 0.22f };
 

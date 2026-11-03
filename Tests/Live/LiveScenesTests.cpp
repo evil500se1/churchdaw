@@ -53,6 +53,7 @@ ChurchDAWLive::Cena cenaDeExemplo()
         canal.solo = false;
         canal.volume = 0.25f + 0.05f * (float) i;
         canal.transpose = (i % 5) - 2;
+        canal.octave = (i % 3) - 1;
         canal.envioDeReverb = 0.1f * (float) (i % 7);
         canal.rotuloDoTimbre = "Timbre " + juce::String (i);
     }
@@ -112,6 +113,7 @@ int main()
             if (a.ligado != b.ligado || a.mudo != b.mudo || a.solo != b.solo
                  || ! perto (a.volume, b.volume)
                  || a.transpose != b.transpose
+                 || a.octave != b.octave
                  || ! perto (a.envioDeReverb, b.envioDeReverb)
                  || a.rotuloDoTimbre != b.rotuloDoTimbre)
                 return falha ("um canal nao sobreviveu a ida e volta");
@@ -175,6 +177,7 @@ int main()
         auto* l = doente.createNewChildElement ("L");
         l->setAttribute ("i", 0);
         l->setAttribute ("transp", 500);
+        l->setAttribute ("oct", 99);
 
         auto* fora = doente.createNewChildElement ("L");
         fora->setAttribute ("i", ChurchDAWLive::numeroDeCanais + 40);
@@ -188,6 +191,32 @@ int main()
 
         if (cena.canais[0].transpose > 24 || cena.canais[0].transpose < -24)
             return falha ("transpose de canal fora da faixa nao foi grampeado");
+
+        if (cena.canais[0].octave > 4 || cena.canais[0].octave < -4)
+            return falha ("oitava de canal fora da faixa nao foi grampeada");
+    }
+
+    // ------------------------------------------------------------------
+    // 4b. Migracao do default antigo do Pad Church.
+    // ------------------------------------------------------------------
+    {
+        juce::XmlElement antiga ("SCENE");
+        auto* l = antiga.createNewChildElement ("L");
+        l->setAttribute ("i", 0);
+        l->setAttribute ("oct", -2);
+        l->setAttribute ("timbre", "PAD LP");
+
+        ChurchDAWLive::Cena migrada;
+        ChurchDAWLive::lerCena (antiga, migrada, true);
+
+        if (migrada.canais[0].octave != 0)
+            return falha ("Pad Church legado nao voltou para oitava neutra");
+
+        ChurchDAWLive::Cena nova;
+        ChurchDAWLive::lerCena (antiga, nova, false);
+
+        if (nova.canais[0].octave != -2)
+            return falha ("cena nova perdeu oitava escolhida sem migracao");
     }
 
     // ------------------------------------------------------------------
@@ -732,6 +761,109 @@ int main()
         for (const auto naoTerminal : { R::ok, R::vazia, R::carregando })
             if (ChurchDAWLive::precisaAvisarResultadoTerminal (naoTerminal))
                 return falha ("resultado nao terminal virou aviso duplicado");
+    }
+
+    // ------------------------------------------------------------------
+    // 18. Os metadados usados pelas telas Performance/Sessao e a ordem do
+    //     setlist precisam sobreviver ao mesmo XML das cenas. Reordenar ou
+    //     remover uma musica tambem deve manter o cursor na cena correta.
+    // ------------------------------------------------------------------
+    {
+        auto original = cenaDeExemplo();
+        original.musica = "Grande e o Senhor";
+        original.tonalidade = "F#";
+        original.compasso = "6/8";
+        original.secao = "Ministracao";
+        original.bpm = 76.5;
+        original.duracaoSegundos = 428.0;
+        original.transicaoSegundos = 1.25;
+
+        juce::XmlElement raiz ("LIVESCENES");
+        ChurchDAWLive::escreverCena (raiz, original, 4);
+
+        ChurchDAWLive::Cena lida;
+        auto* no = raiz.getChildByName ("SCENE");
+        if (no == nullptr)
+            return falha ("metadados nao criaram SCENE");
+
+        ChurchDAWLive::lerCena (*no, lida);
+        if (lida.musica != original.musica
+             || lida.tonalidade != original.tonalidade
+             || lida.compasso != original.compasso
+             || lida.secao != original.secao
+             || std::abs (lida.bpm - original.bpm) > 0.0001
+             || std::abs (lida.duracaoSegundos - original.duracaoSegundos) > 0.0001
+             || std::abs (lida.transicaoSegundos - original.transicaoSegundos) > 0.0001)
+            return falha ("metadados de palco nao sobreviveram ao XML");
+
+        juce::XmlElement adulterada ("SCENE");
+        adulterada.setAttribute ("bpm", 999.0);
+        adulterada.setAttribute ("duration", -10.0);
+        adulterada.setAttribute ("transition", 99.0);
+        ChurchDAWLive::lerCena (adulterada, lida);
+        if (std::abs (lida.bpm - 300.0) > 0.0001
+             || std::abs (lida.duracaoSegundos) > 0.0001
+             || std::abs (lida.transicaoSegundos - 15.0) > 0.0001)
+            return falha ("metadados de palco adulterados nao foram grampeados");
+
+        ChurchDAWLive::Setlist setlist;
+        setlist.nome = "Culto Domingo Manha";
+        setlist.adicionar (2);
+        setlist.adicionar (4);
+        setlist.adicionar (1);
+        setlist.adicionar (4);   // duplicata nao entra
+        setlist.adicionar (-1);  // indice invalido nao entra
+
+        if (setlist.tamanho != 3 || setlist.proximaCena() != 2)
+            return falha ("setlist nao iniciou na primeira cena");
+
+        if (! setlist.mover (0, 2)
+             || setlist.cenaAtual() != 2
+             || ! setlist.removerNaPosicao (1)
+             || setlist.tamanho != 2
+             || setlist.ordem[0] != 4
+             || setlist.ordem[1] != 2
+             || setlist.cenaAtual() != 2)
+            return falha ("reordenacao/remocao perdeu a cena atual do setlist");
+
+        ChurchDAWLive::escreverSetlist (raiz, setlist);
+        ChurchDAWLive::Setlist restaurado;
+        ChurchDAWLive::lerSetlist (raiz, restaurado);
+        if (restaurado.nome != setlist.nome
+             || restaurado.tamanho != 2 || restaurado.posicao != 1
+             || restaurado.ordem[0] != 4 || restaurado.ordem[1] != 2
+             || restaurado.cenaAtual() != 2)
+            return falha ("setlist nao sobreviveu ao XML");
+
+        juce::XmlElement legado ("LIVESCENES");
+        ChurchDAWLive::lerSetlist (legado, restaurado);
+        if (! restaurado.vazio() || restaurado.posicao != -1
+             || restaurado.nome != "Culto atual")
+            return falha ("XML legado sem SETLIST nao restaurou estado vazio");
+    }
+
+    // ------------------------------------------------------------------
+    // 19. O SALVAR superior precisa escolher o contexto que o musico ve:
+    //     primeiro a pagina nova preparada, depois a cena realmente no ar.
+    //     Sem nenhum desses estados ele nao pode sobrescrever slot por acaso.
+    // ------------------------------------------------------------------
+    {
+        ChurchDAWLive::Cena banco[ChurchDAWLive::numeroDeCenas];
+        banco[0].preenchida = true;
+        banco[2].preenchida = true;
+
+        if (ChurchDAWLive::destinoDoSalvarSuperior (1, 0, banco) != 1)
+            return falha ("Salvar superior ignorou a nova cena preparada");
+
+        if (ChurchDAWLive::destinoDoSalvarSuperior (-1, 0, banco) != 0)
+            return falha ("Salvar superior nao recapturou a cena ativa");
+
+        if (ChurchDAWLive::destinoDoSalvarSuperior (2, 0, banco) != 0)
+            return falha ("slot preparado ja preenchido venceu a cena ativa");
+
+        if (ChurchDAWLive::destinoDoSalvarSuperior (-1, -1, banco) != -1
+             || ChurchDAWLive::destinoDoSalvarSuperior (99, 1, banco) != -1)
+            return falha ("Salvar superior escolheu cena sem contexto valido");
     }
 
     std::cout << "LIVE_SCENES_OK\n";

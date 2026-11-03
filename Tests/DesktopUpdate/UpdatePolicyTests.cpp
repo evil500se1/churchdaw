@@ -6,8 +6,10 @@
 // e um "compilou" nunca teria percebido.
 //
 // Uso: UpdatePolicyTests <raiz-do-repo> <policy-serial-1.json> <policy-serial-2.json>
+//                         [version-code-atual] [instalador-da-release]
 
-#include "../../Source/DesktopUpdater.h"
+#include "DesktopUpdater.h"
+#include "ChurchDAWServices.h"
 
 #include <juce_core/juce_core.h>
 #include <juce_cryptography/juce_cryptography.h>
@@ -79,9 +81,7 @@ namespace
 
     juce::File stateFile()
     {
-        return juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory)
-                   .getChildFile ("ChurchDAW")
-                   .getChildFile ("update-state.json");
+        return ChurchDAWDesktopUpdate::updaterTestStateFile();
     }
 
     ChurchDAWDesktopUpdate::Policy makePolicy (int latest, int minimum, bool withInstaller)
@@ -113,6 +113,7 @@ int main (int argc, char* argv[])
     if (argc < 4)
     {
         std::cerr << "uso: UpdatePolicyTests <raiz> <policy-serial-1> <policy-serial-2>"
+                     " [version-code-atual] [instalador-da-release] [policy-android]"
                   << std::endl;
         return 2;
     }
@@ -123,20 +124,57 @@ int main (int argc, char* argv[])
     const juce::File desktopPolicy4 { juce::String (juce::CharPointer_UTF8 (argv[2])) };
     const juce::File desktopPolicy5 { juce::String (juce::CharPointer_UTF8 (argv[3])) };
 
-    // O verificador guarda o maior serial ja aceito no perfil do usuario.
-    // Comecar do zero e devolver o estado real no fim.
+    // Estado isolado por build/processo. O teste nunca toca no perfil real,
+    // inclusive se uma fixture estiver ausente ou houver retorno antecipado.
     const auto state = stateFile();
-    const bool hadState = state.existsAsFile();
-    const auto savedState = hadState ? state.loadFileAsString() : juce::String();
     state.deleteFile();
+    const juce::ScopeGuard cleanupState { [state] { state.deleteFile(); } };
 
     using namespace ChurchDAWDesktopUpdate;
+
+    // Espacos no caminho permanecem em um unico argumento; DMG e PKG
+    // precisam de contextos diferentes para o Gatekeeper.
+    const auto dmg = juce::File::getSpecialLocation (juce::File::tempDirectory)
+        .getChildFile ("Church DAW update.dmg");
+    const auto dmgArgs = macGatekeeperAssessmentCommand (dmg);
+    check (dmgArgs.size() == 8 && dmgArgs[3] == "open"
+               && dmgArgs[4] == "--context"
+               && dmgArgs[5] == "context:primary-signature"
+               && dmgArgs[7] == dmg.getFullPathName(),
+           "G1 DMG usa assinatura primaria e preserva caminho com espacos");
+    const auto pkgArgs = macGatekeeperAssessmentCommand (dmg.withFileExtension ("pkg"));
+    check (pkgArgs.size() == 6 && pkgArgs[3] == "install",
+           "G2 PKG continua usando avaliacao de instalador");
+
+
+    //==========================================================================
+    std::cout << "H. relogio confiavel do cabecalho HTTP Date" << std::endl;
+
+    const auto expectedHttpDate = juce::Time (
+        2026, 7, 15, 12, 34, 56, 0, false).toMilliseconds() / 1000;
+    check (parseHttpDateEpochSeconds (
+               "Sat, 15 Aug 2026 12:34:56 GMT") == expectedHttpDate,
+           "H1 IMF-fixdate valido foi convertido");
+    check (parseHttpDateEpochSeconds (
+               "Thu, 29 Feb 2024 23:59:59 GMT") > 0,
+           "H2 dia bissexto valido foi aceito");
+    check (parseHttpDateEpochSeconds (
+               "Sat, 29 Feb 2025 12:34:56 GMT") == 0,
+           "H3 data civil impossivel foi recusada");
+    check (parseHttpDateEpochSeconds (
+               "2026-08-15T12:34:56Z") == 0,
+           "H4 ISO-8601 nao foi confundido com HTTP Date");
+    check (parseHttpDateEpochSeconds (
+               "Sat, 15 Aug 2026 12:34:56 BRT") == 0,
+           "H5 timezone diferente de GMT foi recusado");
 
     //==========================================================================
     std::cout << "A. assinatura RS256 contra a politica Android REAL" << std::endl;
 
-    const auto androidPolicy = repoRoot.getChildFile (
-        "Packaging/AndroidHosting/app/android/update-policy-v2.json");
+    const auto androidPolicy = argc >= 7
+        ? juce::File (juce::String (juce::CharPointer_UTF8 (argv[6])))
+        : repoRoot.getChildFile (
+            "Packaging/AndroidHosting/app/android/update-policy-v2.json");
 
     juce::MemoryBlock payload;
     juce::String signatureBase64, keyId;
@@ -152,19 +190,21 @@ int main (int argc, char* argv[])
     juce::Base64::convertFromBase64 (decodedSignature, signatureBase64);
     const juce::MemoryBlock signature (decodedSignature.getData(), decodedSignature.getDataSize());
 
-    check (keyId == "churchdaw-update-2026-01", "A0 key_id do vetor confere", keyId);
+    check (keyId == "churchdaw-update-2026-01"
+               || keyId == "churchdaw-update-2026-08",
+           "A0 key_id do vetor confere", keyId);
     check (signature.getSize() == 384, "A0 assinatura tem 384 bytes (RSA-3072)",
            juce::String ((int) signature.getSize()));
 
     juce::String error;
-    check (verifyUpdateRs256Signature (payload, signature, error),
+    check (verifyUpdateRs256Signature (payload, signature, keyId, error),
            "A1 assinatura legitima ACEITA", error);
 
     {
         auto tampered = payload;
         static_cast<char*> (tampered.getData())[10] ^= 0x01;   // um bit
         juce::String e;
-        check (! verifyUpdateRs256Signature (tampered, signature, e),
+        check (! verifyUpdateRs256Signature (tampered, signature, keyId, e),
                "A2 payload adulterado RECUSADO");
     }
 
@@ -172,7 +212,7 @@ int main (int argc, char* argv[])
         auto tampered = signature;
         static_cast<char*> (tampered.getData())[100] ^= 0x01;
         juce::String e;
-        check (! verifyUpdateRs256Signature (payload, tampered, e),
+        check (! verifyUpdateRs256Signature (payload, tampered, keyId, e),
                "A3 assinatura adulterada RECUSADA");
     }
 
@@ -191,7 +231,7 @@ int main (int argc, char* argv[])
         const auto signatureB64 = object->getProperty ("signature").toString();
 
         check (verifySignedPolicyEnvelope (payloadB64, signatureB64,
-                                           "churchdaw-update-2026-01"),
+                                           keyId),
                "F1 envelope Android real ACEITO no desktop");
 
         check (! verifySignedPolicyEnvelope (payloadB64, signatureB64,
@@ -201,11 +241,11 @@ int main (int argc, char* argv[])
         auto broken = payloadB64;
         broken = broken.replaceSection (12, 1, broken[12] == 'A' ? "B" : "A");
         check (! verifySignedPolicyEnvelope (broken, signatureB64,
-                                             "churchdaw-update-2026-01"),
+                                             keyId),
                "F3 payload alterado RECUSADO");
 
         check (! verifySignedPolicyEnvelope (payloadB64, signatureB64.dropLastCharacters (4),
-                                             "churchdaw-update-2026-01"),
+                                             keyId),
                "F4 assinatura de tamanho errado RECUSADA");
     }
 
@@ -347,8 +387,26 @@ int main (int argc, char* argv[])
     {
         Policy policy;
         juce::String e;
-        check (parseSignedPolicy (desktopPolicy5.loadFileAsString(), policy, e),
+        const bool parsedNewest = parseSignedPolicy (
+            desktopPolicy5.loadFileAsString(), policy, e);
+        check (parsedNewest,
                "D1 serial 2 aceito depois do 1", e);
+
+        if (argc >= 5)
+        {
+            const auto currentVersionCode = juce::String::fromUTF8 (argv[4]).getIntValue();
+            juce::String decisionReason;
+            const auto now = juce::Time::currentTimeMillis() / 1000;
+            const auto decision = parsedNewest && currentVersionCode > 0
+                ? decideFor (policy, now, currentVersionCode, decisionReason)
+                : Decision::unavailable;
+            check (decision == Decision::optional || decision == Decision::upToDate,
+                   "D1b build publicado recebe decisao coerente",
+                   "current=" + juce::String (currentVersionCode)
+                       + " latest=" + juce::String (policy.latestVersionCode)
+                       + " minimum=" + juce::String (policy.minimumVersionCode)
+                       + " reason=" + decisionReason);
+        }
 
         Policy older;
         juce::String e2;
@@ -460,6 +518,19 @@ int main (int argc, char* argv[])
             tampered.deleteFile();
         }
 
+        if (argc >= 6)
+        {
+            const juce::File releaseInstaller {
+                juce::String::fromUTF8 (argv[5])
+            };
+            juce::String releaseError;
+            check (releaseInstaller.existsAsFile()
+                       && operatingSystemTrustsInstaller (
+                              releaseInstaller, releaseError),
+                   "E5 instalador publicado ACEITO pelo updater",
+                   releaseInstaller.getFileName() + ": " + releaseError);
+        }
+
         juce::String e3;
         check (! operatingSystemTrustsInstaller (
                    repoRoot.getChildFile ("nao-existe-mesmo.exe"), e3),
@@ -467,11 +538,98 @@ int main (int argc, char* argv[])
     }
 
     //==========================================================================
-    if (hadState)
-        state.replaceWithText (savedState);
-    else
-        state.deleteFile();
+    std::cout << "G. normalizacao de manifest.json e paridade SHA-256 cross-platform" << std::endl;
 
+    {
+        // G1. Testar ChurchDAWServices::normalizeManifestText diretamente
+        const juce::String rawWithCrlfAndBom = juce::String::fromUTF8 ("\xef\xbb\xbf") + juce::String ("line1\r\nline2\rline3\n");
+        const juce::String normalizedDirect = ChurchDAWServices::normalizeManifestText (rawWithCrlfAndBom);
+        check (normalizedDirect == "line1\nline2\nline3\n",
+               "G1 normalizeManifestText remove BOM e converte CRLF/CR para LF",
+               normalizedDirect);
+
+        // G2. Construir variantes de manifesto JSON (CRLF, LF, Misto, UTF-8 BOM)
+        const juce::String sampleManifestJson =
+R"({
+  "schema_version": 1,
+  "package_id": "com.churchdaw.app",
+  "latest_version_code": 14,
+  "minimum_version_code": 9,
+  "latest_version_name": "1.5.9",
+  "update_message": "Atualizacao ChurchDAW",
+  "play_store_url": "https://churchdaw.com/app/android/ChurchDAW-1.5.9-signed.apk",
+  "libraries": [
+    {
+      "id": "church-live",
+      "name": "Church Live",
+      "description": "Pianos e pads",
+      "version": 1,
+      "version_name": "1.0",
+      "install_folder": "church-live",
+      "download_bytes": 1000,
+      "installed_bytes": 1000,
+      "parts": [
+        {
+          "download_url": "https://churchdaw.com/app/android/packs/church-live-v1-segment-01.zip",
+          "sha256": "1c7937e598fffaf640715cf571c76f5ceacc321f7f242b72788697fc3801fdb1",
+          "download_bytes": 1000
+        }
+      ],
+      "included": true,
+      "featured": true,
+      "price_label": "Inclusa",
+      "purchase_url": ""
+    }
+  ]
+})";
+
+        const juce::String lfManifest = sampleManifestJson.replace ("\r\n", "\n").replace ("\r", "\n");
+        const juce::String crlfManifest = lfManifest.replace ("\n", "\r\n");
+
+        juce::String mixedManifest = lfManifest;
+        mixedManifest = mixedManifest.replaceSection (mixedManifest.indexOfChar ('\n'), 1, "\r\n");
+        if (mixedManifest.lastIndexOfChar ('\n') > 0)
+            mixedManifest = mixedManifest.replaceSection (mixedManifest.lastIndexOfChar ('\n'), 1, "\r");
+
+        const juce::String bomManifest = juce::String::fromUTF8 ("\xef\xbb\xbf") + crlfManifest;
+
+        const auto normLF = ChurchDAWServices::normalizeManifestText (lfManifest);
+        const auto normCRLF = ChurchDAWServices::normalizeManifestText (crlfManifest);
+        const auto normMixed = ChurchDAWServices::normalizeManifestText (mixedManifest);
+        const auto normBOM = ChurchDAWServices::normalizeManifestText (bomManifest);
+
+        const auto hashLF = juce::SHA256 (normLF.toRawUTF8(), (size_t) normLF.getNumBytesAsUTF8()).toHexString().toLowerCase();
+        const auto hashCRLF = juce::SHA256 (normCRLF.toRawUTF8(), (size_t) normCRLF.getNumBytesAsUTF8()).toHexString().toLowerCase();
+        const auto hashMixed = juce::SHA256 (normMixed.toRawUTF8(), (size_t) normMixed.getNumBytesAsUTF8()).toHexString().toLowerCase();
+        const auto hashBOM = juce::SHA256 (normBOM.toRawUTF8(), (size_t) normBOM.getNumBytesAsUTF8()).toHexString().toLowerCase();
+
+        // G3. Assert que o hash SHA-256 calculado e 100% identico entre todas as variantes
+        const bool hashParity = (hashLF == hashCRLF) && (hashLF == hashMixed) && (hashLF == hashBOM);
+        check (hashParity, "G2 paridade de hash SHA-256 entre LF, CRLF, Misto e UTF-8 BOM",
+               "LF=" + hashLF + " CRLF=" + hashCRLF + " Mixed=" + hashMixed + " BOM=" + hashBOM);
+
+        // G4. Assert que parseManifest retorna manifest.valid == true para hashes validos em todas as variantes
+        juce::String errLF, errCRLF, errMixed, errBOM;
+        const auto mLF = ChurchDAWServices::parseManifest (lfManifest, errLF, hashLF);
+        const auto mCRLF = ChurchDAWServices::parseManifest (crlfManifest, errCRLF, hashLF);
+        const auto mMixed = ChurchDAWServices::parseManifest (mixedManifest, errMixed, hashLF);
+        const auto mBOM = ChurchDAWServices::parseManifest (bomManifest, errBOM, hashLF);
+
+        check (mLF.valid && errLF.isEmpty(), "G3 parseManifest valido com variante LF", errLF);
+        check (mCRLF.valid && errCRLF.isEmpty(), "G3 parseManifest valido com variante CRLF", errCRLF);
+        check (mMixed.valid && errMixed.isEmpty(), "G3 parseManifest valido com variante Misto", errMixed);
+        check (mBOM.valid && errBOM.isEmpty(), "G3 parseManifest valido com variante UTF-8 BOM", errBOM);
+
+        // G5. Assert que parseManifest retorna error == "Manifesto nao corresponde ao SHA-256 assinado" quando o hash nao confere
+        const juce::String wrongHash = "0000000000000000000000000000000000000000000000000000000000000000";
+        juce::String wrongHashErr;
+        const auto mWrong = ChurchDAWServices::parseManifest (crlfManifest, wrongHashErr, wrongHash);
+        check (! mWrong.valid, "G4 parseManifest recusa hash SHA-256 incorreto");
+        check (wrongHashErr == "Manifesto nao corresponde ao SHA-256 assinado",
+               "G4 mensagem de erro de hash incorreto confere", wrongHashErr);
+    }
+
+    //==========================================================================
     std::cout << std::endl
               << (failures == 0 ? "TODOS OS TESTES PASSARAM" : "TESTES REPROVARAM")
               << ": " << (checks - failures) << "/" << checks << std::endl;

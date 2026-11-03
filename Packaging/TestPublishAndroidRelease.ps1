@@ -75,6 +75,45 @@ function Test-Case {
     }
 }
 
+Test-Case 'local publication uses unique honest provenance without GitHub IDs' {
+    $first = New-AndroidPublicationToken $true 0 0 '' ''
+    $second = New-AndroidPublicationToken $true 0 0 '' ''
+    Assert-True ($first -match '^local-[0-9a-f]{32}$' -and $first -ne $second) 'invalid local token'
+}
+Test-Case 'GitHub publication keeps positive provenance requirement' {
+    Assert-True ((New-AndroidPublicationToken $false 123 456 '789' '1') -ceq '789-1') 'valid GitHub provenance rejected'
+    foreach ($case in @(@($false,0,456,'789','1'),@($false,123,0,'789','1'),@($false,123,456,'',''),@($true,1,1,'',''))) {
+        $rejected = $false
+        try { $null = New-AndroidPublicationToken @case } catch { $rejected = $true }
+        Assert-True $rejected 'invalid or invented provenance accepted'
+    }
+}
+
+Test-Case 'hash do catalogo ignora BOM e estilo de quebra de linha' {
+    $ownedRoot = Join-Path ([IO.Path]::GetTempPath()) (
+        'churchdaw-catalog-hash-test-' + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $ownedRoot | Out-Null
+    try {
+        $lf = Join-Path $ownedRoot 'manifest-lf.json'
+        $crlfBom = Join-Path $ownedRoot 'manifest-crlf-bom.json'
+        $content = "{`n  `"schema_version`": 2,`n  `"name`": `"ChurchDAW`"`n}`n"
+        [IO.File]::WriteAllText($lf, $content, $script:writeUtf8)
+        $withBom = [Text.UTF8Encoding]::new($true).GetPreamble() +
+            $script:writeUtf8.GetBytes($content.Replace("`n", "`r`n"))
+        [IO.File]::WriteAllBytes($crlfBom, $withBom)
+
+        $lfHash = Get-AndroidCatalogSha256 $lf
+        $crlfBomHash = Get-AndroidCatalogSha256 $crlfBom
+        Assert-True ($lfHash -ceq $crlfBomHash) `
+            'hash normalizado divergiu entre LF e CRLF+BOM'
+        Assert-True ($lfHash -match '^[0-9a-f]{64}$') `
+            'hash normalizado nao e SHA-256 hexadecimal'
+    }
+    finally {
+        Remove-Item -LiteralPath $ownedRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Invoke-Scenario {
     param(
         [string] $FailurePoint = '',
@@ -267,7 +306,7 @@ function Invoke-AndroidCandidateSiteProbe {
     $siteText = [IO.File]::ReadAllText($siteSource, $script:utf8)
     $urlMatches = @([regex]::Matches(
         $siteText,
-        'https://churchdaw\.com/app/android/ChurchDAW-(?<version>[0-9]+\.[0-9]+\.[0-9]+)-signed\.apk') |
+        'https://churchdaw\.com/app/android/ChurchDAW-(?<version>[0-9]+\.[0-9]+\.[0-9]+)(?:-r[1-9][0-9]*)?-signed\.apk') |
         ForEach-Object { $_.Value } | Sort-Object -Unique)
     if ($urlMatches.Count -ne 1) {
         throw 'Fixture real precisa conter uma unica URL Android anterior'
@@ -275,7 +314,7 @@ function Invoke-AndroidCandidateSiteProbe {
     $previousUrl = [string] $urlMatches[0]
     $versionMatch = [regex]::Match(
         $previousUrl,
-        'ChurchDAW-(?<version>[0-9]+\.[0-9]+\.[0-9]+)-signed\.apk$')
+        'ChurchDAW-(?<version>[0-9]+\.[0-9]+\.[0-9]+)(?:-r[1-9][0-9]*)?-signed\.apk$')
     if (-not $versionMatch.Success) {
         throw 'Fixture real nao revelou a versao Android anterior'
     }
@@ -290,6 +329,37 @@ function Invoke-AndroidCandidateSiteProbe {
     $sourceCopy = Join-Path $ownedRoot 'index-before.html'
     $candidate = Join-Path $ownedRoot 'index-release.html'
     Copy-Item -LiteralPath $siteSource -Destination $sourceCopy
+    if ($previousVersion -ceq $releaseVersion) {
+        # Quando o site local ja foi atualizado para a mesma versao do Jucer,
+        # recria em memoria a fase anterior que este teste precisa exercitar.
+        $syntheticPrevious = if ($releaseVersion -cne '9.8.7') {
+            '9.8.7'
+        }
+        else { '9.8.6' }
+        $syntheticUrl =
+            "https://churchdaw.com/app/android/ChurchDAW-$syntheticPrevious-signed.apk"
+        $fixture = [IO.File]::ReadAllText($sourceCopy, $script:utf8)
+        $fixture = $fixture.Replace($previousUrl, $syntheticUrl)
+        $fixture = $fixture.Replace(
+            "Android $releaseVersion", "Android $syntheticPrevious")
+        $fixture = $fixture.Replace(
+            "ChurchDAW para Android</h3></div>`n                <span class=`"platform-version`">$releaseVersion</span>",
+            "ChurchDAW para Android</h3></div>`n                <span class=`"platform-version`">$syntheticPrevious</span>")
+        $fixture = $fixture.Replace(
+            '<span class="os-symbol">APK</span><span class="platform-version">' + $releaseVersion + '</span>',
+            '<span class="os-symbol">APK</span><span class="platform-version">' + $syntheticPrevious + '</span>')
+        $fixture = $fixture.Replace(
+            ('A vers' + [char]0x00E3 + "o $releaseVersion para Android"),
+            ('A vers' + [char]0x00E3 + "o $syntheticPrevious para Android"))
+        $fixture = $fixture.Replace(
+            ('Vers' + [char]0x00E3 + "o $releaseVersion " + [char]0x00B7 +
+             ' APK oficial'),
+            ('Vers' + [char]0x00E3 + "o $syntheticPrevious " + [char]0x00B7 +
+             ' APK oficial'))
+        [IO.File]::WriteAllText($sourceCopy, $fixture, $script:writeUtf8)
+        $previousVersion = $syntheticPrevious
+        $previousUrl = $syntheticUrl
+    }
     if ($RemoveOneAndroidUrl) {
         $tampered = [IO.File]::ReadAllText($sourceCopy, $script:utf8)
         $offset = $tampered.IndexOf($previousUrl, [StringComparison]::Ordinal)
@@ -439,6 +509,11 @@ Test-Case 'payload normal exige revogacao zero' {
     Assert-True $caught 'policy normal aceitou revogacao inesperada'
 }
 
+Test-Case 'publicador usa a chave Android ativa' {
+    Assert-True ($script:policyKeyId -ceq 'churchdaw-update-2026-08') `
+        'publicador ficou preso ao identificador da chave Android anterior'
+}
+
 Test-Case 'payload rollback vincula serial revogada' {
     $payload = [pscustomobject] @{
         package_id = 'com.churchdaw.app'
@@ -491,22 +566,32 @@ Test-Case 'site real suporta fase desktop seguida da fase Android' {
     $releaseUrlCount = [regex]::Matches(
         $result.CandidateText,
         [regex]::Escape($result.ReleaseUrl)).Count
-    Assert-True ($releaseUrlCount -eq 3) `
-        "site candidato tem $releaseUrlCount URLs Android, esperado 3"
+    $cinema = $result.CandidateText.Contains('<span class="os-symbol">APK</span>')
+    $expectedUrlCount = if ($cinema) { 2 } else { 4 }
+    Assert-True ($releaseUrlCount -eq $expectedUrlCount) `
+        "site candidato tem $releaseUrlCount URLs Android, esperado $expectedUrlCount"
     foreach ($label in @(
-        "Baixar ChurchDAW $($result.ReleaseVersion) para Android em formato APK",
-        "APK $($result.ReleaseVersion)",
-        "Baixar APK $($result.ReleaseVersion)"
+        "Android $($result.ReleaseVersion)",
+        $(if ($cinema) { '<span class="os-symbol">APK</span><span class="platform-version">' + $result.ReleaseVersion + '</span>' } else { 'A vers' + [char]0x00E3 + "o $($result.ReleaseVersion) para Android" }),
+        ('Vers' + [char]0x00E3 + "o $($result.ReleaseVersion) " +
+         [char]0x00B7 + ' APK oficial')
     )) {
         Assert-True $result.CandidateText.Contains($label) `
             "site candidato sem rotulo Android: $label"
     }
-    Assert-True $result.CandidateText.Contains(
-        "ChurchDAW-$($result.ReleaseVersion)-Setup.exe") `
-        'site da fase desktop nao fixa o EXE da mesma release'
-    Assert-True $result.CandidateText.Contains(
-        "ChurchDAW-$($result.ReleaseVersion)-macOS.dmg") `
-        'site da fase desktop nao fixa o DMG da mesma release'
+    $escapedReleaseVersion = [regex]::Escape($result.ReleaseVersion)
+    $windowsUrls = @([regex]::Matches(
+        $result.CandidateText,
+        "https://churchdaw\.com/app/desktop/ChurchDAW-$escapedReleaseVersion(?:-r[1-9][0-9]*)?-Setup\.exe") |
+        ForEach-Object { $_.Value } | Sort-Object -Unique)
+    Assert-True ($windowsUrls.Count -eq 1) `
+        'site da fase desktop nao fixa um unico EXE da mesma release'
+    $macUrls = @([regex]::Matches(
+        $result.CandidateText,
+        "https://churchdaw\.com/app/desktop/ChurchDAW-$escapedReleaseVersion(?:-r[1-9][0-9]*)?(?:-macOS)?\.dmg") |
+        ForEach-Object { $_.Value } | Sort-Object -Unique)
+    Assert-True ($macUrls.Count -eq 1) `
+        'site da fase desktop nao fixa um unico DMG da mesma release'
 }
 
 Test-Case 'gerador recusa deriva quando formato Android muda' {
@@ -564,7 +649,7 @@ Test-Case 'versionCode candidato precisa ser estritamente maior' {
         $gate,
         [StringComparison]::Ordinal)
     $catalogMutationIndex = $script:publisherSource.IndexOf(
-        '$previousManifest.latest_version_code = $versionCode',
+        "@('latest_version_code', `$versionCode)",
         [StringComparison]::Ordinal)
     Assert-True ($gateIndex -ge 0) `
         'gate versionCode <= publicado ausente'
@@ -572,6 +657,18 @@ Test-Case 'versionCode candidato precisa ser estritamente maior' {
         'catalogo pode ser alterado antes do gate versionCode'
     Assert-True ((14 -le 14) -and (13 -le 14) -and -not (15 -le 14)) `
         'operador do gate nao representa crescimento estrito'
+}
+
+Test-Case 'catalogo preserva piso e policy assinada governa o bloqueio' {
+    Assert-True ($script:publisherSource.Contains(
+        '$previousCatalogMinimum -gt $previousMinimum')) `
+        'publicador nao limita o piso legado do catalogo pela policy assinada'
+    Assert-True (-not $script:publisherSource.Contains(
+        "@('minimum_version_code', `$MinimumVersionCode)")) `
+        'publicador ainda eleva o piso do catalogo de bibliotecas'
+    Assert-True ($script:publisherSource.Contains(
+        'minimum_version_code = $MinimumVersionCode')) `
+        'policy legada deixou de acompanhar o piso assinado'
 }
 
 Test-Case 'replace revalida estado depois do callback e antes do RNTO' {
@@ -597,16 +694,17 @@ Test-Case 'replace revalida estado depois do callback e antes do RNTO' {
 }
 
 Test-Case 'rollbackConfirmed exige restauracoes e HTTPS finais' {
-    $start = $script:publisherSource.IndexOf(
+    $normalizedSource = $script:publisherSource -replace "\r\n", "`n"
+    $start = $normalizedSource.IndexOf(
         '-RollbackAfterPolicy {',
         [StringComparison]::Ordinal)
-    $end = $script:publisherSource.IndexOf(
+    $end = $normalizedSource.IndexOf(
         "`n        }`n`n    Write-PromotionManifest",
         $start,
         [StringComparison]::Ordinal)
     Assert-True ($start -ge 0 -and $end -gt $start) `
         'bloco RollbackAfterPolicy nao foi isolado'
-    $block = $script:publisherSource.Substring($start, $end - $start)
+    $block = $normalizedSource.Substring($start, $end - $start)
     $confirmed = '$script:rollbackConfirmed = $true'
     $confirmedIndex = $block.IndexOf(
         $confirmed,
@@ -679,6 +777,31 @@ Test-Case 'workflow publica no environment e chave desktop protegidos' {
     Assert-True (-not $script:androidWorkflowSource.Contains(
         'ANDROID_UPDATE_PRIVATE_KEY_BASE64')) `
         'workflow ainda referencia o secret Android obsoleto'
+}
+
+Test-Case 'lineage Android e verificada antes da promocao comercial' {
+    foreach ($needle in @(
+        '$allFiles.Count -ne 3',
+        'Assert-ApkSignerRoute 24 27',
+        'Assert-ApkSignerRoute 28 $null',
+        'LINEAGE_VERIFIED_SHA256',
+        '-ExpectedLegacyF25CertificateSha256',
+        '-ExpectedLegacy415aCertificateSha256',
+        '-VerifiedLineageSha256'
+    )) {
+        Assert-True $script:androidWorkflowSource.Contains($needle) `
+            "workflow sem protecao da lineage: $needle"
+    }
+    foreach ($needle in @(
+        "'churchdaw-signing-lineage.bin'",
+        'metadata.legacy_f25_certificate_sha256',
+        'metadata.legacy_415a_certificate_sha256',
+        'metadata.signing_lineage_sha256',
+        "'f25-to-415a-to-current-v3-rotation'"
+    )) {
+        Assert-True $script:publisherSource.Contains($needle) `
+            "publicador sem prova da lineage: $needle"
+    }
 }
 
 Test-Case 'whitelist GitHub aceita endpoints operacionais validos' {

@@ -409,9 +409,9 @@ private:
         if (jSurface == nullptr)
             return nullptr;
 
-        constexpr auto numAttempts = 2;
+        constexpr auto numAttempts = 3;
 
-        for (auto i = 0; i < numAttempts; Thread::sleep (200), ++i)
+        for (auto i = 0; i < numAttempts; Thread::sleep (15), ++i)
             if (auto* ptr = ANativeWindow_fromSurface (env, jSurface.get()))
                 return std::unique_ptr<ANativeWindow, NativeWindowReleaser> { ptr };
 

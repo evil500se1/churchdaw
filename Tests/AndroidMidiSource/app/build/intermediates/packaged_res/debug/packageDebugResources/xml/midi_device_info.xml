@@ -1,9 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<devices>
-    <device
-        manufacturer="ChurchDAW"
-        product="MIDI Mapping Test"
-        tags="test">
-        <output-port name="Automated CC Source" />
-    </device>
-</devices>

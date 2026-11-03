@@ -98,6 +98,8 @@ namespace churchorgan
             Oscillator primary {};
             Oscillator detuned {};
             std::array<float, worshipLayerCount> envelopes {};
+            std::array<float, worshipLayerCount> lastLeft {};
+            std::array<float, worshipLayerCount> lastRight {};
             std::uint32_t noiseState = 1;
             std::uint32_t stabiliseCounter = 0;
             std::uint64_t ageSamples = 0;
@@ -198,6 +200,9 @@ namespace churchorgan
         std::uint64_t activationSerial_ = 0;
         std::uint64_t renderedSamples_ = 0;
         std::uint64_t droppedEvents_ = 0;
+        std::array<float, worshipLayerCount> stealDeclickLeft_ {};
+        std::array<float, worshipLayerCount> stealDeclickRight_ {};
+        float stealDeclickDecay_ = 0.995f;
         std::uint64_t stolenVoices_ = 0;
         WorshipDiagnostics diagnostics_ {};
         bool prepared_ = false;

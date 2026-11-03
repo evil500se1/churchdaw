@@ -117,8 +117,11 @@ public:
         duckReleaseCoefficient = 1.0f - std::exp (
             -1.0f / (float) (sampleRate * 0.42));
 
-        presetFadeOutStep = 1.0f / (float) (sampleRate * 0.025);
-        presetFadeInStep = 1.0f / (float) (sampleRate * 0.055);
+        presetRequestHoldSamples = juce::jmax (
+            1, (int) std::lround (sampleRate * 0.025));
+        presetMorphStep = 1.0f
+                        / (float) juce::jmax (
+                            1, (int) std::lround (sampleRate * 0.120));
         preparePresetCoefficients();
 
         appliedPreset = -1;
@@ -132,7 +135,12 @@ public:
         clearSignalState();
         pendingPreset = appliedPreset;
         presetTransition = PresetTransition::idle;
-        presetTransitionGain = 1.0f;
+        presetHoldSamplesRemaining = 0;
+        presetMorphPosition = 1.0f;
+        fdnDelaySamplesTarget = fdnDelaySamples;
+        fdnFeedbackLowTarget = fdnFeedbackLow;
+        fdnFeedbackMidTarget = fdnFeedbackMid;
+        fdnFeedbackHighTarget = fdnFeedbackHigh;
     }
 
     void setPreset (int index) noexcept
@@ -162,6 +170,8 @@ public:
     // Processa o barramento in-place e devolve somente o retorno molhado.
     void process (juce::AudioBuffer<float>& buffer) noexcept
     {
+        juce::ScopedNoDenormals noDenormals;
+
         const int numSamples = buffer.getNumSamples();
         const bool stereo = buffer.getNumChannels() > 1;
 
@@ -172,53 +182,7 @@ public:
         }
 
         const int requested = desiredPreset.load (std::memory_order_relaxed);
-
-        if (presetTransition == PresetTransition::replaceAtNextBlock)
-        {
-            // O usuario pode voltar ao preset ativo durante os 25 ms de fade.
-            // Nesse caso nao aplique o pedido antigo que ficou em pending.
-            if (requested != appliedPreset)
-            {
-                pendingPreset = requested;
-                clearSignalState();
-                applyPreset (pendingPreset, true);
-                presetTransitionGain = 0.0f;
-            }
-            else
-            {
-                pendingPreset = appliedPreset;
-            }
-
-            presetTransition = PresetTransition::fadingIn;
-        }
-
-        if (requested == appliedPreset)
-        {
-            // Cloud -> Hall -> Cloud antes de zerar deve simplesmente desfazer
-            // o fade, nunca carregar Hall por um bloco para depois voltar.
-            if (presetTransition == PresetTransition::fadingOut)
-            {
-                pendingPreset = appliedPreset;
-                presetTransition = PresetTransition::fadingIn;
-            }
-        }
-        else
-        {
-            pendingPreset = requested;
-
-            if (! tailActive)
-            {
-                clearSignalState();
-                applyPreset (requested, true);
-                presetTransition = PresetTransition::idle;
-                presetTransitionGain = 1.0f;
-            }
-            else if (presetTransition == PresetTransition::idle
-                     || presetTransition == PresetTransition::fadingIn)
-            {
-                presetTransition = PresetTransition::fadingOut;
-            }
-        }
+        handlePresetRequest (requested);
 
         float inputPeakForBlock = 0.0f;
 
@@ -270,12 +234,41 @@ public:
         preparePitchStableMotion (
             blockMotionRate, blockMotionDepth, numSamples);
 
+        // Stable presets keep the same fractional distances for the whole
+        // block. Prepare clamp/integer/fraction once; indices still advance
+        // per sample and interpolation keeps the exact original operation order.
+        // A pending morph may change targets inside this block, so use the
+        // original sample-by-sample path throughout every transition.
+        const bool fixedDelays = presetTransition == PresetTransition::idle
+                              && ! predelaySamples.isSmoothing() && ! size.isSmoothing();
+        std::array<FractionalDelay::LinearDelay, 7> fixedPredelayTaps {};
+        std::array<std::array<FractionalDelay::LinearDelay, 4>, 2> fixedDiffuserTaps {};
+        if (fixedDelays)
+        {
+            const float predelayValue = juce::jlimit (
+                1.0f, (float) predelay[0].capacity() - (float) (sampleRate * 0.09) - 4.0f,
+                predelaySamples.getCurrentValue());
+            fixedPredelayTaps[0] = predelay[0].prepareLinearDelay (predelayValue);
+            for (int tap = 0; tap < 6; ++tap)
+                fixedPredelayTaps[(size_t) tap + 1] = predelay[0].prepareLinearDelay (
+                    predelayValue + earlyMs[(size_t) tap] * (float) sampleRate * 0.001f);
+            for (int stage = 0; stage < 4; ++stage)
+            {
+                fixedDiffuserTaps[0][(size_t) stage] = diffusers[0][stage].prepareLinearDelay (
+                    diffuserMsL[(size_t) stage] * size.getCurrentValue() * (float) sampleRate * 0.001f);
+                fixedDiffuserTaps[1][(size_t) stage] = diffusers[1][stage].prepareLinearDelay (
+                    diffuserMsR[(size_t) stage] * size.getCurrentValue() * (float) sampleRate * 0.001f);
+            }
+        }
+
         for (int sample = 0; sample < numSamples; ++sample)
         {
             const float dryL = left[sample];
             const float dryR = stereo ? right[sample] : dryL;
-            const float inL = inputHighPass[0].process (dryL);
-            const float inR = inputHighPass[1].process (dryR);
+            float inL = inputHighPass[0].process (std::isfinite (dryL) ? dryL : 0.0f);
+            float inR = inputHighPass[1].process (std::isfinite (dryR) ? dryR : 0.0f);
+            if (! std::isfinite (inL)) inL = 0.0f;
+            if (! std::isfinite (inR)) inR = 0.0f;
 
             const float inputPeak = juce::jmax (std::abs (inL), std::abs (inR));
             const float envRate = inputPeak > duckEnvelope
@@ -287,8 +280,15 @@ public:
                 1.0f, (float) predelay[0].capacity() - (float) (sampleRate * 0.09) - 4.0f,
                 predelaySamples.getNextValue());
 
-            const float preL = predelay[0].read (currentPredelay);
-            const float preR = predelay[1].read (currentPredelay);
+            // Os dois predelays possuem exatamente a mesma capacidade e o
+            // mesmo writeIndex (prepare/reset/write acontecem sempre em par).
+            // Calcular clamp, indices e fracao uma vez evita repetir toda a
+            // aritmetica para R sem mudar a interpolacao nem um bit do audio.
+            const auto predelayTap =
+                fixedDelays ? predelay[0].makeLinearTap (fixedPredelayTaps[0])
+                            : predelay[0].makeLinearTap (currentPredelay);
+            const float preL = predelay[0].read (predelayTap);
+            const float preR = predelay[1].read (predelayTap);
 
             float reflectionsL = 0.0f;
             float reflectionsR = 0.0f;
@@ -298,8 +298,13 @@ public:
                 const float tapDelay = currentPredelay
                                      + earlyMs[(size_t) tap] * (float) sampleRate * 0.001f;
                 const int mirrored = (int) earlyMs.size() - 1 - tap;
-                reflectionsL += earlyGain[(size_t) tap] * predelay[tap & 1].read (tapDelay);
-                reflectionsR += earlyGain[(size_t) mirrored] * predelay[(tap + 1) & 1].read (tapDelay);
+                const auto earlyTap =
+                    fixedDelays ? predelay[0].makeLinearTap (fixedPredelayTaps[(size_t) tap + 1])
+                                : predelay[0].makeLinearTap (tapDelay);
+                reflectionsL += earlyGain[(size_t) tap]
+                              * predelay[tap & 1].read (earlyTap);
+                reflectionsR += earlyGain[(size_t) mirrored]
+                              * predelay[(tap + 1) & 1].read (earlyTap);
             }
 
             predelay[0].write (inL);
@@ -312,18 +317,43 @@ public:
 
             for (int stage = 0; stage < 4; ++stage)
             {
-                diffuseL = diffusers[0][stage].process (
-                    diffuseL, diffuserMsL[(size_t) stage] * currentSize
-                                * (float) sampleRate * 0.001f,
-                    currentDiffusion);
-                diffuseR = diffusers[1][stage].process (
-                    diffuseR, diffuserMsR[(size_t) stage] * currentSize
-                                * (float) sampleRate * 0.001f,
-                    currentDiffusion);
+                if (fixedDelays)
+                {
+                    diffuseL = diffusers[0][stage].process (
+                        diffuseL, fixedDiffuserTaps[0][(size_t) stage], currentDiffusion);
+                    diffuseR = diffusers[1][stage].process (
+                        diffuseR, fixedDiffuserTaps[1][(size_t) stage], currentDiffusion);
+                }
+                else
+                {
+                    diffuseL = diffusers[0][stage].process (
+                        diffuseL, diffuserMsL[(size_t) stage] * currentSize
+                                    * (float) sampleRate * 0.001f,
+                        currentDiffusion);
+                    diffuseR = diffusers[1][stage].process (
+                        diffuseR, diffuserMsR[(size_t) stage] * currentSize
+                                    * (float) sampleRate * 0.001f,
+                        currentDiffusion);
+                }
             }
 
             float delayed[8];
             float filteredFeedback[8];
+            const bool morphing =
+                presetTransition == PresetTransition::morphing;
+            const float morph = morphing ? presetMorphPosition : 1.0f;
+            float oldOutputWeight = 0.0f;
+            float newOutputWeight = 1.0f;
+
+            if (morphing)
+            {
+                const float angle = morph
+                                  * juce::MathConstants<float>::halfPi;
+                oldOutputWeight =
+                    juce::dsp::FastMathApproximations::cos (angle);
+                newOutputWeight =
+                    juce::dsp::FastMathApproximations::sin (angle);
+            }
 
             for (int line = 0; line < 8; ++line)
             {
@@ -331,8 +361,36 @@ public:
                 // Doppler e sem a coloracao/atenuacao de um interpolador dentro
                 // do loop. Os primos reduzem coincidencias periodicas entre as
                 // oito linhas e aumentam a densidade modal da cauda.
-                const float raw = fdn[(size_t) line].readFixed (
+                const float oldTap = fdn[(size_t) line].readFixedPrepared (
                     fdnDelaySamples[(size_t) line]);
+                float raw = oldTap;
+                float outputTap = oldTap;
+                float feedbackLow = fdnFeedbackLow[(size_t) line];
+                float feedbackMid = fdnFeedbackMid[(size_t) line];
+                float feedbackHigh = fdnFeedbackHigh[(size_t) line];
+
+                if (morphing)
+                {
+                    const float newTap = fdn[(size_t) line].readFixedPrepared (
+                        fdnDelaySamplesTarget[(size_t) line]);
+
+                    // O loop de realimentacao usa interpolacao linear (soma de
+                    // pesos = 1, portanto nunca ganha energia). A saida usa
+                    // equal-power para duas caudas descorrelacionadas nao
+                    // criarem o antigo buraco wet durante a troca.
+                    raw += (newTap - raw) * morph;
+                    outputTap = oldTap * oldOutputWeight
+                              + newTap * newOutputWeight;
+                    feedbackLow +=
+                        (fdnFeedbackLowTarget[(size_t) line] - feedbackLow)
+                        * morph;
+                    feedbackMid +=
+                        (fdnFeedbackMidTarget[(size_t) line] - feedbackMid)
+                        * morph;
+                    feedbackHigh +=
+                        (fdnFeedbackHighTarget[(size_t) line] - feedbackHigh)
+                        * morph;
+                }
 
                 auto& lowState = fdnFeedbackLowState[(size_t) line];
                 auto& upperState = fdnFeedbackUpperState[(size_t) line];
@@ -342,7 +400,7 @@ public:
                 const float low = lowState;
                 const float mid = upperState - lowState;
                 const float high = raw - upperState;
-                delayed[line] = raw;
+                delayed[line] = outputTap;
                 // A absorcao acontece por linha e ANTES de uma unica matriz
                 // ortogonal, a forma canonica A(z) = U(z) * Gamma(z). Separar
                 // o grave numa matriz estatica e medio/agudo numa matriz movel
@@ -350,10 +408,10 @@ public:
                 // deixou um modo quase marginal em 125 Hz e um ringing cerca
                 // de 23 cents acima da nota no fim da cauda.
                 filteredFeedback[line] =
-                    low * fdnFeedbackLow[(size_t) line]
+                    low * feedbackLow
                     +
-                    mid * fdnFeedbackMid[(size_t) line]
-                    + high * fdnFeedbackHigh[(size_t) line];
+                    mid * feedbackMid
+                    + high * feedbackHigh;
             }
 
             float lateL = 0.0f;
@@ -408,7 +466,9 @@ public:
 
                 // O limite fica muito acima da operacao normal; ele nao colore
                 // a cauda, apenas impede um estado corrompido de virar runaway.
-                writeValue = juce::jlimit (-3.0f, 3.0f, writeValue);
+                writeValue = std::isfinite (writeValue)
+                               ? juce::jlimit (-3.0f, 3.0f, writeValue)
+                               : 0.0f;
                 fdn[(size_t) line].write (writeValue);
             }
 
@@ -425,8 +485,7 @@ public:
 
             const float duck = 1.0f - ducking.getNextValue()
                                       * juce::jlimit (0.0f, 1.0f, duckEnvelope * 3.2f);
-            const float gain = outputGain.getNextValue() * duck
-                             * presetTransitionGain;
+            const float gain = outputGain.getNextValue() * duck;
 
             if (stereo)
             {
@@ -447,14 +506,14 @@ public:
 
         // Depois que a cauda ja caiu abaixo de -120 dBFS por 750 ms, o motor
         // entra em repouso. Isso devolve CPU/bateria no palco quando nenhum
-        // canal envia reverb; o residuo mantido nos buffers e inaudivel e sera
-        // sobrescrito gradualmente na proxima nota.
+        // canal envia reverb. Limpe tambem os buffers: deixar o residuo parado
+        // permite que ele reapareca quando uma nova nota reativa o motor.
         if (inputPeakForBlock <= 0.0000001f && wetPeakForBlock < 0.000001f)
         {
             quietSamples += numSamples;
 
             if (quietSamples >= (int) (sampleRate * 0.75))
-                tailActive = false;
+                clearSignalState();
         }
         else
         {
@@ -466,6 +525,13 @@ private:
     class FractionalDelay
     {
     public:
+        struct LinearDelay { int whole = 1; float fraction = 0.0f; };
+        struct LinearTap
+        {
+            int newer = 0, older = 0;
+            float fraction = 0.0f;
+        };
+
         struct CubicTap
         {
             int previous = 0, centre = 0, next = 0, nextNext = 0;
@@ -487,32 +553,55 @@ private:
 
         int capacity() const noexcept { return (int) data.size(); }
 
+        LinearDelay prepareLinearDelay (float delaySamples) const noexcept
+        {
+            const float delay = juce::jlimit (1.0f, (float) data.size() - 3.0f, delaySamples);
+            const int whole = (int) delay;
+            return { whole, delay - (float) whole };
+        }
+
+        LinearTap makeLinearTap (float delaySamples) const noexcept
+        {
+            if ((int) data.size() < 4 || ! std::isfinite (delaySamples)) return {};
+            return makeLinearTap (prepareLinearDelay (delaySamples));
+        }
+
+        LinearTap makeLinearTap (LinearDelay delay) const noexcept
+        {
+            LinearTap tap;
+            const int count = (int) data.size();
+            tap.fraction = delay.fraction;
+            tap.newer = writeIndex - delay.whole;
+
+            if (tap.newer < 0)
+                tap.newer += count;
+
+            tap.older = tap.newer > 0 ? tap.newer - 1 : count - 1;
+            return tap;
+        }
+
+        float read (const LinearTap& tap) const noexcept
+        {
+            return data[(size_t) tap.newer]
+                 + tap.fraction
+                     * (data[(size_t) tap.older]
+                         - data[(size_t) tap.newer]);
+        }
+
         float read (float delaySamples) const noexcept
         {
             if (data.empty())
                 return 0.0f;
 
-            const int count = (int) data.size();
-            const float maximum = (float) count - 3.0f;
-            const float delay = juce::jlimit (1.0f, maximum, delaySamples);
-            const int wholeDelay = (int) delay;
-            const float fraction = delay - (float) wholeDelay;
-            int newer = writeIndex - wholeDelay;
-
-            if (newer < 0)
-                newer += count;
-
-            const int older = newer > 0 ? newer - 1 : count - 1;
-            return data[(size_t) newer]
-                 + fraction * (data[(size_t) older] - data[(size_t) newer]);
+            return read (makeLinearTap (delaySamples));
         }
 
         float readFixed (int delaySamples) const noexcept
         {
-            if (data.empty())
+            const int count = (int) data.size();
+            if (count < 2)
                 return 0.0f;
 
-            const int count = (int) data.size();
             const int delay = juce::jlimit (1, count - 1, delaySamples);
             int position = writeIndex - delay;
 
@@ -522,11 +611,36 @@ private:
             return data[(size_t) position];
         }
 
+        // Caminho FDN: os taps vieram de preparePresetCoefficients(), que os
+        // limita aos delays primos de cada preset e prepara 180 ms de margem.
+        // Nao repita empty()/jlimit() para oito linhas em cada amostra. O
+        // jassert protege novas tabelas em Debug e custa zero no Release.
+        float readFixedPrepared (int delaySamples) const noexcept
+        {
+            jassert (! data.empty());
+            jassert (delaySamples >= 1
+                     && delaySamples < (int) data.size());
+
+            const int count = (int) data.size();
+            if (count < 2)
+                return 0.0f;
+
+            int position = writeIndex - delaySamples;
+
+            if (position < 0)
+                position += count;
+
+            if ((unsigned int) position >= (unsigned int) count)
+                position = 0;
+
+            return data[(size_t) position];
+        }
+
         CubicTap makeCubicTap (float delaySamples) const noexcept
         {
             CubicTap tap;
 
-            if (data.empty())
+            if ((int) data.size() < 4 || ! std::isfinite (delaySamples))
                 return tap;
 
             const int count = (int) data.size();
@@ -605,6 +719,18 @@ private:
         {
             const float g = juce::jlimit (0.20f, 0.90f, gain);
             const float delayed = delay.read (delaySamples);
+            const float output = delayed - g * input;
+            delay.write (input + g * output);
+            return output;
+        }
+
+        FractionalDelay::LinearDelay prepareLinearDelay (float samples) const noexcept
+        { return delay.prepareLinearDelay (samples); }
+
+        float process (float input, FractionalDelay::LinearDelay tap, float gain) noexcept
+        {
+            const float g = juce::jlimit (0.20f, 0.90f, gain);
+            const float delayed = delay.read (delay.makeLinearTap (tap));
             const float output = delayed - g * input;
             delay.write (input + g * output);
             return output;
@@ -770,10 +896,70 @@ private:
     enum class PresetTransition
     {
         idle,
-        fadingOut,
-        replaceAtNextBlock,
-        fadingIn
+        waitingForStableRequest,
+        morphing
     };
+
+    void handlePresetRequest (int requested) noexcept
+    {
+        if (! tailActive)
+        {
+            // Sem cauda audivel nao ha nada para preservar nem cruzar. Tambem
+            // encerra uma transicao que tenha ficado pendente quando o motor
+            // acabou de entrar em repouso.
+            if (requested != appliedPreset
+                || presetTransition != PresetTransition::idle)
+                applyPreset (requested, true);
+
+            return;
+        }
+
+        if (presetTransition == PresetTransition::idle)
+        {
+            if (requested != appliedPreset)
+            {
+                pendingPreset = requested;
+                presetHoldSamplesRemaining = presetRequestHoldSamples;
+                presetTransition =
+                    PresetTransition::waitingForStableRequest;
+            }
+
+            return;
+        }
+
+        if (presetTransition == PresetTransition::waitingForStableRequest)
+        {
+            // Uma ida e volta muito rapida nao precisa tocar no FDN. Mantemos o
+            // audio do preset ativo durante esta curta janela, sem fade-out.
+            if (requested == appliedPreset)
+            {
+                pendingPreset = appliedPreset;
+                presetHoldSamplesRemaining = 0;
+                presetTransition = PresetTransition::idle;
+            }
+            else if (requested != pendingPreset)
+            {
+                pendingPreset = requested;
+                presetHoldSamplesRemaining = presetRequestHoldSamples;
+            }
+
+            return;
+        }
+
+        if (requested == appliedPreset && requested != pendingPreset)
+        {
+            // Reverter um morph troca os dois taps e espelha a posicao. O valor
+            // produzido na proxima amostra continua no mesmo ponto da curva;
+            // nao ha salto, limpeza de buffer ou alocacao.
+            fdnDelaySamples.swap (fdnDelaySamplesTarget);
+            fdnFeedbackLow.swap (fdnFeedbackLowTarget);
+            fdnFeedbackMid.swap (fdnFeedbackMidTarget);
+            fdnFeedbackHigh.swap (fdnFeedbackHighTarget);
+            presetMorphPosition = 1.0f - presetMorphPosition;
+            pendingPreset = appliedPreset;
+            setPresetControls (appliedPreset, false);
+        }
+    }
 
     void clearSignalState() noexcept
     {
@@ -875,23 +1061,26 @@ private:
 
     void advancePresetTransition() noexcept
     {
-        if (presetTransition == PresetTransition::fadingOut)
+        if (presetTransition == PresetTransition::waitingForStableRequest)
         {
-            presetTransitionGain -= presetFadeOutStep;
+            if (--presetHoldSamplesRemaining <= 0)
+                applyPreset (pendingPreset, false);
 
-            if (presetTransitionGain <= 0.0f)
-            {
-                presetTransitionGain = 0.0f;
-                presetTransition = PresetTransition::replaceAtNextBlock;
-            }
+            return;
         }
-        else if (presetTransition == PresetTransition::fadingIn)
-        {
-            presetTransitionGain += presetFadeInStep;
 
-            if (presetTransitionGain >= 1.0f)
+        if (presetTransition == PresetTransition::morphing)
+        {
+            presetMorphPosition += presetMorphStep;
+
+            if (presetMorphPosition >= 1.0f)
             {
-                presetTransitionGain = 1.0f;
+                presetMorphPosition = 1.0f;
+                fdnDelaySamples = fdnDelaySamplesTarget;
+                fdnFeedbackLow = fdnFeedbackLowTarget;
+                fdnFeedbackMid = fdnFeedbackMidTarget;
+                fdnFeedbackHigh = fdnFeedbackHighTarget;
+                appliedPreset = pendingPreset;
                 presetTransition = PresetTransition::idle;
                 pendingPreset = appliedPreset;
             }
@@ -1012,7 +1201,7 @@ private:
         }
     }
 
-    void applyPreset (int index, bool immediate)
+    void setPresetControls (int index, bool immediate)
     {
         const int safeIndex = juce::jlimit (0, numPresets - 1, index);
         const auto& p = preset (safeIndex);
@@ -1031,17 +1220,44 @@ private:
         setSmooth (ducking, p.ducking, immediate);
         setSmooth (width, p.width, immediate);
         setSmooth (outputGain, p.outputGain, immediate);
+    }
+
+    void applyPreset (int index, bool immediate)
+    {
+        const int safeIndex = juce::jlimit (0, numPresets - 1, index);
+        setPresetControls (safeIndex, immediate);
 
         const auto& preparedPreset = preparedPresets[(size_t) safeIndex];
-        fdnDelaySamples = preparedPreset.delaySamples;
-        fdnFeedbackLow = preparedPreset.feedbackLow;
-        // Compensacoes medidas do crossover complementar fazem os T30 reais
-        // convergirem aos alvos, nao apenas aos nomes dos parametros.
-        fdnFeedbackMid = preparedPreset.feedbackMid;
-        fdnFeedbackHigh = preparedPreset.feedbackHigh;
 
-        appliedPreset = safeIndex;
+        if (immediate)
+        {
+            fdnDelaySamples = preparedPreset.delaySamples;
+            fdnFeedbackLow = preparedPreset.feedbackLow;
+            // Compensacoes medidas do crossover complementar fazem os T30
+            // reais convergirem aos alvos, nao apenas aos nomes.
+            fdnFeedbackMid = preparedPreset.feedbackMid;
+            fdnFeedbackHigh = preparedPreset.feedbackHigh;
+            fdnDelaySamplesTarget = fdnDelaySamples;
+            fdnFeedbackLowTarget = fdnFeedbackLow;
+            fdnFeedbackMidTarget = fdnFeedbackMid;
+            fdnFeedbackHighTarget = fdnFeedbackHigh;
+            appliedPreset = safeIndex;
+            pendingPreset = safeIndex;
+            presetMorphPosition = 1.0f;
+            presetHoldSamplesRemaining = 0;
+            presetTransition = PresetTransition::idle;
+            return;
+        }
+
+        // Os dois taps leem os mesmos buffers FDN, que continuam intactos. O
+        // callback apenas cruza taps/coefs precomputados por 120 ms.
+        fdnDelaySamplesTarget = preparedPreset.delaySamples;
+        fdnFeedbackLowTarget = preparedPreset.feedbackLow;
+        fdnFeedbackMidTarget = preparedPreset.feedbackMid;
+        fdnFeedbackHighTarget = preparedPreset.feedbackHigh;
         pendingPreset = safeIndex;
+        presetMorphPosition = 0.0f;
+        presetTransition = PresetTransition::morphing;
     }
 
     static void hadamard8 (float* values) noexcept
@@ -1097,9 +1313,14 @@ private:
     std::array<float, 8> fdnFeedbackLow {};
     std::array<float, 8> fdnFeedbackMid {};
     std::array<float, 8> fdnFeedbackHigh {};
+    std::array<int, 8> fdnDelaySamplesTarget {};
+    std::array<float, 8> fdnFeedbackLowTarget {};
+    std::array<float, 8> fdnFeedbackMidTarget {};
+    std::array<float, 8> fdnFeedbackHighTarget {};
 
     PresetTransition presetTransition = PresetTransition::idle;
-    float presetTransitionGain = 1.0f;
-    float presetFadeOutStep = 1.0f / 1200.0f;
-    float presetFadeInStep = 1.0f / 2640.0f;
+    int presetRequestHoldSamples = 1200;
+    int presetHoldSamplesRemaining = 0;
+    float presetMorphPosition = 1.0f;
+    float presetMorphStep = 1.0f / 5760.0f;
 };

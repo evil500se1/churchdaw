@@ -287,8 +287,10 @@ public:
     {
         if (ehAudioUnitDeSistema (fileOrIdentifier))
         {
-            juce::Logger::writeToLog ("PLUGINS: " + fileOrIdentifier
-                                      + " e componente de sistema da Apple — ignorado");
+            juce::Logger::writeToLog (
+                "PLUGINS: " + fileOrIdentifier
+                + juce::String::fromUTF8 (
+                    u8" e componente de sistema da Apple — ignorado"));
 
             // "false" e o retorno CERTO aqui, apesar de parecer erro.
             //
@@ -366,7 +368,8 @@ private:
                 juce::Logger::writeToLog (
                     "PLUGINS: " + fileOrIdentifier
                     + " nao respondeu em " + juce::String (prazoPorPluginMs / 1000)
-                    + " s — marcado como problematico e ignorado");
+                    + juce::String::fromUTF8 (
+                        u8" s — marcado como problematico e ignorado"));
                 return false;   // entra na lista de problemas do JUCE
             }
 

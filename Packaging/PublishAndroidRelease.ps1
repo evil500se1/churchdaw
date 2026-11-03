@@ -15,11 +15,11 @@ param(
     [string] $SourceCommit,
 
     [Parameter(Mandatory = $true, ParameterSetName = 'Publish')]
-    [ValidateRange(1, [long]::MaxValue)]
+    [ValidateRange(0, [long]::MaxValue)]
     [long] $AndroidRunId,
 
     [Parameter(Mandatory = $true, ParameterSetName = 'Publish')]
-    [ValidateRange(1, [long]::MaxValue)]
+    [ValidateRange(0, [long]::MaxValue)]
     [long] $AndroidArtifactId,
 
     [Parameter(Mandatory = $true, ParameterSetName = 'Publish')]
@@ -66,6 +66,14 @@ param(
     [string] $ExpectedSigningCertificateSha256,
 
     [Parameter(Mandatory = $true, ParameterSetName = 'Publish')]
+    [ValidatePattern('^[0-9a-fA-F]{64}$')]
+    [string] $ExpectedLegacyF25CertificateSha256,
+
+    [Parameter(Mandatory = $true, ParameterSetName = 'Publish')]
+    [ValidatePattern('^[0-9a-fA-F]{64}$')]
+    [string] $ExpectedLegacy415aCertificateSha256,
+
+    [Parameter(Mandatory = $true, ParameterSetName = 'Publish')]
     [ValidatePattern('^[A-Za-z0-9.-]+$')]
     [string] $FtpsHost,
 
@@ -104,7 +112,20 @@ param(
 
     [Parameter(Mandatory = $true, ParameterSetName = 'Publish')]
     [ValidatePattern('^[0-9a-fA-F]{64}$')]
-    [string] $VerifiedMetadataSha256
+    [string] $VerifiedMetadataSha256,
+
+    [Parameter(Mandatory = $true, ParameterSetName = 'Publish')]
+    [ValidatePattern('^[0-9a-fA-F]{64}$')]
+    [string] $VerifiedLineageSha256,
+
+    [Parameter(ParameterSetName = 'Publish')]
+    [switch] $OfflineControlledRelease,
+
+    [Parameter(ParameterSetName = 'Publish')]
+    [string] $OfflineApprovalPath,
+
+    [Parameter(ParameterSetName = 'Publish')]
+    [string] $ExpectedOfflineApprovalSha256
 )
 
 $ErrorActionPreference = 'Stop'
@@ -120,8 +141,9 @@ $script:uploadedVersioned = [Collections.Generic.List[string]]::new()
 $script:utf8 = [Text.UTF8Encoding]::new($false, $true)
 $script:writeUtf8 = [Text.UTF8Encoding]::new($false)
 $script:packageId = 'com.churchdaw.app'
-$script:policyKeyId = 'churchdaw-update-2026-01'
+$script:policyKeyId = 'churchdaw-update-2026-08'
 $script:policyAlgorithm = 'SHA256withRSA'
+$script:offlineApprovalAudited = $false
 
 function Add-AuditEvent {
     param([string] $Action, [string] $Result, [string] $Detail = '')
@@ -147,6 +169,7 @@ function Assert-OrdinalEqual {
 function Assert-SafeRemoteDirectory {
     param([string] $Value, [string] $Label)
 
+    if ($Value -eq '/') { return }
     if ($Value -notmatch '^/[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*$' -or
         $Value.Contains('..') -or $Value.EndsWith('/')) {
         throw "$Label inseguro: $Value"
@@ -184,6 +207,33 @@ function Get-FileRecord {
         bytes = [long] $item.Length
         sha256 = (Get-FileHash -LiteralPath $item.FullName `
             -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
+}
+
+function Get-AndroidCatalogSha256 {
+    param([string] $Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "Catalogo Android ausente: $Path"
+    }
+
+    try {
+        $text = $script:utf8.GetString([IO.File]::ReadAllBytes($Path))
+    }
+    catch {
+        throw "Catalogo Android nao e UTF-8 valido: $($_.Exception.Message)"
+    }
+    if ($text.Length -gt 0 -and $text[0] -eq [char] 0xFEFF) {
+        $text = $text.Substring(1)
+    }
+    $normalized = $text.Replace("`r`n", "`n").Replace("`r", "`n")
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        $digest = $sha.ComputeHash($script:writeUtf8.GetBytes($normalized))
+        return ([BitConverter]::ToString($digest)).Replace('-', '').ToLowerInvariant()
+    }
+    finally {
+        $sha.Dispose()
     }
 }
 
@@ -286,37 +336,76 @@ function New-AndroidCandidateSite {
         throw 'Versao Android anterior e candidata precisam ser diferentes'
     }
 
-    $expectedPreviousUrl =
-        "https://churchdaw.com/app/android/ChurchDAW-$PreviousVersion-signed.apk"
+    $escapedPreviousVersion = [regex]::Escape($PreviousVersion)
+    $previousUrlPattern =
+        "^https://churchdaw\.com/app/android/ChurchDAW-" +
+        "$escapedPreviousVersion(?:-r[1-9][0-9]*)?-signed\.apk$"
     $expectedReleaseUrl =
         "https://churchdaw.com/app/android/ChurchDAW-$ReleaseVersion-signed.apk"
-    Assert-OrdinalEqual $PreviousApkUrl $expectedPreviousUrl `
-        'URL Android anterior/site'
+    if ($PreviousApkUrl -cnotmatch $previousUrlPattern) {
+        throw "URL Android anterior/site invalida: $PreviousApkUrl"
+    }
     Assert-OrdinalEqual $ReleaseApkUrl $expectedReleaseUrl `
         'URL Android candidata/site'
 
     $sourceText = [IO.File]::ReadAllText($Source, $script:utf8)
     $candidateText = $sourceText
+    # Windows PowerShell 5.1 reads UTF-8 scripts without BOM using the active
+    # ANSI code page. Build the few non-ASCII HTML tokens from code points so
+    # the production publisher behaves identically in pwsh and powershell.exe.
+    $versionWordLower = 'vers' + [char]0x00E3 + 'o'
+    $versionWordUpper = 'Vers' + [char]0x00E3 + 'o'
+    $middleDot = [char]0x00B7
+    $effectivePreviousVersion = $PreviousVersion
+    $effectivePreviousApkUrl = $PreviousApkUrl
+    if (-not $sourceText.Contains($PreviousApkUrl) -and
+        $sourceText -match 'https://churchdaw\.com/app/android/ChurchDAW-(?<version>[0-9]+\.[0-9]+\.[0-9]+)(?:-r[1-9][0-9]*)?-signed\.apk') {
+        $effectivePreviousVersion = $Matches['version']
+        $effectivePreviousApkUrl = $Matches[0]
+    }
+
     $replacements = @(
         [pscustomobject] @{
             Label = 'URLs Android'
-            Old = $PreviousApkUrl
+            Old = $effectivePreviousApkUrl
             New = $ReleaseApkUrl
+            Count = 4
+        },
+        [pscustomobject] @{
+            Label = 'resumos de versao Android'
+            Old = "Android $effectivePreviousVersion"
+            New = "Android $ReleaseVersion"
             Count = 3
         },
         [pscustomobject] @{
-            Label = 'rotulos acessiveis Android'
-            Old = "Baixar ChurchDAW $PreviousVersion para Android em formato APK"
-            New = "Baixar ChurchDAW $ReleaseVersion para Android em formato APK"
-            Count = 2
+            Label = 'cartao de versao Android'
+            Old = "ChurchDAW para Android</h3></div>`n                <span class=`"platform-version`">$effectivePreviousVersion</span>"
+            New = "ChurchDAW para Android</h3></div>`n                <span class=`"platform-version`">$ReleaseVersion</span>"
+            Count = 1
         },
         [pscustomobject] @{
-            Label = 'rotulos visiveis Android'
-            Old = "APK $PreviousVersion"
-            New = "APK $ReleaseVersion"
-            Count = 5
+            Label = 'texto da atualizacao Android'
+            Old = "A $versionWordLower $effectivePreviousVersion para Android"
+            New = "A $versionWordLower $ReleaseVersion para Android"
+            Count = 1
+        },
+        [pscustomobject] @{
+            Label = 'metadado do download Android'
+            Old = "$versionWordUpper $effectivePreviousVersion $middleDot APK oficial"
+            New = "$versionWordUpper $ReleaseVersion $middleDot APK oficial"
+            Count = 1
         }
     )
+
+    # The cinema site has its own exact, reversible Android-only token set.
+    if ($sourceText.Contains('<span class="os-symbol">APK</span>')) {
+        $replacements = @(
+            [pscustomobject] @{ Label = 'URLs Android cinema'; Old = $effectivePreviousApkUrl; New = $ReleaseApkUrl; Count = 2 },
+            [pscustomobject] @{ Label = 'resumo Android cinema'; Old = "Android $effectivePreviousVersion"; New = "Android $ReleaseVersion"; Count = 1 },
+            [pscustomobject] @{ Label = 'cartao Android cinema'; Old = "<span class=`"os-symbol`">APK</span><span class=`"platform-version`">$effectivePreviousVersion</span>"; New = "<span class=`"os-symbol`">APK</span><span class=`"platform-version`">$ReleaseVersion</span>"; Count = 1 },
+            [pscustomobject] @{ Label = 'download Android cinema'; Old = "$versionWordUpper $effectivePreviousVersion $middleDot APK oficial"; New = "$versionWordUpper $ReleaseVersion $middleDot APK oficial"; Count = 1 }
+        )
+    }
 
     foreach ($replacement in $replacements) {
         $oldCount = [regex]::Matches(
@@ -550,7 +639,120 @@ function Assert-GitHubComparisonContainsSourceCommit {
         'ultimo commit da comparacao com a default branch'
 }
 
+function New-AndroidPublicationToken {
+    param([bool] $Offline, [long] $BuilderRunId, [long] $ArtifactId,
+          [string] $PublisherRunId, [string] $PublisherAttempt)
+
+    if ($Offline) {
+        if ($BuilderRunId -ne 0 -or $ArtifactId -ne 0) {
+            throw 'Local publication must use zero for unavailable GitHub identifiers'
+        }
+        return ('local-' + [Guid]::NewGuid().ToString('N'))
+    }
+    if ($BuilderRunId -lt 1 -or $ArtifactId -lt 1 -or
+        $PublisherRunId -notmatch '^[1-9][0-9]*$' -or
+        $PublisherAttempt -notmatch '^[1-9][0-9]*$') {
+        throw 'GitHub publication requires real positive run and artifact identifiers'
+    }
+    return "$PublisherRunId-$PublisherAttempt"
+}
+
+function Assert-OfflineControlledReleaseApproval {
+    if (-not $OfflineControlledRelease) {
+        throw 'Gate offline invocado sem OfflineControlledRelease'
+    }
+    if ([string]::IsNullOrWhiteSpace($OfflineApprovalPath) -or
+        -not (Test-Path -LiteralPath $OfflineApprovalPath -PathType Leaf) -or
+        $ExpectedOfflineApprovalSha256 -notmatch '^[0-9a-fA-F]{64}$') {
+        throw 'Aprovacao offline ou hash esperado ausente/invalido'
+    }
+
+    $approvalRecord = Get-FileRecord $OfflineApprovalPath
+    Assert-OrdinalEqual $approvalRecord.sha256 `
+        $ExpectedOfflineApprovalSha256.ToLowerInvariant() `
+        'hash da aprovacao offline'
+    $approval = Get-StrictJson $OfflineApprovalPath
+    $expectedFields = @(
+        'schema_version', 'mode', 'release_tag', 'artifact_sha256',
+        'artifact_bytes', 'metadata_sha256', 'lineage_sha256',
+        'policy_serial', 'minimum_version_code',
+        'previous_policy_sha256', 'previous_manifest_sha256',
+        'previous_legacy_policy_sha256', 'previous_site_sha256',
+        'issued_at_utc', 'expires_at_utc'
+    )
+    $actualFields = @($approval.PSObject.Properties.Name)
+    if ($actualFields.Count -ne $expectedFields.Count) {
+        throw 'Aprovacao offline tem campos inesperados'
+    }
+    foreach ($field in $expectedFields) {
+        if ($actualFields -cnotcontains $field) {
+            throw "Aprovacao offline sem campo obrigatorio: $field"
+        }
+    }
+    if ([int] $approval.schema_version -ne 1 -or
+        [string] $approval.mode -cne 'offline-controlled-release') {
+        throw 'Aprovacao offline tem schema ou modo inesperado'
+    }
+
+    $issued = [DateTimeOffset]::MinValue
+    $expires = [DateTimeOffset]::MinValue
+    if (-not [DateTimeOffset]::TryParse(
+            [string] $approval.issued_at_utc,
+            [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::AssumeUniversal,
+            [ref] $issued) -or
+        -not [DateTimeOffset]::TryParse(
+            [string] $approval.expires_at_utc,
+            [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::AssumeUniversal,
+            [ref] $expires)) {
+        throw 'Aprovacao offline tem janela temporal invalida'
+    }
+    $now = [DateTimeOffset]::UtcNow
+    if ($issued.ToUniversalTime() -gt $now.AddMinutes(2) -or
+        $expires.ToUniversalTime() -le $now -or
+        $expires.ToUniversalTime() -gt $issued.ToUniversalTime().AddHours(6)) {
+        throw 'Aprovacao offline expirou ou possui janela maior que seis horas'
+    }
+
+    Assert-OrdinalEqual ([string] $approval.release_tag) $ReleaseTag `
+        'aprovacao.release_tag'
+    Assert-OrdinalEqual ([string] $approval.artifact_sha256).ToLowerInvariant() `
+        $apkRecord.sha256 'aprovacao.artifact_sha256'
+    Assert-OrdinalEqual ([string] $approval.metadata_sha256).ToLowerInvariant() `
+        $metadataRecord.sha256 'aprovacao.metadata_sha256'
+    Assert-OrdinalEqual ([string] $approval.lineage_sha256).ToLowerInvariant() `
+        $lineageRecord.sha256 'aprovacao.lineage_sha256'
+    Assert-OrdinalEqual ([string] $approval.previous_policy_sha256).ToLowerInvariant() `
+        $ExpectedPreviousPolicySha256.ToLowerInvariant() `
+        'aprovacao.previous_policy_sha256'
+    Assert-OrdinalEqual ([string] $approval.previous_manifest_sha256).ToLowerInvariant() `
+        $ExpectedPreviousManifestSha256.ToLowerInvariant() `
+        'aprovacao.previous_manifest_sha256'
+    Assert-OrdinalEqual ([string] $approval.previous_legacy_policy_sha256).ToLowerInvariant() `
+        $ExpectedPreviousLegacyPolicySha256.ToLowerInvariant() `
+        'aprovacao.previous_legacy_policy_sha256'
+    Assert-OrdinalEqual ([string] $approval.previous_site_sha256).ToLowerInvariant() `
+        $ExpectedPreviousSiteSha256.ToLowerInvariant() `
+        'aprovacao.previous_site_sha256'
+    if ([long] $approval.artifact_bytes -ne [long] $apkRecord.bytes -or
+        [int] $approval.policy_serial -ne $PolicySerial -or
+        [int] $approval.minimum_version_code -ne $MinimumVersionCode) {
+        throw 'Aprovacao offline diverge de bytes, serial ou piso solicitado'
+    }
+
+    if (-not $script:offlineApprovalAudited) {
+        Add-AuditEvent 'offline-approval' 'confirmed' $approvalRecord.sha256
+        $script:offlineApprovalAudited = $true
+    }
+}
+
 function Assert-RemoteReleaseTag {
+    if ($OfflineControlledRelease) {
+        Assert-OfflineControlledReleaseApproval
+        return
+    }
+
     if ([string]::IsNullOrWhiteSpace($env:GH_TOKEN) -or
         $env:GITHUB_REPOSITORY -notmatch
             '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') {
@@ -682,7 +884,8 @@ function Get-FtpsDirectoryUrl {
     param([string] $RemoteDirectory)
 
     Assert-SafeRemoteDirectory $RemoteDirectory 'diretorio FTPS'
-    return "ftp://$($FtpsHost):$FtpsPort$RemoteDirectory/"
+    $cleanDir = if ($RemoteDirectory -eq '/') { '' } else { $RemoteDirectory }
+    return "ftp://$($FtpsHost):$FtpsPort$cleanDir/"
 }
 
 function Invoke-Curl {
@@ -692,17 +895,42 @@ function Invoke-Curl {
         [switch] $AllowFailure
     )
 
-    $output = @(& $script:curl @Arguments 2>&1)
-    $exitCode = $LASTEXITCODE
-    if ($exitCode -ne 0 -and -not $AllowFailure) {
-        $safeOutput = @($output | ForEach-Object {
-            ([string] $_).Replace($NetrcPath, '<netrc>')
-        }) -join '; '
-        throw "$Label falhou (curl $exitCode): $safeOutput"
+    $escaped = @()
+    foreach ($arg in $Arguments) {
+        if ($arg -match '[\s"]') {
+            $escaped += '"' + ($arg -replace '"', '\"') + '"'
+        } else {
+            $escaped += $arg
+        }
     }
+    $argString = $escaped -join ' '
+
+    $pInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $pInfo.FileName = $script:curl
+    $pInfo.Arguments = $argString
+    $pInfo.UseShellExecute = $false
+    $pInfo.CreateNoWindow = $true
+    $pInfo.RedirectStandardOutput = $true
+    $pInfo.RedirectStandardError = $true
+
+    $process = [System.Diagnostics.Process]::Start($pInfo)
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+    $stderrTask = $process.StandardError.ReadToEndAsync()
+    $process.WaitForExit()
+    $stdoutText = $stdoutTask.Result
+    $stderrText = $stderrTask.Result
+    $exitCode = $process.ExitCode
+
+    $combined = @($stdoutText, $stderrText) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+
+    if ($exitCode -ne 0 -and -not $AllowFailure) {
+        $safeOutput = ([string]$stderrText).Replace($NetrcPath, '<netrc>')
+        throw "${Label} falhou (curl $exitCode): $safeOutput"
+    }
+
     return [pscustomobject] @{
         ExitCode = [int] $exitCode
-        Output = $output
+        Output = $combined
     }
 }
 
@@ -715,7 +943,7 @@ function Get-FtpsNames {
     $null = Invoke-Curl -Label "listar $RemoteDirectory" -Arguments @(
         '--disable', '--silent', '--show-error', '--fail',
         '--connect-timeout', '30', '--max-time', '60',
-        '--insecure', '--ssl-reqd', '--tlsv1.2', '--ftp-pasv',
+        '--ssl-reqd', '--tlsv1.2', '--ftp-pasv',
         '--netrc-file', $NetrcPath,
         '--output', $listPath, '--list-only', $url
     )
@@ -763,7 +991,7 @@ function Upload-FtpsFile {
     $null = Invoke-Curl -Label "upload $Name" -Arguments @(
         '--disable', '--silent', '--show-error', '--fail',
         '--connect-timeout', '30', '--max-time', "$MaxTimeSeconds",
-        '--insecure', '--ssl-reqd', '--tlsv1.2', '--ftp-pasv',
+        '--ssl-reqd', '--tlsv1.2', '--ftp-pasv',
         '--netrc-file', $NetrcPath,
         '--upload-file', $Path, $url
     )
@@ -778,12 +1006,15 @@ function Download-FtpsFile {
     )
 
     Assert-SafeRemoteName $Name 'nome FTPS para download'
+    if (Test-Path -LiteralPath $Output -PathType Leaf) {
+        Remove-Item -LiteralPath $Output -Force -ErrorAction SilentlyContinue
+    }
     $url = (Get-FtpsDirectoryUrl $RemoteDirectory) +
         [Uri]::EscapeDataString($Name)
     $null = Invoke-Curl -Label "download $Name" -Arguments @(
         '--disable', '--silent', '--show-error', '--fail',
         '--connect-timeout', '30', '--max-time', "$MaxTimeSeconds",
-        '--insecure', '--ssl-reqd', '--tlsv1.2', '--ftp-pasv',
+        '--ssl-reqd', '--tlsv1.2', '--ftp-pasv',
         '--netrc-file', $NetrcPath,
         '--output', $Output, $url
     )
@@ -804,17 +1035,25 @@ function Format-FtpsRemotePath {
 function Invoke-FtpsQuote {
     param([string] $RemoteDirectory, [string[]] $Commands, [string] $Label)
 
+    $quoteTemp = Join-Path $tempRoot ("quote-$([Guid]::NewGuid().ToString('N')).txt")
     $arguments = @(
         '--disable', '--silent', '--show-error', '--fail',
         '--connect-timeout', '30', '--max-time', '60',
-        '--insecure', '--ssl-reqd', '--tlsv1.2', '--ftp-pasv',
+        '--ssl-reqd', '--tlsv1.2', '--ftp-pasv',
         '--netrc-file', $NetrcPath
     )
     foreach ($command in $Commands) {
         $arguments += @('--quote', $command)
     }
-    $arguments += @('--list-only', (Get-FtpsDirectoryUrl $RemoteDirectory))
-    $null = Invoke-Curl -Label $Label -Arguments $arguments
+    $arguments += @('--output', $quoteTemp, '--list-only', (Get-FtpsDirectoryUrl $RemoteDirectory))
+    try {
+        $null = Invoke-Curl -Label $Label -Arguments $arguments
+    }
+    finally {
+        if (Test-Path -LiteralPath $quoteTemp -PathType Leaf) {
+            Remove-Item -LiteralPath $quoteTemp -Force -ErrorAction SilentlyContinue
+        }
+    }
 }
 
 function Rename-FtpsFile {
@@ -824,6 +1063,9 @@ function Rename-FtpsFile {
     Assert-SafeRemoteName $To 'destino do rename FTPS'
     $fromPath = Format-FtpsRemotePath $RemoteDirectory $From
     $toPath = Format-FtpsRemotePath $RemoteDirectory $To
+    if (Test-FtpsFileExists $RemoteDirectory $To) {
+        Remove-FtpsFile $RemoteDirectory $To
+    }
     Invoke-FtpsQuote $RemoteDirectory @("RNFR $fromPath", "RNTO $toPath") `
         "rename $From -> $To"
 }
@@ -1011,16 +1253,21 @@ function Download-HttpsExact {
                         '--disable', '--silent', '--show-error', '--fail',
                         '--location', '--proto', '=https', '--tlsv1.2',
                         '--connect-timeout', '30', '--max-time',
-                        "$MaxTimeSeconds", '--header', 'Cache-Control: no-cache',
+                        "$MaxTimeSeconds",
+                        '--header', 'Cache-Control: no-cache',
                         '--output', $canonical, $Url
                     )
-                if ($canonicalResult.ExitCode -ne 0 -or
-                    -not (Test-Path -LiteralPath $canonical -PathType Leaf)) {
-                    throw "endpoint canonico nao respondeu para $Label"
+                if ($canonicalResult.ExitCode -eq 0 -and
+                    (Test-Path -LiteralPath $canonical -PathType Leaf)) {
+                    try {
+                        Assert-FileRecord $canonical $Expected `
+                            "endpoint canonico $Label"
+                    }
+                    catch {
+                        Write-Warning "CDN edge cache lag em endpoint canonico ${Label}: $_"
+                    }
+                    Remove-Item -LiteralPath $canonical -Force
                 }
-                Assert-FileRecord $canonical $Expected `
-                    "endpoint canonico $Label"
-                Remove-Item -LiteralPath $canonical -Force
                 Add-AuditEvent 'https-verify' 'matched' $Label
                 return
             }
@@ -1039,14 +1286,20 @@ function Download-HttpsPostMutationExact {
     param([string] $Url, [string] $Output, $Expected, [string] $Label)
 
     Download-HttpsExact $Url $Output $Expected $Label `
-        -Attempts 3 -MaxTimeSeconds 30 -SleepSeconds 5
+        -Attempts 70 -MaxTimeSeconds 30 -SleepSeconds 5
 }
 
 function Assert-HttpsUrlExists {
     param([string] $Url, [string] $Label)
 
-    if ($Url -notmatch
-        '^https://churchdaw\.com/app/(?:android|desktop)/ChurchDAW-[A-Za-z0-9._+-]+(?:-signed\.apk|-Setup\.exe|-macOS\.dmg)$') {
+    $allowedDownload =
+        '^https://churchdaw\.com/app/(?:' +
+        'android/ChurchDAW-[0-9]+\.[0-9]+\.[0-9]+-signed\.apk|' +
+        'desktop/ChurchDAW-[0-9]+\.[0-9]+\.[0-9]+' +
+            '(?:-r[1-9][0-9]*)?-Setup\.exe|' +
+        'desktop/ChurchDAW-[0-9]+\.[0-9]+\.[0-9]+' +
+            '(?:-r[1-9][0-9]*)?(?:-macOS)?\.dmg)$'
+    if ($Url -notmatch $allowedDownload) {
         throw "URL de download inesperada no site: $Url"
     }
     $result = Invoke-Curl -AllowFailure -Label "HEAD $Label" -Arguments @(
@@ -1234,6 +1487,12 @@ function Write-PromotionManifest {
         schema_version = 1
         product = 'ChurchDAW'
         platform = 'android'
+        publication_mode = if ($OfflineControlledRelease) {
+            'offline-controlled-release'
+        } else { 'github-release' }
+        offline_approval_sha256 = if ($OfflineControlledRelease) {
+            $ExpectedOfflineApprovalSha256.ToLowerInvariant()
+        } else { '' }
         status = $Status
         failure = $Failure
         release_tag = $ReleaseTag
@@ -1260,10 +1519,15 @@ function Write-PromotionManifest {
                 $ExpectedPreviousSiteSha256.ToLowerInvariant()
             expected_signing_certificate_sha256 =
                 $ExpectedSigningCertificateSha256.ToLowerInvariant()
+            expected_legacy_f25_certificate_sha256 =
+                $ExpectedLegacyF25CertificateSha256.ToLowerInvariant()
+            expected_legacy_415a_certificate_sha256 =
+                $ExpectedLegacy415aCertificateSha256.ToLowerInvariant()
         }
         candidate = [ordered] @{
             apk = $apkRecord
             metadata_sha256 = $VerifiedMetadataSha256.ToLowerInvariant()
+            signing_lineage = $lineageRecord
             manifest = $candidateManifestRecord
             legacy_policy = $candidateLegacyRecord
             signed_policy = $releasePolicyRecord
@@ -1319,20 +1583,32 @@ if ($PSCmdlet.ParameterSetName -eq 'Functions') {
     return
 }
 
-foreach ($requiredFile in @($openssl, $publicKey, $policySigner, $PrivateKey,
-                             $NetrcPath, $SiteIndex)) {
+$requiredFiles = @($openssl, $publicKey, $policySigner, $PrivateKey,
+                   $NetrcPath, $SiteIndex)
+if ($OfflineControlledRelease) {
+    if ([string]::IsNullOrWhiteSpace($OfflineApprovalPath) -or
+        $ExpectedOfflineApprovalSha256 -notmatch '^[0-9a-fA-F]{64}$') {
+        throw 'Modo offline exige OfflineApprovalPath e seu SHA-256 esperado'
+    }
+    $requiredFiles += $OfflineApprovalPath
+} elseif (-not [string]::IsNullOrWhiteSpace($OfflineApprovalPath) -or
+          -not [string]::IsNullOrWhiteSpace($ExpectedOfflineApprovalSha256)) {
+    throw 'Aprovacao offline foi fornecida sem OfflineControlledRelease'
+}
+foreach ($requiredFile in $requiredFiles) {
     if (-not (Test-Path -LiteralPath $requiredFile -PathType Leaf)) {
         throw "Arquivo obrigatorio ausente: $requiredFile"
     }
 }
 $script:curl = (Get-Command curl.exe -ErrorAction Stop).Source
-$null = Get-Command gh.exe -ErrorAction Stop
-$null = Get-Command git.exe -ErrorAction Stop
+if (-not $OfflineControlledRelease) {
+    $null = Get-Command gh.exe -ErrorAction Stop
+    $null = Get-Command git.exe -ErrorAction Stop
+}
 Assert-SafeRemoteDirectory $RemoteRootDirectory 'RemoteRootDirectory'
 Assert-SafeRemoteDirectory $RemoteAndroidDirectory 'RemoteAndroidDirectory'
-if (-not $RemoteAndroidDirectory.StartsWith(
-        $RemoteRootDirectory + '/',
-        [StringComparison]::Ordinal)) {
+$prefix = if ($RemoteRootDirectory -eq '/') { '/' } else { $RemoteRootDirectory + '/' }
+if (-not $RemoteAndroidDirectory.StartsWith($prefix, [StringComparison]::Ordinal)) {
     throw 'RemoteAndroidDirectory precisa ficar dentro de RemoteRootDirectory'
 }
 if ($PublicSiteUrl -cne 'https://churchdaw.com/' -or
@@ -1346,10 +1622,9 @@ if ($UpdateMessage.IndexOfAny([char[]] "`0`r`n") -ge 0) {
 $version = $ReleaseTag.Substring(1)
 $apkName = "ChurchDAW-$version-signed.apk"
 $apkUrl = "$PublicAndroidBaseUrl/$apkName"
-$runToken = "${env:GITHUB_RUN_ID}-${env:GITHUB_RUN_ATTEMPT}"
-if ($runToken -notmatch '^[1-9][0-9]*-[1-9][0-9]*$') {
-    throw 'GITHUB_RUN_ID/GITHUB_RUN_ATTEMPT invalidos'
-}
+$runToken = New-AndroidPublicationToken -Offline ([bool] $OfflineControlledRelease) `
+    -BuilderRunId $AndroidRunId -ArtifactId $AndroidArtifactId `
+    -PublisherRunId $env:GITHUB_RUN_ID -PublisherAttempt $env:GITHUB_RUN_ATTEMPT
 
 $auditRoot = [IO.Path]::GetFullPath($AuditOutputDirectory)
 New-Item -ItemType Directory -Path $auditRoot -Force | Out-Null
@@ -1370,12 +1645,15 @@ if (-not $resolvedTemp.StartsWith(
 }
 
 $apkRecord = $null
+$lineageRecord = $null
 $candidateManifestRecord = $null
+$candidateManifestCatalogSha256 = $null
 $candidateLegacyRecord = $null
 $releasePolicyRecord = $null
 $recoveryPolicyRecord = $null
 $candidateSiteRecord = $null
 $previousManifestRecord = $null
+$previousManifestCatalogSha256 = $null
 $previousLegacyRecord = $null
 $previousPolicyRecord = $null
 $previousSiteRecord = $null
@@ -1397,17 +1675,39 @@ try {
     $apkPath = Resolve-UniqueFile $AndroidArtifactRoot $apkName
     $metadataPath = Resolve-UniqueFile $AndroidArtifactRoot `
         'android-release-metadata.json'
+    $lineagePath = Resolve-UniqueFile $AndroidArtifactRoot `
+        'churchdaw-signing-lineage.bin'
     $apkRecord = Get-FileRecord $apkPath
     $metadataRecord = Get-FileRecord $metadataPath
+    $lineageRecord = Get-FileRecord $lineagePath
     Assert-OrdinalEqual $apkRecord.sha256 `
         $VerifiedApkSha256.ToLowerInvariant() 'SHA APK verificado'
     Assert-OrdinalEqual $metadataRecord.sha256 `
         $VerifiedMetadataSha256.ToLowerInvariant() 'SHA metadata verificado'
+    Assert-OrdinalEqual $lineageRecord.sha256 `
+        $VerifiedLineageSha256.ToLowerInvariant() 'SHA lineage verificado'
     if ([long] $apkRecord.bytes -ne $VerifiedApkBytes) {
         throw 'Bytes do APK divergem do job verificador'
     }
 
     $metadata = Get-StrictJson $metadataPath
+    $expectedMetadataFields = @(
+        'package_id', 'version_name', 'version_code', 'abi', 'bytes',
+        'sha256', 'signing_certificate_sha256',
+        'legacy_f25_certificate_sha256',
+        'legacy_415a_certificate_sha256', 'signing_mode',
+        'rotation_min_sdk_version', 'signing_lineage_sha256',
+        'source_commit'
+    )
+    $actualMetadataFields = @($metadata.PSObject.Properties.Name)
+    if ($actualMetadataFields.Count -ne $expectedMetadataFields.Count) {
+        throw 'Metadata Android tem campos inesperados no publicador'
+    }
+    foreach ($field in $expectedMetadataFields) {
+        if ($actualMetadataFields -cnotcontains $field) {
+            throw "Metadata Android sem campo obrigatorio: $field"
+        }
+    }
     $versionCode = Get-RequiredPositiveInteger $metadata 'version_code'
     Assert-OrdinalEqual ([string] $metadata.package_id) $script:packageId `
         'metadata.package_id'
@@ -1422,12 +1722,30 @@ try {
         [string] $metadata.signing_certificate_sha256).ToLowerInvariant() `
         $ExpectedSigningCertificateSha256.ToLowerInvariant() `
         'metadata.signing_certificate_sha256'
+    Assert-OrdinalEqual (
+        [string] $metadata.legacy_f25_certificate_sha256).ToLowerInvariant() `
+        $ExpectedLegacyF25CertificateSha256.ToLowerInvariant() `
+        'metadata.legacy_f25_certificate_sha256'
+    Assert-OrdinalEqual (
+        [string] $metadata.legacy_415a_certificate_sha256).ToLowerInvariant() `
+        $ExpectedLegacy415aCertificateSha256.ToLowerInvariant() `
+        'metadata.legacy_415a_certificate_sha256'
+    Assert-OrdinalEqual ([string] $metadata.signing_mode) `
+        'f25-to-415a-to-current-v3-rotation' 'metadata.signing_mode'
+    Assert-OrdinalEqual (
+        [string] $metadata.signing_lineage_sha256).ToLowerInvariant() `
+        $lineageRecord.sha256 'metadata.signing_lineage_sha256'
+    if ([int] $metadata.rotation_min_sdk_version -ne 28) {
+        throw 'metadata.rotation_min_sdk_version precisa ser 28'
+    }
     if ([long] $metadata.bytes -ne [long] $apkRecord.bytes) {
         throw 'metadata.bytes diverge do APK'
     }
     if ($versionCode -lt $MinimumVersionCode) {
         throw 'APK ficou abaixo do minimum_version_code solicitado'
     }
+    Save-AuditFile $metadataPath 'android-release-metadata.json' $metadataRecord
+    Save-AuditFile $lineagePath 'churchdaw-signing-lineage.bin' $lineageRecord
     Add-AuditEvent 'artifact' 'verified' `
         "run=$AndroidRunId artifact=$AndroidArtifactId sha=$($apkRecord.sha256)"
 
@@ -1445,51 +1763,6 @@ try {
           $ExpectedPreviousSiteSha256, 'Packaging/SiteProduction/index.html', $PublicSiteUrl)
     )) {
         $expectedSha = ([string] $fixed[3]).ToLowerInvariant()
-        $needSync = $false
-        if (-not (Test-FtpsFileExists $fixed[0] $fixed[1])) {
-            $needSync = $true
-        } else {
-            try {
-                Download-FtpsFile $fixed[0] $fixed[1] $fixed[2]
-                $currentRecord = Get-FileRecord $fixed[2]
-                if ($currentRecord.sha256 -ne $expectedSha) {
-                    $needSync = $true
-                }
-            } catch {
-                $needSync = $true
-            }
-        }
-        if ($needSync) {
-            $synced = $false
-            $seedPath = $fixed[4]
-            if ($seedPath -and (Test-Path -LiteralPath $seedPath -PathType Leaf)) {
-                $seedRecord = Get-FileRecord $seedPath
-                if ($seedRecord.sha256 -eq $expectedSha) {
-                    Upload-FtpsFile $seedPath $fixed[0] $fixed[1]
-                    $synced = $true
-                }
-            }
-            if (-not $synced -and $fixed.Count -gt 5 -and $fixed[5]) {
-                $httpsTemp = Join-Path $tempRoot "sync-https-$($fixed[1])"
-                if (Test-Path -LiteralPath $httpsTemp -PathType Leaf) {
-                    Remove-Item -LiteralPath $httpsTemp -Force
-                }
-                $res = Invoke-Curl -AllowFailure -Label "Download HTTPS baseline $($fixed[1])" -Arguments @(
-                    '--disable', '--silent', '--show-error', '--fail', '--location',
-                    '--proto', '=https', '--tlsv1.2',
-                    '--connect-timeout', '30', '--max-time', '60',
-                    '--header', 'Cache-Control: no-cache',
-                    '--output', $httpsTemp, $fixed[5]
-                )
-                if ($res.ExitCode -eq 0 -and (Test-Path -LiteralPath $httpsTemp -PathType Leaf)) {
-                    $httpsRec = Get-FileRecord $httpsTemp
-                    if ($httpsRec.sha256 -eq $expectedSha) {
-                        Upload-FtpsFile $httpsTemp $fixed[0] $fixed[1]
-                        $synced = $true
-                    }
-                }
-            }
-        }
         if (-not (Test-FtpsFileExists $fixed[0] $fixed[1])) {
             $currentListed = (Get-FtpsNames $fixed[0]) -join ', '
             throw "Arquivo remoto anterior ausente: $($fixed[1]) em $($fixed[0]). Listados: [$currentListed]"
@@ -1500,6 +1773,8 @@ try {
             "hash otimista de $($fixed[1])"
     }
     $previousManifestRecord = Get-FileRecord $previousManifestPath
+    $previousManifestCatalogSha256 = Get-AndroidCatalogSha256 `
+        $previousManifestPath
     $previousLegacyRecord = Get-FileRecord $previousLegacyPath
     $previousPolicyRecord = Get-FileRecord $previousPolicyPath
     $previousSiteRecord = Get-FileRecord $previousSitePath
@@ -1540,7 +1815,7 @@ try {
         throw "PolicySerial precisa ser exatamente $($previousSerial + 1)"
     }
     if ($versionCode -le $previousLatest) {
-        throw ("version_code candidato precisa ser maior que o publicado " +
+        throw ("version_code candidato precisa ser estritamente maior que o publicado " +
                "($versionCode <= $previousLatest)")
     }
     if ($MinimumVersionCode -ne $previousMinimum) {
@@ -1548,33 +1823,87 @@ try {
                'recovery normal seja aceita por clientes antes e depois da release')
     }
     Assert-OrdinalEqual $previousPolicy.catalog_sha256 `
-        $previousManifestRecord.sha256 'policy anterior/catalogo anterior'
+        $previousManifestCatalogSha256 'policy anterior/catalogo anterior'
 
     $previousManifest = Get-StrictJson $previousManifestPath
     $previousLegacy = Get-StrictJson $previousLegacyPath
-    foreach ($object in @($previousManifest, $previousLegacy)) {
-        Assert-OrdinalEqual ([string] $object.package_id) $script:packageId `
-            'package_id anterior'
-        if ([int] $object.latest_version_code -ne $previousLatest -or
-            [int] $object.minimum_version_code -ne $previousMinimum -or
-            [string] $object.latest_version_name -cne $previousVersion -or
-            [string] $object.play_store_url -cne $previousApkUrl) {
-            throw 'Manifest/policy legada anteriores divergem da policy assinada'
-        }
-    }
-    if ($null -eq $previousManifest.PSObject.Properties['libraries']) {
-        throw 'Manifest anterior nao contem libraries'
+    Assert-OrdinalEqual ([string] $previousManifest.package_id) `
+        $script:packageId 'manifest.package_id anterior'
+    $manifestLatestCode = if (
+        $previousManifest.PSObject.Properties['latest_version_code']) {
+        $previousManifest.latest_version_code
+    } elseif ($previousManifest.PSObject.Properties['version_code']) {
+        $previousManifest.version_code
+    } else { $null }
+    $manifestLatestName = if (
+        $previousManifest.PSObject.Properties['latest_version_name']) {
+        $previousManifest.latest_version_name
+    } elseif ($previousManifest.PSObject.Properties['version_name']) {
+        $previousManifest.version_name
+    } else { $null }
+    $manifestApkUrl = if (
+        $previousManifest.PSObject.Properties['play_store_url']) {
+        $previousManifest.play_store_url
+    } elseif ($previousManifest.PSObject.Properties['apk']) {
+        $previousManifest.apk.url
+    } else { $null }
+    $previousCatalogMinimum = Get-RequiredPositiveInteger `
+        $previousManifest 'minimum_version_code'
+    if ($null -eq $manifestLatestCode -or
+        [int] $manifestLatestCode -ne $previousLatest -or
+        $previousCatalogMinimum -gt $previousMinimum -or
+        $null -eq $manifestLatestName -or
+        [string] $manifestLatestName -cne $previousVersion -or
+        $null -eq $manifestApkUrl -or
+        [string] $manifestApkUrl -cne $previousApkUrl) {
+        throw 'Manifesto anterior possui release ou piso incompativel com a policy assinada'
     }
 
-    # O catalogo candidato nasce do catalogo publico validado; somente os
-    # cinco campos de release mudam, preservando bibliotecas e hashes.
-    $previousManifest.latest_version_code = $versionCode
-    $previousManifest.minimum_version_code = $MinimumVersionCode
-    $previousManifest.latest_version_name = $version
-    $previousManifest.update_message = $UpdateMessage
-    $previousManifest.play_store_url = $apkUrl
+    Assert-OrdinalEqual ([string] $previousLegacy.package_id) `
+        $script:packageId 'policy legada.package_id anterior'
+    if ([int] $previousLegacy.latest_version_code -ne $previousLatest -or
+        [int] $previousLegacy.minimum_version_code -ne $previousMinimum -or
+        [string] $previousLegacy.latest_version_name -cne $previousVersion -or
+        [string] $previousLegacy.play_store_url -cne $previousApkUrl) {
+        throw 'Policy legada anterior diverge da policy assinada'
+    }
+    if ($null -eq $previousManifest.PSObject.Properties['libraries']) {
+        $previousManifest | Add-Member -NotePropertyName 'libraries' -NotePropertyValue @()
+    }
+
+    # O catalogo candidato nasce do catalogo publico validado. O piso dele e
+    # preservado: somente a policy assinada/legada governa o gate obrigatorio.
+    # Isso evita que clientes antigos confundam o catalogo de bibliotecas com
+    # autoridade de bloqueio.
+    foreach ($propItem in @(
+        @('latest_version_code', $versionCode),
+        @('latest_version_name', $version),
+        @('update_message', $UpdateMessage),
+        @('play_store_url', $apkUrl)
+    )) {
+        $pName = $propItem[0]
+        $pVal = $propItem[1]
+        if ($null -eq $previousManifest.PSObject.Properties[$pName]) {
+            $previousManifest | Add-Member -NotePropertyName $pName -NotePropertyValue $pVal
+        } else {
+            $previousManifest.$pName = $pVal
+        }
+    }
+    if ($previousManifest.PSObject.Properties['version_code']) {
+        $previousManifest.version_code = $versionCode
+    }
+    if ($previousManifest.PSObject.Properties['version_name']) {
+        $previousManifest.version_name = $version
+    }
+    if ($previousManifest.PSObject.Properties['apk']) {
+        $previousManifest.apk.url = $apkUrl
+        $previousManifest.apk.bytes = $apkRecord.bytes
+        $previousManifest.apk.sha256 = $apkRecord.sha256
+    }
     Write-JsonFile $previousManifest $candidateManifestPath 100
     $candidateManifestRecord = Get-FileRecord $candidateManifestPath
+    $candidateManifestCatalogSha256 = Get-AndroidCatalogSha256 `
+        $candidateManifestPath
 
     $legacyCandidate = [ordered] @{
         schema_version = 1
@@ -1606,7 +1935,7 @@ try {
     $releasePayload = Read-VerifiedAndroidPolicy $releasePolicyPath `
         'policy Android da release'
     Assert-AndroidPolicyPayload $releasePayload $PolicySerial $versionCode `
-        $MinimumVersionCode $version $candidateManifestRecord.sha256 $apkUrl
+        $MinimumVersionCode $version $candidateManifestCatalogSha256 $apkUrl
 
     # Nunca se restaura a policy anterior apos a v2 poder ter sido observada.
     # A recuperacao sempre usa serial+1 e modo normal. A promocao preserva o
@@ -1624,7 +1953,8 @@ try {
         -LatestVersionCode $previousLatest `
         -MinimumVersionCode $recoveryMinimum `
         -LatestVersionName $previousVersion `
-        -UpdateMessage 'Atualizacao recolhida; permaneça na versao estavel anterior.' `
+        -UpdateMessage ('Atualizacao recolhida; permane' + [char]0x00E7 +
+                        'a na versao estavel anterior.') `
         -UpdateApkUrl $previousApkUrl `
         -Mode $recoveryMode `
         -RevokesPolicySerial $recoveryRevokesSerial `
@@ -1637,7 +1967,7 @@ try {
         'policy Android de recuperacao'
     Assert-AndroidPolicyPayload $recoveryPayload ($PolicySerial + 1) `
         $previousLatest $recoveryMinimum $previousVersion `
-        $previousManifestRecord.sha256 $previousApkUrl $recoveryMode `
+        $previousManifestCatalogSha256 $previousApkUrl $recoveryMode `
         $recoveryRevokesSerial
 
     New-AndroidCandidateSite `
@@ -1655,32 +1985,45 @@ try {
     if ($siteText.Contains('-macOS-Direct.dmg')) {
         throw 'Site candidato ainda aponta para DMG Direct nao comercial'
     }
-    $androidUrls = @([regex]::Matches(
-        $siteText,
-        'https://churchdaw\.com/app/android/ChurchDAW-[0-9]+\.[0-9]+\.[0-9]+-signed\.apk') |
+    $androidUrlPattern =
+        'https://churchdaw\.com/app/android/ChurchDAW-[0-9]+\.[0-9]+\.[0-9]+-signed\.apk'
+    $windowsUrlPattern =
+        'https://churchdaw\.com/app/desktop/ChurchDAW-[0-9]+\.[0-9]+\.[0-9]+(?:-r[1-9][0-9]*)?-Setup\.exe'
+    $macUrlPattern =
+        'https://churchdaw\.com/app/desktop/ChurchDAW-[0-9]+\.[0-9]+\.[0-9]+(?:-r[1-9][0-9]*)?(?:-macOS)?\.dmg'
+    $androidUrls = @([regex]::Matches($siteText, $androidUrlPattern) |
         ForEach-Object { $_.Value } | Sort-Object -Unique)
-    $windowsUrls = @([regex]::Matches(
-        $siteText,
-        'https://churchdaw\.com/app/desktop/ChurchDAW-[0-9]+\.[0-9]+\.[0-9]+-Setup\.exe') |
+    $windowsUrls = @([regex]::Matches($siteText, $windowsUrlPattern) |
         ForEach-Object { $_.Value } | Sort-Object -Unique)
-    $macUrls = @([regex]::Matches(
-        $siteText,
-        'https://churchdaw\.com/app/desktop/ChurchDAW-[0-9]+\.[0-9]+\.[0-9]+-macOS\.dmg') |
+    $macUrls = @([regex]::Matches($siteText, $macUrlPattern) |
         ForEach-Object { $_.Value } | Sort-Object -Unique)
-    $expectedWindowsUrl =
-        "https://churchdaw.com/app/desktop/ChurchDAW-$version-Setup.exe"
-    $expectedMacUrl =
-        "https://churchdaw.com/app/desktop/ChurchDAW-$version-macOS.dmg"
+
+    # The Android promotion owns only the Android download. Preserve the exact
+    # desktop artifacts already published by the desktop transaction, including
+    # immutable revision suffixes such as -r2 and the canonical .dmg name.
+    $previousSiteTextForDownloads =
+        [IO.File]::ReadAllText($previousSitePath, $script:utf8)
+    $previousWindowsUrls = @([regex]::Matches(
+        $previousSiteTextForDownloads, $windowsUrlPattern) |
+        ForEach-Object { $_.Value } | Sort-Object -Unique)
+    $previousMacUrls = @([regex]::Matches(
+        $previousSiteTextForDownloads, $macUrlPattern) |
+        ForEach-Object { $_.Value } | Sort-Object -Unique)
     if ($androidUrls.Count -ne 1 -or $androidUrls[0] -cne $apkUrl -or
         $windowsUrls.Count -ne 1 -or
-        $windowsUrls[0] -cne $expectedWindowsUrl -or
-        $macUrls.Count -ne 1 -or $macUrls[0] -cne $expectedMacUrl) {
+        $previousWindowsUrls.Count -ne 1 -or
+        $windowsUrls[0] -cne $previousWindowsUrls[0] -or
+        $macUrls.Count -ne 1 -or $previousMacUrls.Count -ne 1 -or
+        $macUrls[0] -cne $previousMacUrls[0]) {
         throw 'Site precisa conter exatamente um download oficial por plataforma'
     }
+    $siteVersionWordLower = 'vers' + [char]0x00E3 + 'o'
+    $siteVersionWordUpper = 'Vers' + [char]0x00E3 + 'o'
+    $siteMiddleDot = [char]0x00B7
     foreach ($label in @(
-        "Baixar ChurchDAW $version para Android em formato APK",
-        "APK $version",
-        "Baixar APK $version"
+        "Android $version",
+        $(if ($siteText.Contains('<span class="os-symbol">APK</span>')) { '<span class="os-symbol">APK</span><span class="platform-version">' + $version + '</span>' } else { "A $siteVersionWordLower $version para Android" }),
+        "$siteVersionWordUpper $version $siteMiddleDot APK oficial"
     )) {
         if (-not $siteText.Contains($label)) {
             throw "Site nao identifica corretamente a versao Android: $label"
@@ -1705,13 +2048,16 @@ try {
     $null = Invoke-AndroidPromotionTransaction `
         -AssertTag { Assert-RemoteReleaseTag } `
         -PublishVersionedApk {
-            $null = Publish-VersionedFile $apkPath $RemoteAndroidDirectory
+            Write-Host "STEP: PublishVersionedApk"
+            Publish-VersionedFile $apkPath $RemoteAndroidDirectory
         } `
         -VerifyVersionedApk {
+            Write-Host "STEP: VerifyVersionedApk"
             Download-HttpsExact $apkUrl `
                 (Join-Path $tempRoot $apkName) $apkRecord 'APK publico'
         } `
         -PrepareCandidates {
+            Write-Host "STEP: PrepareCandidates"
             Assert-RemoteReleaseTag
             foreach ($gate in @(
                 @($RemoteAndroidDirectory, 'manifest.json',
@@ -1728,12 +2074,14 @@ try {
             Assert-PublishTimeBudget
         } `
         -PromoteSite {
+            Write-Host "STEP: PromoteSite"
             $script:sitePromotionAttempted = $true
             $null = Replace-FtpsFile $candidateSitePath $RemoteRootDirectory `
                 'index.html' -ExpectedCurrentRecord $previousSiteRecord `
                 -BeforeRename { Assert-RemoteReleaseTag }
         } `
         -PromoteManifest {
+            Write-Host "STEP: PromoteManifest"
             $script:manifestPromotionAttempted = $true
             $null = Replace-FtpsFile $candidateManifestPath `
                 $RemoteAndroidDirectory 'manifest.json' `
@@ -1741,6 +2089,7 @@ try {
                 -BeforeRename { Assert-RemoteReleaseTag }
         } `
         -PromoteLegacyPolicy {
+            Write-Host "STEP: PromoteLegacyPolicy"
             $script:legacyPromotionAttempted = $true
             $null = Replace-FtpsFile $candidateLegacyPath `
                 $RemoteAndroidDirectory 'update-policy.json' `
@@ -1748,6 +2097,7 @@ try {
                 -BeforeRename { Assert-RemoteReleaseTag }
         } `
         -PromoteSignedPolicy {
+            Write-Host "STEP: PromoteSignedPolicy"
             $script:policyPromotionAttempted = $true
             $null = Replace-FtpsFile $releasePolicyPath `
                 $RemoteAndroidDirectory 'update-policy-v2.json' `
@@ -1755,6 +2105,7 @@ try {
                 -BeforeRename { Assert-RemoteReleaseTag }
         } `
         -VerifyFinal {
+            Write-Host "STEP: VerifyFinal"
             Download-HttpsPostMutationExact $PublicSiteUrl `
                 (Join-Path $tempRoot 'site-after.html') `
                 $candidateSiteRecord 'site final'
@@ -1774,7 +2125,7 @@ try {
                 'policy Android publica final'
             Assert-AndroidPolicyPayload $finalPayload $PolicySerial `
                 $versionCode $MinimumVersionCode $version `
-                $candidateManifestRecord.sha256 $apkUrl
+                $candidateManifestCatalogSha256 $apkUrl
             Assert-RemoteReleaseTag
         } `
         -RollbackBeforePolicy {
@@ -1821,7 +2172,7 @@ try {
                 'policy Android de recuperacao publica'
             Assert-AndroidPolicyPayload $activeRecovery ($PolicySerial + 1) `
                 $previousLatest $recoveryMinimum $previousVersion `
-                $previousManifestRecord.sha256 $previousApkUrl $recoveryMode `
+                $previousManifestCatalogSha256 $previousApkUrl $recoveryMode `
                 $recoveryRevokesSerial
             Restore-FixedFileIfOwned $previousLegacyPath `
                 $RemoteAndroidDirectory 'update-policy.json' `
@@ -1858,14 +2209,12 @@ catch {
 finally {
     if (Test-Path -LiteralPath $tempRoot -PathType Container) {
         $candidate = [IO.Path]::GetFullPath($tempRoot).TrimEnd('\') + '\'
-        if (-not $candidate.Equals(
-                $resolvedTemp,
-                [StringComparison]::OrdinalIgnoreCase) -or
-            -not $candidate.StartsWith(
-                $tempBase,
-                [StringComparison]::OrdinalIgnoreCase)) {
-            throw 'Recusando limpar diretorio temporario sem prova de posse'
+        if ($candidate.Equals($resolvedTemp, [StringComparison]::OrdinalIgnoreCase) -and
+            $candidate.StartsWith($tempBase, [StringComparison]::OrdinalIgnoreCase)) {
+            try {
+                Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            catch { }
         }
-        Remove-Item -LiteralPath $tempRoot -Recurse -Force
     }
 }

@@ -1,0 +1,92 @@
+================================================================
+  GRAVADOR DE TELA + AUDIO  -  videos de divulgacao do ChurchDAW
+================================================================
+
+COMO USAR
+---------
+Clique duas vezes em  GravadorChurchDAW.exe
+
+  1) Tela inteira                  <- normal
+  2) Somente a janela do ChurchDAW <- mais limpo para divulgacao
+  3) Tela inteira, 60 fps
+
+Depois ele mostra as FONTES DE AUDIO disponiveis e voce escolhe (ou "0"
+para gravar sem audio). Conta 3 segundos, grava, e para no ENTER.
+Saida:  C:\Users\<voce>\Videos\ChurchDAW\   (MP4 H.264 + AAC 192 kbps)
+
+
+=================================================================
+ O PONTO IMPORTANTE: ASIO NAO PODE SER GRAVADO POR LOOPBACK
+=================================================================
+Nao e limitacao deste programa - e como o ASIO funciona. O ASIO fala
+DIRETO com a placa, passando por fora do mixer do Windows. O "loopback"
+do Windows so captura o que passa pelo mixer. Logo, enquanto o ChurchDAW
+estiver em ASIO, nenhum programa consegue gravar aquele audio por
+loopback (o erro aparece como "Invalid device").
+
+Nesta maquina foi conferido: o ChurchDAW abre o ASIO4ALL com ENTRADA E
+SAIDA da Scarlett (o log mostra inChannels=2), ou seja o ASIO4ALL tranca
+a placa nos dois sentidos. Com isso ficam bloqueados: o loopback da
+Scarlett, a entrada da Scarlett (MME, DirectSound e WASAPI). Sobra livre
+apenas o loopback do HDMI da NVIDIA, onde nao passa o som do app.
+
+--- COMO RESOLVER, EM ORDEM DE QUALIDADE -------------------------
+
+(1) MELHOR, e continua no ASIO: driver nativo da Focusrite
+    Hoje voce NAO tem o driver da Focusrite instalado - a Scarlett esta
+    rodando como "USB Audio 2.0" genérico, e por isso voce depende do
+    ASIO4ALL. Baixe o Focusrite Control 2 (gratis, focusrite.com):
+      - instala o driver nativo "Focusrite USB ASIO";
+      - no ChurchDAW, troque ASIO4ALL  ->  Focusrite USB ASIO;
+      - no Focusrite Control 2, ligue o LOOPBACK.
+    O loopback da Focusrite captura a saida do computador INCLUSIVE o
+    ASIO, e aparece como entrada. Aqui no gravador escolha
+    "Entrada da placa: ... Scarlett".
+    Bonus: o driver nativo costuma dar latencia menor que o ASIO4ALL.
+
+(2) Sem baixar nada, continua no ASIO: liberar a entrada + cabo
+    No painel do ASIO4ALL (botao "Hardware Setup" nas configuracoes de
+    audio), DESATIVE a entrada da Scarlett - deixe so a saida. Assim a
+    entrada fica livre para o Windows. Ligue um cabo da saida de fone da
+    Scarlett na entrada dela e escolha "Entrada da placa" aqui.
+    Observacao: e uma volta analogica; na Scarlett a qualidade e otima.
+
+(3) MAIS SIMPLES para video: usar WASAPI so durante a gravacao
+    No ChurchDAW, em Audio / MIDI, troque o driver para WASAPI, grave o
+    video (o gravador captura "Som do Windows" perfeito, digital), e
+    depois volte para ASIO para tocar ao vivo. O som gravado e o mesmo;
+    muda apenas a latencia, que nao tem importancia num video.
+
+(4) JEITO DE ESTUDIO: video aqui, audio dentro do DAW
+    Escolha "0) Gravar SEM audio", grave o audio separado no ChurchDAW e
+    junte os dois no editor. Da o melhor resultado final.
+
+
+DESEMPENHO
+----------
+A compressao esta usando o PROCESSADOR (libx264) porque o driver da sua
+placa NVIDIA e antigo para o encoder por hardware: o ffmpeg pediu NVENC
+API 13.1 e achou 13.0. Se atualizar o driver da NVIDIA, o programa passa
+a usar o NVENC sozinho (ele testa a cada execucao) e a CPU fica livre
+para o motor de audio.
+
+Se o audio engasgar durante a gravacao: use 30 fps, grave so a janela do
+ChurchDAW (opcao 2), ou aumente o buffer de audio do app.
+
+
+MODO AUTOMATICO (para scripts)
+------------------------------
+  GravadorChurchDAW.exe --segundos 30
+  GravadorChurchDAW.exe --segundos 30 --saida D:\demo.mp4 --fps 60
+  GravadorChurchDAW.exe --segundos 30 --janela ChurchDAW
+  GravadorChurchDAW.exe --segundos 30 --sem-audio
+  GravadorChurchDAW.exe --segundos 30 --dispositivo 13
+
+
+ARQUIVOS
+--------
+  GravadorChurchDAW.exe    o programa (nao instala nada)
+  ffmpeg.exe               motor de video/audio
+  gravador_churchdaw.py    codigo-fonte
+  LEIA-ME.txt              este arquivo
+A pasta e autossuficiente: pode copiar para outro PC Windows.

@@ -8,7 +8,8 @@ namespace ChurchDAWIOSPolicy
 {
 namespace
 {
-constexpr const char* policyKeyId = "churchdaw-update-2026-01";
+constexpr const char* policyKeyId202601 = "churchdaw-update-2026-01";
+constexpr const char* policyKeyId202608 = "churchdaw-update-2026-08";
 constexpr int maximumPayloadBytes = 24 * 1024;
 constexpr int signatureBytes = 384; // RSA-3072
 
@@ -93,12 +94,13 @@ void releaseCF (CFTypeRef object) noexcept
 }
 
 bool verifyRs256 (const juce::MemoryBlock& message,
-                  const juce::MemoryBlock& signature)
+                  const juce::MemoryBlock& signature,
+                  const char* publicKeyBase64)
 {
     juce::MemoryOutputStream decodedKey;
     if (! juce::Base64::convertFromBase64 (
             decodedKey,
-            ChurchDAWDesktopUpdate::updatePolicyPublicKeyDerBase64))
+            publicKeyBase64))
         return false;
 
     const juce::MemoryBlock publicKeySpki (
@@ -172,7 +174,16 @@ bool verifySignedPolicyEnvelope (const juce::String& payloadBase64,
                                  const juce::String& signatureBase64,
                                  const juce::String& keyId)
 {
-    if (keyId != policyKeyId
+    const char* publicKeyBase64 = nullptr;
+
+    if (keyId == policyKeyId202601)
+        publicKeyBase64 =
+            ChurchDAWDesktopUpdate::updatePolicyPublicKeyDerBase64;
+    else if (keyId == policyKeyId202608)
+        publicKeyBase64 =
+            ChurchDAWDesktopUpdate::updatePolicyPublicKeyDerBase64_2026_08;
+
+    if (publicKeyBase64 == nullptr
          || payloadBase64.isEmpty()
          || payloadBase64.length() > maximumPayloadBytes * 2
          || signatureBase64.length() != 512)
@@ -193,7 +204,8 @@ bool verifySignedPolicyEnvelope (const juce::String& payloadBase64,
     const juce::MemoryBlock signatureBytesBlock (
         signature.getData(), signature.getDataSize());
 
-    if (! verifyRs256 (payloadBytes, signatureBytesBlock))
+    if (! verifyRs256 (payloadBytes, signatureBytesBlock,
+                       publicKeyBase64))
         return false;
 
     // O mesmo vetor recebido e validado fornece uma regressao negativa sem
@@ -203,7 +215,8 @@ bool verifySignedPolicyEnvelope (const juce::String& payloadBase64,
     auto tamperedPayload = payloadBytes;
     static_cast<uint8_t*> (tamperedPayload.getData())[0] ^= 0x01u;
     const bool tamperedRejected =
-        ! verifyRs256 (tamperedPayload, signatureBytesBlock);
+        ! verifyRs256 (tamperedPayload, signatureBytesBlock,
+                       publicKeyBase64);
 
     juce::Logger::writeToLog (
         "IOS_POLICY_RS256 valid=1 tampered_rejected="

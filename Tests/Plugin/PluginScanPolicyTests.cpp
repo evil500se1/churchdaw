@@ -21,7 +21,13 @@ void expect (bool condition, const char* message)
 class EmptyScanFormat final : public juce::AudioPluginFormat
 {
 public:
-    juce::String getName() const override { return "VST3"; }
+    explicit EmptyScanFormat (juce::FileSearchPath defaultsToUse = {},
+                              juce::String formatNameToUse = "VST3")
+        : defaults (std::move (defaultsToUse)), name (std::move (formatNameToUse))
+    {
+    }
+
+    juce::String getName() const override { return name; }
     void findAllTypesForFile (
         juce::OwnedArray<juce::PluginDescription>&,
         const juce::String&) override {}
@@ -49,7 +55,10 @@ public:
     {
         return {};
     }
-    juce::FileSearchPath getDefaultLocationsToSearch() override { return {}; }
+    juce::FileSearchPath getDefaultLocationsToSearch() override
+    {
+        return defaults;
+    }
 
 private:
     void createPluginInstance (
@@ -64,6 +73,9 @@ private:
     {
         return false;
     }
+
+    juce::FileSearchPath defaults;
+    juce::String name;
 };
 
 class SuccessfulEmptyScanner final : public juce::KnownPluginList::CustomScanner
@@ -82,6 +94,19 @@ public:
 int main()
 {
     using namespace ChurchDAWPluginScan;
+
+    {
+        juce::AudioPluginFormatManager formats;
+        formats.addFormat (std::make_unique<EmptyScanFormat>());
+        expect (! podeIniciarBusca (formats, 0),
+                "File-only scans require an existing selected folder");
+        expect (podeIniciarBusca (formats, 1),
+                "An existing folder must enable file-based scanning");
+        formats.addFormat (std::make_unique<EmptyScanFormat> (
+            juce::FileSearchPath(), "AudioUnit"));
+        expect (podeIniciarBusca (formats, 0),
+                "AU-only Macs must scan the registry without any VST folder");
+    }
 
     juce::DynamicObject::Ptr diagnosticRecord (new juce::DynamicObject());
     diagnosticRecord->setProperty ("recordType", "plugin");
@@ -108,12 +133,131 @@ int main()
     classRequest.classIndex = 7;
     ScanRequest decodedClassRequest;
     juce::String protocolError;
+    ScanRequest enumerationRequest;
+    enumerationRequest.phase = ScanPhase::enumeration;
+    enumerationRequest.token = "enumeration-token";
+    enumerationRequest.format = "AudioUnit";
+    enumerationRequest.identifier = "candidate-search";
+    enumerationRequest.descriptionXml = "<SEARCH_PATHS><PATH value=\"/tmp/Plugin folder\"/></SEARCH_PATHS>";
+    ScanRequest decodedEnumeration;
+    expect (deserialiseRequest (serialiseRequest (enumerationRequest),
+                               decodedEnumeration, protocolError)
+             && decodedEnumeration.phase == ScanPhase::enumeration
+             && decodedEnumeration.descriptionXml == enumerationRequest.descriptionXml,
+            "Isolated enumeration must preserve search paths including spaces");
     expect (deserialiseRequest (serialiseRequest (classRequest),
                                 decodedClassRequest, protocolError)
              && decodedClassRequest.phase
                     == ScanPhase::vst3ClassValidation
              && decodedClassRequest.classIndex == 7,
             "VST3 class requests must preserve their isolated class index");
+
+    juce::PluginDescription metadataInstrument;
+    metadataInstrument.name = "Metadata instrument";
+    metadataInstrument.category = "Fx|Instrument|Piano";
+    metadataInstrument.isInstrument = false;
+    expect (descricaoDeclaraInstrumento (metadataInstrument),
+            "VST3 Instrument subcategory must override a stale false role bit");
+
+    juce::PluginDescription omittedRole;
+    omittedRole.name = "Studio Grand fixture";
+    omittedRole.pluginFormatName = "VST3";
+    omittedRole.fileOrIdentifier = "StudioGrand.vst3";
+    omittedRole.uniqueId = 0x5001;
+    omittedRole.category = "Fx";
+    omittedRole.isInstrument = false;
+    expect (deveSerTratadoComoInstrumento (
+                omittedRole, { true, 0, 2 }),
+            "A MIDI-capable output-only VST3 must be treated as an instrument");
+    expect (! deveSerTratadoComoInstrumento (
+                omittedRole, { true, 2, 2 }),
+            "A MIDI-controlled audio effect must remain an effect");
+    expect (! deveSerTratadoComoInstrumento (
+                omittedRole, { false, 0, 2 }),
+            "A signal generator without MIDI must not become an instrument");
+
+    juce::PluginDescription validatedRole = omittedRole;
+    validatedRole.numInputChannels = 99;
+    validatedRole.numOutputChannels = 99;
+    const auto identityBeforeRoleNormalisation =
+        validatedRole.createIdentifierString();
+    expect (normalizarPapelDoPluginValidado (
+                omittedRole, validatedRole, { true, 0, 2 }),
+            "Runtime role normalisation must report a changed description");
+    expect (validatedRole.isInstrument
+             && validatedRole.numInputChannels == 0
+             && validatedRole.numOutputChannels == 2,
+            "Runtime role normalisation did not persist instrument topology");
+    expect (validatedRole.createIdentifierString()
+                 == identityBeforeRoleNormalisation,
+            "Role normalisation must not change the stable plugin identity");
+
+    {
+        juce::KnownPluginList staleRoles;
+        juce::PluginDescription staleInstrument;
+        staleInstrument.name = "Saved piano";
+        staleInstrument.pluginFormatName = "VST3";
+        staleInstrument.fileOrIdentifier = "SavedPiano.vst3";
+        staleInstrument.uniqueId = 0x5101;
+        staleInstrument.category = "Instrument|Piano";
+        staleInstrument.isInstrument = false;
+        staleRoles.addType (staleInstrument);
+
+        juce::PluginDescription savedEffect = staleInstrument;
+        savedEffect.name = "Saved effect";
+        savedEffect.fileOrIdentifier = "SavedEffect.vst3";
+        savedEffect.uniqueId = 0x5102;
+        savedEffect.category = "Fx|Delay";
+        staleRoles.addType (savedEffect);
+
+        expect (normalizarPapeisDaListaConhecida (staleRoles) == 1,
+                "Exactly the stale instrument role must be migrated");
+
+        const auto migrated = staleRoles.getTypeForIdentifierString (
+            staleInstrument.createIdentifierString());
+        expect (migrated != nullptr && migrated->isInstrument,
+                "A saved VST3 instrument remained in the effects catalog");
+    }
+
+    {
+        const auto locationRoot =
+            juce::File::getSpecialLocation (juce::File::tempDirectory)
+                .getChildFile ("churchdaw-plugin-location-policy");
+        const auto custom = locationRoot.getChildFile ("Custom");
+        const auto defaultA = locationRoot.getChildFile ("DefaultA");
+        const auto defaultB = locationRoot.getChildFile ("DefaultB");
+
+        juce::Array<PluginScanLocation> locations;
+        locations.add ({ custom, PluginScanLocationKind::custom, true });
+        locations.add ({ defaultA, PluginScanLocationKind::system, false });
+
+        juce::FileSearchPath defaults;
+        defaults.add (defaultA);
+        defaults.add (defaultB);
+        juce::AudioPluginFormatManager locationFormats;
+        locationFormats.addFormat (
+            std::make_unique<EmptyScanFormat> (defaults));
+
+        const int initialLocationCount = locations.size();
+        const int mergedLocationCount = mesclarPastasPadraoDePlugins (
+            locations, locationFormats, false);
+        expect (mergedLocationCount >= 1,
+                "A saved custom path must not suppress a missing system VST3 path");
+        bool containsDefaultB = false;
+        for (const auto& location : locations)
+            containsDefaultB |= mesmaPastaDeScan (location.folder, defaultB);
+        expect (containsDefaultB
+                 && locations.size()
+                        == initialLocationCount + mergedLocationCount,
+                "The missing default VST3 path was not appended");
+        expect (! locations[1].enabled,
+                "Merging defaults must not re-enable a path disabled by the user");
+        expect (mesclarPastasPadraoDePlugins (
+                    locations, locationFormats, false) == 0
+                 && locations.size()
+                        == initialLocationCount + mergedLocationCount,
+                "Repeated default-path migration must be idempotent");
+    }
 
     expect (! deveEntrarNaBlacklistPersistente (PhaseFinish::result),
             "A normal validation rejection must remain retryable");

@@ -181,10 +181,14 @@ try {
 
     $stamp = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
     $email = "smoke.$stamp@example.invalid"
+    $customerPassword = '7'
     $issueData =
         'csrf_token=' + [Uri]::EscapeDataString($csrf) +
         '&display_name=' + [Uri]::EscapeDataString('Cliente Smoke') +
-        '&email=' + [Uri]::EscapeDataString($email)
+        '&email=' + [Uri]::EscapeDataString($email) +
+        '&customer_password=' + [Uri]::EscapeDataString($customerPassword) +
+        '&customer_password_confirmation=' +
+            [Uri]::EscapeDataString($customerPassword)
     $issue = Invoke-CurlStatus @(
         '-sS', '-o', 'NUL', '-w', '%{http_code}',
         '-X', 'POST',
@@ -203,22 +207,19 @@ try {
         '-H', $cookieHeader,
         '-H', 'User-Agent: ChurchDAW-Admin-Smoke/1'
     )
-    $temporaryCode = [Net.WebUtility]::HtmlDecode(
-        [regex]::Match(
-            $dashboard,
-            'class="admin-code">([^<]+)'
-        ).Groups[1].Value
-    )
-    if (($temporaryCode -eq '') -or
-        ($dashboard -notmatch [regex]::Escape($email))) {
-        throw 'Issued customer or one-time access code missing'
+    if (($dashboard -notmatch [regex]::Escape($email)) -or
+        ($dashboard -notmatch 'name="customer_password"') -or
+        ($dashboard -notmatch 'minlength="8"') -or
+        ($dashboard -notmatch 'id="admin-search"') -or
+        ($dashboard -notmatch 'id="admin-status-filter"')) {
+        throw 'Issued customer or chosen-password form missing'
     }
 
     $windowsSecret = [Convert]::ToBase64String([byte[]] (1..32)).
         TrimEnd('=').Replace('+', '-').Replace('/', '_')
     $windowsBody = @{
         email = $email
-        password = $temporaryCode
+        password = $customerPassword
         installation_id = 'windows-smoke-install-0001'
         device_secret = $windowsSecret
         device_public_key = ''
@@ -235,7 +236,7 @@ try {
         TrimEnd('=').Replace('+', '-').Replace('/', '_')
     $macBody = @{
         email = $email
-        password = $temporaryCode
+        password = $customerPassword
         installation_id = 'macos-smoke-install-000001'
         device_secret = $macSecret
         device_public_key = ''
@@ -243,10 +244,25 @@ try {
         device_label = 'macOS Smoke'
         platform = 'macos'
     } | ConvertTo-Json -Compress
-    $macBlocked = Invoke-JsonLogin $macBody
-    if (($macBlocked[-1] -ne '409') -or
-        (($macBlocked -join "`n") -notmatch 'ACTIVATION_LIMIT')) {
-        throw 'Second device was not blocked'
+    $macLogin = Invoke-JsonLogin $macBody
+    if ($macLogin[-1] -ne '200') {
+        throw "macOS activation failed: $($macLogin -join ' ')"
+    }
+
+    $windowsExtraBody = @{
+        email = $email
+        password = $customerPassword
+        installation_id = 'windows-smoke-install-0002'
+        device_secret = $macSecret
+        device_public_key = ''
+        device_fingerprint = 'win-smoke-fingerprint-extra'
+        device_label = 'Segundo Windows Smoke'
+        platform = 'windows'
+    } | ConvertTo-Json -Compress
+    $windowsBlocked = Invoke-JsonLogin $windowsExtraBody
+    if (($windowsBlocked[-1] -ne '409') -or
+        (($windowsBlocked -join "`n") -notmatch 'ACTIVATION_LIMIT')) {
+        throw 'Second Windows was not blocked'
     }
 
     $dashboard = Invoke-CurlStatus @(
@@ -276,9 +292,9 @@ try {
         throw "Device transfer expected 303, got $deactivate"
     }
 
-    $macLogin = Invoke-JsonLogin $macBody
-    if ($macLogin[-1] -ne '200') {
-        throw "macOS activation after transfer failed: $($macLogin[-1])"
+    $windowsExtraLogin = Invoke-JsonLogin $windowsExtraBody
+    if ($windowsExtraLogin[-1] -ne '200') {
+        throw "Windows activation after releasing its slot failed: $($windowsExtraLogin[-1])"
     }
 
     $dashboard = Invoke-CurlStatus @(
@@ -335,7 +351,7 @@ try {
 
     'ADMIN_HTTP_SMOKE_OK'
     'wrong_login=401 secure_cookie=yes csrf_rejected=403 issue=303'
-    'windows=200 second_device=409 transfer=303 macos=200'
+    'windows=200 macos=200 second_windows=409 release_slot=303 replacement_windows=200'
     'revoke=303 post_revoke=403'
     $databaseResult
 } finally {

@@ -58,39 +58,7 @@ jobs:
           test -x "$APP/ChurchDAW"
           plutil -lint "$PLIST"
 
-          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$PLIST")" = \
-            "com.churchdaw.app"
-          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLIST")" = \
-            "1.5.8"
-          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$PLIST")" = \
-            "1.5.8"
-          test "$(/usr/libexec/PlistBuddy -c 'Print :UIRequiresFullScreen' "$PLIST")" = \
-            "false"
-          test "$(/usr/libexec/PlistBuddy -c 'Print :UIFileSharingEnabled' "$PLIST")" = \
-            "true"
-
-          if /usr/libexec/PlistBuddy \
-              -c 'Print :NSMicrophoneUsageDescription' "$PLIST" >/dev/null 2>&1; then
-            echo "O bundle output-only nao pode declarar uso de microfone" >&2
-            exit 1
-          fi
-
-          DEVICE_FAMILY="$(
-            /usr/libexec/PlistBuddy -c 'Print :UIDeviceFamily' "$PLIST" |
-              awk '/^[[:space:]]*[0-9]+[[:space:]]*$/ { print $1 }' |
-              paste -sd, -
-          )"
-          test "$DEVICE_FAMILY" = "1,2"
-
-          plutil -extract UIBackgroundModes xml1 -o - "$PLIST" |
-            grep -q '<string>audio</string>'
-
-          plutil -extract UISupportedInterfaceOrientations xml1 -o - "$PLIST" |
-            grep -q '<string>UIInterfaceOrientationPortrait</string>'
-          plutil -extract UISupportedInterfaceOrientations xml1 -o - "$PLIST" |
-            grep -q '<string>UIInterfaceOrientationLandscapeLeft</string>'
-          plutil -extract 'UISupportedInterfaceOrientations~ipad' xml1 -o - "$PLIST" |
-            grep -q '<string>UIInterfaceOrientationPortraitUpsideDown</string>'
+          python3 Tests/Studio/ValidateIOSBundle.py "$APP"
 
           while IFS= read -r ENTITLEMENTS; do
             if grep -Eq \
@@ -102,13 +70,13 @@ jobs:
           done < <(find build-ios -type f -name '*.entitlements' -print)
 
           ditto -c -k --sequesterRsrc --keepParent \
-            "$APP" ChurchDAW-1.5.8-iOS-iPadOS-Simulator.zip
+            "$APP" ChurchDAW-iOS-iPadOS-Simulator.zip
 
       - name: Publicar artefato do simulador
         uses: actions/upload-artifact@v4
         with:
-          name: ChurchDAW-1.5.8-iOS-iPadOS-Simulator
-          path: ChurchDAW-1.5.8-iOS-iPadOS-Simulator.zip
+          name: ChurchDAW-iOS-iPadOS-Simulator
+          path: ChurchDAW-iOS-iPadOS-Simulator.zip
           if-no-files-found: error
           compression-level: 0
           retention-days: 14

@@ -50,6 +50,12 @@
 
 #include <CoreMIDI/MIDIServices.h>
 
+#if JUCE_IOS
+ // PATCH ChurchDAW: resolucao de extensoes AUv3 de terceiros no iOS — ver
+ // getComponentDescFromIdentifier e searchPathsForPlugins (Headless.mm).
+ #import <AVFAudio/AVFAudio.h>
+#endif
+
 #include <CoreAudioKit/AUViewController.h>
 
 #include <juce_audio_basics/native/juce_CoreAudioTimeConversions_mac.h>
@@ -177,6 +183,35 @@ namespace AudioUnitFormatHelpers
 
                     return true;
                 }
+
+               #if JUCE_IOS
+                // PATCH ChurchDAW (18/ago/2026): extensao AUv3 de OUTRO app
+                // ainda nao registrada neste processo — AudioComponentFindNext
+                // nao a resolve, mas o AVAudioUnitComponentManager consulta o
+                // registro do sistema (e popula o do processo de quebra).
+                // Sem isto, um AUv3 salvo no setup nunca voltava no boot.
+                @autoreleasepool
+                {
+                    NSArray<AVAudioUnitComponent*>* matches =
+                        [[AVAudioUnitComponentManager sharedAudioUnitComponentManager]
+                            componentsMatchingDescription: desc];
+
+                    if (matches.count > 0)
+                    {
+                        AVAudioUnitComponent* c = matches.firstObject;
+                        name = nsStringToJuce (c.name);
+                        manufacturer = nsStringToJuce (c.manufacturerName);
+
+                        if (manufacturer.isEmpty())
+                            manufacturer = tokens[2];
+
+                        if (version.isEmpty())
+                            version = nsStringToJuce (c.versionString);
+
+                        return true;
+                    }
+                }
+               #endif
             }
         }
 

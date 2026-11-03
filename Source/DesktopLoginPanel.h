@@ -11,12 +11,13 @@ class DesktopLoginPanel final : public juce::Component,
 public:
     explicit DesktopLoginPanel (juce::Image logoImage);
 
-    std::function<void (juce::String email,
+    std::function<void (juce::String identifier,
                         juce::String password,
                         bool remember)> onLogin;
     std::function<void (juce::String email)> onForgotPassword;
     std::function<void()> onBuy;
     std::function<void()> onManageActivation;
+    std::function<void()> onUpdateClient;
 
     void applySnapshot (
         const ChurchDAWDesktopLicensing::Snapshot& snapshot);

@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include <juce_audio_basics/juce_audio_basics.h>
 
@@ -52,11 +52,7 @@ namespace ChurchDAWRotary
             hornRateHz = 0.0;
             drumRateHz = 0.0;
             mix.setCurrentAndTargetValue (0.0f);
-            inputPowerState = 0.0f;
-            outputPowerState = 0.0f;
-            targetLoudnessGain = 1.0f;
-            loudnessGain = 1.0f;
-            loudnessUpdateCounter = 0;
+            resetLoudnessCompensation();
         }
 
         void clearSignalHistory() noexcept
@@ -100,6 +96,12 @@ namespace ChurchDAWRotary
                 // congelados no delay para reaparecer quando o Rotary voltar.
                 if (historyHasSignal)
                     clearSignalHistory();
+
+                // Amount=0 is a true bypass. Detector and correction state
+                // from the previous register must not survive here: otherwise
+                // a later re-enable starts with that stale gain and pumps for
+                // several seconds while the slow compensator relearns.
+                resetLoudnessCompensation();
 
                 // Caminho comum de piano/pad e de estados antigos: nenhum loop
                 // por amostra e nenhum exp quando os rotores ja estao parados.
@@ -181,8 +183,8 @@ namespace ChurchDAWRotary
                 // Amount now controls physical modulation depth. Both rotor
                 // bands share the cabinet propagation delay; only their
                 // Doppler excursions differ. At zero depth the delay is zero
-                // and low+high reconstrÃ³i o input, permitindo entrada suave
-                // no modo Amount=0 sem artefatos de transiÃ§Ã£o.
+                // and low+high reconstroi o input, permitindo entrada suave
+                // no modo Amount=0 sem artefatos de transicao.
                 const double cabinetDelaySeconds =
                     0.00235 * (double) currentDepth;
                 const float hornDelay = (float) (sampleRate
@@ -321,6 +323,15 @@ namespace ChurchDAWRotary
         double getCurrentDrumRateHzForTest() const noexcept { return drumRateHz; }
 
     private:
+        void resetLoudnessCompensation() noexcept
+        {
+            inputPowerState = 0.0f;
+            outputPowerState = 0.0f;
+            targetLoudnessGain = 1.0f;
+            loudnessGain = 1.0f;
+            loudnessUpdateCounter = 0;
+        }
+
         static double transitionSeconds (double current,
                                          double target,
                                          double rise,
@@ -404,15 +415,14 @@ namespace ChurchDAWRotary
         float readFractional (int channel, float delaySamples) const noexcept
         {
             const int size = delay.getNumSamples();
-            float position = (float) writeIndex - delaySamples;
+            if (size <= 0 || ! std::isfinite (delaySamples) || channel < 0 || channel >= delay.getNumChannels())
+                return 0.0f;
 
-            while (position < 0.0f)
+            float position = std::fmod ((float) writeIndex - delaySamples, (float) size);
+            if (position < 0.0f)
                 position += (float) size;
 
-            while (position >= (float) size)
-                position -= (float) size;
-
-            const int index0 = (int) position;
+            const int index0 = juce::jlimit (0, size - 1, (int) position);
             const int index1 = index0 + 1 < size ? index0 + 1 : 0;
             const float fraction = position - (float) index0;
             const float a = delay.getSample (channel, index0);

@@ -11,6 +11,10 @@ namespace ChurchDAWTimbreTone
 {
 struct Settings
 {
+    // Revisao do perfil publicado pelo pack quando estes valores foram
+    // editados. Um sidecar mais novo pode migrar apenas memorias antigas e,
+    // depois disso, as escolhas do musico voltam a ter precedencia normal.
+    int profileRevision = 0;
     float attackSeconds = 0.003f;
     float releaseSeconds = 0.55f;
     float lowDb = 0.0f;
@@ -29,6 +33,24 @@ struct Settings
     // valor 3 jamais e aplicado a um seletor legado.
     int rotaryMode = 1;
     float rotaryAmount = 0.0f;
+
+    bool nordFilterOn = false;
+    int nordFilterType = 1;
+    float nordFilterCutoffHz = 18000.0f;
+    float nordFilterResonance = 0.0f;
+    int nordFilterKeyTrack = 0;
+    int nordFilterDrive = 0;
+    bool nordFilterBright = false;
+    float nordFilterEnvAmount = 0.0f;
+    float nordFilterEnvAttackSeconds = 0.001f;
+    float nordFilterEnvDecaySeconds = 10.0f;
+    float nordFilterEnvReleaseSeconds = 0.55f;
+    bool nordFilterVelocity = false;
+    bool nordAmpEqOn = false;
+    float nordAmpBassDb = 0.0f;
+    float nordAmpMidDb = 0.0f;
+    float nordAmpMidHz = 850.0f;
+    float nordAmpTrebleDb = 0.0f;
 };
 
 inline Settings bounded (Settings value) noexcept
@@ -38,6 +60,8 @@ inline Settings bounded (Settings value) noexcept
         return std::isfinite (candidate) ? candidate : fallback;
     };
 
+    value.profileRevision = juce::jlimit (
+        0, 1000000, value.profileRevision);
     value.attackSeconds = juce::jlimit (
         0.001f, 2.0f, finiteOr (value.attackSeconds, 0.003f));
     value.releaseSeconds = juce::jlimit (
@@ -55,6 +79,37 @@ inline Settings bounded (Settings value) noexcept
     value.rotaryMode = juce::jlimit (0, 3, value.rotaryMode);
     value.rotaryAmount = juce::jlimit (
         0.0f, 1.0f, finiteOr (value.rotaryAmount, 0.0f));
+    value.nordFilterType = juce::jlimit (0, 5, value.nordFilterType);
+    value.nordFilterCutoffHz = juce::jlimit (
+        20.0f, 20000.0f,
+        finiteOr (value.nordFilterCutoffHz, 18000.0f));
+    value.nordFilterResonance = juce::jlimit (
+        0.0f, 1.0f,
+        finiteOr (value.nordFilterResonance, 0.0f));
+    value.nordFilterKeyTrack = juce::jlimit (
+        0, 3, value.nordFilterKeyTrack);
+    value.nordFilterDrive = juce::jlimit (
+        0, 3, value.nordFilterDrive);
+    value.nordFilterEnvAmount = juce::jlimit (
+        -1.0f, 1.0f,
+        finiteOr (value.nordFilterEnvAmount, 0.0f));
+    value.nordFilterEnvAttackSeconds = juce::jlimit (
+        0.001f, 10.0f,
+        finiteOr (value.nordFilterEnvAttackSeconds, 0.001f));
+    value.nordFilterEnvDecaySeconds = juce::jlimit (
+        0.001f, 10.0f,
+        finiteOr (value.nordFilterEnvDecaySeconds, 10.0f));
+    value.nordFilterEnvReleaseSeconds = juce::jlimit (
+        0.01f, 10.0f,
+        finiteOr (value.nordFilterEnvReleaseSeconds, 0.55f));
+    value.nordAmpBassDb = juce::jlimit (
+        -15.0f, 15.0f, finiteOr (value.nordAmpBassDb, 0.0f));
+    value.nordAmpMidDb = juce::jlimit (
+        -15.0f, 15.0f, finiteOr (value.nordAmpMidDb, 0.0f));
+    value.nordAmpMidHz = juce::jlimit (
+        200.0f, 8000.0f, finiteOr (value.nordAmpMidHz, 850.0f));
+    value.nordAmpTrebleDb = juce::jlimit (
+        -15.0f, 15.0f, finiteOr (value.nordAmpTrebleDb, 0.0f));
     return value;
 }
 
@@ -171,6 +226,8 @@ public:
                 tone->setAttribute ("timbre", entry.label);
                 tone->setAttribute ("lib", entry.library);
                 tone->setAttribute (
+                    "profileRev", entry.settings.profileRevision);
+                tone->setAttribute (
                     "attack", (double) entry.settings.attackSeconds);
                 tone->setAttribute (
                     "release", (double) entry.settings.releaseSeconds);
@@ -185,6 +242,38 @@ public:
                 tone->setAttribute ("rotMode", entry.settings.rotaryMode);
                 tone->setAttribute (
                     "rotAmt", (double) entry.settings.rotaryAmount);
+                tone->setAttribute ("nfOn", entry.settings.nordFilterOn);
+                tone->setAttribute ("nfType", entry.settings.nordFilterType);
+                tone->setAttribute (
+                    "nfCut", (double) entry.settings.nordFilterCutoffHz);
+                tone->setAttribute (
+                    "nfRes", (double) entry.settings.nordFilterResonance);
+                tone->setAttribute (
+                    "nfTrack", entry.settings.nordFilterKeyTrack);
+                tone->setAttribute (
+                    "nfDrive", entry.settings.nordFilterDrive);
+                tone->setAttribute (
+                    "nfBright", entry.settings.nordFilterBright);
+                tone->setAttribute (
+                    "nfEnvAmt", (double) entry.settings.nordFilterEnvAmount);
+                tone->setAttribute (
+                    "nfEnvA", (double) entry.settings.nordFilterEnvAttackSeconds);
+                tone->setAttribute (
+                    "nfEnvD", (double) entry.settings.nordFilterEnvDecaySeconds);
+                tone->setAttribute (
+                    "nfEnvR", (double) entry.settings.nordFilterEnvReleaseSeconds);
+                tone->setAttribute (
+                    "nfVel", entry.settings.nordFilterVelocity);
+                tone->setAttribute (
+                    "nEqOn", entry.settings.nordAmpEqOn);
+                tone->setAttribute (
+                    "nEqBass", (double) entry.settings.nordAmpBassDb);
+                tone->setAttribute (
+                    "nEqMid", (double) entry.settings.nordAmpMidDb);
+                tone->setAttribute (
+                    "nEqMidHz", (double) entry.settings.nordAmpMidHz);
+                tone->setAttribute (
+                    "nEqTreble", (double) entry.settings.nordAmpTrebleDb);
             }
     }
 
@@ -232,6 +321,9 @@ public:
 
             entry.settings.attackSeconds = (float) safeDouble (
                 "attack", 0.003);
+            entry.settings.profileRevision = juce::jlimit (
+                0, 1000000,
+                tone->getIntAttribute ("profileRev", 0));
             entry.settings.releaseSeconds = (float) safeDouble (
                 "release", 0.55);
             entry.settings.lowDb = (float) safeDouble ("eqLow", 0.0);
@@ -245,6 +337,40 @@ public:
                 tone->getIntAttribute ("rotMode", 1);
             entry.settings.rotaryAmount = (float) safeDouble (
                 "rotAmt", 0.0);
+            entry.settings.nordFilterOn =
+                tone->getBoolAttribute ("nfOn", false);
+            entry.settings.nordFilterType =
+                tone->getIntAttribute ("nfType", 1);
+            entry.settings.nordFilterCutoffHz = (float) safeDouble (
+                "nfCut", 18000.0);
+            entry.settings.nordFilterResonance = (float) safeDouble (
+                "nfRes", 0.0);
+            entry.settings.nordFilterKeyTrack =
+                tone->getIntAttribute ("nfTrack", 0);
+            entry.settings.nordFilterDrive =
+                tone->getIntAttribute ("nfDrive", 0);
+            entry.settings.nordFilterBright =
+                tone->getBoolAttribute ("nfBright", false);
+            entry.settings.nordFilterEnvAmount = (float) safeDouble (
+                "nfEnvAmt", 0.0);
+            entry.settings.nordFilterEnvAttackSeconds = (float) safeDouble (
+                "nfEnvA", 0.001);
+            entry.settings.nordFilterEnvDecaySeconds = (float) safeDouble (
+                "nfEnvD", 10.0);
+            entry.settings.nordFilterEnvReleaseSeconds = (float) safeDouble (
+                "nfEnvR", 0.55);
+            entry.settings.nordFilterVelocity =
+                tone->getBoolAttribute ("nfVel", false);
+            entry.settings.nordAmpEqOn =
+                tone->getBoolAttribute ("nEqOn", false);
+            entry.settings.nordAmpBassDb = (float) safeDouble (
+                "nEqBass", 0.0);
+            entry.settings.nordAmpMidDb = (float) safeDouble (
+                "nEqMid", 0.0);
+            entry.settings.nordAmpMidHz = (float) safeDouble (
+                "nEqMidHz", 850.0);
+            entry.settings.nordAmpTrebleDb = (float) safeDouble (
+                "nEqTreble", 0.0);
             entry.settings = bounded (entry.settings);
 
             upsertUnlocked (layer, std::move (entry));

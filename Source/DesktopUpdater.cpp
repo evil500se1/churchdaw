@@ -38,14 +38,15 @@ namespace ChurchDAWDesktopUpdate
 
 #if JUCE_WINDOWS
 
-bool verifyUpdateRs256Signature (const juce::MemoryBlock& message,
-                                 const juce::MemoryBlock& signature,
-                                 juce::String& error)
+bool verifyUpdateRs256SignatureWithKey (const juce::MemoryBlock& message,
+                                        const juce::MemoryBlock& signature,
+                                        const char* publicKeyBase64,
+                                        juce::String& error)
 {
     error.clear();
 
     juce::MemoryOutputStream decodedKey;
-    if (! juce::Base64::convertFromBase64 (decodedKey, updatePolicyPublicKeyDerBase64))
+    if (! juce::Base64::convertFromBase64 (decodedKey, publicKeyBase64))
     {
         error = "Chave publica de atualizacao invalida";
         return false;
@@ -100,14 +101,15 @@ bool verifyUpdateRs256Signature (const juce::MemoryBlock& message,
 
 #elif JUCE_MAC
 
-bool verifyUpdateRs256Signature (const juce::MemoryBlock& message,
-                                 const juce::MemoryBlock& signature,
-                                 juce::String& error)
+bool verifyUpdateRs256SignatureWithKey (const juce::MemoryBlock& message,
+                                        const juce::MemoryBlock& signature,
+                                        const char* publicKeyBase64,
+                                        juce::String& error)
 {
     error.clear();
 
     juce::MemoryOutputStream decodedKey;
-    if (! juce::Base64::convertFromBase64 (decodedKey, updatePolicyPublicKeyDerBase64))
+    if (! juce::Base64::convertFromBase64 (decodedKey, publicKeyBase64))
     {
         error = "Chave publica de atualizacao invalida";
         return false;
@@ -178,8 +180,8 @@ bool verifyUpdateRs256Signature (const juce::MemoryBlock& message,
 
 #else
 
-bool verifyUpdateRs256Signature (const juce::MemoryBlock&, const juce::MemoryBlock&,
-                                 juce::String& error)
+bool verifyUpdateRs256SignatureWithKey (const juce::MemoryBlock&, const juce::MemoryBlock&,
+                                        const char*, juce::String& error)
 {
     // Android usa ChurchDAWSignedPolicyVerifier.java; aqui nao ha caminho valido.
     error = "Verificacao de atualizacao indisponivel nesta plataforma";
@@ -187,6 +189,31 @@ bool verifyUpdateRs256Signature (const juce::MemoryBlock&, const juce::MemoryBlo
 }
 
 #endif
+
+bool verifyUpdateRs256Signature (const juce::MemoryBlock& message,
+                                 const juce::MemoryBlock& signature,
+                                 juce::String& error)
+{
+    return verifyUpdateRs256SignatureWithKey (
+        message, signature, updatePolicyPublicKeyDerBase64, error);
+}
+
+bool verifyUpdateRs256Signature (const juce::MemoryBlock& message,
+                                 const juce::MemoryBlock& signature,
+                                 const juce::String& keyId,
+                                 juce::String& error)
+{
+    if (keyId == juce::String (policyKeyId))
+        return verifyUpdateRs256SignatureWithKey (
+            message, signature, updatePolicyPublicKeyDerBase64, error);
+
+    if (keyId == juce::String (policyKeyIdCurrent))
+        return verifyUpdateRs256SignatureWithKey (
+            message, signature, updatePolicyPublicKeyDerBase64_2026_08, error);
+
+    error = "Chave publica de atualizacao desconhecida";
+    return false;
+}
 
 //==============================================================================
 // 2. LEITURA ESTRITA DO ENVELOPE
@@ -274,9 +301,13 @@ namespace
 
     juce::File updateStateFile()
     {
+       #if defined (CHURCHDAW_UPDATE_TEST_STATE_DIR)
+        return updaterTestStateFile();
+       #else
         return juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory)
                    .getChildFile ("ChurchDAW")
                    .getChildFile ("update-state.json");
+       #endif
     }
 
     struct UpdateState
@@ -352,8 +383,15 @@ bool verifySignedPolicyEnvelope (const juce::String& payloadBase64,
 {
     // Mesmas checagens do lado Java, na mesma ordem: chave certa, tamanhos
     // certos, e so entao a conta cara da assinatura.
-    if (keyId != juce::String (policyKeyId)
-         || payloadBase64.isEmpty()
+    const char* publicKeyBase64 = nullptr;
+    if (keyId == juce::String (policyKeyId))
+        publicKeyBase64 = updatePolicyPublicKeyDerBase64;
+    else if (keyId == juce::String (policyKeyIdCurrent))
+        publicKeyBase64 = updatePolicyPublicKeyDerBase64_2026_08;
+    else
+        return false;
+
+    if (payloadBase64.isEmpty()
          || payloadBase64.length() > maximumPayloadBytes * 2
          || signatureBase64.length() != 512)
         return false;
@@ -368,9 +406,10 @@ bool verifySignedPolicyEnvelope (const juce::String& payloadBase64,
         return false;
 
     juce::String error;
-    return verifyUpdateRs256Signature (
+    return verifyUpdateRs256SignatureWithKey (
         juce::MemoryBlock (payload.getData(), payload.getDataSize()),
         juce::MemoryBlock (signature.getData(), signature.getDataSize()),
+        publicKeyBase64,
         error);
 }
 
@@ -413,7 +452,8 @@ bool parseSignedPolicy (const juce::String& envelopeJson,
     if (! readBoundedInt (envelope->getProperty ("schema_version"), 1000000000, envelopeSchema)
          || envelopeSchema != 1
          || algorithm != juce::String (policyAlgorithm)
-         || keyId != juce::String (policyKeyId)
+         || (keyId != juce::String (policyKeyId)
+             && keyId != juce::String (policyKeyIdCurrent))
          || payloadBase64.isEmpty()
          || payloadBase64.length() > maximumPayloadBytes * 2
          || payloadBase64.length() % 4 != 0
@@ -439,7 +479,12 @@ bool parseSignedPolicy (const juce::String& envelopeJson,
     const juce::MemoryBlock message  (decodedPayload.getData(), decodedPayload.getDataSize());
     const juce::MemoryBlock signature (decodedSignature.getData(), decodedSignature.getDataSize());
 
-    if (! verifyUpdateRs256Signature (message, signature, error))
+    const auto* publicKeyBase64 = keyId == juce::String (policyKeyIdCurrent)
+        ? updatePolicyPublicKeyDerBase64_2026_08
+        : updatePolicyPublicKeyDerBase64;
+
+    if (! verifyUpdateRs256SignatureWithKey (message, signature,
+                                              publicKeyBase64, error))
         return false;
 
     // Daqui para baixo o conteudo e autentico -- mas ainda precisa ser sensato.
@@ -540,6 +585,51 @@ bool parseSignedPolicy (const juce::String& envelopeJson,
     return true;
 }
 
+juce::int64 parseHttpDateEpochSeconds (const juce::String& value)
+{
+    juce::StringArray fields;
+    fields.addTokens (value.trim(), " ,:", {});
+    fields.removeEmptyStrings();
+
+    if (fields.size() != 8
+         || fields[0].length() != 3
+         || fields[7] != "GMT")
+        return 0;
+
+    for (const int index : { 1, 3, 4, 5, 6 })
+        if (! fields[index].containsOnly ("0123456789"))
+            return 0;
+
+    const juce::StringArray months {
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+    };
+    const int month = months.indexOf (fields[2]);
+    const int day = fields[1].getIntValue();
+    const int year = fields[3].getIntValue();
+    const int hour = fields[4].getIntValue();
+    const int minute = fields[5].getIntValue();
+    const int second = fields[6].getIntValue();
+    const bool leapYear =
+        (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    const int daysInMonth[] {
+        31, leapYear ? 29 : 28, 31, 30, 31, 30,
+        31, 31, 30, 31, 30, 31
+    };
+
+    if (year < 2020 || year > 2100
+         || month < 0
+         || day < 1 || day > daysInMonth[month]
+         || hour < 0 || hour > 23
+         || minute < 0 || minute > 59
+         || second < 0 || second > 60)
+        return 0;
+
+    return juce::Time (
+        year, month, day, hour, minute,
+        juce::jmin (second, 59), 0, false).toMilliseconds() / 1000;
+}
+
 //==============================================================================
 // 3. BUSCA NA REDE E DECISAO
 //==============================================================================
@@ -614,7 +704,7 @@ Decision fetchPolicy (Policy& policy, juce::String& error)
     const auto serverDate = responseHeaders.getValue ("Date", {});
     if (serverDate.isNotEmpty())
     {
-        const auto parsed = juce::Time::fromISO8601 (serverDate).toMilliseconds() / 1000;
+        const auto parsed = parseHttpDateEpochSeconds (serverDate);
         if (parsed > 1700000000)   // sanidade: depois de nov/2023
             now = parsed;
     }
@@ -882,19 +972,10 @@ bool operatingSystemTrustsInstaller (const juce::File& installer, juce::String& 
     return true;
 
    #elif JUCE_MAC
-    // O Gatekeeper e quem decide de verdade no macOS -- perguntamos a ele em vez
-    // de reimplementar a regra. "--type install" e a avaliacao usada para
-    // instaladores e imagens de disco.
-    // "--verbose" NAO e enfeite: sem ele o spctl imprime apenas
-    // "<caminho>: rejected", e a linha "source=..." — a unica que diz SE a
-    // recusa foi por falta de assinatura ou por assinatura quebrada — nunca
-    // aparece. O ramo de tolerancia abaixo procura exatamente esse texto,
-    // entao sem verbose ele jamais casava e todo DMG ad-hoc virava
-    // "Gatekeeper recusou o instalador". Medido no Mac em 31/07/2026:
-    // com --verbose=4 a saida traz "source=no usable signature".
+    // DMGs usam a avaliacao da assinatura primaria da imagem. O tipo
+    // install e destinado a PKG, conforme o TN2206 da Apple.
     juce::ChildProcess assess;
-    juce::StringArray command { "/usr/sbin/spctl", "--assess", "--type", "install",
-                                "--verbose=4", installer.getFullPathName() };
+    const auto command = macGatekeeperAssessmentCommand (installer);
 
     if (! assess.start (command, juce::ChildProcess::wantStdOut | juce::ChildProcess::wantStdErr))
     {
@@ -902,13 +983,15 @@ bool operatingSystemTrustsInstaller (const juce::File& installer, juce::String& 
         return false;
     }
 
-    const auto output = assess.readAllProcessOutput();
+    // spctl emite apenas um diagnostico curto. Esperar antes da leitura evita
+    // que readAllProcessOutput bloqueie indefinidamente quando o Gatekeeper trava.
     if (! assess.waitForProcessToFinish (20000))
     {
         assess.kill();
         error = "Gatekeeper demorou demais para responder";
         return false;
     }
+    const auto output = assess.readAllProcessOutput();
 
     if (assess.getExitCode() != 0)
     {
@@ -948,6 +1031,17 @@ bool operatingSystemTrustsInstaller (const juce::File& installer, juce::String& 
 //==============================================================================
 // 6. ENTREGA AO SISTEMA
 //==============================================================================
+juce::StringArray macGatekeeperAssessmentCommand (const juce::File& installer)
+{
+    if (installer.hasFileExtension ("dmg"))
+        return { "/usr/sbin/spctl", "--assess", "--type", "open",
+                 "--context", "context:primary-signature", "--verbose=4",
+                 installer.getFullPathName() };
+
+    return { "/usr/sbin/spctl", "--assess", "--type", "install",
+             "--verbose=4", installer.getFullPathName() };
+}
+
 bool launchInstaller (const juce::File& installer, juce::String& error)
 {
     error.clear();

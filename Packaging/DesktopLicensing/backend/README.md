@@ -207,12 +207,12 @@ return [
     'checkout.enabled' => false,
 
     'product.code' => 'churchdaw-desktop-perpetual',
-    'product.name' => 'ChurchDAW Desktop',
+    'product.name' => 'ChurchDAW Windows, macOS e Android',
     'product.currency' => 'BRL',
-    'product.price_cents' => 49900,
+    'product.price_cents' => 19999,
 
-    'legal.terms_version' => '2026-07-28',
-    'legal.privacy_version' => '2026-07-28',
+    'legal.terms_version' => '2026-08-15',
+    'legal.privacy_version' => '2026-08-15',
 
     'mail.from' => 'contato@churchdaw.com',
     'mail.reply_to' => 'contato@churchdaw.com',

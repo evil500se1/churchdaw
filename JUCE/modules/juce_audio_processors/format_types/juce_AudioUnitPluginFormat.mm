@@ -141,19 +141,26 @@ private:
             if (AudioUnitGetProperty (plugin.getAudioUnitHandle(), kAudioUnitProperty_CocoaUI, kAudioUnitScope_Global,
                                       0, info, &dataSize) == noErr)
             {
-                NSString* viewClassName = (NSString*) (info->mCocoaAUViewClass[0]);
-                CFUniquePtr<CFStringRef> path (CFURLCopyPath (info->mCocoaAUViewBundleLocation));
-                NSString* unescapedPath = (NSString*) CFURLCreateStringByReplacingPercentEscapes (nullptr, path.get(), CFSTR (""));
-                NSBundle* viewBundle = [NSBundle bundleWithPath: [unescapedPath autorelease]];
-                Class viewClass = [viewBundle classNamed: viewClassName];
-
-                if ([viewClass conformsToProtocol: @protocol (AUCocoaUIBase)]
-                     && [viewClass instancesRespondToSelector: @selector (interfaceVersion)]
-                     && [viewClass instancesRespondToSelector: @selector (uiViewForAudioUnit: withSize:)])
+                @try
                 {
-                    id factory = [[[viewClass alloc] init] autorelease];
-                    pluginView = [factory uiViewForAudioUnit: plugin.getAudioUnitHandle()
-                                                    withSize: NSMakeSize (getWidth(), getHeight())];
+                    NSString* viewClassName = (NSString*) (info->mCocoaAUViewClass[0]);
+                    CFUniquePtr<CFStringRef> path (CFURLCopyPath (info->mCocoaAUViewBundleLocation));
+                    NSString* unescapedPath = (NSString*) CFURLCreateStringByReplacingPercentEscapes (nullptr, path.get(), CFSTR (""));
+                    NSBundle* viewBundle = [NSBundle bundleWithPath: [unescapedPath autorelease]];
+                    Class viewClass = [viewBundle classNamed: viewClassName];
+
+                    if ([viewClass conformsToProtocol: @protocol (AUCocoaUIBase)]
+                         && [viewClass instancesRespondToSelector: @selector (interfaceVersion)]
+                         && [viewClass instancesRespondToSelector: @selector (uiViewForAudioUnit: withSize:)])
+                    {
+                        id factory = [[[viewClass alloc] init] autorelease];
+                        pluginView = [factory uiViewForAudioUnit: plugin.getAudioUnitHandle()
+                                                        withSize: NSMakeSize (getWidth(), getHeight())];
+                    }
+                }
+                @catch (NSException* e)
+                {
+                    pluginView = nil;
                 }
 
                 for (int i = (dataSize - sizeof (CFURLRef)) / sizeof (CFStringRef); --i >= 0;)

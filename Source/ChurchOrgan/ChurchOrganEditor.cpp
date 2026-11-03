@@ -144,6 +144,17 @@ public:
         repaint();
     }
 
+    void setRightInset (int insetPx)
+    {
+        insetPx = juce::jmax (0, insetPx);
+        if (rightInset == insetPx)
+            return;
+
+        rightInset = insetPx;
+        resized();
+        repaint();
+    }
+
     void refresh (const ChurchOrganUiSnapshot& state)
     {
         quality = state.quality;
@@ -247,6 +258,8 @@ public:
     void resized() override
     {
         auto area = getLocalBounds().reduced (compactHeader() ? 5 : 10, 5);
+        if (rightInset > 0)
+            area.removeFromRight (juce::jmin (rightInset, area.getWidth() / 2));
         const int gap = compactHeader() ? 4 : 7;
         const int target = compactHeader() ? 40 : 52;
 
@@ -257,18 +270,28 @@ public:
 
         if (compactHeader())
         {
-            const bool roomyCompact = getWidth() >= 600;
-            wordmarkBounds = area.removeFromLeft (
-                roomyCompact ? 78 : juce::jlimit (52, 78, getWidth() / 5));
+            const bool roomyCompact = (getWidth() - rightInset) >= 600;
+            wordmarkBounds = (rightInset > 0 && getWidth() < 480)
+                ? juce::Rectangle<int>()
+                : area.removeFromLeft (
+                      roomyCompact ? 78 : juce::jlimit (52, 78, getWidth() / 5));
             engineNameBounds = {};
 
             const int powerWidth = roomyCompact ? 52 : juce::jmax (40, target);
             powerButton.setBounds (area.removeFromRight (powerWidth));
             area.removeFromRight (gap);
-            const int cpuWidth = roomyCompact ? 48 : juce::jmax (34, target - 8);
-            cpuBounds = area.removeFromRight (cpuWidth);
-            cpuAccessibility.setBounds (cpuBounds);
-            area.removeFromRight (gap);
+            if (rightInset > 0 && getWidth() < 430)
+            {
+                cpuBounds = {};
+                cpuAccessibility.setBounds ({});
+            }
+            else
+            {
+                const int cpuWidth = roomyCompact ? 48 : juce::jmax (34, target - 8);
+                cpuBounds = area.removeFromRight (cpuWidth);
+                cpuAccessibility.setBounds (cpuBounds);
+                area.removeFromRight (gap);
+            }
             qualityButton.setBounds (
                 area.removeFromRight (roomyCompact ? 58
                                                   : juce::jmax (40, target)));
@@ -406,6 +429,7 @@ private:
     ChurchOrganParameterSink& sink;
     ChurchOrganLayout::SizeClass sizeClass =
         ChurchOrganLayout::SizeClass::expanded;
+    int rightInset = 0;
     ChurchOrganQuality quality = ChurchOrganQuality::standard;
     bool engineEnabled = true;
     bool midiConnected = true;
@@ -1895,6 +1919,11 @@ ChurchOrganLayout::Page ChurchOrganEditor::getActivePage() const noexcept
 void ChurchOrganEditor::showPage (Page page)
 {
     impl->setPage (page);
+}
+
+void ChurchOrganEditor::setHeaderRightInset (int insetPx)
+{
+    impl->header.setRightInset (insetPx);
 }
 
 ChurchOrganLayout::Shell ChurchOrganEditor::getShellLayoutForTesting() const noexcept

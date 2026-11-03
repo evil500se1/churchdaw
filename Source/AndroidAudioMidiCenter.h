@@ -7,6 +7,7 @@
 #include "BinaryData.h"
 #include "NordLookAndFeel.h"
 #include "TimbresProcessor.h"
+#include "MobileAudioBufferPolicy.h"
 
 #include <functional>
 #include <memory>
@@ -31,7 +32,11 @@ public:
         std::function<void()> refreshMidiInputs;
         std::function<void()> forceUsbReconcile;
         std::function<TimbresProcessor*()> getChurchLive;
+        std::function<void(bool)> setLaunchkeyMappingEnabled;
+        bool launchkeyMappingEnabled = true;
         bool& audioDialogOpen;
+        std::function<void()> startOutputTest;
+        std::function<void()> stopOutputTest;
     };
 
     explicit AndroidAudioMidiCenter (Host hostToUse)
@@ -72,8 +77,12 @@ public:
         styleBody (outHint);
         styleSection (inTitle, juce::String::fromUTF8 (u8"Entrada de áudio"));
         styleBody (inHint);
-        inHint.setText (juce::String::fromUTF8 (u8"Entrada desativada\nO ChurchDAW funciona só com instrumentos virtuais (sem microfone)."),
+        inHint.setText (juce::String::fromUTF8 (u8"Entrada desativada\nA entrada do mixer fica desligada. Para incluir sua voz no vídeo, ligue o microfone no ChurchCam."),
                         juce::dontSendNotification);
+
+        styleCombo (driverTypeBox);
+        driverTypeBox.onChange = [this] { applyDriverTypeFromBox(); };
+        addAndMakeVisible (driverTypeBox);
 
         styleCombo (outDeviceBox);
         outDeviceBox.onChange = [this] { applyOutputDeviceFromBox(); };
@@ -166,6 +175,24 @@ public:
         usbBtn.onClick = [this] { recoverUsb(); };
         addAndMakeVisible (usbBtn);
 
+        launchkeyToggle.setButtonText (juce::String::fromUTF8 (
+            "Mapeamento autom\xc3\xa1tico do Launchkey"));
+        launchkeyToggle.setTooltip (juce::String::fromUTF8 (
+            "Desligue para usar o Launchkey somente como entrada MIDI comum."));
+        launchkeyToggle.setToggleState (host.launchkeyMappingEnabled,
+                                        juce::dontSendNotification);
+        launchkeyToggle.onClick = [this]
+        {
+            if (host.setLaunchkeyMappingEnabled != nullptr)
+                host.setLaunchkeyMappingEnabled (launchkeyToggle.getToggleState());
+        };
+        launchkeyToggle.setWantsKeyboardFocus (false);
+        launchkeyToggle.setColour (juce::ToggleButton::textColourId,
+                                   NordLookAndFeel::txtPrimary());
+        launchkeyToggle.setColour (juce::ToggleButton::tickColourId,
+                                   NordLookAndFeel::nordRedBright());
+        addAndMakeVisible (launchkeyToggle);
+
         addAndMakeVisible (audioSummaryTitle);
         addAndMakeVisible (audioSummaryBody);
         addAndMakeVisible (outTitle);
@@ -203,8 +230,11 @@ public:
         {
             if (auto xml = host.deviceManager.createStateXml())
                 host.appProperties.getUserSettings()->setValue ("audioSetup", xml.get());
+            const int userBuffer = host.appProperties.getUserSettings()
+                ->getIntValue ("androidUserBufferSize",
+                               dev->getCurrentBufferSizeSamples());
             host.appProperties.getUserSettings()->setValue (
-                "bufferSize", dev->getCurrentBufferSizeSamples());
+                "bufferSize", userBuffer);
             host.appProperties.getUserSettings()->setValue (
                 "sampleRate", dev->getCurrentSampleRate());
             host.appProperties.getUserSettings()->saveIfNeeded();
@@ -341,6 +371,7 @@ private:
     // Audio page
     juce::Label audioSummaryTitle, audioSummaryBody;
     juce::Label outTitle, outHint, inTitle, inHint;
+    juce::ComboBox driverTypeBox;
     juce::ComboBox outDeviceBox;
     juce::TextButton testOutBtn, refreshDevicesBtn;
     juce::StringArray outDeviceIds;
@@ -355,10 +386,12 @@ private:
 
     // MIDI/USB page
     juce::Label midiTitle, midiBody, bleTitle, bleBody, usbTitle, usbBody;
+    juce::ToggleButton launchkeyToggle;
     juce::TextButton bleBtn, usbBtn;
     juce::String usbMessage;
     bool usbBusy = false;
     bool testingOut = false;
+    juce::uint64 outputTestGeneration = 0;
 
     static constexpr int headerH = 58;
     static constexpr int cardRadius = 14;
@@ -457,7 +490,7 @@ private:
         const auto hide = [] (juce::Component& c) { c.setVisible (false); };
         hide (audioSummaryTitle); hide (audioSummaryBody);
         hide (outTitle); hide (outHint); hide (inTitle); hide (inHint);
-        hide (outDeviceBox); hide (testOutBtn); hide (refreshDevicesBtn);
+        hide (driverTypeBox); hide (outDeviceBox); hide (testOutBtn); hide (refreshDevicesBtn);
         hide (latModeTitle); hide (latModeHint); hide (srTitle); hide (bufTitle);
         hide (latTotalTitle); hide (latTotalHero); hide (latTotalDetail);
         hide (latStabilityBody);
@@ -465,6 +498,7 @@ private:
         for (auto* b : perfButtons) b->setVisible (false);
         hide (midiTitle); hide (midiBody); hide (bleTitle); hide (bleBody);
         hide (usbTitle); hide (usbBody); hide (bleBtn); hide (usbBtn);
+        hide (launchkeyToggle);
 
         cardAudioSummary = {};
         cardOutput = {};
@@ -483,12 +517,12 @@ private:
         hideAllPageWidgets();
         auto r = content;
         const bool shortH = r.getHeight() < 420;
-        const bool wide = r.getWidth() >= 720 && r.getWidth() > r.getHeight();
+        const bool wide = r.getWidth() >= 660 && r.getWidth() > r.getHeight();
         const int gap = shortH ? 8 : 12;
         const int fieldH = shortH ? 40 : 46;
         const int btnH = shortH ? 42 : 48;
         const int cardPadX = 14;
-        const int cardPadY = 12;
+        const int cardPadY = shortH ? 9 : 12;
         const int sectionTitleGap = 4;
 
         // Cria um card de altura fixa na área e devolve o retângulo interno
@@ -515,6 +549,23 @@ private:
             body.setBounds (inner.removeFromTop (bodyH));
         };
 
+        auto placeMidiSection = [&] (juce::Rectangle<int>& area)
+        {
+            const int bodyH = shortH ? 64 : 80;
+            const int toggleH = shortH ? 34 : 38;
+            const int cardHeight = cardPadY * 2 + titleH + sectionTitleGap
+                                 + bodyH + 8 + toggleH;
+            auto inner = makeCard (area, cardHeight, cardMidi);
+            midiTitle.setVisible (true);
+            midiBody.setVisible (true);
+            midiTitle.setBounds (inner.removeFromTop (titleH));
+            inner.removeFromTop (sectionTitleGap);
+            midiBody.setBounds (inner.removeFromTop (bodyH));
+            inner.removeFromTop (8);
+            launchkeyToggle.setVisible (true);
+            launchkeyToggle.setBounds (inner.removeFromTop (toggleH));
+        };
+
         if (current == Tab::Audio)
         {
             if (wide)
@@ -524,12 +575,24 @@ private:
 
                 // ---- Card de saída (esquerda, topo) ----
                 {
+                    const bool showDriverType = driverTypeBox.getNumItems() > 1;
+                    const int driverBoxH = showDriverType ? (fieldH + 6) : 0;
                     const int cardHeight = cardPadY * 2 + titleH + sectionTitleGap
-                                           + fieldH + 6 + btnH + 6 + (shortH ? 34 : 40);
+                                           + driverBoxH + fieldH + 6 + btnH + 6 + (shortH ? 28 : 40);
                     auto inner = makeCard (left, cardHeight, cardOutput);
                     outTitle.setVisible (true);
                     outTitle.setBounds (inner.removeFromTop (titleH));
                     inner.removeFromTop (sectionTitleGap);
+                    if (showDriverType)
+                    {
+                        driverTypeBox.setVisible (true);
+                        driverTypeBox.setBounds (inner.removeFromTop (fieldH));
+                        inner.removeFromTop (6);
+                    }
+                    else
+                    {
+                        driverTypeBox.setVisible (false);
+                    }
                     outDeviceBox.setVisible (true);
                     outDeviceBox.setBounds (inner.removeFromTop (fieldH));
                     inner.removeFromTop (6);
@@ -541,7 +604,7 @@ private:
                     refreshDevicesBtn.setBounds (row.reduced (0, 1).withTrimmedLeft (5));
                     inner.removeFromTop (6);
                     outHint.setVisible (true);
-                    outHint.setBounds (inner.removeFromTop (shortH ? 34 : 40));
+                    outHint.setBounds (inner.removeFromTop (shortH ? 28 : 40));
                 }
 
                 // ---- Card de resumo (direita, topo) ----
@@ -571,14 +634,26 @@ private:
 
                 // ---- Card de saída ----
                 {
+                    const bool showDriverType = driverTypeBox.getNumItems() > 1;
+                    const int driverBoxH = showDriverType ? (fieldH + (shortH ? 6 : 8)) : 0;
                     const int cardHeight = cardPadY * 2 + titleH + sectionTitleGap
-                                           + fieldH + (shortH ? 6 : 8)
+                                           + driverBoxH + fieldH + (shortH ? 6 : 8)
                                            + btnH + (shortH ? 6 : 8)
                                            + (shortH ? 34 : 40);
                     auto inner = makeCard (r, cardHeight, cardOutput);
                     outTitle.setVisible (true);
                     outTitle.setBounds (inner.removeFromTop (titleH));
                     inner.removeFromTop (sectionTitleGap);
+                    if (showDriverType)
+                    {
+                        driverTypeBox.setVisible (true);
+                        driverTypeBox.setBounds (inner.removeFromTop (fieldH));
+                        inner.removeFromTop (shortH ? 6 : 8);
+                    }
+                    else
+                    {
+                        driverTypeBox.setVisible (false);
+                    }
                     outDeviceBox.setVisible (true);
                     outDeviceBox.setBounds (inner.removeFromTop (fieldH));
                     inner.removeFromTop (shortH ? 6 : 8);
@@ -605,7 +680,78 @@ private:
         {
             updateLatencyBar();
 
-            if (wide)
+            if (wide && shortH)
+            {
+                const int colW = (r.getWidth() - gap * 2) / 3;
+                auto col1 = r.removeFromLeft (colW);
+                r.removeFromLeft (gap);
+                auto col2 = r.removeFromLeft (colW);
+                r.removeFromLeft (gap);
+                auto col3 = r;
+
+                {
+                    const int cardHeight = cardPadY * 2 + titleH + sectionTitleGap
+                                           + fieldH + 5 + 28 + 6 + fieldH;
+                    auto inner = makeCard (col1, cardHeight, cardLatencyMode);
+                    latModeTitle.setVisible (true);
+                    latModeTitle.setBounds (inner.removeFromTop (titleH));
+                    inner.removeFromTop (sectionTitleGap);
+                    auto presets = inner.removeFromTop (fieldH);
+                    const int pw = presets.getWidth() / 4;
+                    for (int i = 0; i < perfButtons.size(); ++i)
+                    {
+                        perfButtons[i]->setVisible (true);
+                        perfButtons[i]->setBounds (presets.removeFromLeft (pw).reduced (1, 0));
+                    }
+                    inner.removeFromTop (5);
+                    latModeHint.setVisible (true);
+                    latModeHint.setBounds (inner.removeFromTop (28));
+                    inner.removeFromTop (6);
+                    velBox.setVisible (true);
+                    velBox.setBounds (inner.removeFromTop (fieldH));
+                }
+
+                {
+                    const int cardHeight = cardPadY * 2
+                                           + (titleH + sectionTitleGap + fieldH) * 2
+                                           + gap;
+                    auto inner = makeCard (col2, cardHeight, cardLatencyDetails);
+                    srTitle.setVisible (true);
+                    srTitle.setBounds (inner.removeFromTop (titleH));
+                    inner.removeFromTop (sectionTitleGap);
+                    sampleRateBox.setVisible (true);
+                    sampleRateBox.setBounds (inner.removeFromTop (fieldH));
+                    inner.removeFromTop (gap);
+                    bufTitle.setVisible (true);
+                    bufTitle.setBounds (inner.removeFromTop (titleH));
+                    inner.removeFromTop (sectionTitleGap);
+                    bufferBox.setVisible (true);
+                    bufferBox.setBounds (inner.removeFromTop (fieldH));
+                }
+
+                {
+                    const int heroH = 34;
+                    const int detailH = 18;
+                    const int stabH = 26;
+                    const int cardHeight = cardPadY * 2 + titleH + sectionTitleGap
+                                           + heroH + 3 + detailH + 8 + 8 + 6 + stabH;
+                    auto inner = makeCard (col3, cardHeight, cardLatencyTotal);
+                    latTotalTitle.setVisible (true);
+                    latTotalTitle.setBounds (inner.removeFromTop (titleH));
+                    inner.removeFromTop (sectionTitleGap);
+                    latTotalHero.setVisible (true);
+                    latTotalHero.setBounds (inner.removeFromTop (heroH));
+                    inner.removeFromTop (3);
+                    latTotalDetail.setVisible (true);
+                    latTotalDetail.setBounds (inner.removeFromTop (detailH));
+                    inner.removeFromTop (8);
+                    latBarBounds = inner.removeFromTop (8);
+                    inner.removeFromTop (6);
+                    latStabilityBody.setVisible (true);
+                    latStabilityBody.setBounds (inner.removeFromTop (stabH));
+                }
+            }
+            else if (wide)
             {
                 auto left = r.removeFromLeft (r.getWidth() / 2).withTrimmedRight (gap / 2);
                 auto right = r.withTrimmedLeft (gap / 2);
@@ -771,39 +917,50 @@ private:
                 auto left = r.removeFromLeft (r.getWidth() / 2).withTrimmedRight (gap / 2);
                 auto right = r.withTrimmedLeft (gap / 2);
 
-                placeSection (midiTitle, midiBody, shortH ? 64 : 80, left, cardMidi);
+                placeMidiSection (left);
 
                 {
+                    // Em aparelhos de palco 2460x1080 a area logica tem so
+                    // ~220 px de altura. Dois cards com os espacamentos de
+                    // tablet deixavam o botao USB fora da tela. Mantemos os
+                    // alvos de toque grandes, mas reduzimos texto e respiros
+                    // apenas nesse modo paisagem baixo.
+                    const int bodyH = shortH ? 20 : 48;
+                    const int actionH = shortH ? 32 : btnH;
+                    const int actionGap = shortH ? 4 : 8;
                     const int cardHeight = cardPadY * 2 + titleH + sectionTitleGap
-                                           + (shortH ? 40 : 48) + 8 + btnH;
+                                           + bodyH + actionGap + actionH;
                     auto inner = makeCard (right, cardHeight, cardBle);
                     bleTitle.setVisible (true);
                     bleTitle.setBounds (inner.removeFromTop (titleH));
                     inner.removeFromTop (sectionTitleGap);
                     bleBody.setVisible (true);
-                    bleBody.setBounds (inner.removeFromTop (shortH ? 40 : 48));
-                    inner.removeFromTop (8);
+                    bleBody.setBounds (inner.removeFromTop (bodyH));
+                    inner.removeFromTop (actionGap);
                     bleBtn.setVisible (true);
-                    bleBtn.setBounds (inner.removeFromTop (btnH));
+                    bleBtn.setBounds (inner.removeFromTop (actionH));
                 }
 
                 {
+                    const int bodyH = shortH ? 20 : 52;
+                    const int actionH = shortH ? 32 : btnH;
+                    const int actionGap = shortH ? 4 : 8;
                     const int cardHeight = cardPadY * 2 + titleH + sectionTitleGap
-                                           + (shortH ? 44 : 52) + 8 + btnH;
+                                           + bodyH + actionGap + actionH;
                     auto inner = makeCard (right, cardHeight, cardUsb);
                     usbTitle.setVisible (true);
                     usbTitle.setBounds (inner.removeFromTop (titleH));
                     inner.removeFromTop (sectionTitleGap);
                     usbBody.setVisible (true);
-                    usbBody.setBounds (inner.removeFromTop (shortH ? 44 : 52));
-                    inner.removeFromTop (8);
+                    usbBody.setBounds (inner.removeFromTop (bodyH));
+                    inner.removeFromTop (actionGap);
                     usbBtn.setVisible (true);
-                    usbBtn.setBounds (inner.removeFromTop (btnH));
+                    usbBtn.setBounds (inner.removeFromTop (actionH));
                 }
             }
             else
             {
-                placeSection (midiTitle, midiBody, shortH ? 64 : 78, r, cardMidi);
+                placeMidiSection (r);
 
                 {
                     const int cardHeight = cardPadY * 2 + titleH + sectionTitleGap
@@ -927,12 +1084,14 @@ private:
         juce::String body;
         body << friendly << "\n";
         if (sr > 0.0 && buf > 0)
-            body << juce::String (sr, 0) << " Hz · "
-                 << buf << " samples · ~"
+            body << juce::String (sr, 0)
+                 << juce::String::fromUTF8 (u8" Hz · ")
+                 << buf << juce::String::fromUTF8 (u8" samples · ~")
                  << juce::String (estTotal, 1) << " ms\n";
         body << juce::String::fromUTF8 (u8"Estéreo L/R");
         if (dev != nullptr)
-            body << " · " << dev->getActiveOutputChannels().countNumberOfSetBits()
+            body << juce::String::fromUTF8 (u8" · ")
+                 << dev->getActiveOutputChannels().countNumberOfSetBits()
                  << " canais";
 
         audioSummaryBody.setText (body, juce::dontSendNotification);
@@ -990,7 +1149,8 @@ private:
         }
         else
         {
-            latTotalHero.setText ("—", juce::dontSendNotification);
+            latTotalHero.setText (juce::String::fromUTF8 (u8"—"),
+                                  juce::dontSendNotification);
             latTotalDetail.setText (
                 juce::String::fromUTF8 (u8"Estimativa indisponível"),
                 juce::dontSendNotification);
@@ -1054,7 +1214,7 @@ private:
                     u8"Máxima estabilidade (~20 ms). Ideal para culto e multi-camadas.");
             case 2:
                 return juce::String::fromUTF8 (
-                    u8"Resposta rápida (~8 ms). Use em aparelhos potentes.");
+                    u8"Menor buffer nativo da saída. Use em aparelhos potentes.");
             case 3:
                 return "Escolha manualmente taxa e buffer abaixo.";
             default:
@@ -1072,8 +1232,58 @@ private:
         return n;
     }
 
+    void rebuildDriverTypeList()
+    {
+        driverTypeBox.clear (juce::dontSendNotification);
+        const auto& types = host.deviceManager.getAvailableDeviceTypes();
+        const auto currentType = host.deviceManager.getCurrentAudioDeviceType();
+
+        int selected = 0;
+        for (int i = 0; i < types.size(); ++i)
+        {
+            const auto name = types.getUnchecked (i)->getTypeName();
+            juce::String label = name;
+            if (name == "ASIO")
+                label = juce::String::fromUTF8 (u8"Driver ASIO (Baixa Latência)");
+            else if (name.containsIgnoreCase ("Low Latency"))
+                label = juce::String::fromUTF8 (u8"Windows Audio (Low Latency)");
+            else if (name == "Windows Audio")
+                label = juce::String::fromUTF8 (u8"Windows Audio (Padrão)");
+
+            driverTypeBox.addItem (label, i + 1);
+            if (name == currentType)
+                selected = i + 1;
+        }
+
+        if (selected > 0)
+            driverTypeBox.setSelectedId (selected, juce::dontSendNotification);
+        else if (driverTypeBox.getNumItems() > 0)
+            driverTypeBox.setSelectedItemIndex (0, juce::dontSendNotification);
+    }
+
+    void applyDriverTypeFromBox()
+    {
+        const int idx = driverTypeBox.getSelectedItemIndex();
+        const auto& types = host.deviceManager.getAvailableDeviceTypes();
+        if (juce::isPositiveAndBelow (idx, types.size()))
+        {
+            const auto newType = types.getUnchecked (idx)->getTypeName();
+            if (newType != host.deviceManager.getCurrentAudioDeviceType())
+            {
+                host.deviceManager.setCurrentAudioDeviceType (newType, true);
+                rebuildDeviceList();
+                rebuildRateBufferLists();
+                refreshAudioSummary();
+                refreshStatus();
+                resized();
+            }
+        }
+    }
+
     void rebuildDeviceList()
     {
+        rebuildDriverTypeList();
+
         outDeviceBox.clear (juce::dontSendNotification);
         outDeviceIds.clear();
 
@@ -1243,6 +1453,8 @@ private:
         setup.useDefaultInputChannels = false;
         host.deviceManager.setAudioDeviceSetup (setup, true);
         host.appProperties.getUserSettings()->setValue ("bufferSize", bufs[idx]);
+        host.appProperties.getUserSettings()->setValue (
+            "androidUserBufferSize", bufs[idx]);
         host.appProperties.getUserSettings()->setValue ("androidPerfPreset", 3);
         host.appProperties.getUserSettings()->saveIfNeeded();
         manualPerf = 3;
@@ -1276,28 +1488,19 @@ private:
         const double sr = juce::jmax (1.0, dev->getCurrentSampleRate());
         auto pick = [&] (double targetMs)
         {
-            int best = bufs.getFirst();
-            double bestErr = 1.0e9;
-            for (int b : bufs)
-            {
-                const double ms = 1000.0 * (double) b / sr;
-                const double err = std::abs (ms - targetMs);
-                if (err < bestErr)
-                {
-                    bestErr = err;
-                    best = b;
-                }
-            }
-            return best;
+            return ChurchDAWMobileAudio::chooseClosestBufferForTargetMs (
+                bufs.getRawDataPointer(), bufs.size(), sr, targetMs);
         };
 
         // Perfis pensados pro culto no celular (fluidez > latencia minima):
-        // Segura ~20 ms, Natural ~12 ms, Rapida ~8 ms (nunca 5 ms no TANK).
+        // Segura ~20 ms, Natural ~12 ms. Rapida usa o menor tamanho realmente
+        // anunciado pela rota: 256 no TANK, 128 numa interface que o ofereca.
         int want = pick (20.0);
         if (preset == 1)
             want = pick (12.0);
         else if (preset == 2)
-            want = pick (8.0);
+            want = ChurchDAWMobileAudio::chooseSmallestAvailableBuffer (
+                bufs.getRawDataPointer(), bufs.size());
 
         auto setup = host.deviceManager.getAudioDeviceSetup();
         setup.bufferSize = want;
@@ -1308,6 +1511,8 @@ private:
 
         // Persiste ja: o tuner e o restart respeitam a escolha do musico.
         host.appProperties.getUserSettings()->setValue ("bufferSize", want);
+        host.appProperties.getUserSettings()->setValue (
+            "androidUserBufferSize", want);
         host.appProperties.getUserSettings()->setValue ("androidPerfPreset", preset);
         host.appProperties.getUserSettings()->saveIfNeeded();
 
@@ -1333,23 +1538,28 @@ private:
             return;
         }
 
+        const auto generation = ++outputTestGeneration;
         testingOut = true;
         testOutBtn.setButtonText ("Parar teste");
         outHint.setText (
             juce::String::fromUTF8 (u8"Testando saída… ouça um tom breve no fone/caixa."),
             juce::dontSendNotification);
 
-        host.deviceManager.playTestSound();
+        if (host.startOutputTest != nullptr)
+            host.startOutputTest();
 
-        juce::Timer::callAfterDelay (1200, [safe = juce::Component::SafePointer<AndroidAudioMidiCenter> (this)]
+        juce::Timer::callAfterDelay (1200, [safe = juce::Component::SafePointer<AndroidAudioMidiCenter> (this), generation]
         {
-            if (safe != nullptr)
+            if (safe != nullptr && safe->testingOut && safe->outputTestGeneration == generation)
                 safe->stopOutputTest();
         });
     }
 
     void stopOutputTest()
     {
+        ++outputTestGeneration; // an older timeout cannot stop a restarted test
+        if (host.stopOutputTest != nullptr)
+            host.stopOutputTest();
         testingOut = false;
         testOutBtn.setButtonText (juce::String::fromUTF8 (u8"Testar saída"));
         if (host.deviceManager.getCurrentAudioDevice() != nullptr)
@@ -1403,7 +1613,8 @@ private:
                 return;
             }
 
-            jclass clazz = env->FindClass ("com/churchdaw/app/ChurchDAWMidiBleBridge");
+            jclass clazz = ChurchDAWServices::findAndroidAppClass (
+                env, activity.get(), "com.churchdaw.app.ChurchDAWMidiBleBridge");
             if (clazz == nullptr)
             {
                 env->ExceptionClear();
@@ -1412,6 +1623,7 @@ private:
                     juce::dontSendNotification);
                 return;
             }
+            const juce::ScopeGuard releaseClazz { [env, clazz] { env->DeleteLocalRef (clazz); } };
 
             jboolean requestedPerms = JNI_FALSE;
             if (jmethodID method = env->GetStaticMethodID (

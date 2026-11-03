@@ -3,6 +3,7 @@
 #include <juce_gui_extra/juce_gui_extra.h>
 #include <juce_cryptography/juce_cryptography.h>
 #include "AppPaths.h"
+#include "DistributionFailure.h"
 
 #if JUCE_ANDROID
  #include <jni.h>
@@ -34,24 +35,24 @@
 //==============================================================================
 namespace ChurchDAWServices
 {
-    inline constexpr int currentVersionCode = 14;
-    inline constexpr const char* currentVersionName = "1.5.9";
+    // Deve acompanhar ChurchDAW.jucer. O PackageManager e a autoridade para o
+    // gate em runtime, mas estes valores alimentam a tela inicial, logs,
+    // fixtures e fallbacks offline; divergir fazia um APK 1.6.24 se anunciar
+    // como 1.6.10 e quebrava a verificacao oficial de release.
+    inline constexpr int currentVersionCode = 10642;
+    inline constexpr const char* currentVersionName = "1.6.35";
     inline constexpr const char* packageId = "com.churchdaw.app";
     inline constexpr const char* updatePolicyUrl =
         "https://churchdaw.com/app/android/update-policy-v2.json";
     inline constexpr const char* fallbackUpdatePolicyUrl =
-        "https://www.churchdaw.com/app/android/update-policy-v2.json";
+        "https://churchdaw.com/app/android/update-policy-v2.json?retry=1";
     inline constexpr const char* manifestUrl = "https://churchdaw.com/app/android/manifest.json";
     inline constexpr const char* fallbackManifestUrl =
-        "https://www.churchdaw.com/app/android/manifest.json";
-    // URL de escape usada quando a policy nao carrega (celular sem internet no
-    // domingo, policy vencida). Ela TEM de terminar em "-signed.apk": a ponte
-    // Java exige isso em ChurchDAWUpdateBridge.isOfficialApkUrl e devolve false
-    // sem nem tentar abrir. Com o nome sem "-signed" o botao "Atualizar" ficava
-    // morto e, no gate obrigatorio, o cliente ficava preso — foi o que
-    // aconteceu em 31/07/2026.
+        "https://churchdaw.com/app/android/manifest.json?retry=1";
+    // Usado somente quando a propria instalacao veio da Google Play. As builds
+    // distribuidas pelo site preservam a URL exata do APK dentro da policy RSA.
     inline constexpr const char* defaultPlayStoreUrl =
-        "https://churchdaw.com/app/android/ChurchDAW-1.5.9-signed.apk";
+        "https://play.google.com/store/apps/details?id=com.churchdaw.app";
     inline constexpr int maximumUpdatePolicyBytes = 32 * 1024;
     inline constexpr int maximumSignedPolicyPayloadBytes = 24 * 1024;
     inline constexpr int maximumVersionNameCharacters = 48;
@@ -80,6 +81,61 @@ namespace ChurchDAWServices
 
         result = first + second;
         return true;
+    }
+
+    // Copia exatamente o numero de bytes declarado pelo catalogo. Downloads
+    // antigos liam ate EOF; alguns proxies/servidores mantem a conexao HTTP
+    // viva depois do Content-Length e o app parecia congelado em 100%.
+    // Parar no tamanho assinado/publicado tambem torna retomada e testes
+    // deterministas. O chamador continua responsavel por flush e SHA-256.
+    inline juce::Result copyExactDownloadBytes (
+        juce::InputStream& input,
+        juce::OutputStream& output,
+        juce::int64 initialBytes,
+        juce::int64 expectedBytes,
+        const std::function<bool()>& shouldCancel,
+        const std::function<void (juce::int64)>& onProgress,
+        juce::int64& totalBytes)
+    {
+        totalBytes = initialBytes;
+
+        if (expectedBytes <= 0 || initialBytes < 0
+             || initialBytes > expectedBytes)
+            return juce::Result::fail (
+                "Faixa de download invalida");
+
+        constexpr int bufferBytes = 128 * 1024;
+        juce::HeapBlock<char> buffer (bufferBytes);
+
+        while (totalBytes < expectedBytes)
+        {
+            if (shouldCancel != nullptr && shouldCancel())
+                return juce::Result::fail ("Download cancelado");
+
+            const auto remaining = expectedBytes - totalBytes;
+            const int wanted = (int) juce::jmin (
+                remaining, (juce::int64) bufferBytes);
+            const int received = input.read (buffer.getData(), wanted);
+
+            if (received <= 0)
+                return juce::Result::fail (
+                    "A conexao terminou antes do tamanho esperado");
+
+            if (received > wanted)
+                return juce::Result::fail (
+                    "O servidor enviou mais dados que o solicitado");
+
+            if (! output.write (buffer.getData(), (size_t) received))
+                return juce::Result::fail (
+                    "Falha ao gravar o download");
+
+            totalBytes += received;
+
+            if (onProgress != nullptr)
+                onProgress (totalBytes);
+        }
+
+        return juce::Result::ok();
     }
 
     inline bool readBoundedInteger (const juce::var& value, juce::int64 maximum,
@@ -269,9 +325,14 @@ namespace ChurchDAWServices
         return text.startsWithIgnoreCase ("https://") && juce::URL (text).isWellFormed();
     }
 
+    inline bool isSafePlayStoreUpdateUrl (const juce::String& text)
+    {
+        return text == defaultPlayStoreUrl;
+    }
+
     // A URL do APK faz parte do payload RSA. Mesmo assim, restringi-la ao
-    // diretorio oficial evita que uma policy malformada abra checkout, outro
-    // host, esquema ou arquivo que nao seja um update ChurchDAW.
+    // diretorio oficial evita que uma policy malformada abra outro host,
+    // esquema, query ou arquivo que nao seja um update assinado do ChurchDAW.
     inline bool isSafeWebsiteUpdateUrl (const juce::String& text)
     {
         static constexpr const char* prefix =
@@ -282,11 +343,17 @@ namespace ChurchDAWServices
              || text.containsAnyOf ("?#\r\n"))
             return false;
 
-        auto name = text.fromFirstOccurrenceOf (prefix, false, false)
-                        .dropLastCharacters (
-                            (int) juce::String ("-signed.apk").length());
+        const auto name = text.fromFirstOccurrenceOf (prefix, false, false)
+                               .dropLastCharacters (
+                                   (int) juce::String ("-signed.apk").length());
 
         return isSafeUpdateVersionName (name);
+    }
+
+    inline bool isSafeAndroidUpdateUrl (const juce::String& text)
+    {
+        return isSafeWebsiteUpdateUrl (text)
+            || isSafePlayStoreUpdateUrl (text);
     }
 
     inline bool isSafeUpdateVersionName (const juce::String& text)
@@ -722,11 +789,10 @@ namespace ChurchDAWServices
         constexpr double kb = 1000.0;
 
         if ((double) bytes >= gb)
-            return juce::String ((double) bytes / gb,
-                                 (double) bytes >= 100.0 * gb ? 0 : 1) + " GB";
+            return juce::String ((double) bytes / gb, 1) + " GB";
 
         if ((double) bytes >= mb)
-            return juce::String ((double) bytes / mb, 0) + " MB";
+            return juce::String ((double) bytes / mb, 1) + " MB";
 
         return juce::String (juce::jmax (1, juce::roundToInt ((double) bytes / kb))) + " KB";
     }
@@ -805,6 +871,16 @@ namespace ChurchDAWServices
         return false;
     }
 
+    inline bool isPadContinuoPackId (const juce::String& id) noexcept
+    {
+        // O catalogo publico historico usa "pad-continuos", enquanto varias
+        // builds e a pasta canonica usam "pad-continuo". Ambos representam o
+        // mesmo pack; tratar o plural como outro produto fazia a UI e a
+        // deteccao de instalacao divergirem.
+        return id.equalsIgnoreCase ("pad-continuo")
+            || id.equalsIgnoreCase ("pad-continuos");
+    }
+
     struct LibraryPart
     {
         static constexpr juce::int64 maximumDownloadBytes =
@@ -849,10 +925,10 @@ namespace ChurchDAWServices
             if (canonical.exists())
                 return canonical;
 
-            if (id == "pad-continuo")
+            if (isPadContinuoPackId (id))
             {
                 const auto legacy =
-                    librariesRoot.getChildFile (id);
+                    librariesRoot.getChildFile ("pad-continuo");
 
                 if (legacy.isDirectory())
                     return legacy;
@@ -1393,7 +1469,7 @@ namespace ChurchDAWServices
              || ! policy.cryptographicallyVerified
              || policy.minimumVersionCode > installedVersionCode
              || policy.latestVersionCode <= installedVersionCode
-             || ! isSafeWebsiteUpdateUrl (policy.playStoreUrl))
+             || ! isSafeAndroidUpdateUrl (policy.playStoreUrl))
             return AndroidUpdatePromptDecision::noPrompt;
 
         return AndroidUpdatePromptDecision::optionalUpdate;
@@ -1406,10 +1482,10 @@ namespace ChurchDAWServices
         if (policy.valid
              && policy.cryptographicallyVerified
              && policy.latestVersionCode >= effectiveMinimum
-             && isSafeWebsiteUpdateUrl (policy.playStoreUrl))
+             && isSafeAndroidUpdateUrl (policy.playStoreUrl))
             return policy.playStoreUrl;
 
-        return defaultPlayStoreUrl;
+        return {};
     }
 
     struct AcceptedUpdatePolicyState
@@ -1440,7 +1516,7 @@ namespace ChurchDAWServices
             // o Church Live de ~12 GB e sem Wi-Fi no domingo.
             auto isOfflineCulto = [] (const LibraryPack& pack)
             {
-                return pack.id.equalsIgnoreCase ("pad-continuo")
+                return isPadContinuoPackId (pack.id)
                     || pack.id.equalsIgnoreCase ("culto-offline")
                     || pack.id.equalsIgnoreCase ("culto-offline-v1");
             };
@@ -1636,12 +1712,125 @@ namespace ChurchDAWServices
              || policy.latestVersionCode > 1000000000
              || ! isSafeUpdateVersionName (policy.latestVersionName)
              || ! isSafeUpdateMessage (policy.updateMessage)
-             || ! isSafeWebsiteUpdateUrl (policy.playStoreUrl))
+             || ! isSafeAndroidUpdateUrl (policy.playStoreUrl))
         {
             error = "Campos de versao, pacote, texto ou URL rejeitados";
             return false;
         }
 
+        policy.valid = true;
+        return true;
+    }
+
+    inline bool parsePublishedAndroidManifestPolicyObject (
+        const juce::DynamicObject* object,
+        UpdatePolicy& policy,
+        juce::String& error)
+    {
+        if (object == nullptr)
+        {
+            error = "Raiz do manifesto precisa ser um objeto";
+            return false;
+        }
+
+        juce::int64 schemaVersion = 0;
+        juce::int64 versionCode = 0;
+        juce::int64 minimumVersionCode = 0;
+        juce::int64 apkBytes = 0;
+        auto* apk = object->getProperty ("apk").getDynamicObject();
+        const auto libraries = object->getProperty ("libraries");
+
+        // O publicador preserva quatro aliases legados para builds anteriores
+        // (latest_*, update_message e play_store_url). Portanto existem dois
+        // formatos publicados validos e estritos:
+        //   8 campos: metadados do APK + libraries;
+        //  12 campos: os oito acima + os quatro aliases legados.
+        // A checagem anterior exigia 7 campos, esquecendo libraries e
+        // rejeitando exatamente o manifesto que o proprio publicador gera.
+        const auto propertyCount = object->getProperties().size();
+        const auto legacyLatestCode =
+            object->getProperty ("latest_version_code");
+        const auto legacyLatestName =
+            object->getProperty ("latest_version_name");
+        const auto legacyUpdateMessage =
+            object->getProperty ("update_message");
+        const auto legacyPlayStoreUrl =
+            object->getProperty ("play_store_url");
+        const bool hasLegacyAliases =
+            ! legacyLatestCode.isVoid() && ! legacyLatestCode.isUndefined()
+            && ! legacyLatestName.isVoid() && ! legacyLatestName.isUndefined()
+            && ! legacyUpdateMessage.isVoid() && ! legacyUpdateMessage.isUndefined()
+            && ! legacyPlayStoreUrl.isVoid() && ! legacyPlayStoreUrl.isUndefined();
+        const bool hasStrictPublishedShape =
+            (propertyCount == 8 && ! hasLegacyAliases)
+            || (propertyCount == 12 && hasLegacyAliases);
+
+        if (! hasStrictPublishedShape
+             || apk == nullptr
+             || apk->getProperties().size() != 4
+             || ! libraries.isArray()
+             || ! readBoundedInteger (object->getProperty ("schema_version"),
+                                      1000000000, schemaVersion)
+             || ! readBoundedInteger (object->getProperty ("version_code"),
+                                      1000000000, versionCode)
+             || ! readBoundedInteger (object->getProperty ("minimum_version_code"),
+                                      1000000000, minimumVersionCode)
+             || ! readBoundedInteger (apk->getProperty ("bytes"),
+                                      maximumPackDownloadBytes, apkBytes))
+        {
+            error = "Campos do manifesto publicado invalidos";
+            return false;
+        }
+
+        const auto manifestPackage =
+            object->getProperty ("package_id").toString().trim();
+        const auto versionName =
+            object->getProperty ("version_name").toString().trim();
+        const auto sourceCommit =
+            object->getProperty ("source_commit").toString().trim();
+        const auto apkUrl = apk->getProperty ("url").toString().trim();
+        const auto apkSha256 =
+            apk->getProperty ("sha256").toString().trim();
+        const auto certificateSha256 =
+            apk->getProperty ("signing_certificate_sha256").toString().trim();
+        juce::int64 legacyVersionCode = 0;
+        const auto legacyVersionName = legacyLatestName.toString().trim();
+        const auto legacyMessage = legacyUpdateMessage.toString().trim();
+        const auto legacyUrl = legacyPlayStoreUrl.toString().trim();
+        const bool legacyAliasesMatch =
+            ! hasLegacyAliases
+            || (readBoundedInteger (legacyLatestCode,
+                                    1000000000, legacyVersionCode)
+                && legacyVersionCode == versionCode
+                && legacyVersionName == versionName
+                && isSafeUpdateMessage (legacyMessage)
+                && legacyUrl == apkUrl);
+
+        if (schemaVersion != 1
+             || manifestPackage != packageId
+             || minimumVersionCode < 1
+             || versionCode < minimumVersionCode
+             || apkBytes < 1
+             || ! isSafeUpdateVersionName (versionName)
+             || sourceCommit.length() != 40
+             || ! sourceCommit.containsOnly ("0123456789abcdef")
+             || ! isSafeWebsiteUpdateUrl (apkUrl)
+             || apkSha256.length() != 64
+             || ! apkSha256.containsOnly ("0123456789abcdef")
+             || certificateSha256.length() != 64
+             || ! certificateSha256.containsOnly ("0123456789abcdef")
+             || ! legacyAliasesMatch)
+        {
+            error = "Metadados do manifesto publicado rejeitados";
+            return false;
+        }
+
+        policy.schemaVersion = (int) schemaVersion;
+        policy.latestVersionCode = (int) versionCode;
+        policy.minimumVersionCode = (int) minimumVersionCode;
+        policy.latestVersionName = versionName;
+        policy.updateMessage = hasLegacyAliases ? legacyMessage : juce::String();
+        policy.playStoreUrl = apkUrl;
         policy.valid = true;
         return true;
     }
@@ -1701,7 +1890,7 @@ namespace ChurchDAWServices
         // checkRemoteManifest() aborta com "Catalogo bloqueado" antes mesmo de
         // pedir o manifest.json -- ou seja, ninguem no Windows/Mac consegue
         // baixar timbre nenhum. A verificacao e a mesma do Android: RSA-3072,
-        // SHA256withRSA, chave churchdaw-update-2026-01.
+        // SHA256withRSA, com rotacao de chave selecionada pelo key_id.
         return ChurchDAWDesktopUpdate::verifySignedPolicyEnvelope (
             payloadBase64, signatureBase64, keyId);
        #else
@@ -1803,7 +1992,8 @@ namespace ChurchDAWServices
                 1000000000, envelopeSchema)
              || envelopeSchema != 2
              || algorithm != "SHA256withRSA"
-             || keyId != "churchdaw-update-2026-01"
+             || (keyId != "churchdaw-update-2026-01"
+                 && keyId != "churchdaw-update-2026-08")
              || payloadBase64.isEmpty()
              || payloadBase64.length() > maximumSignedPolicyPayloadBytes * 2
              || signatureBase64.length() != 512
@@ -1941,7 +2131,7 @@ namespace ChurchDAWServices
              || ! policy.catalogSha256.containsOnly ("0123456789abcdef")
              || ! isSafeUpdateVersionName (policy.latestVersionName)
              || ! isSafeUpdateMessage (policy.updateMessage)
-             || ! isSafeWebsiteUpdateUrl (policy.playStoreUrl))
+             || ! isSafeAndroidUpdateUrl (policy.playStoreUrl))
         {
             error = "Campos do payload assinado rejeitados";
             return {};
@@ -2176,6 +2366,16 @@ namespace ChurchDAWServices
         return true;
     }
 
+    inline juce::String normalizeManifestText (const juce::String& text)
+    {
+        auto normalized = text;
+
+        if (normalized.startsWithChar ((juce::juce_wchar) 0xfeff))
+            normalized = normalized.substring (1);
+
+        return normalized.replace ("\r\n", "\n").replace ("\r", "\n");
+    }
+
     inline RemoteManifest parseManifest (
         const juce::String& json,
         juce::String& error,
@@ -2189,20 +2389,35 @@ namespace ChurchDAWServices
             return manifest;
         }
 
-        const auto catalogSha256 = juce::SHA256 (
+        const auto normalizedJson = normalizeManifestText (json);
+
+        const auto normalizedCatalogSha256 = juce::SHA256 (
+            normalizedJson.toRawUTF8(),
+            (size_t) normalizedJson.getNumBytesAsUTF8()).toHexString().toLowerCase();
+
+        // Politicas Android publicadas antes da normalizacao cross-platform
+        // assinavam os bytes CRLF exatos gerados no Windows. Aceitar tambem o
+        // hash desses bytes mantem essas politicas validas; o SHA continua
+        // vindo do envelope RSA assinado. Politicas novas usam o hash
+        // normalizado e continuam independentes da quebra de linha recebida.
+        const auto originalCatalogSha256 = juce::SHA256 (
             json.toRawUTF8(),
             (size_t) json.getNumBytesAsUTF8()).toHexString().toLowerCase();
 
+        const bool matchesSignedCatalog =
+            normalizedCatalogSha256 == expectedCatalogSha256
+            || originalCatalogSha256 == expectedCatalogSha256;
+
         if (expectedCatalogSha256.length() != 64
              || ! expectedCatalogSha256.containsOnly ("0123456789abcdef")
-             || catalogSha256 != expectedCatalogSha256)
+             || ! matchesSignedCatalog)
         {
             error = "Manifesto nao corresponde ao SHA-256 assinado";
             return manifest;
         }
 
         juce::var parsed;
-        const auto parseResult = juce::JSON::parse (json, parsed);
+        const auto parseResult = juce::JSON::parse (normalizedJson, parsed);
 
         if (parseResult.failed())
         {
@@ -2219,8 +2434,17 @@ namespace ChurchDAWServices
         }
 
         UpdatePolicy embeddedPolicy;
+        const auto publishedVersionCode = object->getProperty ("version_code");
+        const bool isPublishedAndroidManifest =
+            ! publishedVersionCode.isVoid()
+            && ! publishedVersionCode.isUndefined();
+        const bool parsedPolicy = isPublishedAndroidManifest
+            ? parsePublishedAndroidManifestPolicyObject (
+                  object, embeddedPolicy, error)
+            : parseLegacyManifestPolicyObject (
+                  object, embeddedPolicy, error);
 
-        if (! parseLegacyManifestPolicyObject (object, embeddedPolicy, error))
+        if (! parsedPolicy)
             return {};
 
         manifest.schemaVersion = embeddedPolicy.schemaVersion;
@@ -2424,9 +2648,9 @@ namespace ChurchDAWServices
                 // Requisicoes de catalogo podem levar o bearer da biblioteca.
                 // Nao siga redirects: a assinatura protege a integridade do
                 // JSON, mas nao impediria o cabecalho Authorization de ser
-                // encaminhado ao destino de um redirect. O endpoint www que
-                // hoje responde 301 continua sendo apenas uma tentativa de
-                // fallback; o endpoint apex acima serve o JSON diretamente.
+                // encaminhado ao destino de um redirect. As duas tentativas
+                // ficam no host apex oficial; a segunda usa query apenas para
+                // escapar de caches/proxies intermediarios.
                 .withNumRedirectsToFollow (0)
                 .withResponseHeaders (&responseHeaders)
                 .withStatusCode (&response.statusCode)
@@ -2447,8 +2671,16 @@ namespace ChurchDAWServices
 
         for (int tentativa = 0; tentativa < 3 && stream == nullptr; ++tentativa)
         {
+            if (auto* current = juce::Thread::getCurrentThread();
+                current != nullptr && current->threadShouldExit())
+                break;
+
             if (tentativa > 0)
                 juce::Thread::sleep (350);
+
+            if (auto* current = juce::Thread::getCurrentThread();
+                current != nullptr && current->threadShouldExit())
+                break;
 
             stream = juce::URL (endpoint).createInputStream (options);
         }
@@ -2490,6 +2722,8 @@ namespace ChurchDAWServices
         bool localLibraryReady = false;
         juce::String diagnostic;
         juce::String updateDiagnostic;
+        ChurchDAWDistribution::Failure catalogFailure = ChurchDAWDistribution::Failure::none;
+        ChurchDAWDistribution::Failure updateFailure = ChurchDAWDistribution::Failure::none;
     };
 
     struct UpdatePolicyCheck
@@ -2502,6 +2736,7 @@ namespace ChurchDAWServices
         bool localLibraryChecked = false;
         bool localLibraryReady = false;
         juce::String diagnostic;
+        ChurchDAWDistribution::Failure failure = ChurchDAWDistribution::Failure::none;
     };
 
     inline bool saveCache (const juce::String& raw)
@@ -2571,6 +2806,7 @@ namespace ChurchDAWServices
     inline UpdatePolicyCheck checkRemoteUpdatePolicy (int timeoutMs = 5000)
     {
         UpdatePolicyCheck result;
+        result.failure = ChurchDAWDistribution::Failure::connection;
         const auto policyDeadline =
             juce::Time::getMillisecondCounterHiRes()
             + (double) juce::jmax (250, timeoutMs);
@@ -2593,8 +2829,15 @@ namespace ChurchDAWServices
                 juce::String parseError;
                 UpdatePolicy parsed;
                 const auto trustedServerTime = fetched.serverTime;
+                const bool httpSuccess = fetched.statusCode >= 200
+                                      && fetched.statusCode < 300;
 
-                if (trustedServerTime <= 0)
+                if (! httpSuccess)
+                    parseError = fetched.statusCode >= 300
+                                      && fetched.statusCode < 400
+                        ? "Redirecionamento HTTPS recusado"
+                        : "Resposta HTTP sem sucesso";
+                else if (trustedServerTime <= 0)
                     parseError = "Resposta HTTPS sem cabecalho Date confiavel";
                 else if (raw.getNumBytesAsUTF8()
                             <= maximumUpdatePolicyBytes)
@@ -2604,18 +2847,20 @@ namespace ChurchDAWServices
                 else
                     parseError = "Politica excedeu tamanho ou prazo";
 
-                if (fetched.statusCode >= 200
-                     && fetched.statusCode < 300
+                if (httpSuccess
                      && parsed.valid
                      && acceptSignedUpdatePolicy (
                             parsed, true, parseError))
                 {
                     result.policy = std::move (parsed);
                     result.reachedServer = true;
+                    result.failure = ChurchDAWDistribution::Failure::none;
                     saveUpdatePolicyCacheIfCurrent (result.policy, raw);
                     return result;
                 }
 
+                result.failure = ChurchDAWDistribution::retainFailure (
+                    result.failure, ChurchDAWDistribution::failedResponse (true, fetched.statusCode));
                 result.diagnostic = juce::String (endpoint) + " / HTTP "
                                   + juce::String (fetched.statusCode)
                                   + ": " + parseError;
@@ -2670,6 +2915,8 @@ namespace ChurchDAWServices
         result.reachedUpdateServer = updateCheck.reachedServer;
         result.updateFromCache = updateCheck.fromCache;
         result.updateDiagnostic = std::move (updateCheck.diagnostic);
+        result.updateFailure = updateCheck.failure;
+        result.catalogFailure = ChurchDAWDistribution::Failure::connection;
 
         auto expectedCatalogSha256 =
             result.updatePolicy.catalogSha256.toLowerCase();
@@ -2690,11 +2937,14 @@ namespace ChurchDAWServices
         {
             result.diagnostic =
                 "Catalogo bloqueado: politica assinada sem SHA-256 confiavel";
+            result.catalogFailure = result.updateFailure != ChurchDAWDistribution::Failure::none
+                ? result.updateFailure : ChurchDAWDistribution::Failure::validation;
             return result;
         }
 
-        // O dominio oficial e sua variante www servem o mesmo conteudo por
-        // HTTPS direto. Nenhum endpoint critico segue redirects.
+        // As duas tentativas usam o dominio oficial sem www. O virtual host
+        // www responde 301 e, como redirects autenticados sao recusados, nunca
+        // foi um fallback funcional.
         const auto catalogDeadline =
             juce::Time::getMillisecondCounterHiRes()
             + (double) juce::jmax (250, timeoutMs);
@@ -2720,23 +2970,31 @@ namespace ChurchDAWServices
                 const auto& raw = fetched.body;
                 juce::String parseError;
                 RemoteManifest parsed;
+                const bool httpSuccess = fetched.statusCode >= 200
+                                      && fetched.statusCode < 300;
 
-                if (raw.getNumBytesAsUTF8() <= 2 * 1024 * 1024)
+                if (! httpSuccess)
+                    parseError = fetched.statusCode >= 300
+                                      && fetched.statusCode < 400
+                        ? "Redirecionamento HTTPS recusado"
+                        : "Resposta HTTP sem sucesso";
+                else if (raw.getNumBytesAsUTF8() <= 2 * 1024 * 1024)
                     parsed = parseManifest (
                         raw, parseError, expectedCatalogSha256);
                 else
                     parseError = "Manifesto excede 2 MB";
 
-                if (fetched.statusCode >= 200
-                     && fetched.statusCode < 300
-                     && parsed.valid)
+                if (httpSuccess && parsed.valid)
                 {
                     result.manifest = std::move (parsed);
                     result.reachedServer = true;
+                    result.catalogFailure = ChurchDAWDistribution::Failure::none;
                     saveCache (raw);
                     break;
                 }
 
+                result.catalogFailure = ChurchDAWDistribution::retainFailure (
+                    result.catalogFailure, ChurchDAWDistribution::failedResponse (true, fetched.statusCode));
                 result.diagnostic = juce::String (endpoint) + " / HTTP "
                                   + juce::String (fetched.statusCode)
                                   + ": " + parseError;
@@ -2819,8 +3077,21 @@ namespace ChurchDAWServices
             for (const char* name : { "Library", "ChurchLive Library", "SAMPLES",
                                      "Library2", "REDKEYS", "Library3", "Worship",
                                      "Library4", "BASELAB" })
-                if (containsSupportedLibrarySample (shared.getChildFile (name)))
+            {
+                const auto folder = shared.getChildFile (name);
+
+               #if JUCE_ANDROID
+                // Scoped Storage pode permitir isDirectory() e travar a
+                // enumeracao recursiva em milhares de arquivos que nao deixa
+                // abrir. Para o gate de startup, a pasta canonica basta; o
+                // carregador valida os audios quando o usuario abrir o acervo.
+                if (folder.isDirectory())
                     return true;
+               #else
+                if (containsSupportedLibrarySample (folder))
+                    return true;
+               #endif
+            }
 
         return false;
     }
@@ -2895,7 +3166,7 @@ namespace ChurchDAWServices
 
     inline bool startWebsiteUpdate (const juce::String& updateUrl)
     {
-        if (! isSafeWebsiteUpdateUrl (updateUrl))
+        if (! isSafeAndroidUpdateUrl (updateUrl))
             return false;
        
 #if JUCE_ANDROID
@@ -2969,9 +3240,9 @@ namespace ChurchDAWServices
             stopThread (-1);
         }
 
-        void begin()
+        bool begin()
         {
-            startThread (juce::Thread::Priority::normal);
+            return startThread (juce::Thread::Priority::normal);
         }
 
         void cancel()
@@ -3220,12 +3491,12 @@ namespace ChurchDAWServices
             return juce::Result::ok();
         }
 
-        static bool isSafeArchiveEntryName (const juce::String& entryName)
+        static bool isSafeArchiveEntryName (const juce::String& rawEntryName)
         {
+            auto entryName = rawEntryName.trim().replaceCharacter ('\\', '/');
+
             if (entryName.isEmpty() || entryName.length() > 4096
                  || entryName.startsWithChar ('/')
-                 || entryName.startsWithChar ('\\')
-                 || entryName.containsChar ('\\')
                  || entryName.containsChar (':')
                  || entryName.containsChar ('\0'))
                 return false;
@@ -3616,20 +3887,22 @@ namespace ChurchDAWServices
                         "foram preservados para retomar.");
 
                 const auto* entry = archive.getEntry (entryIndex);
+                const auto sanitizedEntryName =
+                    entry->filename.replaceCharacter ('\\', '/');
 
                 if (entry == nullptr
                      || entry->isSymbolicLink
                      || entry->uncompressedSize < 0
                      || entry->uncompressedSize > maximumLibraryEntryBytes
                      || ! isSafeArchiveEntryName (entry->filename)
-                     || entry->filename.trimCharactersAtEnd ("/")
+                     || sanitizedEntryName.trimCharactersAtEnd ("/")
                             == ".churchdaw-library.json")
                     return juce::Result::fail (
                         "Pack contem uma entrada ZIP nao permitida");
 
-                const auto output = staging.getChildFile (entry->filename);
+                const auto output = staging.getChildFile (sanitizedEntryName);
                 const bool directoryEntry =
-                    entry->filename.endsWithChar ('/');
+                    sanitizedEntryName.endsWithChar ('/');
 
                 if (! output.isAChildOf (staging))
                     return juce::Result::fail (
@@ -3680,9 +3953,11 @@ namespace ChurchDAWServices
                 return juce::Result::fail (
                     "Entrada ZIP mudou depois da validacao");
 
-            const auto output = staging.getChildFile (entry->filename);
+            const auto sanitizedFilename =
+                entry->filename.replaceCharacter ('\\', '/');
+            const auto output = staging.getChildFile (sanitizedFilename);
             const bool directoryEntry =
-                entry->filename.endsWithChar ('/');
+                sanitizedFilename.endsWithChar ('/');
 
             if (! output.isAChildOf (staging))
                 return juce::Result::fail (
@@ -4267,33 +4542,24 @@ namespace ChurchDAWServices
                 if (output.failedToOpen() || ! output.setPosition (resumeAt))
                     return juce::Result::fail ("Nao foi possivel gravar o download");
 
-                juce::HeapBlock<char> buffer (128 * 1024);
                 auto total = resumeAt;
-
-                while (! threadShouldExit())
-                {
-                    const int got = input->read (buffer.getData(), 128 * 1024);
-
-                    if (got <= 0)
-                        break;
-
-                    if (! output.write (buffer.getData(), (size_t) got))
-                        return juce::Result::fail ("Erro ao gravar os samples");
-
-                    total += got;
-
-                    if (total > downloadPart.downloadBytes)
-                        return juce::Result::fail (
-                            "Servidor enviou uma parte maior que o catalogo");
-
+                const auto copyResult = copyExactDownloadBytes (
+                    *input,
+                    output,
+                    resumeAt,
+                    downloadPart.downloadBytes,
+                    [this] { return threadShouldExit(); },
+                    [this, partIndex, &downloadPart, &downloadParts]
+                    (juce::int64 downloaded)
+                    {
                     auto message = downloadParts.size() > 1
                         ? "Baixando parte " + juce::String (partIndex + 1)
                             + " de " + juce::String (downloadParts.size()) + " - "
                         : "Baixando ";
-                    message += humanBytes (total) + " de "
+                    message += humanBytes (downloaded) + " de "
                         + humanBytes (downloadPart.downloadBytes);
                     const auto fraction =
-                        (float) ((double) total
+                        (float) ((double) downloaded
                                  / (double) downloadPart.downloadBytes);
                     publish (
                         partProgress (
@@ -4301,7 +4567,13 @@ namespace ChurchDAWServices
                             0.02f + 0.48f * fraction,
                             downloadParts.size()),
                         std::move (message));
-                }
+                    },
+                    total);
+
+                // Nao solicita um read extra apenas para esperar EOF. Fecha a
+                // conexao assim que o Content-Length esperado foi persistido.
+                if (copyResult.wasOk())
+                    input->cancel();
 
                 output.flush();
 
@@ -4312,6 +4584,12 @@ namespace ChurchDAWServices
                     return juce::Result::fail (
                         "Download cancelado. O arquivo parcial esta vinculado "
                         "ao journal e foi preservado para retomar.");
+
+                if (copyResult.failed())
+                    return juce::Result::fail (
+                        "Download incompleto na parte "
+                        + juce::String (partIndex + 1) + ": "
+                        + copyResult.getErrorMessage());
 
                 if (total != downloadPart.downloadBytes)
                     return juce::Result::fail ("Download incompleto na parte "
@@ -4470,6 +4748,24 @@ namespace ChurchDAWServices
             if (progress == nullptr)
                 return;
 
+            // Um pack de 13 GB produz mais de 100 mil blocos de 128 KB. Antes,
+            // cada bloco virava um callAsync; o callback "finalizado" ficava
+            // atras de uma fila enorme da UI e o usuario via 100% para sempre.
+            // Limita atualizacoes a uma cadencia visual, sempre preservando
+            // mudancas relevantes e o estado terminal.
+            const auto nowMs = juce::Time::getMillisecondCounterHiRes();
+            const bool terminal = value >= 0.9999f;
+            const bool meaningfulStep =
+                lastPublishedProgress < 0.0f
+                || std::abs (value - lastPublishedProgress) >= 0.002f;
+            const bool enoughTime = nowMs - lastPublishedProgressMs >= 200.0;
+
+            if (! terminal && ! meaningfulStep && ! enoughTime)
+                return;
+
+            lastPublishedProgress = value;
+            lastPublishedProgressMs = nowMs;
+
             auto callback = progress;
             juce::MessageManager::callAsync ([callback = std::move (callback), value,
                                               text = std::move (text)]
@@ -4496,6 +4792,8 @@ namespace ChurchDAWServices
         Finished finished;
         std::mutex downloadStreamMutex;
         std::shared_ptr<juce::WebInputStream> activeDownloadStream;
+        float lastPublishedProgress = -1.0f;
+        double lastPublishedProgressMs = 0.0;
 
         JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (LibraryInstaller)
     };

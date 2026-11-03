@@ -63,6 +63,14 @@ final class Config
             'mercado_pago.collector_id' => self::environment('MP_COLLECTOR_ID', ''),
             'mercado_pago.application_id' => self::environment('MP_APPLICATION_ID', ''),
             'mercado_pago.sandbox' => self::environment('MP_SANDBOX', '1') === '1',
+            'woovi.enabled' => self::environment('WOOVI_ENABLED', '0') === '1',
+            'woovi.api_key' => self::environment('WOOVI_API_KEY', ''),
+            'woovi.webhook_authorization' =>
+                self::environment('WOOVI_WEBHOOK_AUTHORIZATION', ''),
+            'woovi.sandbox' => self::environment('WOOVI_SANDBOX', '0') === '1',
+            'woovi.charge_expiration_minutes' =>
+                (int) self::environment('WOOVI_CHARGE_EXPIRATION_MINUTES', '30'),
+            'checkout.provider' => self::environment('CHECKOUT_PROVIDER', 'woovi'),
             'checkout.expiration_minutes' =>
                 (int) self::environment('CHECKOUT_EXPIRATION_MINUTES', '4320'),
             'checkout.claim_ttl_seconds' =>
@@ -72,6 +80,10 @@ final class Config
             'product.name' => self::environment('PRODUCT_NAME', 'ChurchDAW Desktop'),
             'product.currency' => self::environment('PRODUCT_CURRENCY', 'BRL'),
             'product.price_cents' => (int) self::environment('PRODUCT_PRICE_CENTS', '0'),
+            'plan.single.price_cents' =>
+                (int) self::environment('PLAN_SINGLE_PRICE_CENTS', '12999'),
+            'plan.complete.price_cents' =>
+                (int) self::environment('PLAN_COMPLETE_PRICE_CENTS', '19990'),
             'legal.terms_version' =>
                 self::environment('TERMS_VERSION', '2026-07-28'),
             'legal.privacy_version' =>
@@ -136,18 +148,36 @@ final class Config
             'product.currency',
         ];
         if ($this->bool('checkout.enabled')) {
-            $required = array_merge($required, [
-                'mercado_pago.access_token',
-                'mercado_pago.webhook_secret',
-                'mercado_pago.collector_id',
-                'mercado_pago.application_id',
-            ]);
+            if ($this->string('checkout.provider') === 'woovi') {
+                $required[] = 'woovi.api_key';
+                if (!$this->bool('woovi.enabled')) {
+                    throw new RuntimeException(
+                        'WOOVI_ENABLED precisa estar ativo para abrir o checkout Woovi.'
+                    );
+                }
+            } elseif ($this->string('checkout.provider') === 'mercado_pago') {
+                $required = array_merge($required, [
+                    'mercado_pago.access_token',
+                    'mercado_pago.webhook_secret',
+                    'mercado_pago.collector_id',
+                    'mercado_pago.application_id',
+                ]);
+            } else {
+                throw new RuntimeException('CHECKOUT_PROVIDER invalido.');
+            }
         }
 
         foreach ($required as $key) {
             if ($this->string($key) === '') {
                 throw new RuntimeException("Configuracao obrigatoria ausente: {$key}");
             }
+        }
+        if ($this->bool('checkout.enabled')
+            && $this->string('checkout.provider') === 'woovi'
+            && strlen($this->string('woovi.webhook_authorization')) < 32) {
+            throw new RuntimeException(
+                'WOOVI_WEBHOOK_AUTHORIZATION deve ter ao menos 32 caracteres.'
+            );
         }
 
         $encryptionKey = base64_decode($this->string('app.encryption_key'), true);
@@ -171,6 +201,16 @@ final class Config
 
         if ($this->int('product.price_cents') <= 0) {
             throw new RuntimeException('PRODUCT_PRICE_CENTS deve ser maior que zero.');
+        }
+        if ($this->int('plan.single.price_cents') <= 0
+            || $this->int('plan.complete.price_cents') <= 0) {
+            throw new RuntimeException('Os precos dos planos devem ser maiores que zero.');
+        }
+        if ($this->int('woovi.charge_expiration_minutes') < 5
+            || $this->int('woovi.charge_expiration_minutes') > 1440) {
+            throw new RuntimeException(
+                'WOOVI_CHARGE_EXPIRATION_MINUTES deve estar entre 5 e 1440.'
+            );
         }
         if ($this->int('trial.minutes') < 20
             || $this->int('trial.minutes') > 120) {
@@ -257,27 +297,35 @@ final class Config
                 );
             }
             if ($this->bool('checkout.enabled')) {
-                if ($this->bool('mercado_pago.sandbox')) {
-                    throw new RuntimeException(
-                        'MP_SANDBOX deve ser 0 em producao.'
-                    );
-                }
-                if (strlen($this->string('mercado_pago.webhook_secret')) < 24) {
-                    throw new RuntimeException(
-                        'MP_WEBHOOK_SECRET de producao deve ter ao menos 24 caracteres.'
-                    );
-                }
-                foreach ([
-                    'mercado_pago.collector_id' => 'MP_COLLECTOR_ID',
-                    'mercado_pago.application_id' => 'MP_APPLICATION_ID',
-                ] as $key => $environmentName) {
-                    if (!preg_match(
-                        '/^[0-9]{4,32}$/',
-                        $this->string($key)
-                    )) {
+                if ($this->string('checkout.provider') === 'woovi') {
+                    if ($this->bool('woovi.sandbox')) {
                         throw new RuntimeException(
-                            "{$environmentName} numerico e obrigatorio em producao."
+                            'WOOVI_SANDBOX deve ser 0 em producao.'
                         );
+                    }
+                } else {
+                    if ($this->bool('mercado_pago.sandbox')) {
+                        throw new RuntimeException(
+                            'MP_SANDBOX deve ser 0 em producao.'
+                        );
+                    }
+                    if (strlen($this->string('mercado_pago.webhook_secret')) < 24) {
+                        throw new RuntimeException(
+                            'MP_WEBHOOK_SECRET de producao deve ter ao menos 24 caracteres.'
+                        );
+                    }
+                    foreach ([
+                        'mercado_pago.collector_id' => 'MP_COLLECTOR_ID',
+                        'mercado_pago.application_id' => 'MP_APPLICATION_ID',
+                    ] as $key => $environmentName) {
+                        if (!preg_match(
+                            '/^[0-9]{4,32}$/',
+                            $this->string($key)
+                        )) {
+                            throw new RuntimeException(
+                                "{$environmentName} numerico e obrigatorio em producao."
+                            );
+                        }
                     }
                 }
             }

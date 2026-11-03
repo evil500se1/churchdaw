@@ -315,8 +315,15 @@ namespace churchorgan
                 float value = renderManualSample (manual, clickAmount_);
 
                 if (manual == manualIndex (Manual::upper))
-                    value += renderPercussionSample()
-                             + character_.leakageSample();
+                {
+                    value += renderPercussionSample();
+
+                    // Leakage/hum/mechanical character colours notes and
+                    // their contact release, but must not leave the ChurchDAW
+                    // master behaving like an open microphone while idle.
+                    if (active != 0)
+                        value += character_.leakageSample();
+                }
 
                 const float performanceGain =
                     baseOutputTrim_
@@ -724,9 +731,24 @@ namespace churchorgan
     {
         if (manual == Manual::pedal)
         {
-            pedalPhysicallyHeld_[static_cast<std::size_t> (note)] = true;
-            pedalVelocities_[static_cast<std::size_t> (note)] =
+            auto& state = manuals_[manualIndex (Manual::pedal)];
+            const auto noteIndex = static_cast<std::size_t> (note);
+            const bool wasSustained =
+                state.sustained[noteIndex]
+                && ! pedalPhysicallyHeld_[noteIndex];
+
+            pedalPhysicallyHeld_[noteIndex] = true;
+            pedalVelocities_[noteIndex] =
                 static_cast<std::uint8_t> (velocity);
+            state.sustained[noteIndex] = false;
+
+            // Rearticule a mesma nota quando ela estava apenas presa pelo
+            // sustain. refreshPedalVoices() nao cria outra voz para uma tecla
+            // que ja esta ativa, portanto sem isto a segunda batida parecia
+            // engolida ate o pedal ser solto.
+            if (wasSustained && state.physicallyHeld[noteIndex])
+                activateManualNote (state, note, velocity, true);
+
             refreshPedalVoices();
             return;
         }
@@ -746,7 +768,15 @@ namespace churchorgan
     {
         if (manual == Manual::pedal)
         {
-            pedalPhysicallyHeld_[static_cast<std::size_t> (note)] = false;
+            auto& state = manuals_[manualIndex (Manual::pedal)];
+            const auto noteIndex = static_cast<std::size_t> (note);
+            pedalPhysicallyHeld_[noteIndex] = false;
+
+            if (state.sustainDown)
+                state.sustained[noteIndex] = true;
+            else
+                state.sustained[noteIndex] = false;
+
             refreshPedalVoices();
             return;
         }
@@ -796,6 +826,22 @@ namespace churchorgan
         state.sustainDown = down;
         if (down)
             return;
+
+        if (manual == Manual::pedal)
+        {
+            // No manual de pedal, state.physicallyHeld representa as vozes
+            // selecionadas pelo modo mono/poly; a verdade fisica vive no
+            // array separado. Usar state.physicallyHeld aqui fazia toda nota
+            // sustentada parecer ainda pressionada e o CC64-off nunca a
+            // liberava.
+            for (std::size_t note = 0; note < midiNoteCount; ++note)
+                if (state.sustained[note]
+                     && ! pedalPhysicallyHeld_[note])
+                    state.sustained[note] = false;
+
+            refreshPedalVoices();
+            return;
+        }
 
         for (std::size_t note = 0; note < midiNoteCount; ++note)
             if (state.sustained[note] && ! state.physicallyHeld[note])
@@ -879,7 +925,9 @@ namespace churchorgan
         {
             for (std::size_t note = 0; note < midiNoteCount; ++note)
             {
-                const bool shouldHold = pedalPhysicallyHeld_[note];
+                const bool shouldHold =
+                    pedalPhysicallyHeld_[note]
+                    || state.sustained[note];
                 if (shouldHold && ! state.physicallyHeld[note])
                 {
                     state.physicallyHeld[note] = true;
@@ -901,12 +949,33 @@ namespace churchorgan
         }
 
         int selected = -1;
+
+        // Uma tecla fisicamente pressionada sempre vence uma nota que ficou
+        // apenas latched. Mantem a regra historica de prioridade para a nota
+        // mais grave quando mais de um pedal fisico esta abaixado.
         for (std::size_t note = 0; note < midiNoteCount; ++note)
             if (pedalPhysicallyHeld_[note])
             {
                 selected = static_cast<int> (note);
                 break;
             }
+
+        // Sem tecla fisica, conserve primeiro a voz monofonica atual se ela
+        // esta sustentada. Isso evita saltar para outra nota antiga latched ao
+        // receber o note-off da nota mais recente.
+        if (selected < 0
+             && monophonicPedalNote_ >= 0
+             && state.sustained[
+                    static_cast<std::size_t> (monophonicPedalNote_)])
+            selected = monophonicPedalNote_;
+
+        if (selected < 0)
+            for (std::size_t note = 0; note < midiNoteCount; ++note)
+                if (state.sustained[note])
+                {
+                    selected = static_cast<int> (note);
+                    break;
+                }
 
         if (selected == monophonicPedalNote_)
             return;

@@ -1,0 +1,828 @@
+{
+    "schema_version": 1,
+    "library_id": "church-live",
+    "library_name": "Church Live",
+    "generated_at": "2026-08-04T05:09:39.9288235Z",
+    "base_url": "https://churchdaw.com/app/android/timbres",
+    "instruments": [
+        {
+            "id": "amber-upright-lp4",
+            "name": "Amber Upright",
+            "raw_label": "Amber Upright LP4",
+            "category": "PIANOS",
+            "library_id": "church-live",
+            "install_relative": "Imported",
+            "file_count": 880,
+            "download_bytes": 1213777970,
+            "download_url": "",
+            "sha256": "e7f70232da145d29667043df48404bc39b9ff93f0321311c882acf1127edd43b",
+            "included": true,
+            "ready": true,
+            "parts": [
+                {
+                    "download_url": "https://churchdaw.com/app/android/timbres/amber-upright-lp4-v1.zip.part01",
+                    "sha256": "23f85994c113ca4436957f84f0c5447b256499b0e40a8d9490303400442256ce",
+                    "download_bytes": 524288000
+                },
+                {
+                    "download_url": "https://churchdaw.com/app/android/timbres/amber-upright-lp4-v1.zip.part02",
+                    "sha256": "f88045af97c430775c1fd27ed41239af4e69c439f07662c4a810a5dedd709722",
+                    "download_bytes": 524288000
+                },
+                {
+                    "download_url": "https://churchdaw.com/app/android/timbres/amber-upright-lp4-v1.zip.part03",
+                    "sha256": "d744ad9fea5797b2424b22d0fe6d832e9d3cd5771ebe2acff7adbe1757696bb8",
+                    "download_bytes": 165201970
+                }
+            ]
+        },
+        {
+            "id": "analog",
+            "name": "ANALOG",
+            "raw_label": "ANALOG",
+            "category": "LEADS & SYNTHS",
+            "library_id": "church-live",
+            "install_relative": "Imported",
+            "file_count": 29,
+            "download_bytes": 130070256,
+            "download_url": "https://churchdaw.com/app/android/timbres/analog-v1.zip",
+            "sha256": "0b9d85be570170fef74bf51e5528710997f47f69974ecf1321d8017131cdb711",
+            "included": true,
+            "ready": true
+        },
+        {
+            "id": "bellp4",
+            "name": "BEL",
+            "raw_label": "BELLP4",
+            "category": "BELLS",
+            "library_id": "church-live",
+            "install_relative": "Imported",
+            "file_count": 21,
+            "download_bytes": 21450065,
+            "download_url": "https://churchdaw.com/app/android/timbres/bellp4-v1.zip",
+            "sha256": "c72a4098a623f849c449ba56344abcbcf06fbeaee5a55a30cb21a6e11f24fc7f",
+            "included": true,
+            "ready": true
+        },
+        {
+            "id": "bell",
+            "name": "BELL",
+            "raw_label": "BELL",
+            "category": "BELLS",
+            "library_id": "church-live",
+            "install_relative": "Imported",
+            "file_count": 116,
+            "download_bytes": 115787288,
+            "download_url": "https://churchdaw.com/app/android/timbres/bell-v1.zip",
+            "sha256": "303e8c6d12ef841e97f48ccd05c484d2d5a93357ccae0d28467b3c5a86b88c7e",
+            "included": true,
+            "ready": true
+        },
+        {
+            "id": "black-upright-lp4",
+            "name": "Black Upright",
+            "raw_label": "Black Upright LP4",
+            "category": "PIANOS",
+            "library_id": "church-live",
+            "install_relative": "Imported",
+            "file_count": 880,
+            "download_bytes": 1061227567,
+            "download_url": "",
+            "sha256": "62576f6e0cab0bf54b69b173606b866f5e9801c778351efa05a11e10b5a270b9",
+            "included": true,
+            "ready": true,
+            "parts": [
+                {
+                    "download_url": "https://churchdaw.com/app/android/timbres/black-upright-lp4-v1.zip.part01",
+                    "sha256": "6a2759d1f93ac4ca75bb9af84e578d97e60799522070cceeaa0b19fa4864415d",
+                    "download_bytes": 524288000
+                },
+                {
+                    "download_url": "https://churchdaw.com/app/android/timbres/black-upright-lp4-v1.zip.part02",
+                    "sha256": "25fea2e2a39a5bb12eb490d30f6926a3e321a8936518a772447e48945f6f9d50",
+                    "download_bytes": 524288000
+                },
+                {
+                    "download_url": "https://churchdaw.com/app/android/timbres/black-upright-lp4-v1.zip.part03",
+                    "sha256": "93a3444e31d3c8c155c12f12d24b0f41a3e7acb9e44cb111e91061c73a88604d",
+                    "download_bytes": 12651567
+                }
+            ]
+        },
+        {
+            "id": "ep-ballad",
+            "name": "EP Ballad",
+            "raw_label": "EP Ballad",
+            "category": "PIANOS",
+            "library_id": "church-live",
+            "install_relative": "Imported",
+            "file_count": 120,
+            "download_bytes": 154106798,
+            "download_url": "https://churchdaw.com/app/android/timbres/ep-ballad-v1.zip",
+            "sha256": "0aa848a1bfb38affa99433d0fe69594f3f28e16d7e9c50a17e4092ad685d5e86",
+            "included": true,
+            "ready": true
+        },
+        {
+            "id": "ep-stockholm-lp4",
+            "name": "EP Stockholm",
+            "raw_label": "EP Stockholm LP4",
+            "category": "PIANOS",
+            "library_id": "church-live",
+            "install_relative": "Imported",
+            "file_count": 270,
+            "download_bytes": 368540086,
+            "download_url": "https://churchdaw.com/app/android/timbres/ep-stockholm-lp4-v1.zip",
+            "sha256": "79992d763c726ccaa7e7477929564bd52f9ca4e1da39c8a1c3acc5f3fdc17730",
+            "included": true,
+            "ready": true
+        },
+        {
+            "id": "felt-upright-lp4",
+            "name": "Felt Upright",
+            "raw_label": "Felt Upright LP4",
+            "category": "PIANOS",
+            "library_id": "church-live",
+            "install_relative": "Imported",
+            "file_count": 880,
+            "download_bytes": 1014298396,
+            "download_url": "",
+            "sha256": "1ebc9a8324a0847b4eec85b81be9514ab990601c96e5cff0635940c498b32c7f",
+            "included": true,
+            "ready": true,
+            "parts": [
+                {
+                    "download_url": "https://churchdaw.com/app/android/timbres/felt-upright-lp4-v1.zip.part01",
+                    "sha256": "9c7ecf99b83794d966d47827b74c27d48dbd5962da75bc6b525ac5c1f5682830",
+                    "download_bytes": 524288000
+                },
+                {
+                    "download_url": "https://churchdaw.com/app/android/timbres/felt-upright-lp4-v1.zip.part02",
+                    "sha256": "ba0869e38ec6f85950f6a8ee47b9c9e121c77f575ef673ff8fa9a5e3ae5f0757",
+                    "download_bytes": 490010396
+                }
+            ]
+        },
+        {
+            "id": "fxfc2",
+            "name": "FX",
+            "raw_label": "FXFC2",
+            "category": "LEADS & SYNTHS",
+            "library_id": "church-live",
+            "install_relative": "Imported",
+            "file_count": 25,
+            "download_bytes": 104537659,
+            "download_url": "https://churchdaw.com/app/android/timbres/fxfc2-v1.zip",
+            "sha256": "013379ac737a181b077f91764860214183e587bfc918e4e0b23378d6e431461b",
+            "included": true,
+            "ready": true
+        },
+        {
+            "id": "fxlp4",
+            "name": "FX",
+            "raw_label": "FXLP4",
+            "category": "LEADS & SYNTHS",
+            "library_id": "church-live",
+            "install_relative": "Imported",
+            "file_count": 17,
+            "download_bytes": 93264932,
+            "download_url": "https://churchdaw.com/app/android/timbres/fxlp4-v1.zip",
+            "sha256": "bd46a3dd6fb69aadf5bf636758a16af4f2e81af172a25c957d6e72e5edfd6f21",
+            "included": true,
+            "ready": true
+        },
+        {
+            "id": "fx-ns4",
+            "name": "FX",
+            "raw_label": "FX NS4",
+            "category": "LEADS & SYNTHS",
+            "library_id": "church-live",
+            "install_relative": "Imported",
+            "file_count": 25,
+            "download_bytes": 54900964,
+            "download_url": "https://churchdaw.com/app/android/timbres/fx-ns4-v1.zip",
+            "sha256": "79d0a7406d3128dcefac527e07c1c5f8c0428a4ea9b9e7c209ccdb044b63c18f",
+            "included": true,
+            "ready": true
+        },
+        {
+            "id": "grand-upright-lp4",
+            "name": "Grand Upright",
+            "raw_label": "Grand Upright LP4",
+            "category": "PIANOS",
+            "library_id": "church-live",
+            "install_relative": "Imported",
+            "file_count": 880,
+            "download_bytes": 1098798080,
+            "download_url": "",
+            "sha256": "2227d651539de482e2e851e3e7ec72bac61c751a4305046417c6efbe4029cd20",
+            "included": true,
+            "ready": true,
+            "parts": [
+                {
+                    "download_url": "https://churchdaw.com/app/android/timbres/grand-upright-lp4-v1.zip.part01",
+                    "sha256": "de2b3d8a3a93296f326f836ed32d0c4f06b4760c5716357cd84034fab05ed42e",
+                    "download_bytes": 524288000
+                },
+                {
+                    "download_url": "https://churchdaw.com/app/android/timbres/grand-upright-lp4-v1.zip.part02",
+                    "sha256": "c0f7ab9b30a0778ebfb472ce8d1005c8211e533addf153ff75ef2aa71cb7b6c8",
+                    "download_bytes": 524288000
+                },
+                {
+                    "download_url": "https://churchdaw.com/app/android/timbres/grand-upright-lp4-v1.zip.part03",
+                    "sha256": "0633e2781186190522b145530b67d824f3251d54fbbc3149c269796e061ad6c1",
+                    "download_bytes": 50222080
+                }
+            ]
+        },
+        {
+            "id": "lead-2",
+            "name": "Lead 2",
+            "raw_label": "Lead 2",
+            "category": "LEADS & SYNTHS",
+            "library_id": "church-live",
+            "install_relative": "Imported",
+            "file_count": 29,
+            "download_bytes": 49213710,
+            "download_url": "https://churchdaw.com/app/android/timbres/lead-2-v1.zip",
+            "sha256": "38fa4bebc34c994175668effad66c2a3b5d0b7f110b05611c5cfc1fa75915ec1",
+            "included": true,
+            "ready": true
+        },
+        {
+            "id": "lead-3",
+            "name": "Lead 3",
+            "raw_label": "Lead 3",
+            "category": "LEADS & SYNTHS",
+            "library_id": "church-live",
+            "install_relative": "Imported",
+            "file_count": 29,
+            "download_bytes": 102265483,
+            "download_url": "https://churchdaw.com/app/android/timbres/lead-3-v1.zip",
+            "sha256": "1bc3606fb142f74944082ce49e1eaac9bff9620c08f33121e1f2e5a8e74bb458",
+            "included": true,
+            "ready": true
+        },
+        {
+            "id": "lead-4",
+            "name": "Lead 4",
+            "raw_label": "Lead 4",
+            "category": "LEADS & SYNTHS",
+            "library_id": "church-live",
+            "install_relative": "Imported",
+            "file_count": 29,
+            "download_bytes": 67450781,
+            "download_url": "https://churchdaw.com/app/android/timbres/lead-4-v1.zip",
+            "sha256": "794c697eddc092b64d91a7307314d75d9f866ae1bb2b978ae03495dab382e3e5",
+            "included": true,
+            "ready": true
+        },
+        {
+            "id": "lead-saw",
+            "name": "LEAD SAW",
+            "raw_label": "LEAD SAW",
+            "category": "LEADS & SYNTHS",
+            "library_id": "church-live",
+            "install_relative": "LEAD SAW",
+            "file_count": 21,
+            "download_bytes": 31830608,
+            "download_url": "https://churchdaw.com/app/android/timbres/lead-saw-v1.zip",
+            "sha256": "c7c0cf475fd858b74a000b718c4e584a8c8e77155a5c642261a6a0c9636c71ea",
+            "included": true,
+            "ready": true
+        },
+        {
+            "id": "lead-sine",
+            "name": "LEAD SINE",
+            "raw_label": "LEAD SINE",
+            "category": "LEADS & SYNTHS",
+            "library_id": "church-live",
+            "install_relative": "LEAD SINE",
+            "file_count": 21,
+            "download_bytes": 32017480,
+            "download_url": "https://churchdaw.com/app/android/timbres/lead-sine-v1.zip",
+            "sha256": "74b41104547eca9f69842df24d3b442155f9a1bd2f95a7265b911e1ad76783b2",
+            "included": true,
+            "ready": true
+        },
+        {
+            "id": "mellow_upright",
+            "name": "Mellow Upright",
+            "raw_label": "Mellow Upright",
+            "category": "PIANOS",
+            "library_id": "church-live",
+            "install_relative": "Pianos/Mellow Upright",
+            "file_count": 117,
+            "download_bytes": 236255729,
+            "download_url": "https://churchdaw.com/app/android/timbres/mellow-upright-v1.zip",
+            "sha256": "330c6aa7d53cabea1d7dc949584f05904a554f1a8b4dfcd4ff4eff25a946dd5b",
+            "included": true,
+            "ready": true
+        },
+        {
+            "id": "pad_worship_2_0_ed_bento",
+            "name": "New Pad",
+            "raw_label": "New Pad",
+            "category": "PADS",
+            "library_id": "church-live",
+            "install_relative": "Pads/New Pad",
+            "file_count": 14,
+            "download_bytes": 30362451,
+            "download_url": "https://churchdaw.com/app/android/timbres/pad_worship_2_0_ed_bento-v1.zip",
+            "sha256": "2e89e74a0843f3ecdf0af238797978fee6ea60a99197a7c89f1e806f6e7edc37",
+            "included": true,
+            "ready": true
+        },
+        {
+            "id": "pad-bell",
+            "name": "Pad Bell",
+            "raw_label": "Pad Bell",
+            "category": "PADS",
+            "library_id": "church-live",
+            "install_relative": "Imported",
+            "file_count": 23,
+            "download_bytes": 82700063,
+            "download_url": "https://churchdaw.com/app/android/timbres/pad-bell-v1.zip",
+            "sha256": "68714d6337c57e6aa5c2ca9838b3e47891e7e2c9fcd9f6738955fb5618b2977e",
+            "included": true,
+            "ready": true
+        },
+        {
+            "id": "pad-guitar",
+            "name": "Pad Guitar",
+            "raw_label": "Pad Guitar",
+            "category": "PADS",
+            "library_id": "church-live",
+            "install_relative": "Imported",
+            "file_count": 30,
+            "download_bytes": 87682856,
+            "download_url": "https://churchdaw.com/app/android/timbres/pad-guitar-v1.zip",
+            "sha256": "e44fe0e6a38795bc8f76ac14b7cc9f6fe0f7c423597cfe41fcf7bde2d7697262",
+            "included": true,
+            "ready": true
+        },
+        {
+            "id": "pad-rev-shim",
+            "name": "Pad Rev Shim",
+            "raw_label": "Pad Rev Shim",
+            "category": "PADS",
+            "library_id": "church-live",
+            "install_relative": "Imported",
+            "file_count": 30,
+            "download_bytes": 82369204,
+            "download_url": "https://churchdaw.com/app/android/timbres/pad-rev-shim-v1.zip",
+            "sha256": "84ef569c1f5699b3767e1e89606c0c5cce4804ba2066020df9f1eea4647756de",
+            "included": true,
+            "ready": true
+        },
+        {
+            "id": "pad1",
+            "name": "Pad1",
+            "raw_label": "Pad1",
+            "category": "PADS",
+            "library_id": "church-live",
+            "install_relative": "Imported",
+            "file_count": 29,
+            "download_bytes": 98240161,
+            "download_url": "https://churchdaw.com/app/android/timbres/pad1-v1.zip",
+            "sha256": "7a8977f781c6ee6a236b59b01c4ca77e038e8e40a001ba7e85bd0a969a9847f1",
+            "included": true,
+            "ready": true
+        },
+        {
+            "id": "pad2",
+            "name": "Pad2",
+            "raw_label": "Pad2",
+            "category": "PADS",
+            "library_id": "church-live",
+            "install_relative": "Imported",
+            "file_count": 29,
+            "download_bytes": 63223807,
+            "download_url": "https://churchdaw.com/app/android/timbres/pad2-v1.zip",
+            "sha256": "03817159a0734eb12c4c8dd7aff34a5fd60b14e7cd1a18c7c4d60b839f9863a1",
+            "included": true,
+            "ready": true
+        },
+        {
+            "id": "pad3",
+            "name": "Pad3",
+            "raw_label": "Pad3",
+            "category": "PADS",
+            "library_id": "church-live",
+            "install_relative": "Imported",
+            "file_count": 29,
+            "download_bytes": 105184749,
+            "download_url": "https://churchdaw.com/app/android/timbres/pad3-v1.zip",
+            "sha256": "0aba3e4106b9ad337f4ca03699f4939409e6d549ead32dd35322af45cef1b196",
+            "included": true,
+            "ready": true
+        },
+        {
+            "id": "paddark",
+            "name": "PadDark",
+            "raw_label": "PadDark",
+            "category": "PADS",
+            "library_id": "church-live",
+            "install_relative": "Imported",
+            "file_count": 29,
+            "download_bytes": 104577404,
+            "download_url": "https://churchdaw.com/app/android/timbres/paddark-v1.zip",
+            "sha256": "bb770dd0917ff08e44a5da1069078edcf34f776d33ac2a96160376a86f864bf8",
+            "included": true,
+            "ready": true
+        },
+        {
+            "id": "padmix",
+            "name": "PADMIX",
+            "raw_label": "PADMIX",
+            "category": "PADS",
+            "library_id": "church-live",
+            "install_relative": "Imported",
+            "file_count": 25,
+            "download_bytes": 72364707,
+            "download_url": "https://churchdaw.com/app/android/timbres/padmix-v1.zip",
+            "sha256": "ce83dedf29b2deb817160ec359dc535035750a239ea4008d4bba87a42234762c",
+            "included": true,
+            "ready": true
+        },
+        {
+            "id": "padvox",
+            "name": "PadVox",
+            "raw_label": "PadVox",
+            "category": "PADS",
+            "library_id": "church-live",
+            "install_relative": "Imported",
+            "file_count": 21,
+            "download_bytes": 73808017,
+            "download_url": "https://churchdaw.com/app/android/timbres/padvox-v1.zip",
+            "sha256": "73bf0c21a73c682ca7fa678276e00907a0052168f379cf106dccbaddc4977706",
+            "included": true,
+            "ready": true
+        },
+        {
+            "id": "pearl-upright-lp4",
+            "name": "Pearl Upright",
+            "raw_label": "Pearl Upright LP4",
+            "category": "PIANOS",
+            "library_id": "church-live",
+            "install_relative": "Imported",
+            "file_count": 880,
+            "download_bytes": 1061484509,
+            "download_url": "",
+            "sha256": "359f0ce37a620725a013c69db7dcf09d2c3b42ef310dd3cd99c3e103cfa9d07d",
+            "included": true,
+            "ready": true,
+            "parts": [
+                {
+                    "download_url": "https://churchdaw.com/app/android/timbres/pearl-upright-lp4-v1.zip.part01",
+                    "sha256": "a1f39640563a611f38b341206fa29b26419e106dbccf318c1329cf27bc82c5a5",
+                    "download_bytes": 524288000
+                },
+                {
+                    "download_url": "https://churchdaw.com/app/android/timbres/pearl-upright-lp4-v1.zip.part02",
+                    "sha256": "ddcc92221c64b9ca3ef05120501a7ee10e59567273b866b002d9649ac2d85067",
+                    "download_bytes": 524288000
+                },
+                {
+                    "download_url": "https://churchdaw.com/app/android/timbres/pearl-upright-lp4-v1.zip.part03",
+                    "sha256": "2dbb833930fbb466bb2e5f3d6ac1fdbe32e8c6e1079bd478015e580c4ff795ac",
+                    "download_bytes": 12908509
+                }
+            ]
+        },
+        {
+            "id": "pipe-layers",
+            "name": "Pipe Layers",
+            "raw_label": "Pipe Layers",
+            "category": "ORGAOS",
+            "library_id": "church-live",
+            "install_relative": "Imported",
+            "file_count": 29,
+            "download_bytes": 68068619,
+            "download_url": "https://churchdaw.com/app/android/timbres/pipe-layers-v1.zip",
+            "sha256": "3520b3a41c9c1352b4dc71366f5aa91561e15ee4e50f69e0db0ac0e74758194f",
+            "included": true,
+            "ready": true
+        },
+        {
+            "id": "plucked",
+            "name": "Plucked",
+            "raw_label": "Plucked",
+            "category": "LEADS & SYNTHS",
+            "library_id": "church-live",
+            "install_relative": "Imported",
+            "file_count": 25,
+            "download_bytes": 36529902,
+            "download_url": "https://churchdaw.com/app/android/timbres/plucked-v1.zip",
+            "sha256": "36068d219488d02983058f4424fec664676f6e28f484a8c32ff519fae1d93eb4",
+            "included": true,
+            "ready": true
+        },
+        {
+            "id": "plucked2",
+            "name": "Plucked2",
+            "raw_label": "Plucked2",
+            "category": "LEADS & SYNTHS",
+            "library_id": "church-live",
+            "install_relative": "Imported",
+            "file_count": 29,
+            "download_bytes": 21327367,
+            "download_url": "https://churchdaw.com/app/android/timbres/plucked2-v1.zip",
+            "sha256": "753b7d9d954c2a06c9363bdbc3863839212326dbfba88ad9e62abc9cae4fc592",
+            "included": true,
+            "ready": true
+        },
+        {
+            "id": "prophetic-ambience",
+            "name": "Prophetic Ambience",
+            "raw_label": "AMBIENCIA",
+            "category": "PADS",
+            "library_id": "church-live",
+            "install_relative": "Pads/Prophetic Ambience",
+            "file_count": 26,
+            "download_bytes": 55389997,
+            "download_url": "https://churchdaw.com/app/android/timbres/prophetic-ambience-v1.zip",
+            "sha256": "cf0adc8c28d274aa1db9e596bf1be3abfc72a3d27b1bc79ec4e10607881ddeb3",
+            "included": true,
+            "ready": true
+        },
+        {
+            "id": "rev",
+            "name": "REV",
+            "raw_label": "REV",
+            "category": "PADS",
+            "library_id": "church-live",
+            "install_relative": "Imported",
+            "file_count": 21,
+            "download_bytes": 26007941,
+            "download_url": "https://churchdaw.com/app/android/timbres/rev-v1.zip",
+            "sha256": "04af55a1480b84e009720fa8959f07de86b72670d2d000c0cc761d5012e6fc45",
+            "included": true,
+            "ready": true
+        },
+        {
+            "id": "rev2",
+            "name": "REV2",
+            "raw_label": "REV2",
+            "category": "PADS",
+            "library_id": "church-live",
+            "install_relative": "Imported",
+            "file_count": 21,
+            "download_bytes": 19983196,
+            "download_url": "https://churchdaw.com/app/android/timbres/rev2-v1.zip",
+            "sha256": "3cc46ec62518ce9c5d7abda3c6ec5d82dbbde6964b7e99073a27967dd8adae95",
+            "included": true,
+            "ready": true
+        },
+        {
+            "id": "soft-grand-lp4",
+            "name": "Soft Grand",
+            "raw_label": "Soft Grand LP4",
+            "category": "PIANOS",
+            "library_id": "church-live",
+            "install_relative": "Imported",
+            "file_count": 880,
+            "download_bytes": 1006635833,
+            "download_url": "",
+            "sha256": "db1ae6cae91bff31cdf2fa2a2d17a9358537d9c421a4112194b4f32d197d1adc",
+            "included": true,
+            "ready": true,
+            "parts": [
+                {
+                    "download_url": "https://churchdaw.com/app/android/timbres/soft-grand-lp4-v1.zip.part01",
+                    "sha256": "c4ba35cbc806793e878acf5a6a4e04af2515789bdd37173c72e2102716211299",
+                    "download_bytes": 524288000
+                },
+                {
+                    "download_url": "https://churchdaw.com/app/android/timbres/soft-grand-lp4-v1.zip.part02",
+                    "sha256": "1e3d5408b2f5e6a32a791d8a180b5ae589bdbc6f183e629daa7ef23e7155e96c",
+                    "download_bytes": 482347833
+                }
+            ]
+        },
+        {
+            "id": "string",
+            "name": "String",
+            "raw_label": "String",
+            "category": "STRINGS",
+            "library_id": "church-live",
+            "install_relative": "Imported",
+            "file_count": 48,
+            "download_bytes": 137360030,
+            "download_url": "https://churchdaw.com/app/android/timbres/string-v1.zip",
+            "sha256": "8a94f51d7de284f65d4e82d15d7f0c6994e7ea156ccb4810e8e4c244ad67a656",
+            "included": true,
+            "ready": true
+        },
+        {
+            "id": "string-fabio",
+            "name": "String Fabio",
+            "raw_label": "String Fabio",
+            "category": "STRINGS",
+            "library_id": "church-live",
+            "install_relative": "Imported",
+            "file_count": 196,
+            "download_bytes": 678609877,
+            "download_url": "",
+            "sha256": "29ea2a1dcc099fd9e08d1b2b2c2d1e743a2aa18c343983b53f99f31c964e4822",
+            "included": true,
+            "ready": true,
+            "parts": [
+                {
+                    "download_url": "https://churchdaw.com/app/android/timbres/string-fabio-v1.zip.part01",
+                    "sha256": "8158c1d4157c08b7999eb87c82b0db4a7c6b1d9b57a6170e95bfffcd3bbcbda1",
+                    "download_bytes": 524288000
+                },
+                {
+                    "download_url": "https://churchdaw.com/app/android/timbres/string-fabio-v1.zip.part02",
+                    "sha256": "e45f0185548fcbc8f3f430baa16ae7edff8aed6fb8d9d4ebd558d1168fadf883",
+                    "download_bytes": 154321877
+                }
+            ]
+        },
+        {
+            "id": "studio-grand-2-lp4",
+            "name": "Studio Grand 2",
+            "raw_label": "Studio Grand 2 LP4",
+            "category": "PIANOS",
+            "library_id": "church-live",
+            "install_relative": "Imported",
+            "file_count": 880,
+            "download_bytes": 1010959475,
+            "download_url": "",
+            "sha256": "5e336d94c894f0abc74d4a1eb2482dec867719be8a285e789f7f7aca13ed7f80",
+            "included": true,
+            "ready": true,
+            "parts": [
+                {
+                    "download_url": "https://churchdaw.com/app/android/timbres/studio-grand-2-lp4-v1.zip.part01",
+                    "sha256": "42d0792b1b2ca7a8db0b4a43697ff9fd3b44ba25dfa13ca54e3e146d9136ec41",
+                    "download_bytes": 524288000
+                },
+                {
+                    "download_url": "https://churchdaw.com/app/android/timbres/studio-grand-2-lp4-v1.zip.part02",
+                    "sha256": "44498a828979a79ab2f15d9e8bb025b5c0f602065168c3597e56f02b23094699",
+                    "download_bytes": 486671475
+                }
+            ]
+        },
+        {
+            "id": "super-octave",
+            "name": "Super Octave",
+            "raw_label": "Super Octave",
+            "category": "PIANOS",
+            "library_id": "church-live",
+            "install_relative": "Super Octave",
+            "file_count": 29,
+            "download_bytes": 72083553,
+            "download_url": "https://churchdaw.com/app/android/timbres/super-octave-v1.zip",
+            "sha256": "38408152fd4a678dce901ecbabc8b83d6b2a6613b9271f5669055ce99420a9c4",
+            "included": true,
+            "ready": true
+        },
+        {
+            "id": "synth-analog",
+            "name": "SYNTH ANALOG",
+            "raw_label": "SYNTH ANALOG",
+            "category": "LEADS & SYNTHS",
+            "library_id": "church-live",
+            "install_relative": "SYNTH ANALOG",
+            "file_count": 29,
+            "download_bytes": 35724166,
+            "download_url": "https://churchdaw.com/app/android/timbres/synth-analog-v1.zip",
+            "sha256": "754dce502859a5d08a203cad9c445c34db6d052d83c9a2617986d970b63e2529",
+            "included": true,
+            "ready": true
+        },
+        {
+            "id": "synthfull",
+            "name": "SynthFull",
+            "raw_label": "SynthFull",
+            "category": "LEADS & SYNTHS",
+            "library_id": "church-live",
+            "install_relative": "Imported",
+            "file_count": 29,
+            "download_bytes": 94912539,
+            "download_url": "https://churchdaw.com/app/android/timbres/synthfull-v1.zip",
+            "sha256": "b29ce966e8bcb1f8e3a961a6fc282c59731d97137935b75374791abce3a9fa7e",
+            "included": true,
+            "ready": true
+        },
+        {
+            "id": "synthplayer",
+            "name": "SynthPlayer",
+            "raw_label": "SynthPlayer",
+            "category": "LEADS & SYNTHS",
+            "library_id": "church-live",
+            "install_relative": "Imported",
+            "file_count": 29,
+            "download_bytes": 68409741,
+            "download_url": "https://churchdaw.com/app/android/timbres/synthplayer-v1.zip",
+            "sha256": "7b10ebc5027a2f8b9c0bc7cf8fcad2f612b68cb15847419d4930829c420a78bd",
+            "included": true,
+            "ready": true
+        },
+        {
+            "id": "synthstring",
+            "name": "SynthString",
+            "raw_label": "SynthString",
+            "category": "STRINGS",
+            "library_id": "church-live",
+            "install_relative": "Imported",
+            "file_count": 29,
+            "download_bytes": 75030739,
+            "download_url": "https://churchdaw.com/app/android/timbres/synthstring-v1.zip",
+            "sha256": "fe63eee5a372214558f81ee7079f86c9729fcea500c908a3c0026dcbe83d4a21",
+            "included": true,
+            "ready": true
+        },
+        {
+            "id": "tines-layer",
+            "name": "Tines Layer",
+            "raw_label": "Tines Layer",
+            "category": "PIANOS",
+            "library_id": "church-live",
+            "install_relative": "Imported",
+            "file_count": 120,
+            "download_bytes": 172742312,
+            "download_url": "https://churchdaw.com/app/android/timbres/tines-layer-v1.zip",
+            "sha256": "e8085f965fef7774ba021d6e1c6e39cb747ecea7b68aab6203f648df6792e6fc",
+            "included": true,
+            "ready": true
+        },
+        {
+            "id": "tines-mk-i",
+            "name": "Tines MK I",
+            "raw_label": "Tines MK I",
+            "category": "PIANOS",
+            "library_id": "church-live",
+            "install_relative": "Imported",
+            "file_count": 120,
+            "download_bytes": 160802222,
+            "download_url": "https://churchdaw.com/app/android/timbres/tines-mk-i-v1.zip",
+            "sha256": "97d6f158a4ee693c6337d70c1f72286a3d0113e80f9d145e38e35d9e62ceba73",
+            "included": true,
+            "ready": true
+        },
+        {
+            "id": "vocal-fx-corda",
+            "name": "Vocal FX Corda",
+            "raw_label": "Vocal FX Corda",
+            "category": "LEADS & SYNTHS",
+            "library_id": "church-live",
+            "install_relative": "Imported",
+            "file_count": 48,
+            "download_bytes": 147737097,
+            "download_url": "https://churchdaw.com/app/android/timbres/vocal-fx-corda-v1.zip",
+            "sha256": "87e65f627ca839aa80bc64f9077a01f0f467c2dd07f7d1b2154412205c085f47",
+            "included": true,
+            "ready": true
+        },
+        {
+            "id": "warm",
+            "name": "Warm",
+            "raw_label": "Warm",
+            "category": "PADS",
+            "library_id": "church-live",
+            "install_relative": "Imported",
+            "file_count": 29,
+            "download_bytes": 101409867,
+            "download_url": "https://churchdaw.com/app/android/timbres/warm-v1.zip",
+            "sha256": "77abc3d2c3d6bfb272c54c3789e6fb2379c7054a1a7fee47386db4233444b101",
+            "included": true,
+            "ready": true
+        },
+        {
+            "id": "white-grand-lp4",
+            "name": "White Grand",
+            "raw_label": "White Grand LP4",
+            "category": "PIANOS",
+            "library_id": "church-live",
+            "install_relative": "Imported",
+            "file_count": 880,
+            "download_bytes": 1141742610,
+            "download_url": "",
+            "sha256": "891fa85f6ba6124a3da520f545fb9da97845a327e1594a036f3e93578621e695",
+            "included": true,
+            "ready": true,
+            "parts": [
+                {
+                    "download_url": "https://churchdaw.com/app/android/timbres/white-grand-lp4-v1.zip.part01",
+                    "sha256": "b75c9096700e08adc80b8e0363e2c1e52ef979240f68013a9ae73eae4f6ff9a1",
+                    "download_bytes": 524288000
+                },
+                {
+                    "download_url": "https://churchdaw.com/app/android/timbres/white-grand-lp4-v1.zip.part02",
+                    "sha256": "c0831580fd32a12bdea8098c1e71ed2f03ae5b998cf9c306e0da3e487ecb1255",
+                    "download_bytes": 524288000
+                },
+                {
+                    "download_url": "https://churchdaw.com/app/android/timbres/white-grand-lp4-v1.zip.part03",
+                    "sha256": "06ecbc7e2b8cc78fb7873efb80649d49fb869a94cc3e613942d4ddec1caccbaa",
+                    "download_bytes": 93166610
+                }
+            ]
+        }
+    ]
+}

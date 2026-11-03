@@ -1,9 +1,11 @@
 #pragma once
 
 #include <juce_gui_extra/juce_gui_extra.h>
+#include <thread>
 #include "ChurchDAWServices.h"
 #include "AndroidCultoConnectivity.h"
 #include "NordLookAndFeel.h"
+#include "LibraryCatalogStatus.h"
 
 class LibraryCatalogPanel;
 
@@ -56,12 +58,13 @@ public:
                 || ! managedFolder.getChildFile (".churchdaw-library.json").existsAsFile()
                 || installedVersion <= 0
                 || ! managedContentIsUsable);
-        const bool installed = pack.isInstalled() && ! managedInstallIsInconsistent;
+        const bool packIsInstalled = pack.isInstalled() && ! managedInstallIsInconsistent;
+        installed = packIsInstalled;
         const bool updateAvailable = installedVersion > 0
                                   && installedVersion < pack.version
                                   && (! managedPathExists || managedContentIsUsable);
 
-        if (installed)
+        if (packIsInstalled)
         {
             status = "INSTALADA";
             statusColour = juce::Colour (0xff63d28b);
@@ -110,7 +113,7 @@ public:
             action.setEnabled (false);
         }
 
-        if (! installed && ! catalogActionsAllowed)
+        if (! packIsInstalled && ! catalogActionsAllowed)
         {
             action.setButtonText (catalogUnavailableText.isNotEmpty()
                                       ? catalogUnavailableText
@@ -145,19 +148,18 @@ public:
     }
 
     const juce::String& id() const noexcept { return pack.id; }
+    bool isInstalled() const noexcept { return installed; }
 
     void paint (juce::Graphics& g) override
     {
+        const bool desktop = NordLookAndFeel::usesDesktopControls (*this);
         const bool dense = getHeight() <= 100;
         const bool compact = dense || getHeight() <= 118;
         auto card = getLocalBounds().toFloat().reduced (1.0f);
-        g.setColour (juce::Colours::black.withAlpha (0.20f));
-        g.fillRoundedRectangle (card.translated (0.0f, dense ? 2.0f : 4.0f),
-                                dense ? 10.0f : 14.0f);
-        g.setColour (juce::Colour (0xff22252b));
-        g.fillRoundedRectangle (card, dense ? 10.0f : 14.0f);
-        g.setColour (juce::Colours::white.withAlpha (0.075f));
-        g.drawRoundedRectangle (card, dense ? 10.0f : 14.0f, 1.0f);
+        g.setColour (desktop ? juce::Colour (0xff22262d) : NordLookAndFeel::bgCardHi());
+        g.fillRoundedRectangle (card, dense ? 8.0f : 10.0f);
+        g.setColour (desktop ? juce::Colours::white.withAlpha (0.055f) : NordLookAndFeel::borderSoft());
+        g.drawRoundedRectangle (card.reduced (0.5f), dense ? 8.0f : 10.0f, 1.0f);
 
         const int marginX = dense ? 10 : compact ? 14 : 18;
         const int marginY = dense ? 8 : compact ? 10 : 13;
@@ -169,7 +171,7 @@ public:
         auto statusArea = area.removeFromTop (dense ? 14 : compact ? 17 : 20);
         g.setColour (statusColour);
         g.setFont (juce::Font (juce::FontOptions (dense ? 9.5f : compact ? 11.5f : 11.0f)).boldened()
-                       .withExtraKerningFactor (0.08f));
+                       .withExtraKerningFactor (desktop ? 0.025f : 0.08f));
         g.drawText (status, statusArea, juce::Justification::centredLeft);
 
         auto titleArea = area.removeFromTop (dense ? 22 : compact ? 27 : 35);
@@ -190,13 +192,13 @@ public:
 
         if (meta.isNotEmpty())
         {
-            g.setColour (juce::Colours::white.withAlpha (0.42f));
+            g.setColour (desktop ? NordLookAndFeel::txtSecondary() : juce::Colours::white.withAlpha (0.42f));
             g.setFont (juce::Font (juce::FontOptions (dense ? 9.5f : 11.5f)));
             g.drawText (meta, area.removeFromTop (dense ? 13 : compact ? 16 : 18),
                         juce::Justification::centredLeft);
         }
 
-        g.setColour (juce::Colours::white.withAlpha (0.62f));
+        g.setColour (desktop ? NordLookAndFeel::txtSecondary() : juce::Colours::white.withAlpha (0.62f));
         g.setFont (juce::Font (juce::FontOptions (dense ? 10.5f : compact ? 12.0f : 12.5f)));
         const auto bodyText = installing ? installText
                             : lastError.isNotEmpty() ? lastError
@@ -243,7 +245,7 @@ private:
         // Um marker valido mais apenas um WAV fazia o card dizer INSTALADA e
         // desabilitar o botao, enquanto o painel do Pad continuava indisponivel.
         // Nesse caso o catalogo deve oferecer Reparar.
-        if (pack.id == "pad-continuo")
+        if (ChurchDAWServices::isPadContinuoPackId (pack.id))
         {
             auto complete = [] (const juce::File& candidate)
             {
@@ -293,6 +295,7 @@ private:
     bool catalogActionsAllowed = false;
     juce::String catalogUnavailableText;
     juce::Colour statusColour { juce::Colours::white };
+    bool installed = false;
     bool installing = false;
     float progress = 0.0f;
 
@@ -321,6 +324,23 @@ public:
                                       juce::Colours::white);
         addAndMakeVisible (closeButton);
         addAndMakeVisible (refreshButton);
+        for (auto* filter : { &allFilter, &installedFilter, &availableFilter })
+        {
+            filter->setClickingTogglesState (true);
+            filter->setColour (juce::TextButton::buttonColourId, juce::Colour (0xff24272e));
+            filter->setColour (juce::TextButton::buttonOnColourId, NordLookAndFeel::nordRed());
+            filter->setColour (juce::TextButton::textColourOffId,
+                               NordLookAndFeel::txtSecondary());
+            filter->setColour (juce::TextButton::textColourOnId, juce::Colours::white);
+            addAndMakeVisible (*filter);
+        }
+        allFilter.setButtonText ("Todas");
+        installedFilter.setButtonText ("Instaladas");
+        availableFilter.setButtonText ("Disponiveis");
+        allFilter.setToggleState (true, juce::dontSendNotification);
+        allFilter.onClick = [this] { setLibraryFilter (0); };
+        installedFilter.onClick = [this] { setLibraryFilter (1); };
+        availableFilter.onClick = [this] { setLibraryFilter (2); };
         addAndMakeVisible (legacyAccessButton);
         addAndMakeVisible (viewport);
         viewport.setViewedComponent (&content, false);
@@ -393,8 +413,19 @@ public:
     ~LibraryCatalogPanel() override
     {
         signalThreadShouldExit();
+        if (installer != nullptr)
+        {
+            installer->cancel();
+            if (installer->isThreadRunning() && ! installer->waitForThreadToExit (60))
+                std::thread ([dead = std::move (installer)] () mutable { dead.reset(); }).detach();
+            else
+                installer.reset();
+        }
+       #if JUCE_ANDROID || JUCE_IOS
+        stopThread (1200);
+       #else
         stopThread (16000);
-        installer.reset();
+       #endif
         restoreScreenSaver();
         viewport.setViewedComponent (nullptr, false);
     }
@@ -418,7 +449,8 @@ public:
             {
                 self->installedPacks = std::move (installed);
                 self->refreshButton.setEnabled (true);
-                juce::String connectionFailureReason;
+                const auto failure = check.catalogFailure != ChurchDAWDistribution::Failure::none
+                    ? check.catalogFailure : check.updateFailure;
 
                 if (check.reachedServer && check.manifest.valid)
                 {
@@ -426,6 +458,7 @@ public:
                     self->catalogActionsAllowed = true;
                     self->catalogUnavailableText.clear();
                     self->statusText = "Catalogo atualizado e pronto";
+                    self->catalogEmptyText = "Nenhum pack publicado.\nAs bibliotecas instaladas continuam disponiveis.";
                 }
                 else
                 {
@@ -435,28 +468,23 @@ public:
                         self->manifest = std::move (check.manifest);
 
                     self->catalogActionsAllowed = false;
-                    self->catalogUnavailableText = "Sem conexao";
-                    connectionFailureReason =
-                        check.updateDiagnostic.isNotEmpty()
-                            ? check.updateDiagnostic
-                            : check.diagnostic;
-                    self->statusText =
-                        "Sem conexao. Downloads ficam pausados."
-                        + (connectionFailureReason.isNotEmpty()
-                            ? "\n" + connectionFailureReason.substring (0, 180)
-                            : juce::String());
+                    const auto status = ChurchDAWLibraryStatus::unavailable (failure, false);
+                    self->catalogUnavailableText = status.button;
+                    self->statusText = status.message;
+                    self->catalogEmptyText = status.empty;
+                    juce::Logger::writeToLog (
+                        "Library catalog unavailable: update=" + check.updateDiagnostic
+                        + " catalog=" + check.diagnostic);
                 }
 
                 self->rebuildCards();
 
-                if (! self->catalogActionsAllowed
-                     && self->showingInstalledLibraries)
-                    self->statusText =
-                        "Catalogo online indisponivel. Bibliotecas instaladas "
-                        "continuam prontas para uso."
-                        + (connectionFailureReason.isNotEmpty()
-                            ? "\n" + connectionFailureReason.substring (0, 180)
-                            : juce::String());
+                if (! self->catalogActionsAllowed)
+                {
+                    const auto status = ChurchDAWLibraryStatus::unavailable (
+                        failure, self->showingInstalledLibraries);
+                    self->statusText = status.message;
+                }
 
                 self->repaint();
             }
@@ -468,22 +496,17 @@ public:
         // O componente ocupa o pai inteiro. Alem do efeito visual, esta pelicula
         // intercepta o toque fora do card e impede mudar timbre/abrir outro
         // painel por baixo durante uma instalacao.
-        g.setColour (juce::Colours::black.withAlpha (0.72f));
+        const bool desktop = NordLookAndFeel::usesDesktopControls (*this);
+        g.setColour (juce::Colours::black.withAlpha (desktop ? 0.58f : 0.72f));
         g.fillRect (getLocalBounds());
 
         const bool dense = isShortLandscape();
         const bool compact = dense || isCompact();
         auto bounds = surfaceBounds().toFloat();
-        const float corner = dense ? 12.0f : compact ? 14.0f : 20.0f;
-        g.setColour (juce::Colours::black.withAlpha (0.42f));
-        g.fillRoundedRectangle (bounds.translated (0.0f, dense ? 2.0f : compact ? 3.0f : 7.0f),
-                                corner);
-        g.setGradientFill (juce::ColourGradient (juce::Colour (0xff1a1c22),
-                                                 bounds.getX(), bounds.getY(),
-                                                 juce::Colour (0xff101116),
-                                                 bounds.getRight(), bounds.getBottom(), false));
+        const float corner = desktop ? 14.0f : dense ? 12.0f : compact ? 14.0f : 20.0f;
+        g.setColour (desktop ? juce::Colour (0xff1b1f26) : NordLookAndFeel::bgCard());
         g.fillRoundedRectangle (bounds, corner);
-        g.setColour (juce::Colours::white.withAlpha (0.09f));
+        g.setColour (desktop ? juce::Colour (0xff3b414b) : NordLookAndFeel::borderDefault());
         g.drawRoundedRectangle (bounds.reduced (0.5f), corner, 1.0f);
 
         const int margin = dense ? 8 : compact ? 12 : 26;
@@ -492,21 +515,23 @@ public:
         auto header = area.removeFromTop (headerHeight);
         auto textHeader = header;
         textHeader.removeFromRight (dense ? 220 : compact ? 296 : 320);
-        g.setColour (NordLookAndFeel::nordRedBright());
+        g.setColour (desktop ? NordLookAndFeel::txtSecondary() : NordLookAndFeel::nordRedBright());
         g.setFont (juce::Font (juce::FontOptions (dense ? 9.0f : compact ? 10.5f : 11.5f)).boldened()
-                       .withExtraKerningFactor (0.10f));
+                       .withExtraKerningFactor (desktop ? 0.035f : 0.10f));
         g.drawText ("CHURCHDAW STORE", textHeader.removeFromTop (dense ? 12 : compact ? 15 : 20),
                     juce::Justification::centredLeft);
         g.setColour (juce::Colours::white);
         g.setFont (juce::Font (juce::FontOptions (dense ? 18.0f : compact ? 22.0f : 27.0f)).boldened());
         g.drawText ("Bibliotecas", textHeader.removeFromTop (dense ? 21 : compact ? 28 : 38),
                     juce::Justification::centredLeft);
-        g.setColour (juce::Colours::white.withAlpha (0.46f));
+        g.setColour (desktop ? NordLookAndFeel::txtSecondary() : juce::Colours::white.withAlpha (0.46f));
         g.setFont (juce::Font (juce::FontOptions (dense ? 9.5f : 11.5f)));
         g.drawFittedText (statusText, textHeader, juce::Justification::centredLeft,
                           1, 0.72f);
 
         area.removeFromTop (dense ? 4 : compact ? 6 : 10);
+        area.removeFromTop (dense ? 30 : compact ? 36 : 40);
+        area.removeFromTop (dense ? 4 : compact ? 6 : 8);
 
         if (legacyAccessButton.isVisible())
         {
@@ -556,6 +581,17 @@ public:
                                      .withSizeKeepingCentre (refreshWidth, buttonHeight));
         area.removeFromTop (dense ? 4 : compact ? 6 : 10);
 
+        auto filters = area.removeFromTop (dense ? 30 : compact ? 36 : 40);
+        const int filterGap = dense ? 5 : 7;
+        const int filterWidth = juce::jmax (1,
+            (filters.getWidth() - filterGap * 2) / 3);
+        allFilter.setBounds (filters.removeFromLeft (filterWidth));
+        filters.removeFromLeft (filterGap);
+        installedFilter.setBounds (filters.removeFromLeft (filterWidth));
+        filters.removeFromLeft (filterGap);
+        availableFilter.setBounds (filters);
+        area.removeFromTop (dense ? 4 : compact ? 6 : 8);
+
         if (legacyAccessButton.isVisible())
         {
             auto legacyCard = area.removeFromTop (dense ? 48 : compact ? 64 : 72);
@@ -573,21 +609,69 @@ public:
             juce::jmax (1, viewport.getWidth() - viewport.getScrollBarThickness());
         const int columnGap = dense ? 8 : 0;
         const int columns = dense && contentWidth >= 680 ? 2 : 1;
-        const int rows = (cards.size() + columns - 1) / columns;
+        int visibleCards = 0;
+        for (auto* card : cards)
+            visibleCards += card->isVisible() ? 1 : 0;
+
+        const int rows = (visibleCards + columns - 1) / columns;
         content.setSize (contentWidth, juce::jmax (viewport.getHeight(), rows * cardStep));
         const int cardWidth =
             juce::jmax (1, (content.getWidth() - columnGap * (columns - 1)) / columns);
 
+        int visibleIndex = 0;
         for (int i = 0; i < cards.size(); ++i)
         {
-            const int column = i % columns;
-            const int row = i / columns;
+            if (! cards[i]->isVisible())
+                continue;
+
+            const int column = visibleIndex % columns;
+            const int row = visibleIndex / columns;
             const int x = column * (cardWidth + columnGap);
             const int width = column == columns - 1 ? content.getWidth() - x : cardWidth;
             cards[i]->setBounds (x, row * cardStep, width, cardHeight);
+            ++visibleIndex;
         }
 
         emptyState.setBounds (content.getLocalBounds().reduced (24));
+    }
+
+    void setLibraryFilter (int filter)
+    {
+        libraryFilter = juce::jlimit (0, 2, filter);
+        allFilter.setToggleState (libraryFilter == 0, juce::dontSendNotification);
+        installedFilter.setToggleState (libraryFilter == 1, juce::dontSendNotification);
+        availableFilter.setToggleState (libraryFilter == 2, juce::dontSendNotification);
+        applyLibraryFilter();
+        resized();
+        repaint();
+    }
+
+    void applyLibraryFilter()
+    {
+        int visibleCount = 0;
+
+        for (auto* card : cards)
+        {
+            const bool visible = libraryFilter == 0
+                              || (libraryFilter == 1 && card->isInstalled())
+                              || (libraryFilter == 2 && ! card->isInstalled());
+            card->setVisible (visible);
+            visibleCount += visible ? 1 : 0;
+        }
+
+        emptyState.setVisible (visibleCount == 0);
+
+        if (visibleCount == 0)
+        {
+            // All restores the current catalog result after leaving a filter;
+            // Installed/Available keep their own inventory-specific prompts.
+            emptyState.setText (libraryFilter == 1
+                                  ? juce::String ("Nenhuma biblioteca instalada.")
+                                  : libraryFilter == 2
+                                      ? juce::String::fromUTF8 ("Nenhuma biblioteca dispon\xc3\xadvel.")
+                                      : catalogEmptyText,
+                                juce::dontSendNotification);
+        }
     }
 
     void parentSizeChanged() override
@@ -620,7 +704,7 @@ private:
 
     bool isShortLandscape() const noexcept
     {
-       #if JUCE_ANDROID
+       #if JUCE_ANDROID || JUCE_IOS
         const auto surface = surfaceBounds();
 
         if (surface.getWidth() < 700
@@ -809,20 +893,13 @@ private:
             displayedIds.add (pack.id);
         }
 
-        emptyState.setVisible (cards.isEmpty());
-
         if (cards.isEmpty())
         {
-            emptyState.setText (
-                manifest.valid
-                    ? juce::String ("Nenhum pack publicado.\nAs bibliotecas instaladas continuam disponiveis.")
-                    : juce::String ("Catalogo indisponivel.\nConecte-se e toque em Atualizar catalogo."),
-                juce::dontSendNotification);
-
             if (manifest.valid && catalogActionsAllowed)
                 statusText = "Nenhum pack publicado. As bibliotecas instaladas continuam disponiveis.";
         }
 
+        applyLibraryFilter();
         resized();
         repaint();
     }
@@ -973,11 +1050,14 @@ private:
     ChurchDAWServices::RemoteManifest manifest;
     juce::Array<ChurchDAWServices::LibraryPack> installedPacks;
     juce::TextButton closeButton, refreshButton, legacyAccessButton;
+    juce::TextButton allFilter, installedFilter, availableFilter;
     juce::Viewport viewport;
     juce::Component content;
     juce::Label emptyState;
     juce::OwnedArray<LibraryPackCard> cards;
+    int libraryFilter = 0;
     juce::String statusText { "Buscando o catalogo..." };
+    juce::String catalogEmptyText { "Buscando o catalogo..." };
     bool catalogActionsAllowed = false;
     juce::String catalogUnavailableText { "Verificando..." };
     juce::String activePackId;

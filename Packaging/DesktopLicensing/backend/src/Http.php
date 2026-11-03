@@ -47,6 +47,12 @@ final class Request
             ';',
             $headers['content-type'] ?? ''
         )[0]));
+        // A Woovi valida o endpoint com um POST autenticado que pode chegar
+        // sem Content-Type. Eventos reais continuam exigindo JSON e passam
+        // pela verificacao criptografica no servico de webhook.
+        if ($path === '/api/v1/webhooks/woovi' && $contentType === '') {
+            $contentType = 'application/json';
+        }
         if (str_starts_with($path, '/api/')
             && in_array($method, ['POST', 'PUT', 'PATCH', 'DELETE'], true)
             && $contentType !== 'application/json') {
@@ -231,6 +237,45 @@ final class Response
         exit;
     }
 
+    /**
+     * Responde AGORA e so entao executa o trabalho pesado. Webhook de
+     * pagamento tem de devolver 200 rapido (a Woovi reenvia se demorar),
+     * mas o cliente nao pode esperar o cron de 15 minutos pela licenca.
+     * Com PHP-FPM a conexao fecha em fastcgi_finish_request; sem ele, o
+     * flush ainda entrega a resposta antes do processamento.
+     */
+    public static function emptyThen(
+        int $status,
+        ?string $requestId,
+        callable $after
+    ): never {
+        self::securityHeaders($requestId);
+        http_response_code($status);
+        header('Cache-Control: no-store, max-age=0');
+        header('Content-Length: 0');
+
+        if (function_exists('fastcgi_finish_request')) {
+            fastcgi_finish_request();
+        } else {
+            if (function_exists('litespeed_finish_request')) {
+                litespeed_finish_request();
+            }
+            @ob_end_flush();
+            @flush();
+        }
+
+        // O trabalho pos-resposta NUNCA pode virar erro HTTP: a resposta ja
+        // foi enviada. Falha aqui apenas deixa o evento na fila para o cron.
+        try {
+            $after();
+        } catch (\Throwable $error) {
+            error_log(
+                'ChurchDAW webhook pos-resposta: ' . $error->getMessage()
+            );
+        }
+        exit;
+    }
+
     public static function redirect(
         string $location,
         int $status = 303,
@@ -255,7 +300,7 @@ final class Response
         header('X-Frame-Options: DENY');
         header('Referrer-Policy: no-referrer');
         header("Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=()");
-        header("Content-Security-Policy: default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; base-uri 'none'; form-action 'self' https://www.mercadopago.com.br https://mercadopago.com.br; frame-ancestors 'none'");
+        header("Content-Security-Policy: default-src 'self'; img-src 'self' data: https://api.woovi.com https://api.woovi-sandbox.com; style-src 'self'; script-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'");
         if ($requestId !== null) {
             header('X-Request-ID: ' . $requestId);
         }

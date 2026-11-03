@@ -1,41 +1,100 @@
-/build/
-/build-mac/
-/asiosdk/
-insert_params.txt
-*.user
-.vs/
+# ---- SEGREDOS: nunca versionar ----
+.secrets/
+*.pem
+!Packaging/AndroidUpdatePolicyPublicKey.pem
+!Packaging/DesktopLicensing/keys/churchdaw-license-public.pem
+!Packaging/churchdaw-upload-certificate.pem
+*.pfx
+*.p12
 *.jks
 *.keystore
-*.p12
-.secrets/
-Packaging/DesktopLicensing/backend/config/local.php
-Packaging/DesktopLicensing/backend/config/*.local.php
-Packaging/DesktopLicensing/backend/.env
-Packaging/DesktopLicensing/backend/.env.*
-!Packaging/DesktopLicensing/backend/.env.example
-Packaging/DesktopLicensing/backend/var/
-Packaging/DesktopLicensing/backend/**/*.key
-Packaging/DesktopLicensing/backend/**/*private*.pem
+*.token
+*_rsa
+*_rsa.pub
+*.local.php
+*credential*.xml
+Packaging/*.tar
+ChurchDAW-Secrets/
 
-# revisao autonoma: estado efemero nao versionado
-.claude/locks/*.lock
-.claude/reports/
-.claude/tasks/
-
-# gerados/efemeros (curadoria 30/07/2026)
+# ---- Artefatos de build ----
+build/
+build_*/
 /build-*/
-/Builds/
-/Releases/
-/JuceLibraryCode/
-/work/
-shot.png
-*.preprocessed-recovery.h
-*.recovered.h
-*.replay-recovery.h
-.claude/
+JuceLibraryCode/
+*.obj
+*.exe
+*.dll
+*.lib
+*.pdb
+*.ilk
+
+# ---- Copias e backups manuais ----
+_snapshot-*/
+server-backup-*/
+Staging/
+SCRATCH/
+*.bak*
+*.preprocessed-recovery.*
+*.replay-recovery.*
+*.patch
+
+# ---- Dependencias de terceiros (grandes) ----
+#
+# ATENCAO: JUCE/ e asiosdk/ NAO sao descartaveis -- o CMakeLists.txt faz
+# add_subdirectory(JUCE), entao um clone deste repo NAO configura sozinho.
+# Sao ignorados so pelo tamanho (97 MB / 4289 arquivos). O JUCE aqui e COPIA
+# SOLTA na versao 9.0.0, nao submodulo e sem commit pinado: clonar do upstream
+# pode divergir em silencio do que gerou os binarios publicados.
+#
+# Ao levar este repo para outra maquina, leve a pasta JUCE junto:
+#     tar -czf JUCE.tgz JUCE      (26 MB comprimido)
+# O asiosdk/ e Windows-only; o CMake so o habilita se o header existir.
+# JUCE/ rastreado no GitHub para CI macOS/iOS/Android
+asiosdk/
+
+# ---- Diversos ----
+*.log
+.DS_Store
+Thumbs.db
+
+# ---- Capturas e artefatos de teste (milhares de PNGs) ----
+Packaging/*.png
+Packaging/*.jpg
+Packaging/*.mp4
+# Packaging/AndroidHosting/ rastreado para auditoria do build-android.yml
+Captura-Ambiencia2/
+Diagnostico-Ruido/
+Diagnostico-Android/
+
+# ---- Packs de samples: audio nao vai em repo de codigo ----
 Packaging/AndroidPacks/
+*.flac
+*.wav
+*.apk
+*.idsig
+Packaging/AndroidLoginTests/
 Packaging/AndroidMainUiTests/
-Packaging/AndroidHosting/**/*.apk
-Packaging/AndroidHosting/app/android/packs/
-Packaging/**/*.apk
-Tests/**/outputs/
+Packaging/DevicePrivateBackup/
+Packaging/screen-captures/
+
+# ---- Artefatos de release (instaladores, logs, manifestos) ----
+Releases/
+Packaging/release-*/
+Source_Update.zip
+
+# Downloads de terceiros (packs, instaladores baixados)
+Downloads/
+.codex-backups/
+Builds/
+.build-block2/
+.build-block2-release/
+.build-block2-sanitize/
+binary_cache/
+dist/
+dist-*/
+release-candidate-*/
+
+# Python cache
+*.pyc
+__pycache__/
+

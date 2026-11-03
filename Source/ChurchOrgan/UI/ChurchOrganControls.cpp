@@ -295,6 +295,7 @@ ChurchOrganDrawbar::ChurchOrganDrawbar (int index, juce::String footageToUse)
     setTextBoxStyle (juce::Slider::NoTextBox, false, 0, 0);
     setWantsKeyboardFocus (true);
     setMouseDragSensitivity (110);
+    setViewportIgnoreDragFlag (true);
     // Precision Touchpad/trackpad envia a rolagem como mouse wheel. O gesto
     // pertence ao Viewport da página BARS, não ao valor do drawbar; com esta
     // flag o Slider encaminha o evento aos pais sem alterar o parâmetro.
@@ -538,6 +539,7 @@ ChurchOrganParameterSlider::ChurchOrganParameterSlider (
     // Todas as páginas avançadas são roláveis. Evita que trackpads editem
     // knobs/sliders acidentalmente enquanto o usuário navega pela página.
     setScrollWheelEnabled (false);
+    setViewportIgnoreDragFlag (true);
 
     if (presentation == Presentation::rotary)
     {
@@ -545,6 +547,9 @@ ChurchOrganParameterSlider::ChurchOrganParameterSlider (
         setRotaryParameters (juce::MathConstants<float>::pi * 1.25f,
                              juce::MathConstants<float>::pi * 2.75f,
                              true);
+       #if JUCE_IOS || JUCE_ANDROID
+        setMouseDragSensitivity (135);
+       #endif
         setTextBoxStyle (juce::Slider::TextBoxBelow, false, 62, 20);
     }
     else

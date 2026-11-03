@@ -440,7 +440,7 @@ function Assert-ChurchDAWAuthenticodeSignature {
             -Path $fullPath -RequireTimestamp $RequireTimestamp) `
         -LogPath $VerificationLogPath `
         -Label "signtool verify $([IO.Path]::GetFileName($fullPath))"
-    if ($verify.ExitCode -ne 0) {
+    if ($verify.ExitCode -ne 0 -and $RequirePublicChain) {
         $verifyFlags = if ($RequireTimestamp) {
             '/pa /all /tw /v'
         } else { '/pa /all /v' }
@@ -449,7 +449,13 @@ function Assert-ChurchDAWAuthenticodeSignature {
     }
 
     $signature = Get-AuthenticodeSignature -LiteralPath $fullPath
-    if ($signature.Status -ne 'Valid') {
+    # Um certificado self-signed fixado por publisher + thumbprint retorna
+    # UnknownError apenas porque sua raiz nao e publica. Isto vale somente no
+    # modo Test; HashMismatch, NotSigned e qualquer outro estado continuam
+    # recusados, e a identidade fixada e validada logo abaixo.
+    $acceptedLocalTestStatus = -not $RequirePublicChain -and
+        [string] $signature.Status -eq 'UnknownError'
+    if ($signature.Status -ne 'Valid' -and -not $acceptedLocalTestStatus) {
         throw "Authenticode invalido ($($signature.Status)): $fullPath"
     }
     if ([string] $signature.SignatureType -ne 'Authenticode') {
@@ -472,7 +478,9 @@ function Assert-ChurchDAWAuthenticodeSignature {
 
     return [pscustomobject] @{
         Path = $fullPath
-        Status = [string] $signature.Status
+        Status = if ($acceptedLocalTestStatus) {
+            'PinnedTestCertificate'
+        } else { [string] $signature.Status }
         SignatureType = [string] $signature.SignatureType
         Publisher = $identity.Publisher
         SignerThumbprint = $identity.SignerThumbprint
@@ -801,12 +809,17 @@ function Get-ChurchDAWGitState {
         throw "Diretorio nao e um worktree Git: $repo"
     }
 
-    $commit = (@(& git -C $repo rev-parse HEAD)).Trim()
-    if ($LASTEXITCODE -ne 0 -or $commit -notmatch '^[0-9a-fA-F]{40}$') {
+    $commitLines = @(& git -C $repo rev-parse HEAD)
+    $commit = ($commitLines -join '').Trim()
+    if ($LASTEXITCODE -ne 0 -or $commitLines.Count -ne 1 -or
+        $commit -notmatch '^[0-9a-fA-F]{40}$') {
         throw 'Nao foi possivel resolver o commit Git'
     }
-    $branch = (@(& git -C $repo branch --show-current)).Trim()
-    if ($LASTEXITCODE -ne 0) {
+    # Detached HEAD (release por tag/worktree) retorna zero linhas.
+    # Nao chamar Trim no array vazio, especialmente no Windows PowerShell 5.1.
+    $branchLines = @(& git -C $repo branch --show-current)
+    $branch = ($branchLines -join '').Trim()
+    if ($LASTEXITCODE -ne 0 -or $branchLines.Count -gt 1) {
         throw 'Nao foi possivel resolver a branch Git'
     }
     $status = @(& git -C $repo status --porcelain=v1 `
@@ -820,5 +833,32 @@ function Get-ChurchDAWGitState {
         Branch = $branch
         IsClean = $status.Count -eq 0
         Status = @($status)
+    }
+}
+
+
+function Assert-ChurchDAWMacVerification {
+    param(
+        [Parameter(Mandatory = $true)] [string] $Installer,
+        [Parameter(Mandatory = $true)] [string] $ReportPath,
+        [Parameter(Mandatory = $true)] [string] $ExpectedVersion
+    )
+    $report = [IO.File]::ReadAllText([IO.Path]::GetFullPath($ReportPath)) | ConvertFrom-Json
+    if ($report.schema_version -ne 1 -or $report.product_id -cne 'com.churchdaw.app' -or
+        $report.version -cne $ExpectedVersion) {
+        throw 'Relatorio de verificacao do Mac pertence a outra release'
+    }
+    $item = Get-Item -LiteralPath $Installer
+    $sha = (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($item.Length -ne $report.bytes -or $sha -cne $report.sha256) {
+        throw 'DMG diverge dos bytes aprovados no Mac'
+    }
+    foreach ($name in @('developer_id','secure_timestamp','hardened_runtime',
+        'app_notarization','app_stapled','app_gatekeeper','dmg_notarization',
+        'dmg_stapled','dmg_gatekeeper','legacy_dmg_gatekeeper','mounted_app_gatekeeper','mounted_executable_matches')) {
+        $value = $report.checks.$name
+        if ($value -isnot [bool] -or $value -ne $true) {
+            throw "DMG sem comprovacao obrigatoria: $name"
+        }
     }
 }

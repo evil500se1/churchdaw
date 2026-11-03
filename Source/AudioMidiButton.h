@@ -59,6 +59,80 @@ public:
         if (bounds.isEmpty())
             return;
 
+        if (getComponentID() == "headerNav" && NordLookAndFeel::usesDesktopShell (*this))
+        {
+            // Reuse the shell's surfaces and glyphs. The audio panel supplies
+            // its own active state; painting must not mutate the button toggle.
+            getLookAndFeel().drawButtonBackground (
+                g, *this, active ? NordLookAndFeel::nordRed()
+                                 : juce::Colours::transparentBlack,
+                shouldDrawButtonAsHighlighted, shouldDrawButtonAsDown);
+            NordLookAndFeel::drawDesktopNavigationContents (
+                g, *this, shouldDrawButtonAsHighlighted, active);
+            return;
+        }
+
+        // Dentro do shell desktop este componente participa da mesma barra de
+        // navegacao dos demais destinos. O desenho antigo criava um card azul
+        // elevado e quebrava a continuidade visual exatamente no ultimo item.
+        if (getComponentID() == "headerNav")
+        {
+            if (shouldDrawButtonAsHighlighted || shouldDrawButtonAsDown)
+            {
+                g.setColour (juce::Colours::white.withAlpha (
+                    shouldDrawButtonAsDown ? 0.060f : 0.032f));
+                g.fillRect (bounds);
+            }
+
+            g.setColour (juce::Colours::white.withAlpha (0.055f));
+            g.drawVerticalLine (juce::roundToInt (bounds.getRight()),
+                                bounds.getY() + 8.0f, bounds.getBottom() - 8.0f);
+
+            const auto label = buttonText.toUpperCase();
+            const auto font = juce::Font (juce::FontOptions (11.0f,
+                                                             juce::Font::bold));
+            const float iconSide = 14.0f;
+            const float textW = juce::GlyphArrangement::getStringWidth (font, label);
+            const float groupW = iconSide + 6.0f + textW;
+            const float startX = bounds.getCentreX() - groupW * 0.5f;
+            auto icon = juce::Rectangle<float> (
+                startX, bounds.getCentreY() - iconSide * 0.5f,
+                iconSide, iconSide);
+
+            const auto colour = active ? NordLookAndFeel::nordRedBright()
+                                       : juce::Colours::white.withAlpha (0.78f);
+            g.setColour (colour);
+            juce::Path speaker;
+            speaker.startNewSubPath (icon.getX(), icon.getCentreY() - 2.5f);
+            speaker.lineTo (icon.getX() + 4.0f, icon.getCentreY() - 2.5f);
+            speaker.lineTo (icon.getX() + 8.0f, icon.getY() + 2.0f);
+            speaker.lineTo (icon.getX() + 8.0f, icon.getBottom() - 2.0f);
+            speaker.lineTo (icon.getX() + 4.0f, icon.getCentreY() + 2.5f);
+            speaker.lineTo (icon.getX(), icon.getCentreY() + 2.5f);
+            speaker.closeSubPath();
+            g.fillPath (speaker);
+            g.drawLine (icon.getX() + 10.5f, icon.getY() + 4.0f,
+                        icon.getX() + 10.5f, icon.getBottom() - 4.0f, 1.0f);
+            g.drawLine (icon.getX() + 13.0f, icon.getY() + 2.0f,
+                        icon.getX() + 13.0f, icon.getBottom() - 2.0f, 1.0f);
+
+            g.setFont (font);
+            g.drawText (label,
+                        juce::Rectangle<float> (startX + iconSide + 6.0f,
+                                                bounds.getY(), textW + 2.0f,
+                                                bounds.getHeight()),
+                        juce::Justification::centredLeft);
+
+            if (active)
+            {
+                g.setColour (NordLookAndFeel::nordRedBright().withAlpha (0.9f));
+                g.fillRoundedRectangle (bounds.getX() + 12.0f,
+                                        bounds.getBottom() - 2.5f,
+                                        bounds.getWidth() - 24.0f, 2.0f, 1.0f);
+            }
+            return;
+        }
+
         const float h = bounds.getHeight();
         const float w = bounds.getWidth();
         const float r = juce::jmin (7.0f, h * 0.28f);
@@ -183,7 +257,9 @@ public:
         const float iconH = juce::jlimit (10.0f, 16.0f, h * 0.46f);
         const float speakerW = iconH * 1.0f;
         const float midiW = iconH * 1.1f;
-        const bool isNarrow = (buttonText.trim() == juce::String::fromUTF8 ("\xc3\x81udio") || w < 85.0f);
+        const bool isNarrow = (buttonText.trim().equalsIgnoreCase (
+                                   juce::String::fromUTF8 ("\xc3\x81udio"))
+                               || w < 85.0f);
 
         juce::Colour iconColour = active ? juce::Colour (0xffffffff)
                                          : (shouldDrawButtonAsHighlighted ? juce::Colour (0xfff0f4fa)

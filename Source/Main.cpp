@@ -1,9 +1,12 @@
 #include <juce_gui_extra/juce_gui_extra.h>
 
 #include <iostream>   // logger de stdout do self-test de CI
+#include <thread>
 
 #include "NordLookAndFeel.h"
 #include "MainComponent.h"
+#include "ChurchDAWAudioActivity.h"
+#include "WindowsAudioPerformance.h"
 #include "StartupPanel.h"
 #include "BinaryData.h"
 
@@ -153,34 +156,48 @@ static juce::Rectangle<int> currentAndroidWindowBounds()
     if (env == nullptr || activity == nullptr)
         return {};
 
-    const auto clazz = ChurchDAWServices::findAndroidAppClass (
-        env, activity.get(),
-        "com.churchdaw.app.ChurchDAWLicenseBridge");
-    if (clazz == nullptr)
+    static jclass cachedClass = nullptr;
+    static jmethodID cachedMethod = nullptr;
+
+    if (cachedClass == nullptr || cachedMethod == nullptr)
     {
-        env->ExceptionClear();
-        return {};
+        const auto localClazz = ChurchDAWServices::findAndroidAppClass (
+            env, activity.get(),
+            "com.churchdaw.app.ChurchDAWLicenseBridge");
+        if (localClazz == nullptr)
+        {
+            env->ExceptionClear();
+            return {};
+        }
+
+        const auto method = env->GetStaticMethodID (
+            localClazz, "getWindowBoundsDp",
+            "(Landroid/app/Activity;)J");
+        if (method == nullptr)
+        {
+            env->ExceptionClear();
+            env->DeleteLocalRef (localClazz);
+            return {};
+        }
+
+        if (cachedClass == nullptr)
+            cachedClass = static_cast<jclass> (env->NewGlobalRef (localClazz));
+        cachedMethod = method;
+        env->DeleteLocalRef (localClazz);
     }
 
-    const auto method = env->GetStaticMethodID (
-        clazz, "getWindowBoundsDp",
-        "(Landroid/app/Activity;)J");
-    if (method == nullptr)
-    {
-        env->ExceptionClear();
-        env->DeleteLocalRef (clazz);
+    if (cachedClass == nullptr || cachedMethod == nullptr)
         return {};
-    }
 
     const auto packed = static_cast<juce::uint64> (
         env->CallStaticLongMethod (
-            clazz, method, activity.get()));
+            cachedClass, cachedMethod, activity.get()));
     const bool ok = ! env->ExceptionCheck();
     if (! ok)
+    {
         env->ExceptionClear();
-    env->DeleteLocalRef (clazz);
-    if (! ok)
         return {};
+    }
 
     const auto x = static_cast<int> (
         (packed >> 48) & 0xffffULL);
@@ -234,7 +251,21 @@ public:
 
     void resized() override
     {
-       #if JUCE_ANDROID
+       #if JUCE_IOS
+        if (iosMainContent != nullptr)
+        {
+            iosMainContent->setBounds (getLocalBounds());
+            return;
+        }
+
+        auto safeBounds = getLocalBounds();
+        if (const auto* display =
+                juce::Desktop::getInstance()
+                    .getDisplays().getDisplayForRect (getBounds()))
+            safeBounds = display->safeAreaInsets
+                .subtractedFrom (safeBounds);
+        panel.setBounds (safeBounds);
+       #elif JUCE_ANDROID
         panel.setBounds (getLocalBounds());
        #else
         auto safeBounds = getLocalBounds();
@@ -249,6 +280,37 @@ public:
 
     StartupPanel panel;
 
+   #if JUCE_IOS
+    void showMainContent (
+        bool safeMode,
+        ChurchDAWMidiMapping::DeferredOwnerTeardownGate* teardownGate)
+    {
+        if (iosMainContent != nullptr)
+            return;
+
+        // Mantem o mesmo UIWindow/UIViewController usado pelo StartupPanel.
+        // Assim o iPadOS nao precisa iniciar outra transicao de aparencia para
+        // mostrar a DAW depois de validar policy, catalogo e biblioteca.
+        setAlwaysOnTop (false);
+        iosMainContent = std::make_unique<MainComponent> (
+            safeMode, teardownGate);
+        panel.setVisible (false);
+        addAndMakeVisible (*iosMainContent);
+        iosMainContent->toFront (false);
+        resized();
+    }
+
+    MainComponent* content() const noexcept
+    {
+        return iosMainContent.get();
+    }
+
+    void clearMainContent()
+    {
+        iosMainContent.reset();
+    }
+   #endif
+
 private:
     void timerCallback() override
     {
@@ -258,6 +320,10 @@ private:
             setBounds (bounds);
        #endif
     }
+
+   #if JUCE_IOS
+    std::unique_ptr<MainComponent> iosMainContent;
+   #endif
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (StartupWindow)
 };
@@ -272,7 +338,10 @@ public:
                                 juce::DocumentWindow::closeButton),
           panel (std::move (logo))
     {
-        setUsingNativeTitleBar (true);
+        setUsingNativeTitleBar (false);
+        setTitleBarHeight (30);
+        setTitleBarTextCentred (false);
+        setIcon (loadChurchDAWBrandImage());
         setContentNonOwned (&panel, false);
         setResizable (true, true);
         setResizeLimits (760, 580, 1600, 1000);
@@ -358,8 +427,14 @@ public:
 
     ~ChurchDAWStartupCheckThread() override
     {
-        signalThreadShouldExit();
+        cancel();
         stopThread (30000);
+    }
+
+    void cancel() noexcept
+    {
+        cancelled.store (true, std::memory_order_release);
+        signalThreadShouldExit();
     }
 
     void run() override
@@ -368,7 +443,7 @@ public:
                          ? std::move (seededCheck)
                          : ChurchDAWServices::checkRemoteManifest();
 
-        if (threadShouldExit())
+        if (threadShouldExit() || cancelled.load (std::memory_order_acquire))
             return;
 
         check.localLibraryReady =
@@ -386,7 +461,7 @@ public:
                     check.updatePolicy.minimumVersionCode);
        #endif
 
-        if (threadShouldExit())
+        if (threadShouldExit() || cancelled.load (std::memory_order_acquire))
             return;
 
         auto deliver = callback;
@@ -402,6 +477,7 @@ private:
     Callback callback;
     ChurchDAWServices::StartupCheck seededCheck;
     bool useSeededCheck = false;
+    std::atomic<bool> cancelled { false };
 };
 
 class ChurchDAWUpdatePolicyCheckThread final : public juce::Thread
@@ -417,15 +493,21 @@ public:
 
     ~ChurchDAWUpdatePolicyCheckThread() override
     {
-        signalThreadShouldExit();
+        cancel();
         stopThread (20000);
+    }
+
+    void cancel() noexcept
+    {
+        cancelled.store (true, std::memory_order_release);
+        signalThreadShouldExit();
     }
 
     void run() override
     {
         auto check = ChurchDAWServices::checkRemoteUpdatePolicy();
 
-        if (threadShouldExit())
+        if (threadShouldExit() || cancelled.load (std::memory_order_acquire))
             return;
 
         check.localLibraryReady =
@@ -442,7 +524,7 @@ public:
                     check.policy.minimumVersionCode);
        #endif
 
-        if (threadShouldExit())
+        if (threadShouldExit() || cancelled.load (std::memory_order_acquire))
             return;
 
         auto deliver = callback;
@@ -456,7 +538,28 @@ public:
 
 private:
     Callback callback;
+    std::atomic<bool> cancelled { false };
 };
+
+template <typename CheckThread>
+static void retireCheckThreadNonBlocking (std::unique_ptr<CheckThread>& holder)
+{
+    if (holder == nullptr)
+        return;
+
+    holder->cancel();
+
+    if (! holder->isThreadRunning() || holder->waitForThreadToExit (40))
+    {
+        holder.reset();
+        return;
+    }
+
+    std::thread ([dead = std::move (holder)] () mutable
+    {
+        dead.reset();
+    }).detach();
+}
 
 #if JUCE_ANDROID
 static int getInstalledAndroidVersionCode()
@@ -510,11 +613,11 @@ static juce::String androidUpdateEligibilityDiagnostic (int status)
     switch (status)
     {
         case eligibilityConfirmed:
-            return "APK assinado confirmado pela policy do ChurchDAW";
+            return "atualizacao oficial confirmada pela policy do ChurchDAW";
         case eligibilityNotRequired:
             return "versao instalada ja suficiente";
         case eligibilityWebsiteUnavailable:
-            return "site de atualizacao indisponivel";
+            return "distribuicao oficial indisponivel";
         default:
             return "consulta de atualizacao indisponivel";
     }
@@ -632,8 +735,8 @@ static int effectiveRequiredAndroidVersion (
     }
 
     // Um piso novo e aceito somente de policy RSA valida. Antes de elevar o
-    // minimo, o processo de release publica o APK assinado no churchdaw.com e
-    // valida sua resposta HTTPS; o gate abre esse APK para o instalador Android.
+    // minimo, o release publica e verifica o APK assinado no churchdaw.com; se
+    // esta instalacao veio da Play, a bridge usa a ficha oficial da loja.
     if (policy.valid
          && policy.cryptographicallyVerified
          && policy.minimumVersionCode > installedVersionCode
@@ -675,11 +778,186 @@ static ChurchDAWServices::UpdatePolicy policyForRequiredGate (
 }
 #endif
 
+#if JUCE_WINDOWS || JUCE_MAC
+// GUARDA DE ABERTURA (crash-loop breaker). O boot restaura o setup de audio
+// e a cadeia de plugins de terceiros DENTRO do proprio processo: um driver
+// (ASIO4ALL!) ou plugin podre mata o app antes de qualquer janela. O padrao
+// dos browsers: no boot escrevemos boot-recovery.flag junto ao ChurchDAW.settings
+// e a apagamos no fechamento limpo. Marker presente na abertura seguinte =
+// o run anterior morreu: entre em MODO SEGURO e ponha o setup suspeito em
+// quarentena (backup *.recovered-<data>.xml fora do
+// ChurchDAW.settings), quebrando
+// o loop de crash. O diagnostico fica no ChurchDAW.log (linhas RECOVERY:).
+static juce::File churchDAWBootMarkerFile()
+{
+    const auto qaSettingsDir = juce::SystemStats::getEnvironmentVariable (
+                                   "CHURCHDAW_QA_SETTINGS_DIR", {})
+                                   .trim();
+    const bool qaDirValid = qaSettingsDir.isNotEmpty()
+        && juce::File::isAbsolutePath (qaSettingsDir);
+
+    return juce::File::getSpecialLocation (
+               juce::File::userApplicationDataDirectory)
+        .getChildFile (qaDirValid ? qaSettingsDir : "ChurchDAW")
+        .getChildFile ("boot-recovery.flag");
+}
+
+// Move a chave <key> do ChurchDAW.settings para um arquivo irmao de backup e
+// remove-a do settings. Arquivo real do PropertiesFile: ChurchDAW.settings. Nao altera nada se o settings ou a chave nao existem.
+// Quantos fechamentos anormais SEGUIDOS ja aconteceram. Um isolado nao diz
+// nada sobre a culpa do setup de audio: e muito mais provavel queda de luz,
+// reboot do Windows ou o proprio update do que um driver podre.
+static juce::File churchDAWBootStrikeFile()
+{
+    return churchDAWBootMarkerFile().getSiblingFile ("boot-recovery.strikes");
+}
+
+static int churchDAWRecoveryStrikes()
+{
+    const auto f = churchDAWBootStrikeFile();
+    if (! f.existsAsFile())
+        return 0;
+
+    return juce::jlimit (0, 9, f.loadFileAsString().trim().getIntValue());
+}
+
+static void churchDAWSetRecoveryStrikes (int strikes)
+{
+    const auto f = churchDAWBootStrikeFile();
+
+    if (strikes <= 0)
+    {
+        f.deleteFile();
+        return;
+    }
+
+    f.getParentDirectory().createDirectory();
+    f.replaceWithText (juce::String (strikes));
+}
+
+static void churchDAWQuarantineSetting (const juce::File& settingsFile,
+                                        const juce::String& key,
+                                        const juce::String& stamp)
+{
+    auto xml = juce::parseXML (settingsFile);
+    if (xml == nullptr)
+        return;
+
+    auto* child = xml->getChildByName (key);
+    if (child == nullptr)
+        return;
+
+    const auto backup = settingsFile.getSiblingFile (
+        key + ".recovered-" + stamp + ".xml");
+    if (! backup.existsAsFile())
+        juce::XmlElement (*child).writeTo (backup);
+
+    xml->removeChildElement (child, true);
+    xml->writeTo (settingsFile);
+}
+
+// ULTIMA CONFIGURACAO BOA. O crash-loop breaker precisava jogar o musico no
+// audio padrao depois de um driver podre: ele abria, mas sem a interface de
+// sempre. Aqui guardamos uma copia do setup que ja rodou de verdade
+// (audioSetupGood) para que a recuperacao devolva a configuração que o
+// musico usava, e nao o padrao de fabrica.
+//
+// O par e o flag audioSetupPending: ele marca que o setup atual ainda NAO
+// foi comprovado. Se o app morrer com pendencia, o boot seguinte descarta o
+// suspeito e restaura o bom -- o usuario nao precisa reescolher nada.
+static bool churchDAWCopySetting (const juce::File& settingsFile,
+                                  const juce::String& fromKey,
+                                  const juce::String& toKey)
+{
+    auto xml = juce::parseXML (settingsFile);
+    if (xml == nullptr)
+        return false;
+
+    auto* origem = xml->getChildByName (fromKey);
+    if (origem == nullptr)
+        return false;
+
+    if (auto* antigo = xml->getChildByName (toKey))
+        xml->removeChildElement (antigo, true);
+
+    xml->addChildElement (new juce::XmlElement (*origem));
+    return xml->writeTo (settingsFile);
+}
+
+// Promove o setup atual a "bom" e limpa a pendencia. Chamado no fechamento
+// limpo e depois de alguns segundos de vida com audio de pe.
+static void churchDAWPromoteGoodAudio (const juce::File& settingsFile,
+                                       bool audioVivo)
+{
+    if (! audioVivo)
+        return;
+
+    auto xml = juce::parseXML (settingsFile);
+    if (xml == nullptr)
+        return;
+    if (xml->getChildByName ("audioSetup") == nullptr)
+        return;
+    if (xml->getIntAttribute ("audioSetupHealthy", 0) != 1)
+        return;
+
+    if (churchDAWCopySetting (settingsFile, "audioSetup", "audioSetupGood"))
+    {
+        auto xml2 = juce::parseXML (settingsFile);
+        if (xml2 != nullptr)
+        {
+            xml2->setAttribute ("audioSetupPending", 0);
+            xml2->writeTo (settingsFile);
+        }
+        juce::Logger::writeToLog (
+            "AUDIO_GOOD: setup de audio atual promovido a ultima configuracao boa");
+    }
+}
+
+// Descarta o setup pendente (o suspeito) e restaura o ultimo bom, se houver.
+// Devolve uma msg curta para a UI.
+static juce::String churchDAWDiscardPendingAudio (
+    const juce::File& settingsFile, const juce::String& stamp)
+{
+    churchDAWQuarantineSetting (settingsFile, "audioSetup", stamp);
+
+    auto xml = juce::parseXML (settingsFile);
+    if (xml != nullptr)
+    {
+        xml->setAttribute ("audioSetupPending", 0);
+        xml->writeTo (settingsFile);
+    }
+
+    if (churchDAWCopySetting (settingsFile, "audioSetupGood", "audioSetup"))
+    {
+        juce::Logger::writeToLog (
+            "RECOVERY: setup de audio pendente descartado; ultima configuracao "
+            "boa restaurada (backup em audioSetup.recovered-" + stamp + ".xml)");
+        return "restaurada";
+    }
+
+    juce::Logger::writeToLog (
+        "RECOVERY: setup de audio pendente descartado; sem configuracao boa "
+        "conhecida, abrindo com o audio padrao (backup em audioSetup.recovered-"
+        + stamp + ".xml)");
+    return "descartada";
+}
+#endif
+
 //==============================================================================
-class ChurchDAWApplication : public juce::JUCEApplication
+class ChurchDAWApplication : public juce::JUCEApplication,
+                             private juce::AsyncUpdater,
+                             private juce::Timer
 {
 public:
-    ChurchDAWApplication() = default;
+    ChurchDAWApplication()
+    {
+        mainWindowTeardownGate.setDrainReadyCallback (
+            this, [] (void* context) noexcept
+            {
+                static_cast<ChurchDAWApplication*> (context)
+                    ->triggerAsyncUpdate();
+            });
+    }
 
     const juce::String getApplicationName() override { return "ChurchDAW"; }
     const juce::String getApplicationVersion() override
@@ -718,6 +996,21 @@ public:
 
     void initialise (const juce::String& commandLine) override
     {
+       #if JUCE_ANDROID
+        juce::Logger::writeToLog (
+            "CHURCHDAW_RELEASE_LICENSE_GATE=ANDROID_ENABLED");
+       #elif CHURCHDAW_DESKTOP_LICENSING && (JUCE_WINDOWS || JUCE_MAC)
+        juce::Logger::writeToLog (
+            "CHURCHDAW_RELEASE_LICENSE_GATE=DESKTOP_ENABLED");
+       #elif JUCE_WINDOWS || JUCE_MAC
+        juce::Logger::writeToLog (
+            "CHURCHDAW_RELEASE_LICENSE_GATE=DESKTOP_DISABLED_TEST_ONLY");
+       #endif
+
+        safeModeRequested = commandLine.containsIgnoreCase ("--churchdaw-safe-mode");
+        if (safeModeRequested)
+            juce::Logger::writeToLog (
+                "SAFE_MODE: solicitado pela linha de comando");
        #if CHURCHDAW_HOSTS_PLUGINS
         // O ChurchDAW relanca A SI MESMO como processo de varredura: quando
         // a linha de comando traz o canal do scanner, esta instancia NAO e
@@ -791,62 +1084,128 @@ public:
             juce::Logger::setCurrentLogger (fileLogger.get());
         }
 
+        // Queda sem rastro era o pior caso de suporte: o log parava numa linha
+        // qualquer e ninguem sabia ONDE o app morreu. Agora a pilha vai para o
+        // mesmo ChurchDAW.log que o cliente ja sabe mandar. No Windows o JUCE
+        // simboliza pelo .pdb ao lado do exe (quando existe); sem ele ainda
+        // sai modulo + deslocamento. Roda na thread que falhou, com o processo
+        // ja condenado: melhor esforco, sem nada alem de escrever a linha.
+        juce::SystemStats::setApplicationCrashHandler ([] (void*)
+        {
+            juce::Logger::writeToLog ("CRASH: excecao nao tratada; pilha:\n"
+                                      + juce::SystemStats::getStackBacktrace());
+        });
+
+       #if JUCE_WINDOWS
+        // Antes de nascer qualquer thread de audio: tira o processo do EcoQoS
+        // do Windows 11. Sem isto, com o ChurchDAW atras do software de
+        // projecao, o sistema pode empurrar o motor para nucleos de eficiencia
+        // e o som pipoca sem a CPU estar cheia (ver WindowsAudioPerformance.h).
+        juce::Logger::writeToLog (
+            juce::String ("WINDOWS_QOS high_qos=")
+            + (ChurchDAWWindowsPerformance::optProcessOutOfPowerThrottling() ? "1" : "0"));
+       #endif
+
+       #if JUCE_WINDOWS || JUCE_MAC
+        // GUARDA DE ABERTURA (crash-loop breaker): veja churchDAWBootMarkerFile.
+        // Marker vivo = fechamento anterior anormal (crash de driver/plugin,
+        // queda de luz, kill). Reage: MODO SEGURO (safeModeRequested ja pula
+        // audioSetup, cadeia e plugins de terceiros em MainComponent) e
+        // QUARENTENA do setup suspeito, para o proximo boot limpo nao
+        // restaurar de novo o que matou o processo e recriar o loop.
+        const auto bootMarkerFile = churchDAWBootMarkerFile();
+        if (bootMarkerFile.existsAsFile())
+        {
+            juce::Logger::writeToLog (
+                "RECOVERY: fechamento anterior terminou de forma anormal; "
+                "iniciando em MODO SEGURO (audio padrao, sem restaurar "
+                "cadeia/plugins; reescolha o driver em Configuracoes de audio)");
+            safeModeRequested = true;
+
+            const auto stamp = juce::Time::getCurrentTime()
+                                   .formatted ("%Y%m%d-%H%M%S");
+            const auto settingsFile = bootMarkerFile.getParentDirectory()
+                                          .getChildFile ("ChurchDAW.settings");
+            auto xmlPendente = juce::parseXML (settingsFile);
+            const bool audioPendente = xmlPendente != nullptr
+                && xmlPendente->getIntAttribute ("audioSetupPending", 0) == 1;
+
+            if (audioPendente)
+            {
+                // O suspeito e o setup novo que o musico acabou de escolher:
+                // devolvemos a ultima configuracao que comprovadamente rodou.
+                recoveryNotice = churchDAWDiscardPendingAudio (settingsFile, stamp);
+
+                if (recoveryNotice == "restaurada")
+                {
+                    // Aqui o modo seguro seria um tiro no pe: ele ignora o
+                    // setup de audio -- exatamente o que acabamos de restaurar.
+                    // Com a configuracao boa de volta, abrimos normal.
+                    safeModeRequested = false;
+                    juce::Logger::writeToLog (
+                        "RECOVERY: abrindo normalmente com a ultima configuracao boa "
+                        "(modo seguro desligado)");
+                }
+            }
+            else
+            {
+                // Nada foi trocado pelo musico, entao um fechamento anormal
+                // sozinho NAO e prova contra o setup de audio. So no segundo
+                // seguido a gente mexe na configuracao.
+                const int strikes = churchDAWRecoveryStrikes() + 1;
+                churchDAWSetRecoveryStrikes (strikes);
+
+                if (strikes < 2)
+                {
+                    safeModeRequested = false;
+                    juce::Logger::writeToLog (
+                        "RECOVERY: fechamento anormal (" + juce::String (strikes)
+                        + "/2); abrindo com a configuracao salva, sem quarentena. "
+                          "Se o app cair de novo no proximo boot, o setup entra "
+                          "em quarentena.");
+                }
+                else if (churchDAWCopySetting (settingsFile, "audioSetupGood",
+                                               "audioSetup"))
+                {
+                    // Segunda queda seguida: o suspeito e o setup atual, mas
+                    // em vez de jogar o musico no padrao de fabrica devolvemos
+                    // a ultima configuracao que comprovadamente abriu.
+                    churchDAWQuarantineSetting (settingsFile, "chain", stamp);
+                    churchDAWSetRecoveryStrikes (0);
+                    safeModeRequested = false;
+                    juce::Logger::writeToLog (
+                        "RECOVERY: segunda queda seguida; ultima configuracao "
+                        "boa restaurada (backup em audioSetup.recovered-"
+                        + stamp + ".xml)");
+                    recoveryNotice = "restaurada";
+                }
+                else
+                {
+                    churchDAWQuarantineSetting (settingsFile, "audioSetup", stamp);
+                    churchDAWQuarantineSetting (settingsFile, "chain", stamp);
+                    churchDAWSetRecoveryStrikes (0);
+                    juce::Logger::writeToLog (
+                        "RECOVERY: segunda queda seguida e sem configuracao boa "
+                        "conhecida; audioSetup/chain anteriores preservados em "
+                        "*.recovered-" + stamp + ".xml");
+                    recoveryNotice = "quarentena";
+                }
+            }
+        }
+        bootMarkerFile.getParentDirectory().createDirectory();
+        bootMarkerFile.replaceWithText (
+            juce::Time::getCurrentTime().toISO8601 (true));
+
+        // O aviso de recuperacao espera a janela existir para nao nascer
+        // atras dela. A promocao do setup de audio acontece no MainComponent,
+        // que conhece o estado real do device.
+        confirmacaoAudioTimer.startTimer (3000);
+       #endif
+
         juce::LookAndFeel::setDefaultLookAndFeel (&nordLookAndFeel);
 
-        // traduz os textos internos do JUCE (seletor de audio/MIDI) pra pt-BR
-        juce::LocalisedStrings::setCurrentMappings (new juce::LocalisedStrings (juce::String::fromUTF8 (
-            "language: pt-BR\n"
-            "countries: br\n"
-            "\"Audio device type:\" = \"Tipo de driver:\"\n"
-            "\"Device:\" = \"Dispositivo:\"\n"
-            "\"Output:\" = \"Sa\xc3\xad" "da:\"\n"
-            "\"Input:\" = \"Entrada:\"\n"
-            "\"Active output channels:\" = \"Sa\xc3\xad" "das ativas:\"\n"
-            "\"Active input channels:\" = \"Entradas ativas:\"\n"
-            "\"Sample rate:\" = \"Taxa de amostragem:\"\n"
-            "\"Audio buffer size:\" = \"Tamanho do buffer:\"\n"
-            "\"Control Panel\" = \"Painel do driver\"\n"
-            "\"Opens the device's own control panel\" = \"Abre o painel de controle da interface\"\n"
-            "\"Reset Device\" = \"Resetar\"\n"
-            "\"Resets the audio interface - sometimes needed after changing a device's properties in its custom control panel\" = \"Reinicia a interface de \xc3\xa1udio\"\n"
-            "\"Test\" = \"Testar\"\n"
-            "\"Plays a test tone\" = \"Toca um tom de teste\"\n"
-            "\"Active MIDI inputs:\" = \"Entradas MIDI ativas:\"\n"
-            "\"MIDI Output:\" = \"Sa\xc3\xad" "da MIDI:\"\n"
-            "\"No MIDI inputs available\" = \"Nenhuma entrada MIDI\"\n"
-            "\"(no audio output channels found)\" = \"(sem canais de sa\xc3\xad" "da)\"\n"
-            "\"(no audio input channels found)\" = \"(sem canais de entrada)\"\n"
-            "\"none\" = \"nenhum\"\n"
-            "\"Show advanced settings...\" = \"Mostrar avan\xc3\xa7" "adas...\"\n"
-            "\"Error when trying to open audio device!\" = \"Erro ao abrir o dispositivo de \xc3\xa1udio!\"\n"
-            "\"OK\" = \"OK\"\n"
-            // janela de plugins (PluginListComponent) — vinha toda em ingles
-            "\"Name\" = \"Nome\"\n"
-            "\"Format\" = \"Formato\"\n"
-            "\"Category\" = \"Categoria\"\n"
-            "\"Manufacturer\" = \"Fabricante\"\n"
-            "\"Description\" = \"Descri\xc3\xa7\xc3\xa3o\"\n"
-            "\"Options...\" = \"Op\xc3\xa7\xc3\xb5" "es...\"\n"
-            "\"Scan\" = \"Escanear\"\n"
-            "\"Cancel\" = \"Cancelar\"\n"
-            "\"Clear list\" = \"Limpar lista\"\n"
-            // o JUCE troca XFMTX pelo nome do formato DEPOIS de traduzir
-            "\"Scan for new or updated XFMTX plug-ins\" = \"Escanear plugins XFMTX novos ou atualizados\"\n"
-            "\"Remove all XFMTX plug-ins\" = \"Remover todos os plugins XFMTX\"\n"
-            "\"Remove selected plug-in from list\" = \"Remover o plugin selecionado\"\n"
-            "\"Remove plug-in from list\" = \"Remover o plugin da lista\"\n"
-            "\"Remove any plug-ins whose files no longer exist\" = \"Remover plugins que n\xc3\xa3o existem mais\"\n"
-            "\"Show folder containing selected plug-in\" = \"Abrir a pasta do plugin selecionado\"\n"
-            "\"Show folder containing plug-in\" = \"Abrir a pasta do plugin\"\n"
-            "\"Select folders to scan...\" = \"Escolha as pastas para escanear...\"\n"
-            "\"Scanning for plug-ins...\" = \"Procurando plugins...\"\n"
-            "\"Searching for all possible plug-in files...\" = \"Vasculhando os arquivos de plugin...\"\n"
-            "\"Testing\" = \"Testando\"\n"
-            "\"Scan complete\" = \"Escaneamento conclu\xc3\xad" "do\"\n"
-            "\"Plugin Scanning\" = \"Escaneamento de plugins\"\n"
-            "\"Deactivated after failing to initialise correctly\" = \"Desativado: consulte etapa, chamada e c\xc3\xb3" "digo no relat\xc3\xb3rio de scan\"\n"
-            "\"The following files encountered fatal errors during validation\" = \"Falhas isoladas (crash, timeout ou incompatibilidade). O motivo exato foi salvo em Library/Logs/ChurchDAW/PluginScan\"\n"
-            "\"The following files appeared to be plugin files, but failed to load correctly\" = \"Plugins recusados na valida\xc3\xa7\xc3\xa3o. Consulte etapa, chamada, c\xc3\xb3" "digo e stack no relat\xc3\xb3rio de scan\"\n"), false));
+        // traduz os textos internos do JUCE (seletor de audio/MIDI e janela de plugins) pra pt-BR
+        NordLookAndFeel::installPortugueseStrings();
 
        #if JUCE_ANDROID && defined (CHURCHDAW_ANDROID_UI_QA)
         // SOMENTE matriz visual local: permite abrir o mixer no emulador sem
@@ -1149,17 +1508,6 @@ public:
                             ->requestPasswordReset (
                                 std::move (email));
                 };
-            androidLoginWindow->panel.onBuy = []
-            {
-                ChurchDAWAndroidLicensing::Client::
-                    purchaseUrl().launchInDefaultBrowser();
-            };
-            androidLoginWindow->panel.onSupport = []
-            {
-                juce::URL (
-                    "https://churchdaw.com/#duvidas")
-                    .launchInDefaultBrowser();
-            };
             androidLoginWindow->panel.onManageActivation = []
             {
                 ChurchDAWAndroidLicensing::Client::
@@ -1233,71 +1581,305 @@ public:
    #if CHURCHDAW_DESKTOP_LICENSING && (JUCE_WINDOWS || JUCE_MAC)
     void beginDesktopLicenseGate()
     {
-        licenseClient =
-            std::make_unique<ChurchDAWDesktopLicensing::Client>();
+        ++desktopLicenseGateEpoch;
+        if (licenseClient == nullptr)
+        {
+            licenseClient =
+                std::make_unique<ChurchDAWDesktopLicensing::Client>();
+            auto guard = applicationAlive;
+            licenseClient->onSnapshot =
+                [this, guard] (
+                    const ChurchDAWDesktopLicensing::Snapshot& snapshot)
+                {
+                    if (! guard->load())
+                        return;
+
+                    handleDesktopLicenseSnapshot (snapshot);
+                };
+        }
+
+        licenseGatePassed = false;
+        desktopTerminalTransitionPending = false;
+        showDesktopLoginWindow();
+        licenseClient->resumeSavedSession();
+    }
+
+    void showDesktopLoginWindow()
+    {
+        if (loginWindow != nullptr || licenseClient == nullptr)
+            return;
+
         loginWindow = std::make_unique<DesktopLoginWindow> (
             loadChurchDAWBrandImage());
-
         loginWindow->panel.onLogin =
-            [this] (juce::String email,
-                    juce::String password,
-                    bool remember)
-            {
-                if (licenseClient != nullptr)
-                    licenseClient->login (std::move (email),
-                                          std::move (password),
+                [this] (juce::String identifier,
+                        juce::String password,
+                        bool remember)
+                {
+                    if (licenseClient != nullptr)
+                        licenseClient->login (std::move (identifier),
+                                              std::move (password),
                                           remember);
             };
-
         loginWindow->panel.onForgotPassword =
             [this] (juce::String email)
             {
                 if (licenseClient != nullptr)
                     licenseClient->requestPasswordReset (std::move (email));
             };
-
         loginWindow->panel.onBuy = []
         {
             ChurchDAWDesktopLicensing::Client::purchaseUrl()
                 .launchInDefaultBrowser();
         };
-
         loginWindow->panel.onManageActivation = []
         {
             ChurchDAWDesktopLicensing::Client::accountPortalUrl()
                 .launchInDefaultBrowser();
         };
+        loginWindow->panel.onUpdateClient = []
+        {
+            ChurchDAWDesktopLicensing::Client::downloadUrl()
+                .launchInDefaultBrowser();
+        };
+        loginWindow->panel.applySnapshot (
+            licenseClient->currentSnapshot());
+    }
+
+    bool desktopLicenseGateAllowsOpen (juce::uint64 expectedEpoch) const
+    {
+        if (licenseClient == nullptr)
+            return false;
+
+        return ChurchDAWDesktopLicensing::gateEpochAllowsOpen (
+            expectedEpoch,
+            desktopLicenseGateEpoch,
+            licenseGatePassed,
+            desktopTerminalTransitionPending,
+            licenseClient->currentSnapshot());
+    }
+
+    void handleDesktopLicenseSnapshot (
+        const ChurchDAWDesktopLicensing::Snapshot& snapshot)
+    {
+        if (loginWindow != nullptr)
+            loginWindow->panel.applySnapshot (snapshot);
+
+       #if CHURCHDAW_DESKTOP_LICENSING && (JUCE_WINDOWS || JUCE_MAC)
+        avisarSeLicencaPertoDeVencer (snapshot);
+       #endif
+
+        if (snapshot.requiresAppClosure)
+        {
+            handleDesktopRuntimeTermination (snapshot);
+            return;
+        }
+
+        if (! snapshot.canOpenApp || licenseGatePassed
+            || desktopTerminalTransitionPending)
+            return;
+
+        licenseGatePassed = true;
+        const auto openEpoch = ++desktopLicenseGateEpoch;
+        const bool reopenMainWindow = desktopReturnToMainAfterLogin;
+        auto guard = applicationAlive;
+        juce::Timer::callAfterDelay (
+            280, [this, guard, reopenMainWindow, openEpoch]
+        {
+            if (! guard->load()
+                || ! desktopLicenseGateAllowsOpen (openEpoch))
+                return;
+
+            loginWindow = nullptr;
+            desktopReturnToMainAfterLogin = false;
+            if (reopenMainWindow)
+                beginMainWindow();
+            else
+                beginPostLicenseStartup();
+        });
+    }
+
+    void mostrarAvisoLicenca (const juce::String& titulo,
+                              const juce::String& corpo)
+    {
+        juce::AlertWindow::showMessageBoxAsync (
+            juce::MessageBoxIconType::WarningIcon,
+            titulo, corpo, juce::String::fromUTF8 ("Entendi"));
+    }
+
+    // Avisa ANTES de vencer: hoje o musico so descobre que a licenca venceu
+    // quando o app ja fechou a janela. Cinco dias de antecedencia dao tempo de
+    // conectar a igreja na internet sem correria.
+    void avisarSeLicencaPertoDeVencer (
+        const ChurchDAWDesktopLicensing::Snapshot& snapshot)
+    {
+        if (licenseExpiryWarned || snapshot.offlineUntil <= 0
+            || ! snapshot.canOpenApp)
+            return;
+
+        const auto agoraSegundos = juce::Time::currentTimeMillis() / 1000;
+        const auto restante = snapshot.offlineUntil - agoraSegundos;
+        if (restante <= 0 || restante > 5LL * 86400LL)
+            return;
+
+        licenseExpiryWarned = true;
+        const int dias = (int) ((restante + 86399LL) / 86400LL);
+        mostrarAvisoLicenca (
+            "Conecte a internet para renovar",
+            "Faltam cerca de " + juce::String (dias)
+                + " dia(s) para o ChurchDAW exigir uma nova validacao da "
+                  "licenca. Abra o app conectado por alguns minutos e a "
+                  "validacao se renova sem pressa.");
+    }
+
+    // Adia o encerramento por licenca enquanto houver som saindo. O gate de
+    // licenca roda em thread propria e NAO depende de rede, entao sem isto a
+    // janela fechava no meio do culto exatamente no dia do vencimento.
+    bool adiarEncerramentoSeHouverSom (
+        const ChurchDAWDesktopLicensing::Snapshot& snapshot)
+    {
+        const auto agora = juce::Time::currentTimeMillis();
+
+        if (! ChurchDAWAudioActivity::audibleWithin (15000))
+        {
+            desktopTerminationDeferredAtMs = 0;
+            return false;
+        }
+
+        if (desktopTerminationDeferredAtMs <= 0)
+            desktopTerminationDeferredAtMs = agora;
+
+        // Toleranca: meia hora de som cobre o resto de um culto sem permitir
+        // uso indefinido depois do vencimento.
+        if ((agora - desktopTerminationDeferredAtMs) >= (30LL * 60LL * 1000LL))
+            return false;
+
+        if (desktopTerminationDeferredAtMs != agora)
+            return true;   // reavaliacao ja agendada
+
+        mostrarAvisoLicenca (
+            "Licenca vencida — vamos fechar quando o som parar",
+            "Ainda ha som saindo, entao o ChurchDAW nao fecha agora. Conecte a "
+            "internet para renovar; se nao renovar, o app encerra assim que o "
+            "audio ficar em silencio.");
 
         auto guard = applicationAlive;
-        licenseClient->onSnapshot =
-            [this, guard] (
-                const ChurchDAWDesktopLicensing::Snapshot& snapshot)
+        const auto epoch = desktopLicenseGateEpoch;
+        juce::Timer::callAfterDelay (
+            30000,
+            [this, guard, epoch, snap = snapshot]
             {
-                if (! guard->load() || loginWindow == nullptr)
+                if (! guard->load() || epoch != desktopLicenseGateEpoch)
+                    return;
+                handleDesktopRuntimeTermination (snap);
+            });
+        return true;
+    }
+
+    void handleDesktopRuntimeTermination (
+        ChurchDAWDesktopLicensing::Snapshot terminalSnapshot)
+    {
+       #if CHURCHDAW_DESKTOP_LICENSING && (JUCE_WINDOWS || JUCE_MAC)
+        if (adiarEncerramentoSeHouverSom (terminalSnapshot))
+            return;
+       #endif
+
+        if (desktopTerminalTransitionPending)
+        {
+            licenseGatePassed = false;
+            return;
+        }
+
+        const bool hadMainSurface = mainWindow != nullptr
+                                 || startingMainWindow
+                                 || splash != nullptr;
+        const auto transitionEpoch = ++desktopLicenseGateEpoch;
+        licenseGatePassed = false;
+        desktopTerminalTransitionPending = true;
+        desktopReturnToMainAfterLogin = hadMainSurface;
+        startingMainWindow = false;
+        const bool needsFade = mainWindow != nullptr
+                            && mainWindow->content() != nullptr;
+        if (needsFade)
+            mainWindow->content()->beginLicenseFadeOut();
+
+        auto guard = applicationAlive;
+        juce::Timer::callAfterDelay (
+            needsFade ? 900 : 50,
+            [this, guard, transitionEpoch,
+             terminalSnapshot = std::move (terminalSnapshot)]
+            {
+                if (! guard->load()
+                    || transitionEpoch != desktopLicenseGateEpoch)
                     return;
 
-                loginWindow->panel.applySnapshot (snapshot);
+                gate = nullptr;
+                splash = nullptr;
+                startupWindow = nullptr;
+                requestMainWindowTeardown (
+                    [this, terminalSnapshot = std::move (terminalSnapshot)]
+                    {
+                        startingMainWindow = false;
+                        licenseGatePassed = false;
+                        desktopTerminalTransitionPending = false;
+                        showDesktopLoginWindow();
+                        if (loginWindow != nullptr)
+                            loginWindow->panel.applySnapshot (
+                                terminalSnapshot);
+                    });
+            });
+    }
 
-                if (! snapshot.canOpenApp || licenseGatePassed)
+    void handleDesktopUserLogout()
+    {
+        if (licenseClient == nullptr || desktopTerminalTransitionPending)
+            return;
+
+        const auto transitionEpoch = ++desktopLicenseGateEpoch;
+        licenseGatePassed = false;
+        desktopTerminalTransitionPending = true;
+        desktopReturnToMainAfterLogin = false;
+        startingMainWindow = false;
+
+        const bool needsFade = mainWindow != nullptr
+                            && mainWindow->content() != nullptr;
+        if (needsFade)
+            mainWindow->content()->beginLicenseFadeOut();
+
+        // O cliente invalida runtime/cofre local antes de qualquer rede. O POST
+        // remoto usa apenas uma copia transitoria e segue em segundo plano.
+        licenseClient->signOut();
+
+        auto guard = applicationAlive;
+        juce::Timer::callAfterDelay (
+            needsFade ? 900 : 50,
+            [this, guard, transitionEpoch]
+            {
+                if (! guard->load()
+                    || transitionEpoch != desktopLicenseGateEpoch)
                     return;
 
-                licenseGatePassed = true;
-                juce::Timer::callAfterDelay (280, [this, guard]
-                {
-                    if (! guard->load())
-                        return;
-
-                    loginWindow = nullptr;
-                    beginPostLicenseStartup();
-                });
-            };
-
-        licenseClient->resumeSavedSession();
+                gate = nullptr;
+                splash = nullptr;
+                startupWindow = nullptr;
+                requestMainWindowTeardown (
+                    [this]
+                    {
+                        startingMainWindow = false;
+                        desktopTerminalTransitionPending = false;
+                        showDesktopLoginWindow();
+                        if (loginWindow != nullptr
+                             && licenseClient != nullptr)
+                            loginWindow->panel.applySnapshot (
+                                licenseClient->currentSnapshot());
+                    });
+            });
     }
    #endif
 
     void startStartupCheck()
     {
+        retireCheckThreadNonBlocking (startupCheck);
         auto guard = applicationAlive;
         startupCheck = std::make_unique<ChurchDAWStartupCheckThread> (
             [this, guard] (ChurchDAWServices::StartupCheck check)
@@ -1311,6 +1893,7 @@ public:
     void recheckLocalLibrary (
         ChurchDAWServices::StartupCheck check)
     {
+        retireCheckThreadNonBlocking (startupCheck);
         auto guard = applicationAlive;
         startupCheck = std::make_unique<ChurchDAWStartupCheckThread> (
             std::move (check),
@@ -1469,9 +2052,116 @@ public:
             );
     }
 
+    MainComponent* currentMainContent() const noexcept
+    {
+       #if JUCE_IOS
+        return startupWindow != nullptr ? startupWindow->content() : nullptr;
+       #else
+        return mainWindow != nullptr ? mainWindow->content() : nullptr;
+       #endif
+    }
+
+    // Every runtime owner transition enters here. The application owns both
+    // the gate and the single continuation, so they outlive MainComponent and
+    // MainWindow. Multiple requests coalesce; the first continuation wins,
+    // while a later terminal request upgrades the same completion to quit.
+    void requestMainWindowTeardown (
+        std::function<void()> continuation = {},
+        bool quitAfterTeardown = false)
+    {
+        jassert (juce::MessageManager::getInstance()->isThisTheMessageThread());
+
+        if (mainWindowTeardownPending)
+        {
+            quitAfterMainWindowTeardown =
+                quitAfterMainWindowTeardown || quitAfterTeardown;
+            return;
+        }
+
+        mainWindowTeardownPending = true;
+        quitAfterMainWindowTeardown = quitAfterTeardown;
+        mainWindowTeardownContinuation = std::move (continuation);
+        (void) mainWindowTeardownGate.requestClose();
+
+        if (auto* content = currentMainContent())
+            content->beginOwnerTeardown();
+    }
+
+    bool mainWindowTeardownCanRun() const noexcept
+    {
+        if (! mainWindowTeardownGate.isClosedAndDrained())
+            return false;
+        if (auto* content = currentMainContent())
+            return content->ownerTeardownIsReady();
+        return true;
+    }
+
+    void destroyCurrentMainSurfaceAfterDrain()
+    {
+        jassert (mainWindowTeardownCanRun());
+       #if JUCE_IOS
+        if (startupWindow != nullptr)
+            startupWindow->clearMainContent();
+       #else
+        mainWindow = nullptr; // fecha callbacks de audio/MIDI
+       #endif
+    }
+
+    void handleAsyncUpdate() override
+    {
+        (void) mainWindowTeardownGate.consumeScheduledDrain();
+        if (! mainWindowTeardownPending)
+            return;
+
+        if (! mainWindowTeardownCanRun())
+        {
+            startTimer (1);
+            return;
+        }
+
+        stopTimer();
+        destroyCurrentMainSurfaceAfterDrain();
+        const bool reset = mainWindowTeardownGate.resetAfterDrain();
+        jassert (reset);
+        juce::ignoreUnused (reset);
+
+        auto continuation = std::move (mainWindowTeardownContinuation);
+        const bool shouldQuit = quitAfterMainWindowTeardown;
+        mainWindowTeardownContinuation = {};
+        mainWindowTeardownPending = false;
+        quitAfterMainWindowTeardown = false;
+
+        if (continuation != nullptr)
+            continuation();
+        if (shouldQuit)
+            quit();
+    }
+
+    void timerCallback() override
+    {
+        if (! mainWindowTeardownPending)
+        {
+            stopTimer();
+            return;
+        }
+
+        if (mainWindowTeardownCanRun())
+        {
+            stopTimer();
+            triggerAsyncUpdate();
+        }
+    }
+
     void beginMainWindow()
     {
-        if (mainWindow != nullptr || startingMainWindow)
+        juce::uint64 expectedDesktopLicenseEpoch = 0;
+       #if CHURCHDAW_DESKTOP_LICENSING && (JUCE_WINDOWS || JUCE_MAC)
+        expectedDesktopLicenseEpoch = desktopLicenseGateEpoch;
+        if (! desktopLicenseGateAllowsOpen (expectedDesktopLicenseEpoch))
+            return;
+       #endif
+
+        if (currentMainContent() != nullptr || startingMainWindow)
             return;
 
        #if JUCE_ANDROID
@@ -1491,25 +2181,69 @@ public:
         // A solicitacao nasce dentro de um botao/timer do proprio StartupPanel.
         // Destruir o painel nessa mesma pilha seria use-after-free; o proximo
         // evento faz a troca de janelas com seguranca.
-        juce::MessageManager::callAsync ([this, guard]
+        juce::MessageManager::callAsync (
+            [this, guard, expectedDesktopLicenseEpoch]
         {
             if (! guard->load())
                 return;
 
-            splash = std::make_unique<SplashWindow>();
-            startupWindow = nullptr;
-
-            // Deixa a splash nova chegar a tela antes do construtor pesado.
-            juce::Timer::callAfterDelay (100, [this, guard]
+           #if CHURCHDAW_DESKTOP_LICENSING && (JUCE_WINDOWS || JUCE_MAC)
+            if (! desktopLicenseGateAllowsOpen (
+                    expectedDesktopLicenseEpoch))
             {
-                if (guard->load())
-                    createMainWindow();
+                startingMainWindow = false;
+                return;
+            }
+           #endif
+
+           #if JUCE_IOS
+            // Cada TopLevelWindow vira um UIWindow/UIViewController nativo no
+            // iOS. O StartupWindow continua como a unica janela raiz; depois
+            // dos gates, apenas seu conteudo interno e trocado pela DAW.
+            splash = nullptr;
+            constexpr int nativeWindowTransitionDelayMs = 50;
+           #else
+            splash = std::make_unique<SplashWindow>();
+            constexpr int nativeWindowTransitionDelayMs = 100;
+            startupWindow = nullptr;
+           #endif
+
+            // Deixa a troca de janela terminar antes do construtor pesado.
+            juce::Timer::callAfterDelay (
+                nativeWindowTransitionDelayMs,
+                [this, guard, expectedDesktopLicenseEpoch]
+            {
+                if (! guard->load())
+                    return;
+
+               #if CHURCHDAW_DESKTOP_LICENSING && (JUCE_WINDOWS || JUCE_MAC)
+                if (! desktopLicenseGateAllowsOpen (
+                        expectedDesktopLicenseEpoch))
+                {
+                    startingMainWindow = false;
+                    splash = nullptr;
+                    return;
+                }
+               #endif
+
+                createMainWindow (expectedDesktopLicenseEpoch);
             });
         });
     }
 
-    void createMainWindow()
+    void createMainWindow (juce::uint64 expectedDesktopLicenseEpoch = 0)
     {
+       #if CHURCHDAW_DESKTOP_LICENSING && (JUCE_WINDOWS || JUCE_MAC)
+        if (! desktopLicenseGateAllowsOpen (expectedDesktopLicenseEpoch))
+        {
+            startingMainWindow = false;
+            splash = nullptr;
+            return;
+        }
+       #else
+        juce::ignoreUnused (expectedDesktopLicenseEpoch);
+       #endif
+
        #if JUCE_ANDROID
         // Cobre o intervalo entre beginMainWindow() e este callback (splash).
         if (foregroundRevalidationPending)
@@ -1521,7 +2255,41 @@ public:
         }
        #endif
 
-        mainWindow = std::make_unique<MainWindow> (getApplicationName());
+       #if JUCE_IOS
+        if (startupWindow == nullptr)
+        {
+            startingMainWindow = false;
+            return;
+        }
+        startupWindow->showMainContent (
+            safeModeRequested, &mainWindowTeardownGate);
+       #elif CHURCHDAW_DESKTOP_LICENSING && (JUCE_WINDOWS || JUCE_MAC)
+        auto guard = applicationAlive;
+        mainWindow = std::make_unique<MainWindow> (
+            getApplicationName(),
+            [this, guard]
+            {
+                if (guard->load())
+                    handleDesktopUserLogout();
+            }, safeModeRequested, &mainWindowTeardownGate);
+       #else
+        mainWindow = std::make_unique<MainWindow> (
+            getApplicationName(), std::function<void()> {}, safeModeRequested,
+            &mainWindowTeardownGate);
+       #endif
+
+       #if CHURCHDAW_DESKTOP_LICENSING && (JUCE_WINDOWS || JUCE_MAC)
+        if (! desktopLicenseGateAllowsOpen (expectedDesktopLicenseEpoch))
+        {
+            requestMainWindowTeardown (
+                [this]
+                {
+                    startingMainWindow = false;
+                    splash = nullptr;
+                });
+            return;
+        }
+       #endif
 
        #if JUCE_ANDROID
         if (androidTrialActive && androidTrialExpiresAt > 0)
@@ -1529,8 +2297,8 @@ public:
                 *this, androidTrialExpiresAt);
        #endif
 
-        if (splash != nullptr && mainWindow->content() != nullptr)
-            gate = std::make_unique<LoadGate> (*splash, *mainWindow->content(),
+        if (splash != nullptr && currentMainContent() != nullptr)
+            gate = std::make_unique<LoadGate> (*splash, *currentMainContent(),
                                                [this] { splash = nullptr; });
         else
             juce::Timer::callAfterDelay (900, [this] { splash = nullptr; });
@@ -1538,6 +2306,14 @@ public:
 
     void suspended() override
     {
+       #if JUCE_IOS || JUCE_ANDROID
+        if (auto* content = currentMainContent()) content->suspendChurchCam();
+       #endif
+       #if CHURCHDAW_DESKTOP_LICENSING && (JUCE_WINDOWS || JUCE_MAC)
+        if (licenseClient != nullptr)
+            licenseClient->applicationSuspended();
+       #endif
+
        #if JUCE_ANDROID
         foregroundReturnPending = true;
         // Marque no momento em que o app sai: um cold check/timer pode terminar
@@ -1548,11 +2324,27 @@ public:
 
     void resumed() override
     {
+       #if JUCE_IOS || JUCE_ANDROID
+        if (auto* content = currentMainContent())
+        {
+            content->resumeChurchCam();
+           #if JUCE_IOS
+            content->ensureMobileAudioRunningAfterResume();
+           #endif
+        }
+       #endif
         // Em macOS/Windows/Android o controlador pode voltar do sleep sem o
         // evento que recentraliza pitch bend. O reset e enfileirado no motor e
         // ocorre no proximo bloco, antes de o musico voltar a tocar.
-        if (mainWindow != nullptr && mainWindow->content() != nullptr)
-            mainWindow->content()->resetMidiTransportState();
+        if (auto* content = currentMainContent())
+            content->resetMidiTransportState();
+
+       #if CHURCHDAW_DESKTOP_LICENSING && (JUCE_WINDOWS || JUCE_MAC)
+        // Sleep pode atravessar o prazo de lease ou esconder uma substituicao
+        // de sessao. A thread unica acorda e faz um status imediato.
+        if (licenseClient != nullptr)
+            licenseClient->applicationResumed();
+       #endif
 
        #if JUCE_ANDROID
         if (! foregroundReturnPending)
@@ -1612,7 +2404,13 @@ public:
             startupWindow = std::make_unique<StartupWindow> (std::move (logo));
         }
 
-        startupWindow->panel.onContinue = [this] { beginMainWindow(); };
+        startupWindow->panel.onContinue = [this]
+        {
+            if (androidLicenseGatePassed)
+                requestMainWindowAfterLicense();
+            else
+                beginStartupAfterUpdateGate();
+        };
         startupWindow->panel.showChecking();
         startStartupCheck();
        #endif
@@ -1625,13 +2423,20 @@ public:
         startingMainWindow = false;
         splash = nullptr;
 
+        if (! androidLicenseGatePassed)
+        {
+            startupWindow = nullptr;
+            beginStartupAfterUpdateGate();
+            return;
+        }
+
         if (startupWindow == nullptr)
         {
             auto logo = loadChurchDAWBrandImage();
             startupWindow = std::make_unique<StartupWindow> (std::move (logo));
         }
 
-        startupWindow->panel.onContinue = [this] { beginMainWindow(); };
+        startupWindow->panel.onContinue = [this] { requestMainWindowAfterLicense(); };
         startupWindow->panel.showChecking();
         startStartupCheck();
        #endif
@@ -1644,17 +2449,12 @@ public:
              || foregroundUpdateCheck != nullptr)
             return;
 
-        auto logo = loadChurchDAWBrandImage();
-        startupWindow = std::make_unique<StartupWindow> (std::move (logo));
-        startupWindow->panel.showChecking();
-        startupWindow->panel.onContinue = [this] { beginMainWindow(); };
-
-        // Nao desmonta o motor durante uma verificacao normal: o audio pode
-        // continuar estavel, mas nenhuma funcao da DAW fica acessivel. Se o piso
-        // exigir update, a janela principal e destruida abaixo e o audio para.
-        mainWindow->setEnabled (false);
-        mainWindow->setVisible (false);
-
+        // A DAW NAO pode sumir atras de uma checagem de rede toda vez que o
+        // app volta ao primeiro plano no meio do culto. A verificacao roda em
+        // segundo plano e a janela principal continua visivel e utilizavel;
+        // so se o piso exigir update e que o gate aparece (handleForeground
+        // UpdateCheck cuida disso). Antes, setEnabled(false)/setVisible(false)
+        // escondiam a DAW inteira durante a consulta.
         auto guard = applicationAlive;
         startForegroundUpdateCheckThread (std::move (guard));
        #endif
@@ -1664,6 +2464,7 @@ public:
         std::shared_ptr<std::atomic<bool>> guard)
     {
        #if JUCE_ANDROID
+        retireCheckThreadNonBlocking (foregroundUpdateCheck);
         foregroundUpdateCheck =
             std::make_unique<ChurchDAWUpdatePolicyCheckThread> (
                 [this, guard] (ChurchDAWServices::UpdatePolicyCheck check)
@@ -1683,7 +2484,7 @@ public:
        #if JUCE_ANDROID
         foregroundUpdateCheck = nullptr;
 
-        if (mainWindow == nullptr || startupWindow == nullptr)
+        if (mainWindow == nullptr)
             return;
 
         const int installedVersionCode = check.installedVersionCode > 0
@@ -1705,23 +2506,37 @@ public:
 
         if (installedVersionCode < effectiveMinimum)
         {
+            // Update obrigatorio: so AGORA a DAW sai de cena e o gate aparece.
+            // A janela principal e destruida (fecha callbacks de audio/MIDI)
+            // e o StartupWindow mostra o piso exigido.
             foregroundRevalidationPending = false;
             requiredUpdateGateActive = true;
             requiredUpdateFloor = effectiveMinimum;
             gate = nullptr;
             splash = nullptr;
-            mainWindow = nullptr; // fecha callbacks de audio/MIDI antes do gate
-            startingMainWindow = false;
-            startupWindow->panel.showRequiredUpdate (
-                policyForRequiredGate (
-                    std::move (check.policy), effectiveMinimum));
+            requestMainWindowTeardown (
+                [this, effectiveMinimum,
+                 policy = std::move (check.policy)] () mutable
+                {
+                    startingMainWindow = false;
+                    if (startupWindow == nullptr)
+                    {
+                        auto logo = loadChurchDAWBrandImage();
+                        startupWindow = std::make_unique<StartupWindow> (
+                            std::move (logo));
+                    }
+
+                    startupWindow->panel.showRequiredUpdate (
+                        policyForRequiredGate (
+                            std::move (policy), effectiveMinimum));
+                });
             return;
         }
 
         if (foregroundRevalidationPending)
         {
             // Outro suspend/resume ocorreu enquanto esta resposta estava em
-            // voo. Mantenha UI/audio inacessiveis e consulte mais uma vez.
+            // voo. Mantenha a consulta e faca mais uma vez.
             foregroundRevalidationPending = false;
             startForegroundUpdateCheckThread (applicationAlive);
             return;
@@ -1738,9 +2553,119 @@ public:
        #endif
     }
 
+    // Confirma que o setup atual sobreviveu a vida real: promove a ultima
+    // configuracao boa alguns segundos depois de abrir, e mostra o aviso de
+    // recuperacao quando o boot anterior morreu.
+    class ConfirmacaoAudioTimer : public juce::Timer
+    {
+    public:
+        explicit ConfirmacaoAudioTimer (ChurchDAWApplication& dono) : owner (dono) {}
+        void timerCallback() override
+        {
+            stopTimer();
+            owner.mostrarAvisoRecuperacao();
+        }
+    private:
+        ChurchDAWApplication& owner;
+    };
+
+    juce::String recoveryNotice;
+    ConfirmacaoAudioTimer confirmacaoAudioTimer { *this };
+
+    void mostrarAvisoRecuperacao()
+    {
+        if (recoveryNotice.isEmpty())
+            return;
+
+        juce::String titulo, corpo;
+        if (recoveryNotice == "restaurada")
+        {
+            titulo = "Abrimos com o seu audio anterior";
+            corpo = "O driver escolhido na ultima vez travou a abertura, entao "
+                    "voltamos para a configuracao que funcionava antes. Se quiser "
+                    "tentar de novo, abra Configuracoes de audio.";
+        }
+        else if (recoveryNotice == "descartada")
+        {
+            titulo = "Abrimos com o audio padrao";
+            corpo = "O driver escolhido na ultima vez travou a abertura e nao "
+                    "tinha uma configuracao anterior salva. Escolha o driver em "
+                    "Configuracoes de audio.";
+        }
+        else
+        {
+            titulo = "Abrimos em modo seguro";
+            corpo = "A ultima abertura terminou de forma anormal, entao o setup "
+                    "de audio e a cadeia de plugins foram preservados em arquivos "
+                    "*.recovered-* e nao foram restaurados. Reescolha o driver em "
+                    "Configuracoes de audio.";
+        }
+
+        recoveryNotice = juce::String();
+        juce::AlertWindow::showMessageBoxAsync (
+            juce::MessageBoxIconType::WarningIcon,
+            juce::String::fromUTF8 (titulo.toRawUTF8()),
+            juce::String::fromUTF8 (corpo.toRawUTF8()),
+            juce::String::fromUTF8 ("Entendi"));
+    }
+
+   #if JUCE_WINDOWS || JUCE_MAC
+    juce::File churchDAWSettingsFile() const
+    {
+        return churchDAWBootMarkerFile().getParentDirectory()
+            .getChildFile ("ChurchDAW.settings");
+    }
+   #endif
+
     void shutdown() override
     {
+       #if JUCE_WINDOWS || JUCE_MAC
+        // Fechamento chegou ao fim: libera a guarda. O proximo boot restaura
+        // o estado normal do musico. Crash aqui embaixo NAO re-apaga o
+        // marker, entao o boot seguinte entra em MODO SEGURO por seguranca.
+        // Fechamento limpo com audio de pe = o setup atual e confiavel.
+        auto xmlFim = juce::parseXML (churchDAWSettingsFile());
+        churchDAWPromoteGoodAudio (churchDAWSettingsFile(),
+                                   xmlFim != nullptr
+                                       && xmlFim->getIntAttribute ("audioSetupHealthy", 0) == 1);
+
+        churchDAWBootMarkerFile().deleteFile();
+        churchDAWSetRecoveryStrikes (0);
+       #endif
+
         applicationAlive->store (false);
+        cancelPendingUpdate();
+        stopTimer();
+
+        // Normal quit has already gone through requestMainWindowTeardown and
+        // therefore arrives with no content. appWillTerminateByForce may call
+        // shutdown directly on Apple platforms. In that process-terminal-only
+        // case, never spin or destroy through an active vendor frame: leak the
+        // single top-level surface and let process termination reclaim it.
+        if (auto* content = currentMainContent())
+        {
+            (void) mainWindowTeardownGate.requestClose();
+            content->beginOwnerTeardown();
+            if (mainWindowTeardownCanRun())
+            {
+                destroyCurrentMainSurfaceAfterDrain();
+                (void) mainWindowTeardownGate.resetAfterDrain();
+            }
+            else
+            {
+                juce::Logger::writeToLog (
+                    "SHUTDOWN: process-terminal surface retained because a plug-in frame is active");
+               #if JUCE_IOS
+                (void) startupWindow.release();
+               #else
+                (void) mainWindow.release();
+               #endif
+            }
+        }
+
+        mainWindowTeardownPending = false;
+        quitAfterMainWindowTeardown = false;
+        mainWindowTeardownContinuation = {};
        #if CHURCHDAW_DESKTOP_LICENSING && (JUCE_WINDOWS || JUCE_MAC)
         loginWindow = nullptr;
         licenseClient = nullptr;
@@ -1751,13 +2676,12 @@ public:
         androidLicenseClient = nullptr;
         ChurchDAWServices::setLibraryAuthorizationToken ({});
        #endif
-        startupCheck = nullptr;
-        startupUpdateCheck = nullptr;
-        foregroundUpdateCheck = nullptr;
+        retireCheckThreadNonBlocking (startupCheck);
+        retireCheckThreadNonBlocking (startupUpdateCheck);
+        retireCheckThreadNonBlocking (foregroundUpdateCheck);
         gate = nullptr;          // para o timer antes de soltar a janela que ele consulta
         splash = nullptr;
         startupWindow = nullptr;
-        mainWindow = nullptr;
         juce::LookAndFeel::setDefaultLookAndFeel (nullptr);
 
         // O encerramento fica registrado: assim, da proxima vez que o app
@@ -1767,9 +2691,19 @@ public:
         fileLogger = nullptr;
     }
 
+    void memoryWarningReceived() override
+    {
+        juce::Logger::writeToLog ("MEMORY_WARNING: liberando caches descartaveis");
+        if (auto* content = currentMainContent())
+            content->handleMemoryWarning();
+        juce::ImageCache::releaseUnusedImages();
+    }
+
     void systemRequestedQuit() override
     {
-        quit();
+        juce::Logger::writeToLog (
+            "SHUTDOWN_REQUEST: JUCEApplication::systemRequestedQuit");
+        requestMainWindowTeardown ({}, true);
     }
 
    #if JUCE_ANDROID
@@ -1803,20 +2737,69 @@ public:
                        private juce::Timer
     {
     public:
-        explicit MainWindow (const juce::String& name)
+        explicit MainWindow (
+            const juce::String& name,
+            std::function<void()> logoutActionToUse = {},
+            bool safeModeToUse = false,
+            ChurchDAWMidiMapping::DeferredOwnerTeardownGate*
+                teardownGate = nullptr)
             : DocumentWindow (name,
                               NordLookAndFeel::background(),
-                              DocumentWindow::allButtons)
+                              DocumentWindow::allButtons),
+              logoutAction (std::move (logoutActionToUse)),
+              safeMode (safeModeToUse)
         {
-            setUsingNativeTitleBar (true);
-            holder = new ScaledHolder();
+            setUsingNativeTitleBar (false);
+           #if JUCE_ANDROID || JUCE_IOS
+            // Mobile ja possui o header touch do ChurchDAW. A titlebar da
+            // DocumentWindow acrescentava outros 30 dp com icone, titulo e
+            // botoes de desktop; no iPad ela ainda dividia o mesmo espaco com
+            // relogio/Wi-Fi do sistema, deixando todos os textos sobrepostos.
+            setTitleBarButtonsRequired (0, false);
+            setTitleBarHeight (0);
+           #else
+            setTitleBarHeight (30);
+            setTitleBarTextCentred (false);
+            setIcon (loadChurchDAWBrandImage());
+           #endif
+            if (logoutAction != nullptr)
+            {
+                juce::Component::addAndMakeVisible (logoutButton);
+                logoutButton.setTooltip (
+                    "Encerra esta sessao e volta para o login");
+                logoutButton.setColour (
+                    juce::TextButton::buttonColourId,
+                    juce::Colours::transparentBlack);
+                logoutButton.setColour (
+                    juce::TextButton::buttonOnColourId,
+                    NordLookAndFeel::nordRed().withAlpha (0.55f));
+                logoutButton.setColour (
+                    juce::TextButton::textColourOffId,
+                    NordLookAndFeel::txtSecondary());
+                logoutButton.setColour (
+                    juce::TextButton::textColourOnId,
+                    juce::Colours::white);
+                logoutButton.onClick = [this]
+                {
+                    if (logoutAction != nullptr)
+                        logoutAction();
+                };
+            }
+            holder = new ScaledHolder (safeMode, teardownGate);
             setContentOwned (holder, true);
+            startTimer (250);
+           #if JUCE_ANDROID || JUCE_IOS
+            // A janela mobile ocupa a tela do aparelho e nao pode ser
+            // redimensionada pelo usuario. Manter o resizer de desktop ativo
+            // desenhava uma alca diagonal sobre o ultimo canal no Android.
+            setResizable (false, false);
+           #else
             setResizable (true, true);
             // Limite provisório até o peer nativo informar a moldura. O mínimo
             // final é derivado da work area logo abaixo.
             setResizeLimits (760, 480, 32000, 32000);
             centreWithSize (getWidth(), getHeight());
-            setVisible (true);
+           #endif
 
             // Abre ocupando a AREA UTIL da tela. setFullScreen(true) dimensionava a
             // janela pela tela INTEIRA: a barra de titulo empurrava o conteudo pra
@@ -1834,7 +2817,13 @@ public:
            #else
             setFullScreen (true);
            #endif
+            // No iOS, tornar o controller visivel e imediatamente depois
+            // alterna-lo para fullscreen sobrepunha duas transicoes UIKit
+            // ("Unbalanced calls to begin/end appearance transitions"). A
+            // geometria deve estar pronta antes da primeira apresentacao.
+            setVisible (true);
            #else
+            setVisible (true);
             if (auto* display = juce::Desktop::getInstance().getDisplays().getPrimaryDisplay())
             {
                 // userBounds e a area para o CONTEUDO. Com barra de titulo
@@ -1917,7 +2906,22 @@ public:
 
         void closeButtonPressed() override
         {
+            juce::Logger::writeToLog (
+                "SHUTDOWN_REQUEST: MainWindow::closeButtonPressed");
             juce::JUCEApplication::getInstance()->systemRequestedQuit();
+        }
+
+        void resized() override
+        {
+            juce::DocumentWindow::resized();
+            if (logoutButton.isVisible())
+            {
+                constexpr int buttonWidth = 128;
+                logoutButton.setBounds (
+                    juce::jmax (4, getWidth() - buttonWidth - 112),
+                    3, buttonWidth, 24);
+                logoutButton.toFront (false);
+            }
         }
 
         MainComponent* content() const
@@ -1933,6 +2937,40 @@ public:
             if (! bounds.isEmpty() && getBounds() != bounds)
                 setBounds (bounds);
            #endif
+
+           #if ! JUCE_ANDROID && ! JUCE_IOS
+            const juce::File trigger ("/tmp/churchdaw_screenshot_trigger");
+            if (trigger.existsAsFile())
+            {
+                trigger.deleteFile();
+                auto snap = createComponentSnapshot (getLocalBounds(), true, 1.0f);
+                juce::File out ("/Users/igorteixeira/.gemini/antigravity/scratch/churchdaw_app.png");
+                out.deleteFile();
+                juce::FileOutputStream stream (out);
+                if (stream.openedOk())
+                {
+                    juce::PNGImageFormat png;
+                    png.writeImageToStream (snap, stream);
+                    juce::Logger::writeToLog ("SCREENSHOT: salvo em " + out.getFullPathName());
+                }
+            }
+
+            const juce::File padTrigger ("/tmp/churchdaw_pad_trigger");
+            if (padTrigger.existsAsFile())
+            {
+                padTrigger.deleteFile();
+                if (holder != nullptr)
+                    holder->inner.showPadWindow();
+            }
+
+            const juce::File midiMapTrigger ("/tmp/churchdaw_midi_map_trigger");
+            if (midiMapTrigger.existsAsFile())
+            {
+                midiMapTrigger.deleteFile();
+                if (holder != nullptr)
+                    holder->inner.toggleMidiLearn();
+            }
+           #endif
         }
 
         // O layout foi desenhado para ~1280x672 px LOGICOS (tela 1920 no
@@ -1944,7 +2982,14 @@ public:
         // No Windows a 150% a conta da 1.0 e nada muda.
         struct ScaledHolder : public juce::Component
         {
-            ScaledHolder() { addAndMakeVisible (inner); }
+            explicit ScaledHolder (
+                bool safeModeToUse,
+                ChurchDAWMidiMapping::DeferredOwnerTeardownGate*
+                    teardownGate)
+                : inner (safeModeToUse, teardownGate)
+            {
+                addAndMakeVisible (inner);
+            }
 
             void resized() override
             {
@@ -1979,6 +3024,9 @@ public:
         };
 
         ScaledHolder* holder = nullptr;
+        const bool safeMode = false;
+        std::function<void()> logoutAction;
+        juce::TextButton logoutButton { "Sair da conta" };
 
         JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MainWindow)
     };
@@ -2049,18 +3097,21 @@ private:
             gate = nullptr;
             splash = nullptr;
             startupWindow = nullptr;
-            mainWindow = nullptr;
-            startingMainWindow = false;
-            androidTrialActive = false;
-            androidTrialPreparationPending = false;
-            androidTrialReserveWaiting = false;
-            androidTrialStartWaiting = false;
-            androidTrialExpiresAt = 0;
-            androidLicenseGatePassed = false;
-            ChurchDAWServices::setLibraryAuthorizationToken ({});
-            if (androidLicenseClient != nullptr)
-                androidLicenseClient->signOut();
-            showAndroidLoginWindow();
+            requestMainWindowTeardown (
+                [this]
+                {
+                    startingMainWindow = false;
+                    androidTrialActive = false;
+                    androidTrialPreparationPending = false;
+                    androidTrialReserveWaiting = false;
+                    androidTrialStartWaiting = false;
+                    androidTrialExpiresAt = 0;
+                    androidLicenseGatePassed = false;
+                    ChurchDAWServices::setLibraryAuthorizationToken ({});
+                    if (androidLicenseClient != nullptr)
+                        androidLicenseClient->signOut();
+                    showAndroidLoginWindow();
+                });
         });
     }
    #endif
@@ -2157,8 +3208,20 @@ private:
    #if CHURCHDAW_DESKTOP_LICENSING && (JUCE_WINDOWS || JUCE_MAC)
     std::unique_ptr<DesktopLoginWindow> loginWindow;
     std::unique_ptr<ChurchDAWDesktopLicensing::Client> licenseClient;
+    juce::uint64 desktopLicenseGateEpoch = 0;
     bool licenseGatePassed = false;
+    bool desktopTerminalTransitionPending = false;
+    bool desktopReturnToMainAfterLogin = false;
+    // Licenca vencida com som tocando: adia o encerramento ate o silencio
+    // (no maximo 30 min) e avisa quando a janela offline esta perto do fim.
+    juce::int64 desktopTerminationDeferredAtMs = 0;
+    bool licenseExpiryWarned = false;
    #endif
+    ChurchDAWMidiMapping::DeferredOwnerTeardownGate
+        mainWindowTeardownGate;
+    std::function<void()> mainWindowTeardownContinuation;
+    bool mainWindowTeardownPending = false;
+    bool quitAfterMainWindowTeardown = false;
     std::unique_ptr<SplashWindow> splash;
     std::unique_ptr<StartupWindow> startupWindow;
     std::unique_ptr<ChurchDAWStartupCheckThread> startupCheck;
@@ -2169,6 +3232,7 @@ private:
     std::shared_ptr<std::atomic<bool>> applicationAlive =
         std::make_shared<std::atomic<bool>> (true);
     bool startingMainWindow = false;
+    bool safeModeRequested = false;
     bool legacyAccessWasHandled = false;
     bool foregroundReturnPending = false;
     bool foregroundRevalidationPending = false;

@@ -63,8 +63,10 @@ public:
     {
         setContent (Stage::chooseTarget,
                     "PASSO 1",
-                    "Toque no controle que voce quer comandar",
-                    "Volume, reverb, master ou qualquer knob do app");
+                    juce::String::fromUTF8 (
+                        "CLIQUE no controle que voc\xc3\xaa quer comandar"),
+                    juce::String::fromUTF8 (
+                        "Fader, knob ou bot\xc3\xa3o \xe2\x80\x94 clique no console para selecionar"));
     }
 
     void showMoveHardware (const juce::String& target)
@@ -80,7 +82,25 @@ public:
         setContent (Stage::moveHardware,
                     "PASSO 2",
                     target.isNotEmpty() ? target + " selecionado" : "Tom do Pad selecionado",
-                    "Agora toque a tecla que vai acionar esse comando");
+                    // O pad de borracha e o pedal de pe mandam CC, nao nota, e
+                    // agora tambem sao aceitos aqui. Enquanto a frase falava so
+                    // em "tecla", o cliente com pad apertava, nada acontecia, e
+                    // nao havia nada na tela sugerindo que aquilo era esperado.
+                    juce::String::fromUTF8 (
+                        "Agora toque a tecla \xe2\x80\x94 ou aperte o pad / pedal"));
+    }
+
+    void showReceipt (const juce::String& target, const juce::String& source,
+                      int channel, int number, bool note, bool saved, int value = -1)
+    {
+        const auto message = (note ? "Nota " : "CC ") + juce::String (number);
+        setContent (saved ? Stage::mapped : Stage::naoSalvou,
+                    saved ? "SALVO" : "NAO SALVOU",
+                    target + juce::String::fromUTF8 ("  ←  ") + message,
+                    (source.isNotEmpty() ? source : juce::String ("Controlador MIDI"))
+                        + " / Ch " + juce::String (channel)
+                        + (value >= 0 ? " / Valor " + juce::String (value) + "/127" : juce::String())
+                        + (saved ? " / salvo automaticamente" : " / ativo somente nesta sessao"));
     }
 
     void showMapped (const juce::String& target, int cc, bool salvou = true)
@@ -166,15 +186,26 @@ public:
                           : success                   ? NordLookAndFeel::greenOk()
                                                       : NordLookAndFeel::oledAmber();
 
-        g.setGradientFill (juce::ColourGradient (juce::Colour (0xff181a20),
-                                                 bounds.getX(), bounds.getY(),
-                                                 juce::Colour (0xff0d0f13),
-                                                 bounds.getX(), bounds.getBottom(), false));
+        g.setColour (juce::Colour (0xff202329));
         g.fillRoundedRectangle (bounds, 7.0f);
-        g.setColour (juce::Colours::black.withAlpha (0.85f));
+        g.setColour (juce::Colours::white.withAlpha (0.08f));
         g.drawRoundedRectangle (bounds.reduced (0.5f), 7.0f, 1.0f);
-        g.setColour (accent.withAlpha (0.92f));
-        g.fillRoundedRectangle (bounds.removeFromBottom (2.0f), 1.0f);
+        g.setColour (accent.withAlpha (0.85f));
+        g.fillRoundedRectangle (bounds.getX(), bounds.getY() + 8.0f,
+                                2.0f, juce::jmax (1.0f, bounds.getHeight() - 16.0f), 1.0f);
+
+        // Short landscape windows still need a complete, readable instruction.
+        if (getHeight() < 42)
+        {
+            auto line = getLocalBounds().reduced (10, 2);
+            g.setColour (accent);
+            g.setFont (juce::Font (juce::FontOptions (10.0f)).boldened());
+            g.drawText (badgeText, line.removeFromLeft (80), juce::Justification::centredLeft);
+            g.setColour (NordLookAndFeel::txtPrimary());
+            g.setFont (juce::Font (juce::FontOptions (12.0f)));
+            g.drawText (title, line, juce::Justification::centredLeft, true);
+            return;
+        }
 
         auto area = getLocalBounds().reduced (13, 5);
         const bool narrow = getWidth() < 560;
@@ -278,6 +309,8 @@ private:
         badgeText = std::move (badge);
         title = std::move (nextTitle);
         detail = std::move (nextDetail);
+        setTitle (badgeText + ": " + title);
+        setDescription (detail);
         repaint();
     }
 

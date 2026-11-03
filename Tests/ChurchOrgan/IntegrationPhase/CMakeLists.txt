@@ -62,6 +62,13 @@ target_sources(ChurchOrganIntegrationTests PRIVATE
 target_link_libraries(ChurchOrganIntegrationTests
     PRIVATE ChurchOrganIntegration)
 
+juce_add_console_app(ChurchOrganTransistorFactoryTests
+    PRODUCT_NAME "ChurchOrganTransistorFactoryTests")
+target_sources(ChurchOrganTransistorFactoryTests PRIVATE
+    TransistorFactoryDefaultsTests.cpp)
+target_link_libraries(ChurchOrganTransistorFactoryTests
+    PRIVATE ChurchOrganIntegration)
+
 juce_add_console_app(ChurchOrganIntegrationBenchmark
     PRODUCT_NAME "ChurchOrganIntegrationBenchmark")
 target_sources(ChurchOrganIntegrationBenchmark PRIVATE
@@ -72,6 +79,7 @@ target_link_libraries(ChurchOrganIntegrationBenchmark
 foreach(target
         ChurchOrganIntegration
         ChurchOrganIntegrationTests
+        ChurchOrganTransistorFactoryTests
         ChurchOrganIntegrationBenchmark)
     if(MSVC)
         target_compile_options(${target} PRIVATE
@@ -87,6 +95,8 @@ endforeach()
 if(MSVC)
     target_link_options(ChurchOrganIntegrationTests
         PRIVATE /STACK:33554432)
+    target_link_options(ChurchOrganTransistorFactoryTests
+        PRIVATE /STACK:33554432)
     target_link_options(ChurchOrganIntegrationBenchmark
         PRIVATE /STACK:33554432)
 endif()
@@ -98,10 +108,15 @@ add_test(
     COMMAND ChurchOrganIntegrationTests)
 
 add_test(
+    NAME ChurchOrganTransistorFactoryDefaults
+    COMMAND ChurchOrganTransistorFactoryTests)
+
+add_test(
     NAME ChurchOrganIntegrationBenchmark
     COMMAND ChurchOrganIntegrationBenchmark)
 
 set_tests_properties(
     ChurchOrganIntegrationCorrectness
+    ChurchOrganTransistorFactoryDefaults
     ChurchOrganIntegrationBenchmark
     PROPERTIES TIMEOUT 420)

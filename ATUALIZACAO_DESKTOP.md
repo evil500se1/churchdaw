@@ -4,6 +4,37 @@ Traz para o desktop a ideia que já existe no Android, com uma diferença que
 manda em todo o resto do desenho: **no Android quem instala é a Play Store, e no
 desktop não existe loja.**
 
+## Estado publicado — 14/08/2026
+
+O auto-update está **ativo para Windows e macOS** no endpoint de produção
+`https://churchdaw.com/app/desktop/update-policy-v1.json`.
+
+- policy assinada: serial `29`, versão `1.6.24`, version code `10631`;
+- Windows: `ChurchDAW-1.6.24-Setup.exe`, `14.829.056` bytes,
+  SHA-256 `d5837282e89847545932b2283147023ae4277ddf32d23bb61071ef929266a561`;
+- macOS: `ChurchDAW-1.6.24.dmg`, `18.035.338` bytes,
+  SHA-256 `7fdd338cf15922a044fdc479df70a0f1a52fbadc9324ebd00bed01e08221cab7`;
+- validade da policy: até `12/11/2026 21:41:41 -03:00`.
+
+Na auditoria desta data, os dois arquivos públicos e a policy foram baixados
+novamente por HTTPS e bateram byte a byte em tamanho e SHA-256 com os artefatos
+locais e o payload RS256. O envelope público passou no verificador nativo com
+`41/41` provas no Windows e `37/37` no macOS. Em ambos, a decisão exata para o
+build `10615` (ChurchDAW 1.6.8) foi **atualização opcional**. A suíte completa
+passou `19/19` testes tanto no Windows quanto no Mac; a paridade de manifestos
+passou `47/47` em cada plataforma.
+
+Os dois arquivos foram baixados novamente pelo HTTPS depois da promoção e
+bateram byte a byte com o payload RS256. O verificador nativo passou `38/38`
+provas para a policy serial 29, incluindo anti-replay, adulteração de payload,
+SHA-256 e a decisão do instalador Windows publicado.
+
+O DMG 1.6.24 publicado tem binário universal `x86_64` + `arm64`, piso macOS
+10.15, Developer ID, notarização Apple aceita, ticket grampeado e Gatekeeper
+aprovado. O instalador Windows foi publicado sem Authenticode porque o cliente
+autorizou o certificado de teste; o updater aceita a ausência de assinatura do
+sistema somente porque a policy RS256 e o SHA-256 conferem os bytes exatos.
+
 O `ChurchDAWUpdateBridge.java` fixa a regra de ouro do Android:
 
 > o app nunca baixa nem executa um APK vindo da hospedagem
@@ -17,29 +48,34 @@ uma vez.
 
 ## Como a confiança é construída
 
-Nada é executado por vir da nossa hospedagem. São **duas provas independentes**,
-e as duas precisam passar:
+Nada é executado apenas por vir da nossa hospedagem. A prova obrigatória é a
+assinatura RS256 da policy, que prende o SHA-256 aos bytes exatos do instalador.
+A assinatura do sistema também é verificada quando existe:
 
 | # | Prova | Windows | macOS |
 |---|-------|---------|-------|
 | 1 | Assinatura RS256 nossa sobre o manifesto | BCrypt (`crypt32`, `bcrypt`) | Security.framework |
 | 2 | Assinatura do sistema no instalador | Authenticode (`WinVerifyTrust`) | Gatekeeper (`spctl --assess`) |
 
-A prova 1 usa a **mesma chave RSA-3072 do Android** (`churchdaw-update-2026-01`,
-`Packaging/AndroidUpdatePolicyPublicKey.pem`). Uma chave só para guardar, um
-script só para assinar, e uma policy que não pode ser válida numa plataforma e
-inválida na outra.
+A prova 1 usa a mesma família de chaves RSA-3072 do Android. O verificador
+aceita explicitamente `churchdaw-update-2026-01` e a rotação
+`churchdaw-update-2026-08`; qualquer outro `key_id` é recusado.
 
-A prova 2 existe porque as duas falham de formas diferentes: se um dia a nossa
-chave privada vazar, o Authenticode/Gatekeeper ainda segura; se a cadeia da
-Microsoft/Apple falhar, a nossa segura.
+A prova 2 existe porque as duas falham de formas diferentes. Entretanto, a
+distribuição direta atual ainda não possui Authenticode no EXE público;
+`CHURCHDAW_UPDATE_REQUIRE_OS_SIGNATURE=0` aceita a ausência de assinatura, mas
+continua recusando assinatura presente e inválida. Assim, hoje a autorização
+criptográfica obrigatória é RS256 + SHA-256 + HTTPS no domínio próprio.
 
 O SHA-256 do instalador viaja **dentro** do payload assinado, e o app inteiro
 vai embutido no instalador como recurso PE — então a corrente fecha inteira:
 
 ```
-assinatura RSA → payload → SHA-256 → instalador → Authenticode → ChurchDAW.exe
+assinatura RSA → payload → SHA-256 → bytes exatos do instalador
 ```
+
+Quando disponível, Authenticode/Gatekeeper acrescenta uma prova independente
+sobre esses mesmos bytes.
 
 O payload é recurso `RCDATA` (dentro da imagem PE), não dados grudados no fim do
 arquivo. Isso importa: assim o hash Authenticode **cobre também o app**, e trocar
@@ -62,8 +98,9 @@ O portão **só é avaliado no arranque**, em `Main.cpp`, antes de existir motor
 
 `minimum_version_code` sozinho não bloqueia nada. O portão só arma quando existe,
 para aquela plataforma, um instalador anunciado, baixado, com SHA-256 conferido,
-assinado pelo sistema e de versão suficiente. Faltando qualquer elo — rede caiu,
-hospedagem fora do ar, assinatura recusada, instalador não publicado — o app
+com qualquer assinatura de sistema presente validada e de versão suficiente.
+Faltando qualquer elo obrigatório — rede caiu, hospedagem fora do ar, assinatura
+RS256 recusada, hash divergente, instalador não publicado — o app
 **abre normalmente** e apenas avisa.
 
 Casos que falham para o lado seguro, todos cobertos por teste:
@@ -159,7 +196,7 @@ cmake --build build --config Release --target ChurchDAWUpdatePolicyTests
     . <policy-serial-4.json> <policy-serial-5.json>
 ```
 
-27 verificações. Destaques:
+40 verificações. Destaques:
 
 - **Grupo A** usa a **policy Android real já publicada** como vetor conhecido. Se
   o algoritmo, a codificação da mensagem ou a chave embutida estivessem errados,
@@ -223,20 +260,18 @@ teste foi removida do Mac; o `$HOME` ficou exatamente como estava.
 
 ## Pendências
 
-1. **Certificado de assinatura de código para Windows.** É o único item que
-   separa o sistema de estar no ar. O fluxo inteiro já foi provado funcionando
-   com um certificado de teste; falta o real. Ele já era necessário de qualquer
-   forma, senão o SmartScreen assusta cada comprador.
-   Depois de comprado: `BuildDesktopRelease.ps1 -PfxPath ...` e acabou.
+1. **Windows Authenticode.** O instalador público 1.6.8 está disponível e seu
+   hash é autorizado pela policy assinada, mas o arquivo ainda aparece como
+   `NotSigned`. Um certificado de assinatura de código melhora a reputação no
+   SmartScreen e restabelece a segunda prova independente.
 
-2. **macOS: assinatura + notarização** (`Signature=adhoc`, `TeamIdentifier=not
-   set`, Apple Developer US$ 99/ano). Único item que falta para o Mac.
+2. **Developer ID e notarização.** O DMG público foi construído, montado e
+   verificado em um Mac físico, mas o Gatekeeper o rejeita por ausência de uma
+   identidade Apple Developer ID e do ticket de notarização.
 
-   Validado no MacinCloud (macOS 26.3) em 28/07/2026 — ver abaixo.
-
-3. **Hospedar `app/desktop/update-policy-v1.json`** e os instaladores. Hoje o
-   endereço responde 404, e o app trata isso corretamente como "não deu para
-   saber" e abre normal (verificado com o app rodando).
+3. **Renovação da policy.** O serial 17 expira em 06/11/2026; uma policy nova e
+   encadeada precisa ser publicada antes dessa data, mesmo se a versão do app
+   não mudar.
 
 ---
 

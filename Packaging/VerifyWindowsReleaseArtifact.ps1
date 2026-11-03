@@ -214,6 +214,15 @@ $appPath = Resolve-UniqueFile $root 'ChurchDAW.exe'
 $extractedPath = Resolve-UniqueFile $root `
     'ChurchDAW-installer-payload.extracted.exe'
 
+foreach ($binary in @($appPath, $extractedPath)) {
+    $binaryAscii = [Text.Encoding]::ASCII.GetString(
+        [IO.File]::ReadAllBytes($binary))
+    if (-not $binaryAscii.Contains(
+            'CHURCHDAW_RELEASE_LICENSE_GATE=DESKTOP_ENABLED')) {
+        throw "Gate comercial de licenca ausente: $binary"
+    }
+}
+
 $artifactDirectory = Split-Path -Parent $manifestPath
 foreach ($path in @($checksumsPath, $installerPath, $appPath, $extractedPath)) {
     if (-not (Split-Path -Parent $path).Equals(

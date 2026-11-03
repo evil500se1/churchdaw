@@ -1,10 +1,15 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(ChurchOrganMotionIsolated LANGUAGES CXX)
+project(ChurchOrganMotionIsolated LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+
+add_subdirectory(
+    "${CMAKE_CURRENT_LIST_DIR}/../../../JUCE"
+    "${CMAKE_CURRENT_BINARY_DIR}/JUCE"
+    EXCLUDE_FROM_ALL)
 
 set(CHURCH_ORGAN_SOURCE_DIR
     "${CMAKE_CURRENT_LIST_DIR}/../../../Source/ChurchOrgan")
@@ -20,7 +25,15 @@ target_include_directories(ChurchOrganMotion
 add_executable(ChurchOrganMotionTests
     ChurchOrganMotionTests.cpp)
 target_link_libraries(ChurchOrganMotionTests
-    PRIVATE ChurchOrganMotion)
+    PRIVATE
+        ChurchOrganMotion
+        juce::juce_audio_basics
+        juce::juce_recommended_config_flags)
+
+target_compile_definitions(ChurchOrganMotionTests
+    PRIVATE
+        JUCE_WEB_BROWSER=0
+        JUCE_USE_CURL=0)
 
 add_executable(ChurchOrganMotionBenchmark
     ChurchOrganMotionBenchmark.cpp)

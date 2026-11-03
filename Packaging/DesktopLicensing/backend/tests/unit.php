@@ -3,6 +3,7 @@
 declare(strict_types=1);
 
 use ChurchDAW\Licensing\ApiException;
+use ChurchDAW\Licensing\AdminViews;
 use ChurchDAW\Licensing\Config;
 use ChurchDAW\Licensing\Crypto;
 use ChurchDAW\Licensing\MercadoPagoClient;
@@ -47,6 +48,85 @@ putenv('LIBRARY_STORAGE_PATH=' . $libraryStorage);
 
 $config = Config::load($root);
 $crypto = new Crypto($config);
+$derivedRefreshToken = $crypto->deriveRefreshToken(
+    'token-id',
+    'family-id',
+    'user-id',
+    'license-id',
+    'device-id'
+);
+expect(
+    strlen($derivedRefreshToken) === 43
+        && hash_equals(
+            $derivedRefreshToken,
+            $crypto->deriveRefreshToken(
+                'token-id',
+                'family-id',
+                'user-id',
+                'license-id',
+                'device-id'
+            )
+        )
+        && !hash_equals(
+            $derivedRefreshToken,
+            $crypto->deriveRefreshToken(
+                'different-token-id',
+                'family-id',
+                'user-id',
+                'license-id',
+                'device-id'
+            )
+        ),
+    'refresh derivado nao e deterministico e isolado por token'
+);
+$customerViews = new Views($config);
+$purchaseHtml = $customerViews->purchase();
+$resetHtml = $customerViews->resetPassword();
+$successHtml = $customerViews->purchaseSuccess();
+expect(
+    str_contains($purchaseHtml, 'minlength="8"')
+        && !str_contains($purchaseHtml, 'minlength="12"')
+        && str_contains($resetHtml, 'minlength="8"')
+        && str_contains($resetHtml, 'pelo menos 8 caracteres'),
+    'telas do cliente nao aplicam senha minima de oito caracteres'
+);
+expect(
+    str_contains($successHtml, 'Pagamento confirmado!')
+        && str_contains($successHtml, 'mesmo e-mail e a mesma senha')
+        && str_contains(
+            $successHtml,
+            '/app/desktop/ChurchDAW-1.6.26-r2-Setup.exe'
+        )
+        && str_contains(
+            $successHtml,
+            '/app/desktop/ChurchDAW-1.6.26.dmg'
+        )
+        && str_contains(
+            $successHtml,
+            '/app/android/ChurchDAW-1.6.26-signed.apk'
+        )
+        && !str_contains($successHtml, 'Confirme também seu e-mail')
+        && !str_contains($successHtml, 'pagamento for confirmado'),
+    'tela de sucesso nao orienta download e primeiro acesso corretamente'
+);
+$adminDashboard = (new AdminViews($config))->dashboard([
+    'csrf_token' => 'unit-csrf',
+    'counts' => [],
+    'licenses' => [],
+    'flash' => null,
+]);
+expect(
+    str_contains($adminDashboard, 'name="customer_password"')
+        && str_contains(
+            $adminDashboard,
+            'name="customer_password_confirmation"'
+        )
+        && str_contains($adminDashboard, 'minlength="8"')
+        && !str_contains($adminDashboard, 'minlength="12"')
+        && str_contains($adminDashboard, 'id="admin-search"')
+        && str_contains($adminDashboard, 'id="admin-status-filter"'),
+    'painel admin nao oferece senha livre, pesquisa e filtros'
+);
 expect(
     !$config->bool('checkout.enabled'),
     'checkout deve iniciar pausado ate liberacao explicita'
@@ -104,20 +184,55 @@ putenv('MP_SANDBOX=1');
 Config::load($root)->assertRuntimeReady();
 
 putenv('CHECKOUT_ENABLED=1');
+$checkoutWithoutWooviSwitchRejected = false;
+try {
+    Config::load($root)->assertRuntimeReady();
+} catch (RuntimeException $error) {
+    $checkoutWithoutWooviSwitchRejected = str_contains(
+        $error->getMessage(),
+        'WOOVI_ENABLED'
+    );
+}
+expect(
+    $checkoutWithoutWooviSwitchRejected,
+    'checkout Woovi foi ativado sem a trava operacional'
+);
+putenv('WOOVI_ENABLED=1');
 $checkoutWithoutProviderRejected = false;
 try {
     Config::load($root)->assertRuntimeReady();
 } catch (RuntimeException $error) {
     $checkoutWithoutProviderRejected = str_contains(
         $error->getMessage(),
-        'mercado_pago.access_token'
+        'woovi.api_key'
     );
 }
 expect(
     $checkoutWithoutProviderRejected,
     'checkout foi ativado sem credenciais do provedor'
 );
+putenv('WOOVI_API_KEY=' . str_repeat('w', 64));
+$checkoutWithoutWebhookAuthorizationRejected = false;
+try {
+    Config::load($root)->assertRuntimeReady();
+} catch (RuntimeException $error) {
+    $checkoutWithoutWebhookAuthorizationRejected = str_contains(
+        $error->getMessage(),
+        'WOOVI_WEBHOOK_AUTHORIZATION'
+    );
+}
+expect(
+    $checkoutWithoutWebhookAuthorizationRejected,
+    'checkout foi ativado sem segredo do handshake de webhook'
+);
+putenv('WOOVI_WEBHOOK_AUTHORIZATION=' . str_repeat('a', 48));
+putenv('WOOVI_SANDBOX=0');
+Config::load($root)->assertRuntimeReady();
 putenv('CHECKOUT_ENABLED=0');
+putenv('WOOVI_ENABLED=0');
+putenv('WOOVI_API_KEY');
+putenv('WOOVI_WEBHOOK_AUTHORIZATION');
+putenv('WOOVI_SANDBOX=0');
 putenv('APP_ENV=test');
 putenv('APP_RELEASE');
 putenv('MP_SANDBOX=1');
@@ -202,9 +317,10 @@ expect(Money::toCents('499.00') === 49900, 'conversao monetaria');
 expect(Money::toCents(499.0) === 49900, 'conversao monetaria float');
 
 PasswordPolicy::assertValid('uma frase longa e exclusiva', 'teste@churchdaw.com');
+PasswordPolicy::assertValid('12345678');
 $weakRejected = false;
 try {
-    PasswordPolicy::assertValid('senha123');
+    PasswordPolicy::assertValid('1234567');
 } catch (ApiException) {
     $weakRejected = true;
 }

@@ -162,11 +162,6 @@ public:
         return value;
     }
 
-    static juce::URL purchaseUrl()
-    {
-        return juce::URL ("https://churchdaw.com/comprar");
-    }
-
     static juce::URL accountPortalUrl()
     {
         return juce::URL ("https://churchdaw.com/minha-conta");

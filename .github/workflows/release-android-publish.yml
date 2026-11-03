@@ -257,10 +257,14 @@ jobs:
       apk_bytes: ${{ steps.verify.outputs.apk_bytes }}
       metadata_sha256: ${{ steps.verify.outputs.metadata_sha256 }}
       certificate_sha256: ${{ steps.verify.outputs.certificate_sha256 }}
+      lineage_sha256: ${{ steps.verify.outputs.lineage_sha256 }}
       version_code: ${{ steps.verify.outputs.version_code }}
     env:
       RELEASE_TAG: ${{ inputs.release_tag }}
       EXPECTED_COMMIT: ${{ inputs.expected_commit_sha }}
+      EXPECTED_CERTIFICATE_SHA256: ${{ vars.ANDROID_EXPECTED_CERTIFICATE_SHA256 }}
+      EXPECTED_LEGACY_F25_CERTIFICATE_SHA256: ${{ vars.ANDROID_LEGACY_F25_CERTIFICATE_SHA256 }}
+      EXPECTED_LEGACY_415A_CERTIFICATE_SHA256: ${{ vars.ANDROID_LEGACY_415A_CERTIFICATE_SHA256 }}
 
     steps:
       - name: Baixar codigo confiavel dos verificadores
@@ -293,16 +297,23 @@ jobs:
           $metadataFile = @($allFiles | Where-Object {
             $_.Name -ceq 'android-release-metadata.json'
           })
-          if ($allFiles.Count -ne 2 -or $apk.Count -ne 1 -or
-              $metadataFile.Count -ne 1) {
-            throw 'Artifact Android precisa conter somente APK e metadata unicos'
+          $lineageFile = @($allFiles | Where-Object {
+            $_.Name -ceq 'churchdaw-signing-lineage.bin'
+          })
+          if ($allFiles.Count -ne 3 -or $apk.Count -ne 1 -or
+              $metadataFile.Count -ne 1 -or $lineageFile.Count -ne 1) {
+            throw 'Artifact Android precisa conter APK, metadata e lineage unicos'
           }
 
           $metadata = Get-Content -LiteralPath $metadataFile[0].FullName `
             -Raw -Encoding UTF8 | ConvertFrom-Json
           $expectedFields = @(
             'package_id', 'version_name', 'version_code', 'abi', 'bytes',
-            'sha256', 'signing_certificate_sha256', 'source_commit')
+            'sha256', 'signing_certificate_sha256',
+            'legacy_f25_certificate_sha256',
+            'legacy_415a_certificate_sha256', 'signing_mode',
+            'rotation_min_sdk_version', 'signing_lineage_sha256',
+            'source_commit')
           $actualFields = @($metadata.PSObject.Properties.Name)
           if ($actualFields.Count -ne $expectedFields.Count) {
             throw 'Metadata Android tem campos inesperados'
@@ -317,6 +328,8 @@ jobs:
             -Algorithm SHA256).Hash.ToUpperInvariant()
           $metadataHash = (Get-FileHash -LiteralPath $metadataFile[0].FullName `
             -Algorithm SHA256).Hash.ToUpperInvariant()
+          $lineageHash = (Get-FileHash -LiteralPath $lineageFile[0].FullName `
+            -Algorithm SHA256).Hash.ToUpperInvariant()
           if ([string] $metadata.package_id -cne 'com.churchdaw.app' -or
               [string] $metadata.version_name -cne $version -or
               [string] $metadata.abi -cne 'arm64-v8a' -or
@@ -326,9 +339,37 @@ jobs:
               -not ([string] $metadata.sha256).Equals(
                 $apkHash,
                 [StringComparison]::OrdinalIgnoreCase) -or
+              -not ([string] $metadata.signing_lineage_sha256).Equals(
+                $lineageHash,
+                [StringComparison]::OrdinalIgnoreCase) -or
+              [string] $metadata.signing_mode -cne
+                'f25-to-415a-to-current-v3-rotation' -or
+              [int] $metadata.rotation_min_sdk_version -ne 28 -or
               [long] $metadata.bytes -ne [long] $apk[0].Length -or
               [int] $metadata.version_code -lt 1) {
             throw 'Metadata Android diverge do APK/tag/commit'
+          }
+
+          $expectedCurrent =
+            ($env:EXPECTED_CERTIFICATE_SHA256 -replace '\s', '').ToUpperInvariant()
+          $expectedF25 =
+            ($env:EXPECTED_LEGACY_F25_CERTIFICATE_SHA256 -replace '\s', '').ToUpperInvariant()
+          $expected415a =
+            ($env:EXPECTED_LEGACY_415A_CERTIFICATE_SHA256 -replace '\s', '').ToUpperInvariant()
+          foreach ($certificate in @(
+            $expectedCurrent, $expectedF25, $expected415a
+          )) {
+            if ($certificate -notmatch '^[0-9A-F]{64}$') {
+              throw 'Pin protegido de certificado Android ausente ou invalido'
+            }
+          }
+          if (-not ([string] $metadata.signing_certificate_sha256).Equals(
+                $expectedCurrent, [StringComparison]::OrdinalIgnoreCase) -or
+              -not ([string] $metadata.legacy_f25_certificate_sha256).Equals(
+                $expectedF25, [StringComparison]::OrdinalIgnoreCase) -or
+              -not ([string] $metadata.legacy_415a_certificate_sha256).Equals(
+                $expected415a, [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'Pins de certificado da metadata divergem das vars protegidas'
           }
 
           $apksignerExe = if ($IsWindows) { 'apksigner.bat' } else { 'apksigner' }
@@ -343,27 +384,59 @@ jobs:
           if ($null -eq $buildTools) {
             throw 'apksigner/aapt nao encontrados no Android SDK do runner'
           }
-          $signerOutput = @(& (Join-Path $buildTools.FullName $apksignerExe) `
-            verify --verbose --print-certs $apk[0].FullName)
-          if ($LASTEXITCODE -ne 0 -or
-              -not ($signerOutput -match
-                'Verified using v2 scheme \(APK Signature Scheme v2\): true')) {
-            throw 'APK nao passou novamente na assinatura v2'
+          function Assert-ApkSignerRoute {
+            param(
+              [int] $MinimumSdk,
+              [Nullable[int]] $MaximumSdk,
+              [string] $SchemePattern,
+              [string] $ExpectedCertificate
+            )
+            $arguments = @(
+              'verify', '--verbose', '--print-certs',
+              '--min-sdk-version', [string] $MinimumSdk
+            )
+            if ($null -ne $MaximumSdk) {
+              $arguments += @('--max-sdk-version', [string] $MaximumSdk)
+            }
+            $arguments += $apk[0].FullName
+            $previousPreference = $ErrorActionPreference
+            try {
+              # Windows PowerShell 5 pode transformar stderr nativo em erro
+              # terminante mesmo quando apksigner conclui com codigo zero.
+              $ErrorActionPreference = 'Continue'
+              $output = @(& (Join-Path $buildTools.FullName $apksignerExe) `
+                @arguments 2>&1 | ForEach-Object { [string] $_ })
+              $verificationExitCode = $LASTEXITCODE
+            }
+            finally {
+              $ErrorActionPreference = $previousPreference
+            }
+            if ($verificationExitCode -ne 0 -or
+                -not ($output -match $SchemePattern)) {
+              $output | ForEach-Object { Write-Host $_ }
+              throw "APK nao passou na rota de assinatura API $MinimumSdk"
+            }
+            $cert = @($output | ForEach-Object {
+              [regex]::Match(
+                $_,
+                '(?i)^Signer #1 certificate SHA-256 digest:\s*([0-9a-f]{64})$'
+              )
+            } | Where-Object { $_.Success })
+            if ($cert.Count -ne 1 -or
+                $cert[0].Groups[1].Value.ToUpperInvariant() -cne
+                  $ExpectedCertificate) {
+              throw "Certificado inesperado na rota API $MinimumSdk"
+            }
+            $output | ForEach-Object { Write-Host $_ }
           }
-          $certLine = $signerOutput | Where-Object {
-            $_ -match '(?:Signer #\d+|V2 Signer): certificate SHA-256 digest:'
-          } | Select-Object -First 1
-          if (-not $certLine -or
-              $certLine -notmatch
-                'certificate SHA-256 digest:\s*([0-9a-fA-F]{64})') {
-            throw 'Fingerprint do certificado APK nao encontrado'
-          }
-          $certificateHash = $Matches[1].ToUpperInvariant()
-          if (-not ([string] $metadata.signing_certificate_sha256).Equals(
-              $certificateHash,
-              [StringComparison]::OrdinalIgnoreCase)) {
-            throw 'Certificado real diverge da metadata'
-          }
+
+          Assert-ApkSignerRoute 24 27 `
+            'Verified using v2 scheme \(APK Signature Scheme v2\): true' `
+            $expectedF25
+          Assert-ApkSignerRoute 28 $null `
+            'Verified using v3 scheme \(APK Signature Scheme v3\): true' `
+            $expectedCurrent
+          $certificateHash = $expectedCurrent
 
           $badging = @(& (Join-Path $buildTools.FullName $aaptExe) `
             dump badging $apk[0].FullName)
@@ -393,6 +466,7 @@ jobs:
           "apk_bytes=$($apk[0].Length)" >> $env:GITHUB_OUTPUT
           "metadata_sha256=$metadataHash" >> $env:GITHUB_OUTPUT
           "certificate_sha256=$certificateHash" >> $env:GITHUB_OUTPUT
+          "lineage_sha256=$lineageHash" >> $env:GITHUB_OUTPUT
           "version_code=$([int] $metadata.version_code)" >> $env:GITHUB_OUTPUT
 
       - name: Preservar prova Android
@@ -400,7 +474,9 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ChurchDAW-publisher-Android-proof-${{ github.run_id }}
-          path: candidate-android/android-release-metadata.json
+          path: |
+            candidate-android/android-release-metadata.json
+            candidate-android/churchdaw-signing-lineage.bin
           if-no-files-found: warn
           retention-days: 30
 
@@ -424,6 +500,8 @@ jobs:
       POLICY_SERIAL: ${{ vars.ANDROID_POLICY_SERIAL }}
       MINIMUM_VERSION_CODE: ${{ vars.ANDROID_MINIMUM_VERSION_CODE }}
       EXPECTED_CERTIFICATE_SHA256: ${{ vars.ANDROID_EXPECTED_CERTIFICATE_SHA256 }}
+      EXPECTED_LEGACY_F25_CERTIFICATE_SHA256: ${{ vars.ANDROID_LEGACY_F25_CERTIFICATE_SHA256 }}
+      EXPECTED_LEGACY_415A_CERTIFICATE_SHA256: ${{ vars.ANDROID_LEGACY_415A_CERTIFICATE_SHA256 }}
       FTPS_PORT: ${{ vars.HOSTGATOR_FTPS_PORT }}
       REMOTE_ROOT_DIRECTORY: ${{ vars.HOSTGATOR_REMOTE_ROOT }}
       REMOTE_ANDROID_DIRECTORY: ${{ vars.HOSTGATOR_ANDROID_REMOTE_DIR }}
@@ -433,6 +511,7 @@ jobs:
       APK_VERIFIED_BYTES: ${{ needs.verify-android.outputs.apk_bytes }}
       METADATA_VERIFIED_SHA256: ${{ needs.verify-android.outputs.metadata_sha256 }}
       CERTIFICATE_VERIFIED_SHA256: ${{ needs.verify-android.outputs.certificate_sha256 }}
+      LINEAGE_VERIFIED_SHA256: ${{ needs.verify-android.outputs.lineage_sha256 }}
       ANDROID_ARTIFACT_ID: ${{ needs.verify-provenance.outputs.artifact_id }}
       ANDROID_ARTIFACT_DIGEST: ${{ needs.verify-provenance.outputs.artifact_digest }}
       ANDROID_ARTIFACT_SIZE: ${{ needs.verify-provenance.outputs.artifact_size }}
@@ -535,12 +614,15 @@ jobs:
           $ErrorActionPreference = 'Stop'
           foreach ($name in @(
             'POLICY_SERIAL', 'MINIMUM_VERSION_CODE',
-            'EXPECTED_CERTIFICATE_SHA256', 'FTPS_PORT',
+            'EXPECTED_CERTIFICATE_SHA256',
+            'EXPECTED_LEGACY_F25_CERTIFICATE_SHA256',
+            'EXPECTED_LEGACY_415A_CERTIFICATE_SHA256', 'FTPS_PORT',
             'REMOTE_ROOT_DIRECTORY', 'REMOTE_ANDROID_DIRECTORY',
             'PUBLIC_SITE_URL', 'PUBLIC_ANDROID_BASE_URL',
             'HOSTGATOR_FTPS_HOST', 'APK_VERIFIED_SHA256',
             'APK_VERIFIED_BYTES', 'METADATA_VERIFIED_SHA256',
-            'CERTIFICATE_VERIFIED_SHA256', 'ANDROID_ARTIFACT_ID',
+            'CERTIFICATE_VERIFIED_SHA256', 'LINEAGE_VERIFIED_SHA256',
+            'ANDROID_ARTIFACT_ID',
             'ANDROID_ARTIFACT_DIGEST', 'ANDROID_ARTIFACT_SIZE'
           )) {
             if ([string]::IsNullOrWhiteSpace(
@@ -571,6 +653,10 @@ jobs:
             -UpdateMessage $env:UPDATE_MESSAGE `
             -PrivateKey '${{ steps.credentials.outputs.private_key }}' `
             -ExpectedSigningCertificateSha256 $env:EXPECTED_CERTIFICATE_SHA256 `
+            -ExpectedLegacyF25CertificateSha256 `
+              $env:EXPECTED_LEGACY_F25_CERTIFICATE_SHA256 `
+            -ExpectedLegacy415aCertificateSha256 `
+              $env:EXPECTED_LEGACY_415A_CERTIFICATE_SHA256 `
             -FtpsHost $env:HOSTGATOR_FTPS_HOST `
             -FtpsPort ([int] $env:FTPS_PORT) `
             -NetrcPath '${{ steps.credentials.outputs.netrc }}' `
@@ -582,7 +668,8 @@ jobs:
             -AuditOutputDirectory .\android-promotion-audit `
             -VerifiedApkSha256 $env:APK_VERIFIED_SHA256 `
             -VerifiedApkBytes ([long] $env:APK_VERIFIED_BYTES) `
-            -VerifiedMetadataSha256 $env:METADATA_VERIFIED_SHA256
+            -VerifiedMetadataSha256 $env:METADATA_VERIFIED_SHA256 `
+            -VerifiedLineageSha256 $env:LINEAGE_VERIFIED_SHA256
 
       - name: Remover credenciais temporarias
         if: always()

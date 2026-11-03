@@ -1,6 +1,7 @@
 #include "OrganAmpCab.h"
 #include "RotaryCabinet.h"
 #include "ScannerVibrato.h"
+#include "../../../Source/ChannelRotarySpeaker.h"
 
 #include <algorithm>
 #include <array>
@@ -311,6 +312,57 @@ namespace
             4.15f,
             0.001f,
             "scanner reports nominal phase-line latency");
+    }
+
+    void testScannerBypassRefreshesInternalHistory (TestContext& context)
+    {
+        churchorgan::ScannerVibrato scanner;
+        churchorgan::ScannerParameters active;
+        active.mode = churchorgan::ScannerMode::chorus3;
+        active.character = churchorgan::ScannerCharacter::deep;
+        active.noise = 0.0f;
+        active.output = 1.0f;
+        scanner.setParameters (active);
+        context.expect (
+            scanner.prepare ({ sampleRate, blockSize, 0x51a7U, 0.19f }),
+            "scanner history probe prepares");
+
+        std::vector<float> toneA (
+            static_cast<std::size_t> (sampleRate * 0.25));
+        fillSine (toneA, 997.0f, 0.55f);
+        processInBlocks (scanner, toneA);
+
+        auto bypass = active;
+        bypass.mode = churchorgan::ScannerMode::bypass;
+        scanner.setParameters (bypass);
+
+        // Keep tone A running until the wet ramp has completely reached
+        // bypass. The final delay/filter history is therefore non-zero.
+        std::vector<float> bypassSettling (
+            static_cast<std::size_t> (sampleRate * 0.50));
+        fillSine (bypassSettling, 997.0f, 0.55f, 0.37f);
+        processInBlocks (scanner, bypassSettling);
+
+        const auto phaseBeforeStableBypass = scanner.currentPhase();
+        std::vector<float> stableBypassSilence (
+            static_cast<std::size_t> (sampleRate * 0.50), 0.0f);
+        processInBlocks (scanner, stableBypassSilence);
+        const auto phaseAfterStableBypass = scanner.currentPhase();
+        auto phaseAdvance =
+            phaseAfterStableBypass - phaseBeforeStableBypass;
+        if (phaseAdvance < 0.0f)
+            phaseAdvance += 1.0f;
+
+        context.expect (
+            phaseAdvance > 0.30f && phaseAdvance < 0.48f,
+            "stable scanner bypass keeps the scanner phase running");
+
+        scanner.setParameters (active);
+        std::vector<float> restartSilence (4096, 0.0f);
+        processInBlocks (scanner, restartSilence);
+        context.expect (
+            peakOf (restartSilence) < 1.0e-5f,
+            "scanner re-enable cannot resurrect pre-bypass audio");
     }
 
     void testAmpCharacterAndProtection (TestContext& context)
@@ -693,6 +745,186 @@ namespace
         return sample;
     }
 
+    void testRotaryPartialMixIsTimeAligned (TestContext& context)
+    {
+        churchorgan::RotaryCabinet rotary;
+        churchorgan::RotaryParameters parameters;
+        parameters.speedMode = churchorgan::RotarySpeedMode::stop;
+        parameters.mix = 0.5f;
+        parameters.micDistance = 0.0f;
+        parameters.stereoWidth = 0.0f;
+        parameters.doppler = 0.0f;
+        parameters.amplitudeModulation = 0.0f;
+        parameters.cabinetResonance = 0.0f;
+        parameters.airAbsorption = 0.0f;
+        parameters.earlyReflections = 0.0f;
+        parameters.output = 0.5f;
+        rotary.setParameters (parameters);
+
+        context.expect (
+            rotary.prepare ({ sampleRate, 512, 0.0f, 0.5f }),
+            "partial-mix rotary prepares");
+
+        std::array<float, 512> left {};
+        std::array<float, 512> right {};
+        left[0] = 0.2f;
+        right[0] = 0.2f;
+        rotary.process (left.data(), right.data(), left.size());
+
+        const auto nominalDelay = static_cast<std::size_t> (
+            rotary.nominalWetLatencyMilliseconds()
+                * static_cast<float> (sampleRate)
+                / 1000.0f);
+        const auto guaranteedPreDelayEnd = nominalDelay > 4
+            ? nominalDelay - 4
+            : std::size_t { 0 };
+        auto preDelayPeak = 0.0f;
+        for (std::size_t sample = 0;
+             sample < guaranteedPreDelayEnd;
+             ++sample)
+        {
+            preDelayPeak = std::max (
+                preDelayPeak,
+                std::max (std::abs (left[sample]),
+                          std::abs (right[sample])));
+        }
+
+        auto arrivalPeak = 0.0f;
+        const auto arrivalStart = nominalDelay > 4
+            ? nominalDelay - 4
+            : std::size_t { 0 };
+        const auto arrivalEnd = std::min (
+            left.size(), nominalDelay + 12);
+        for (auto sample = arrivalStart;
+             sample < arrivalEnd;
+             ++sample)
+        {
+            arrivalPeak = std::max (
+                arrivalPeak,
+                std::max (std::abs (left[sample]),
+                          std::abs (right[sample])));
+        }
+
+        context.expect (
+            preDelayPeak < 1.0e-7f,
+            "partial rotary mix does not leak an undelayed dry path");
+        context.expect (
+            arrivalPeak > 1.0e-4f,
+            "partial rotary mix arrives at cabinet propagation time");
+    }
+
+    void testChannelRotaryBypassResetsLoudnessMemory (
+        TestContext& context)
+    {
+        constexpr int samplesPerBlock = 128;
+        constexpr auto stop = ChurchDAWRotary::Speaker::stopMode;
+        constexpr auto fast = ChurchDAWRotary::Speaker::fastMode;
+
+        ChurchDAWRotary::Speaker previouslyDriven;
+        ChurchDAWRotary::Speaker fresh;
+        previouslyDriven.prepare (sampleRate, samplesPerBlock);
+
+        juce::AudioBuffer<float> warmup (2, samplesPerBlock);
+        auto warmupPhase = 0.0;
+        const auto fillBuffer = [] (
+            juce::AudioBuffer<float>& buffer,
+            int count,
+            double frequency,
+            double& phase,
+            float level)
+        {
+            const auto phaseStep =
+                static_cast<double> (twoPi) * frequency / sampleRate;
+            for (auto sample = 0; sample < count; ++sample)
+            {
+                const auto value =
+                    level * static_cast<float> (std::sin (phase));
+                phase += phaseStep;
+                if (phase >= static_cast<double> (twoPi))
+                    phase -= static_cast<double> (twoPi);
+                buffer.setSample (0, sample, value);
+                buffer.setSample (1, sample, value);
+            }
+        };
+
+        // Build a deliberately register-specific loudness estimate.
+        auto warmupRemaining = static_cast<int> (sampleRate * 12.0);
+        while (warmupRemaining > 0)
+        {
+            const auto count =
+                std::min (samplesPerBlock, warmupRemaining);
+            fillBuffer (warmup, count, 80.0, warmupPhase, 0.42f);
+            previouslyDriven.process (warmup, count, 1.0f, fast);
+            warmupRemaining -= count;
+        }
+
+        // Let Amount reach its stable bypass while preserving the old
+        // detector state, then leave the channel bypassed for a long time.
+        auto bypassRemaining = static_cast<int> (sampleRate * 0.25);
+        while (bypassRemaining > 0)
+        {
+            const auto count =
+                std::min (samplesPerBlock, bypassRemaining);
+            for (auto sample = 0; sample < count; ++sample)
+            {
+                warmup.setSample (0, sample, 0.0f);
+                warmup.setSample (1, sample, 0.0f);
+            }
+            previouslyDriven.process (warmup, count, 0.0f, stop);
+            bypassRemaining -= count;
+        }
+        previouslyDriven.advanceSilently (
+            static_cast<int> (sampleRate * 90.0), stop);
+
+        fresh.prepare (sampleRate, samplesPerBlock);
+        juce::AudioBuffer<float> drivenBlock (2, samplesPerBlock);
+        juce::AudioBuffer<float> freshBlock (2, samplesPerBlock);
+        auto probePhase = 0.0;
+        auto differenceEnergy = 0.0;
+        auto referenceEnergy = 0.0;
+        auto maximumDifference = 0.0f;
+        auto probeRemaining = static_cast<int> (sampleRate * 0.50);
+
+        while (probeRemaining > 0)
+        {
+            const auto count =
+                std::min (samplesPerBlock, probeRemaining);
+            fillBuffer (
+                drivenBlock, count, 6000.0, probePhase, 0.28f);
+            for (auto channel = 0; channel < 2; ++channel)
+                for (auto sample = 0; sample < count; ++sample)
+                    freshBlock.setSample (
+                        channel,
+                        sample,
+                        drivenBlock.getSample (channel, sample));
+
+            previouslyDriven.process (drivenBlock, count, 1.0f, stop);
+            fresh.process (freshBlock, count, 1.0f, stop);
+
+            for (auto channel = 0; channel < 2; ++channel)
+                for (auto sample = 0; sample < count; ++sample)
+                {
+                    const auto reference =
+                        freshBlock.getSample (channel, sample);
+                    const auto difference =
+                        drivenBlock.getSample (channel, sample) - reference;
+                    differenceEnergy +=
+                        static_cast<double> (difference) * difference;
+                    referenceEnergy +=
+                        static_cast<double> (reference) * reference;
+                    maximumDifference = std::max (
+                        maximumDifference, std::abs (difference));
+                }
+            probeRemaining -= count;
+        }
+
+        const auto relativeError = std::sqrt (
+            differenceEnergy / std::max (referenceEnergy, 1.0e-30));
+        context.expect (
+            relativeError < 0.002 && maximumDifference < 0.001f,
+            "channel rotary re-enable matches fresh loudness state");
+    }
+
     void testRotaryLongMixLoudness (
         TestContext& context,
         bool stereo)
@@ -1061,10 +1293,13 @@ int main()
 
     testPrepareValidation (context);
     testScannerBypassAndModulation (context);
+    testScannerBypassRefreshesInternalHistory (context);
     testAmpCharacterAndProtection (context);
     testAmpOversamplingAliasReduction (context);
     testRotaryGeometryAndRamps (context);
     testRotaryDeterminismAndMonoPerspective (context);
+    testRotaryPartialMixIsTimeAligned (context);
+    testChannelRotaryBypassResetsLoudnessMemory (context);
     testRotaryLongMixLoudness (context, false);
     testRotaryLongMixLoudness (context, true);
     testNoRenderAllocations (context);

@@ -529,6 +529,14 @@ namespace churchorgan
             const auto cabinetBase =
                 hornLine_.read (baseDelay)
                 + drumLine_.read (baseDelay);
+            // The rotor path necessarily carries the cabinet propagation
+            // delay.  Mixing it with the original, undelayed input creates a
+            // fixed comb filter whenever mix is between 0 and 1.  Rebuild the
+            // dry reference from the same delayed mid/side history so the
+            // crossfade changes cabinet colour without adding metallic phase
+            // notches.
+            const auto alignedDryLeft = cabinetBase + delayedSide;
+            const auto alignedDryRight = cabinetBase - delayedSide;
             const auto cabinetFloor =
                 0.14f
                 + 0.045f * (1.0f - distance)
@@ -556,16 +564,18 @@ namespace churchorgan
 
             const auto dryPower = stereo
                 ? 0.5f
-                    * (dryLeft * dryLeft + dryRight * dryRight)
-                : dryLeft * dryLeft;
+                    * (alignedDryLeft * alignedDryLeft
+                       + alignedDryRight * alignedDryRight)
+                : alignedDryLeft * alignedDryLeft;
             const auto wetPower = stereo
                 ? 0.5f
                     * (wetLeft * wetLeft + wetRight * wetRight)
                 : wetLeft * wetLeft;
             const auto crossPower = stereo
                 ? 0.5f
-                    * (dryLeft * wetLeft + dryRight * wetRight)
-                : dryLeft * wetLeft;
+                    * (alignedDryLeft * wetLeft
+                       + alignedDryRight * wetRight)
+                : alignedDryLeft * wetLeft;
 
             dryPowerState_ += loudnessMeterStep_
                 * (dryPower - dryPowerState_);
@@ -624,11 +634,11 @@ namespace churchorgan
                 1.32f);
 
             auto outputLeft =
-                (dryWeight * dryLeft + wetWeight * wetLeft)
+                (dryWeight * alignedDryLeft + wetWeight * wetLeft)
                 * correlationCompensation
                 * outputGain;
             auto outputRight =
-                (dryWeight * dryRight + wetWeight * wetRight)
+                (dryWeight * alignedDryRight + wetWeight * wetRight)
                 * correlationCompensation
                 * outputGain;
 

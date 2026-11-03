@@ -386,6 +386,57 @@ Test-Case 'publisher revalida tag antes da policy e dos RNTOs' {
         'site e policy nao possuem exatamente dois gates pre-RNTO'
 }
 
+Test-Case 'Git aceita release em detached HEAD no PowerShell 5.1' {
+    $testRepo = Join-Path ([IO.Path]::GetTempPath()) (
+        'churchdaw-git-state-' + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $testRepo | Out-Null
+    try {
+        & git -C $testRepo init -q -b main
+        if ($LASTEXITCODE -ne 0) { throw 'git init falhou' }
+        & git -C $testRepo -c user.name=Fixture -c user.email=fixture@example.invalid `
+            commit -q --allow-empty -m fixture
+        if ($LASTEXITCODE -ne 0) { throw 'git commit de fixture falhou' }
+        $named = Get-ChurchDAWGitState $testRepo
+        Assert-True ($named.Branch -ceq 'main' -and $named.IsClean) 'branch inicial invalida'
+        & git -C $testRepo checkout -q --detach HEAD
+        if ($LASTEXITCODE -ne 0) { throw 'git checkout falhou' }
+        $detached = Get-ChurchDAWGitState $testRepo
+        Assert-True ($detached.Branch -ceq '' -and $detached.IsClean) 'detached HEAD invalido'
+        Assert-True ($detached.Commit -ceq $named.Commit) 'commit mudou ao destacar HEAD'
+        [IO.File]::WriteAllText((Join-Path $testRepo 'changed.txt'), 'fixture')
+        Assert-True (-not (Get-ChurchDAWGitState $testRepo).IsClean) 'arquivo pendente ignorado'
+    } finally {
+        Remove-Item -LiteralPath $testRepo -Recurse -Force
+    }
+}
+
+Test-Case 'publicacao exige laudo do Mac ligado ao DMG exato' {
+    $root = Join-Path ([IO.Path]::GetTempPath()) ('churchdaw-mac-gate-' + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $root | Out-Null
+    try {
+        $dmg = Join-Path $root 'ChurchDAW-1.6.31.dmg'
+        $reportPath = Join-Path $root 'verification.json'
+        [IO.File]::WriteAllText($dmg, 'verified fixture')
+        Assert-Throws { Assert-ChurchDAWMacVerification $dmg $reportPath '1.6.31' } 'laudo ausente aceito'
+        $checks = @{}
+        foreach ($key in @('developer_id','secure_timestamp','hardened_runtime',
+            'app_notarization','app_stapled','app_gatekeeper','dmg_notarization',
+            'dmg_stapled','dmg_gatekeeper','legacy_dmg_gatekeeper','mounted_app_gatekeeper','mounted_executable_matches')) { $checks[$key]=$true }
+        $report = @{ schema_version=1; product_id='com.churchdaw.app'; version='1.6.31';
+            bytes=(Get-Item $dmg).Length; sha256=(Get-FileHash $dmg -Algorithm SHA256).Hash.ToLowerInvariant(); checks=$checks }
+        [IO.File]::WriteAllText($reportPath, ($report | ConvertTo-Json -Depth 4))
+        Assert-ChurchDAWMacVerification $dmg $reportPath '1.6.31'
+        Assert-Throws { Assert-ChurchDAWMacVerification $dmg $reportPath '1.6.32' } 'laudo de outra versao aceito'
+        $checks.dmg_notarization=$false
+        [IO.File]::WriteAllText($reportPath, ($report | ConvertTo-Json -Depth 4))
+        Assert-Throws { Assert-ChurchDAWMacVerification $dmg $reportPath '1.6.31' } 'DMG nao notarizado aceito'
+        $checks.dmg_notarization=$true
+        [IO.File]::WriteAllText($reportPath, ($report | ConvertTo-Json -Depth 4))
+        [IO.File]::WriteAllText($dmg, 'tampered fixture')
+        Assert-Throws { Assert-ChurchDAWMacVerification $dmg $reportPath '1.6.31' } 'DMG adulterado aceito'
+    } finally { Remove-Item -LiteralPath $root -Recurse -Force }
+}
+
 Write-Host ''
 if ($script:failures -ne 0) {
     throw ("WINDOWS_RELEASE_PIPELINE_TESTS_FAILED: " +

@@ -151,6 +151,7 @@ struct CanalDaCena
     float volume = 1.0f / 1.5f;
 
     int   transpose = 0;
+    int   octave = 0;
     float envioDeReverb = 0.0f;
 
     // So diagnostico: o painel compara com o que esta carregado hoje e avisa
@@ -163,6 +164,23 @@ struct Cena
     bool preenchida = false;
     juce::String nome;
     juce::String gravadaEm;      // ISO-8601, para o musico saber qual e a nova
+
+    // Metadados de palco. Sao aditivos: cenas antigas continuam validas e
+    // recebem valores neutros, enquanto Performance/Sessao passam a mostrar
+    // a mesma informacao que o musico usa no culto.
+    //
+    // musica e deliberadamente separada de nome/secao. Uma musica pode possuir
+    // varias cenas (Intro, Verso, Refrao...) e o Setlist continua referenciando
+    // os snapshots reais. Assim o formato antigo permanece compativel, mas a
+    // Session consegue apresentar a hierarquia culto -> musica -> cena sem
+    // inventar uma segunda copia do estado de audio.
+    juce::String musica;
+    juce::String tonalidade { "C" };
+    juce::String compasso { "4/4" };
+    juce::String secao { "Cena" };
+    double bpm = 120.0;
+    double duracaoSegundos = 0.0;
+    double transicaoSegundos = 0.35;
 
     // SHA-256 hexadecimal do arquivo binario em live-scene-pages/. Guardar so
     // o ID torna o XML pequeno e impede caminho injetado por arquivo corrompido.
@@ -293,6 +311,29 @@ struct InteracaoDeCenas
     }
 };
 
+// Decide o que o indicador/botao SALVAR do cabecalho deve gravar.
+//
+// Uma pagina nova ainda nao e uma cena ativa: o audio foi zerado, mas o slot
+// continua vazio ate o segundo gesto de salvar. Por isso ela tem precedencia
+// sobre a cena ativa anterior. Fora desse fluxo, SALVAR recaptura a cena que
+// esta realmente no ar. Sem um dos dois contextos, ele continua sendo apenas
+// o salvamento geral do projeto e nao sobrescreve um slot arbitrario.
+inline int destinoDoSalvarSuperior (
+    int cenaEmPreparacao,
+    int cenaAtiva,
+    const Cena (&cenas)[numeroDeCenas]) noexcept
+{
+    if (juce::isPositiveAndBelow (cenaEmPreparacao, numeroDeCenas)
+         && ! cenas[cenaEmPreparacao].preenchida)
+        return cenaEmPreparacao;
+
+    if (juce::isPositiveAndBelow (cenaAtiva, numeroDeCenas)
+         && cenas[cenaAtiva].preenchida)
+        return cenaAtiva;
+
+    return -1;
+}
+
 //==============================================================================
 // Geometria pura da faixa de cenas.
 //
@@ -387,6 +428,144 @@ inline LayoutDaFaixaDeCenas calcularLayoutDaFaixaDeCenas (int largura, int altur
 }
 
 //==============================================================================
+// Setlist — a ordem fixa do culto.
+//
+// As 10 cenas continuam soltas na grade; o setlist e so uma sequencia de
+// indices que o musico definiu na ordem do culto. O gesto "proxima cena"
+// (footswitch/CC, tratado no MainComponent com o mecanismo de pickup existente)
+// chama proximaCena() e aciona o fluxo de carregamento que ja existe
+// (AcaoDeCena::carregar via tocar()). Assim TODA a defesa anti-acidente do
+// painel continua valendo: um toque so carrega, gravar continua exigindo armar
+// GRAVAR antes, etc.
+//
+// Sem setlist configurado, proximaCena() devolve -1 e o chamador nao faz nada
+// — nenhum comportamento existente muda. Este struct e estado puro de UI: nao
+// entra na thread de audio. A unica String e o nome do culto; a sequencia
+// continua fixa e sem alocacao durante navegacao/reordem.
+//==============================================================================
+struct Setlist
+{
+    static constexpr int capacidadeMaxima = 64; // teto alto, sem alocacao dinamica
+
+    // Nome do culto/projeto ao vivo. O array abaixo continua sendo a sequencia
+    // exata de snapshots; o agrupamento em musicas vem de Cena::musica.
+    juce::String nome { "Culto atual" };
+    std::array<int, capacidadeMaxima> ordem = {};
+    int tamanho = 0;
+    int posicao = -1; // -1 = antes da primeira; proximaCena devolve ordem[0]
+
+    bool vazio() const noexcept { return tamanho <= 0; }
+
+    bool indiceValido (int indice) const noexcept
+    {
+        return juce::isPositiveAndBelow (indice, numeroDeCenas);
+    }
+
+    void limpar() noexcept
+    {
+        tamanho = 0;
+        posicao = -1;
+    }
+
+    // Adiciona uma cena ao fim do setlist. Ignora indice invalido e duplicata
+    // para nao inflar a lista por engano. Nao aloca.
+    void adicionar (int indice) noexcept
+    {
+        if (! indiceValido (indice) || tamanho >= capacidadeMaxima)
+            return;
+
+        for (int i = 0; i < tamanho; ++i)
+            if (ordem[(size_t) i] == indice)
+                return;
+
+        ordem[(size_t) tamanho] = indice;
+        ++tamanho;
+    }
+
+    // Reposiciona o cursor para a cena atualmente no ar, se ela estiver no
+    // setlist. Devolve true se achou. Usado quando o musico carrega uma cena
+    // manualmente e o setlist precisa se sincronizar sem pular musica.
+    bool reposicionarPara (int indice) noexcept
+    {
+        for (int i = 0; i < tamanho; ++i)
+        {
+            if (ordem[(size_t) i] == indice)
+            {
+                posicao = i;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Devolve o indice da proxima cena do setlist e avanca o cursor, ou -1 se
+    // nao ha setlist ou chegou ao fim. NAO carrega nada por si: so entrega o
+    // indice para o chamador acionar o fluxo existente. Ao chegar ao fim fica
+    // parado (devolve -1) para o musico nao pular do fim para o inicio sem
+    // querer no meio do culto.
+    int proximaCena() noexcept
+    {
+        if (vazio())
+            return -1;
+
+        const int proxima = posicao + 1;
+
+        if (! juce::isPositiveAndBelow (proxima, tamanho))
+            return -1;
+
+        posicao = proxima;
+        return ordem[(size_t) posicao];
+    }
+
+    // Indice da cena do setlist na posicao atual do cursor, ou -1 se o cursor
+    // ainda nao aponta para nenhuma. So para diagnostico/UI.
+    int cenaAtual() const noexcept
+    {
+        if (! juce::isPositiveAndBelow (posicao, tamanho))
+            return -1;
+
+        return ordem[(size_t) posicao];
+    }
+
+    bool removerNaPosicao (int indice) noexcept
+    {
+        if (! juce::isPositiveAndBelow (indice, tamanho))
+            return false;
+
+        for (int i = indice; i + 1 < tamanho; ++i)
+            ordem[(size_t) i] = ordem[(size_t) (i + 1)];
+
+        --tamanho;
+        if (posicao > indice) --posicao;
+        else if (posicao == indice) posicao = juce::jmin (indice, tamanho - 1);
+        if (tamanho <= 0) posicao = -1;
+        return true;
+    }
+
+    bool mover (int origem, int destino) noexcept
+    {
+        if (! juce::isPositiveAndBelow (origem, tamanho)
+             || ! juce::isPositiveAndBelow (destino, tamanho)
+             || origem == destino)
+            return false;
+
+        const int cena = ordem[(size_t) origem];
+        if (origem < destino)
+            for (int i = origem; i < destino; ++i)
+                ordem[(size_t) i] = ordem[(size_t) (i + 1)];
+        else
+            for (int i = origem; i > destino; --i)
+                ordem[(size_t) i] = ordem[(size_t) (i - 1)];
+
+        ordem[(size_t) destino] = cena;
+        if (posicao == origem) posicao = destino;
+        else if (origem < posicao && destino >= posicao) --posicao;
+        else if (origem > posicao && destino <= posicao) ++posicao;
+        return true;
+    }
+};
+
+//==============================================================================
 // Serializacao.
 //
 // REGRA: a leitura e ADITIVA. Atributo ausente significa "nao mexe neste
@@ -403,6 +582,14 @@ inline void escreverCena (juce::XmlElement& pai, const Cena& cena, int indice)
     auto* c = pai.createNewChildElement ("SCENE");
     c->setAttribute ("index", indice);
     c->setAttribute ("filled", cena.preenchida ? 1 : 0);
+    c->setAttribute ("name", cena.nome);
+    c->setAttribute ("song", cena.musica);
+    c->setAttribute ("key", cena.tonalidade);
+    c->setAttribute ("meter", cena.compasso);
+    c->setAttribute ("section", cena.secao);
+    c->setAttribute ("bpm", cena.bpm);
+    c->setAttribute ("duration", cena.duracaoSegundos);
+    c->setAttribute ("transition", cena.transicaoSegundos);
 
     // Cena vazia nao tem estado para guardar. Escrever os 14 canais dela era
     // gravar 140 elementos <L> de valores de fabrica que a leitura aditiva
@@ -411,7 +598,6 @@ inline void escreverCena (juce::XmlElement& pai, const Cena& cena, int indice)
     if (! cena.preenchida)
         return;
 
-    c->setAttribute ("name", cena.nome);
     c->setAttribute ("savedAt", cena.gravadaEm);
 
     if (idDeEstadoDoMotorValido (cena.estadoDoMotorId))
@@ -461,16 +647,40 @@ inline void escreverCena (juce::XmlElement& pai, const Cena& cena, int indice)
         l->setAttribute ("solo", canal.solo ? 1 : 0);
         l->setAttribute ("vol", (double) canal.volume);
         l->setAttribute ("transp", canal.transpose);
+        l->setAttribute ("oct", canal.octave);
         l->setAttribute ("send", (double) canal.envioDeReverb);
         l->setAttribute ("timbre", canal.rotuloDoTimbre);
     }
 }
 
-inline void lerCena (const juce::XmlElement& c, Cena& cena)
+inline bool isLegacyChurchPadTimbre (const juce::String& label) noexcept
+{
+    const auto name = label.trim();
+    return name.equalsIgnoreCase ("PAD LP")
+        || name.equalsIgnoreCase ("Church Pad")
+        || name.equalsIgnoreCase ("Pad Continuo");
+}
+
+inline void lerCena (const juce::XmlElement& c, Cena& cena,
+                     bool migrateLegacyPadOctave = false)
 {
     cena.preenchida = c.getIntAttribute ("filled", cena.preenchida ? 1 : 0) != 0;
     cena.nome       = c.getStringAttribute ("name", cena.nome);
+    cena.musica     = c.getStringAttribute ("song", cena.musica)
+                          .trim().substring (0, 56);
     cena.gravadaEm  = c.getStringAttribute ("savedAt", cena.gravadaEm);
+    cena.tonalidade = c.getStringAttribute ("key", cena.tonalidade)
+                          .trim().substring (0, 8);
+    cena.compasso = c.getStringAttribute ("meter", cena.compasso)
+                        .trim().substring (0, 8);
+    cena.secao = c.getStringAttribute ("section", cena.secao)
+                     .trim().substring (0, 28);
+    cena.bpm = juce::jlimit (30.0, 300.0,
+        c.getDoubleAttribute ("bpm", cena.bpm));
+    cena.duracaoSegundos = juce::jlimit (0.0, 86400.0,
+        c.getDoubleAttribute ("duration", cena.duracaoSegundos));
+    cena.transicaoSegundos = juce::jlimit (0.0, 15.0,
+        c.getDoubleAttribute ("transition", cena.transicaoSegundos));
 
     if (auto* engine = c.getChildByName ("ENGINE"))
     {
@@ -526,8 +736,82 @@ inline void lerCena (const juce::XmlElement& c, Cena& cena)
         canal.solo           = l->getIntAttribute ("solo", canal.solo ? 1 : 0) != 0;
         canal.volume         = (float) l->getDoubleAttribute ("vol", (double) canal.volume);
         canal.transpose      = juce::jlimit (-24, 24, l->getIntAttribute ("transp", canal.transpose));
+        canal.octave         = juce::jlimit (-4, 4, l->getIntAttribute ("oct", canal.octave));
         canal.envioDeReverb  = (float) l->getDoubleAttribute ("send", (double) canal.envioDeReverb);
         canal.rotuloDoTimbre = l->getStringAttribute ("timbre", canal.rotuloDoTimbre);
+
+        // Versoes antigas aplicavam octave=-2 como "default" do Pad Church.
+        // O valor correto pertence ao canal e deve nascer em zero; cenas novas
+        // continuam livres para salvar qualquer oitava escolhida pelo musico.
+        if (migrateLegacyPadOctave
+             && canal.octave == -2
+             && isLegacyChurchPadTimbre (canal.rotuloDoTimbre))
+            canal.octave = 0;
+    }
+}
+
+//==============================================================================
+// Serializacao do setlist.
+//
+// Bloco separado (<SETLIST>) no mesmo pai que os <SCENE>: nao toca nos dados
+// de nenhuma cena, entao um banco gravado por uma versao que nao conhecia
+// setlist continua lendo identico. Leitura aditiva, como a das cenas: bloco
+// ausente significa "sem setlist" e o comportamento do painel nao muda.
+//==============================================================================
+inline void escreverSetlist (juce::XmlElement& pai, const Setlist& setlist)
+{
+    const auto nome = setlist.nome.trim().substring (0, 64);
+    if (setlist.vazio() && nome.isEmpty())
+        return;
+
+    auto* s = pai.createNewChildElement ("SETLIST");
+    s->setAttribute ("name", nome);
+    s->setAttribute ("size", setlist.tamanho);
+    s->setAttribute ("pos", setlist.posicao);
+
+    for (int i = 0; i < setlist.tamanho; ++i)
+    {
+        auto* e = s->createNewChildElement ("S");
+        e->setAttribute ("i", i);
+        e->setAttribute ("scene", setlist.ordem[(size_t) i]);
+    }
+}
+
+inline void lerSetlist (const juce::XmlElement& pai, Setlist& setlist)
+{
+    setlist = Setlist{};
+
+    if (auto* s = pai.getChildByName ("SETLIST"))
+    {
+        setlist.nome = s->getStringAttribute ("name", setlist.nome)
+                           .trim().substring (0, 64);
+        if (setlist.nome.isEmpty())
+            setlist.nome = "Culto atual";
+        const int tamanho = juce::jlimit (0, Setlist::capacidadeMaxima,
+                                          s->getIntAttribute ("size", 0));
+        const int posicao = juce::jlimit (-1, Setlist::capacidadeMaxima,
+                                          s->getIntAttribute ("pos", -1));
+
+        for (int i = 0; i < tamanho; ++i)
+            setlist.ordem[(size_t) i] = 0;
+
+        for (auto* e : s->getChildWithTagNameIterator ("S"))
+        {
+            const int idx = e->getIntAttribute ("i", -1);
+
+            if (! juce::isPositiveAndBelow (idx, tamanho))
+                continue;
+
+            const int cena = e->getIntAttribute ("scene", -1);
+
+            if (! setlist.indiceValido (cena))
+                continue;
+
+            setlist.ordem[(size_t) idx] = cena;
+        }
+
+        setlist.tamanho = tamanho;
+        setlist.posicao = juce::isPositiveAndBelow (posicao, tamanho) ? posicao : -1;
     }
 }
 

@@ -181,6 +181,8 @@ namespace churchorgan
             240.0f,
             targetAutoMixLayerGain_);
 
+        stealDeclickDecay_ = std::exp (
+            -1.0f / static_cast<float> (std::max (1.0, spec_.sampleRate * 0.004)));
         prepared_ = true;
         updateAllTargets();
         reset();
@@ -209,6 +211,8 @@ namespace churchorgan
     {
         voices_.fill ({});
         events_.fill ({});
+        stealDeclickLeft_.fill (0.0f);
+        stealDeclickRight_.fill (0.0f);
         eventCount_ = 0;
         activationSerial_ = 0;
         renderedSamples_ = 0;
@@ -676,6 +680,8 @@ namespace churchorgan
                         && target == 0.0f)
                     {
                         envelope = 0.0f;
+                        voice.lastLeft[layer] = 0.0f;
+                        voice.lastRight[layer] = 0.0f;
                         continue;
                     }
 
@@ -701,8 +707,12 @@ namespace churchorgan
                         * velocityGain
                         * expressionGain
                         * voiceScale;
-                    rawLeft[layer] += component.left * gain;
-                    rawRight[layer] += component.right * gain;
+                    const auto sampleLeft = component.left * gain;
+                    const auto sampleRight = component.right * gain;
+                    voice.lastLeft[layer] = sampleLeft;
+                    voice.lastRight[layer] = sampleRight;
+                    rawLeft[layer] += sampleLeft;
+                    rawRight[layer] += sampleRight;
                 }
 
                 voice.primary.advance();
@@ -730,6 +740,10 @@ namespace churchorgan
                  layer < worshipLayerCount;
                  ++layer)
             {
+                rawLeft[layer] += stealDeclickLeft_[layer];
+                rawRight[layer] += stealDeclickRight_[layer];
+                stealDeclickLeft_[layer] *= stealDeclickDecay_;
+                stealDeclickRight_[layer] *= stealDeclickDecay_;
                 auto& runtime = layerRuntime_[layer];
                 runtime.leftLowPass +=
                     lowPassStep[layer]
@@ -1008,7 +1022,14 @@ namespace churchorgan
         }
 
         if (voice.active)
+        {
+            for (std::size_t layer = 0; layer < worshipLayerCount; ++layer)
+            {
+                stealDeclickLeft_[layer] += voice.lastLeft[layer];
+                stealDeclickRight_[layer] += voice.lastRight[layer];
+            }
             ++stolenVoices_;
+        }
         initialiseVoice (
             voice,
             index,

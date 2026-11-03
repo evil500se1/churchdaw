@@ -1,0 +1,151 @@
+workflows:
+  churchdaw-ios-ipados:
+    name: ChurchDAW — iPad & iPhone (Device IPA + Simulator)
+    instance_type: mac_mini_m2
+    max_build_duration: 60
+    environment:
+      xcode: latest
+    triggering:
+      events:
+        - push
+      branch_patterns:
+        - pattern: main
+          include: true
+          source: true
+    scripts:
+      - name: Exibir ambiente Xcode e SDKs
+        script: |
+          set -euo pipefail
+          xcodebuild -version
+          cmake --version
+          xcrun --sdk iphoneos --show-sdk-version
+          xcrun --sdk iphonesimulator --show-sdk-version
+
+      - name: Configurar CMake para iOS / iPadOS
+        script: |
+          set -euo pipefail
+          cmake -S . -B build-ios -G Xcode \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+            -DCMAKE_XCODE_GENERATE_SCHEME=ON
+
+      - name: Compilar ChurchDAW arm64 para iPad e iPhone fisicos (sem assinatura)
+        script: |
+          set -euo pipefail
+          cmake --build build-ios \
+            --config Release \
+            --target MinhaDAW \
+            --parallel 4 \
+            -- \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=""
+
+          DEVICE_APP="$(find build-ios -path '*Release-iphoneos*' -type d -name ChurchDAW.app -print -quit)"
+          if [[ -z "$DEVICE_APP" ]]; then
+            DEVICE_APP="$(find build-ios -type d -name ChurchDAW.app -print -quit)"
+          fi
+          test -n "$DEVICE_APP"
+          python3 Tests/Studio/ValidateIOSBundle.py "$DEVICE_APP"
+
+          mkdir -p dist-ios Payload
+          rm -rf Payload/ChurchDAW.app
+          cp -R "$DEVICE_APP" Payload/ChurchDAW.app
+          ditto -c -k --sequesterRsrc --keepParent Payload dist-ios/ChurchDAW-iPad-iPhone-Device-arm64.ipa
+          rm -rf Payload
+
+      - name: Compilar e validar pacote para Simulador iPhone / iPad
+        script: |
+          set -euo pipefail
+          cmake --build build-ios \
+            --config Release \
+            --target MinhaDAW \
+            --parallel 4 \
+            -- \
+            -sdk iphonesimulator \
+            -destination "generic/platform=iOS Simulator" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=""
+
+          SIM_APP="$(find build-ios -path '*Release-iphonesimulator*' -type d -name ChurchDAW.app -print -quit)"
+          test -n "$SIM_APP"
+          plutil -lint "$SIM_APP/Info.plist"
+          python3 Tests/Studio/ValidateIOSBundle.py "$SIM_APP"
+
+          while IFS= read -r ENTITLEMENTS; do
+            if grep -Eq 'com\.apple\.security\.(device\.audio-input|cs\.disable-library-validation)' "$ENTITLEMENTS"; then
+              echo "Entitlement exclusivo de macOS vazou para o iOS: $ENTITLEMENTS" >&2
+              exit 1
+            fi
+          done < <(find build-ios -type f -name '*.entitlements' -print)
+
+          mkdir -p dist-ios
+          ditto -c -k --sequesterRsrc --keepParent "$SIM_APP" dist-ios/ChurchDAW-iPad-iPhone-Simulator.zip
+    artifacts:
+      - dist-ios/*.ipa
+      - dist-ios/*.zip
+
+  churchdaw-macos:
+    name: ChurchDAW — macOS Universal (arm64 + Intel DMG)
+    instance_type: mac_mini_m2
+    max_build_duration: 60
+    environment:
+      xcode: latest
+    triggering:
+      events:
+        - push
+      branch_patterns:
+        - pattern: main
+          include: true
+          source: true
+    scripts:
+      - name: Configurar e compilar ChurchDAW Universal (arm64 + x86_64)
+        script: |
+          set -euo pipefail
+          cmake -B build-mac \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCHURCHDAW_ENABLE_DESKTOP_LICENSING=OFF \
+            -DCHURCHDAW_ALLOW_UNLICENSED_DESKTOP_BUILD=ON \
+            -DCHURCHDAW_BUILD_LICENSE_TESTS=OFF \
+            -DCHURCHDAW_BUILD_AUDIO_TESTS=ON \
+            -DCHURCHDAW_UPDATE_REQUIRE_OS_SIGNATURE=OFF
+          cmake --build build-mac --config Release --parallel 4
+
+      - name: Rodar suites CTest de DSP, MIDI e Layout no macOS
+        script: |
+          set -euo pipefail
+          ctest --test-dir build-mac -C Release --output-on-failure -j 4
+
+      - name: Assinar ad-hoc, auditar arquiteturas e gerar DMG Universal
+        script: |
+          set -euo pipefail
+          APP="build-mac/MinhaDAW_artefacts/Release/ChurchDAW.app"
+          EXE="$APP/Contents/MacOS/ChurchDAW"
+          PLIST="$APP/Contents/Info.plist"
+          test -d "$APP"
+          plutil -lint "$PLIST"
+
+          ARCHS="$(lipo -archs "$EXE")"
+          echo "Arquiteturas no binario macOS: $ARCHS"
+          grep -qw arm64 <<<"$ARCHS"
+          grep -qw x86_64 <<<"$ARCHS"
+
+          codesign --force --deep --sign - --options runtime \
+            --entitlements Packaging/ChurchDAW.entitlements "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+
+          VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLIST")"
+          mkdir -p dist-mac dmg-stage
+          cp -R "$APP" dmg-stage/ChurchDAW.app
+          ln -s /Applications dmg-stage/Applications
+          hdiutil create \
+            -volname "ChurchDAW $VERSION" \
+            -srcfolder dmg-stage \
+            -ov -format UDZO \
+            "dist-mac/ChurchDAW-${VERSION}-macOS-Universal.dmg"
+          rm -rf dmg-stage
+    artifacts:
+      - dist-mac/*.dmg

@@ -1168,6 +1168,72 @@ bool testAllPresetNoiseFloor()
     return passed;
 }
 
+bool testDormantRestartHasNoStoredResidue()
+{
+    constexpr double sampleRate = 48000.0;
+    constexpr int blockSize = 257;
+    constexpr int preset = 1;
+    WorshipReverb subject;
+    WorshipReverb fresh;
+    subject.setPreset (preset);
+    fresh.setPreset (preset);
+    subject.prepare (sampleRate, blockSize);
+    fresh.prepare (sampleRate, blockSize);
+
+    juce::AudioBuffer<float> subjectBuffer (2, blockSize);
+    juce::AudioBuffer<float> freshBuffer (2, blockSize);
+    subjectBuffer.clear();
+    subjectBuffer.setSample (0, 0, 0.2f);
+    subjectBuffer.setSample (1, 0, 0.2f);
+    subject.process (subjectBuffer);
+
+    const int sleepSamples = (int) std::ceil (
+        (subject.getTailLengthSeconds() + 1.25) * sampleRate);
+    for (int rendered = blockSize;
+         rendered < sleepSamples;
+         rendered += blockSize)
+    {
+        subjectBuffer.clear();
+        subject.process (subjectBuffer);
+    }
+
+    float maximumError = 0.0f;
+    bool finite = true;
+    constexpr int comparisonBlocks = 192;
+    for (int block = 0; block < comparisonBlocks; ++block)
+    {
+        subjectBuffer.clear();
+        freshBuffer.clear();
+
+        if (block == 0)
+        {
+            subjectBuffer.setSample (0, 0, 0.2f);
+            subjectBuffer.setSample (1, 0, 0.2f);
+            freshBuffer.setSample (0, 0, 0.2f);
+            freshBuffer.setSample (1, 0, 0.2f);
+        }
+
+        subject.process (subjectBuffer);
+        fresh.process (freshBuffer);
+
+        for (int channel = 0; channel < 2; ++channel)
+            for (int sample = 0; sample < blockSize; ++sample)
+            {
+                const auto current = subjectBuffer.getSample (channel, sample);
+                const auto expected = freshBuffer.getSample (channel, sample);
+                finite = finite && std::isfinite (current);
+                maximumError = juce::jmax (
+                    maximumError, std::abs (current - expected));
+            }
+    }
+
+    const bool passed = finite && maximumError <= 1.0e-12f;
+    std::cout << "Dormant reverb restart: max error="
+              << maximumError << " -> "
+              << (passed ? "PASS" : "FAIL") << '\n';
+    return passed;
+}
+
 bool testBlockSizeEnergyConsistency()
 {
     constexpr double sampleRate = 48000.0;
@@ -1524,6 +1590,108 @@ bool testPresetChanges()
     return passed;
 }
 
+bool testPresetChangePreservesWetTailWithoutHole()
+{
+    constexpr double sampleRate = 48000.0;
+    constexpr int blockSize = 127;
+    constexpr int totalSamples = (int) (2.2 * sampleRate);
+    constexpr int excitationEnd = (int) (0.45 * sampleRate);
+    constexpr int switchSample = (int) (1.0 * sampleRate);
+    constexpr int rmsWindow = (int) (0.010 * sampleRate);
+    WorshipReverb reverb;
+    reverb.setPreset (1); // Cloud: cauda longa e densa.
+    reverb.prepare (sampleRate, blockSize);
+    juce::AudioBuffer<float> buffer (2, blockSize);
+    std::vector<float> wet ((size_t) totalSamples, 0.0f);
+    uint32_t noiseState = UINT32_C (0x243f6a88);
+    bool changed = false;
+    bool finite = true;
+    float maximumStep = 0.0f;
+    float previous = 0.0f;
+
+    for (int start = 0; start < totalSamples; start += blockSize)
+    {
+        if (! changed && start >= switchSample)
+        {
+            reverb.setPreset (8); // Hall
+            changed = true;
+        }
+
+        buffer.clear();
+        const int valid = juce::jmin (blockSize, totalSamples - start);
+
+        for (int sample = 0; sample < valid; ++sample)
+        {
+            const int position = start + sample;
+            if (position < excitationEnd)
+            {
+                noiseState ^= noiseState << 13;
+                noiseState ^= noiseState >> 17;
+                noiseState ^= noiseState << 5;
+                const float noise =
+                    ((float) (noiseState & UINT32_C (0xffff))
+                        / 32767.5f - 1.0f) * 0.08f;
+                buffer.setSample (0, sample, noise);
+                buffer.setSample (1, sample, -0.73f * noise);
+            }
+        }
+
+        reverb.process (buffer);
+
+        for (int sample = 0; sample < valid; ++sample)
+        {
+            const float value = 0.5f * (
+                buffer.getSample (0, sample)
+                + buffer.getSample (1, sample));
+            wet[(size_t) (start + sample)] = value;
+            finite = finite && std::isfinite (value);
+            maximumStep = juce::jmax (
+                maximumStep, std::abs (value - previous));
+            previous = value;
+        }
+    }
+
+    const auto rms = [&wet] (int first, int count)
+    {
+        long double energy = 0.0L;
+        for (int sample = 0; sample < count; ++sample)
+        {
+            const long double value = wet[(size_t) (first + sample)];
+            energy += value * value;
+        }
+        return std::sqrt ((double) (energy / (long double) count));
+    };
+
+    const double beforeRms = rms (switchSample - 4 * rmsWindow,
+                                  4 * rmsWindow);
+    double minimumTransitionRms = std::numeric_limits<double>::max();
+
+    for (int first = switchSample;
+         first + rmsWindow <= switchSample + (int) (0.30 * sampleRate);
+         first += rmsWindow / 2)
+        minimumTransitionRms = juce::jmin (
+            minimumTransitionRms, rms (first, rmsWindow));
+
+    const double preservedTailRms = rms (
+        switchSample + (int) (0.30 * sampleRate),
+        (int) (0.20 * sampleRate));
+    const double minimumRatio = minimumTransitionRms
+                              / juce::jmax (beforeRms, 1.0e-15);
+    const double preservedRatio = preservedTailRms
+                                / juce::jmax (beforeRms, 1.0e-15);
+    const bool passed = finite && changed
+                     && beforeRms > 1.0e-6
+                     && minimumRatio >= 0.035
+                     && preservedRatio >= 0.035
+                     && maximumStep < 0.02f;
+
+    std::cout << "Preset tail continuity Cloud->Hall: min10ms/pre="
+              << minimumRatio << " late/pre=" << preservedRatio
+              << " max step=" << maximumStep
+              << " -> " << (passed ? "PASS" : "FAIL") << '\n';
+    return passed;
+}
+
 bool testRapidPresetReversal()
 {
     constexpr double sampleRate = 48000.0;
@@ -1702,6 +1870,9 @@ int main (int argc, char** argv)
         ++failures;
     if (selected ("--noise-floor") && ! testAllPresetNoiseFloor())
         ++failures;
+    if (selected ("--sleep-restart")
+        && ! testDormantRestartHasNoStoredResidue())
+        ++failures;
     if (selected ("--block-consistency")
         && ! testBlockSizeEnergyConsistency())
         ++failures;
@@ -1711,6 +1882,9 @@ int main (int argc, char** argv)
         && ! testFractionalDelayBoundsAndReprepare())
         ++failures;
     if (selected ("--preset-changes") && ! testPresetChanges())
+        ++failures;
+    if (selected ("--preset-tail-continuity")
+        && ! testPresetChangePreservesWetTailWithoutHole())
         ++failures;
     if (selected ("--rapid-reversal") && ! testRapidPresetReversal())
         ++failures;

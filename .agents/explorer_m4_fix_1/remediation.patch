@@ -1,0 +1,29 @@
+--- Source/TimbresProcessor.h
++++ Source/TimbresProcessor.h
+@@ -14142,1 +14142,1 @@
+-        const int transpLabelH = compactMasterVertical ? 9 : 11;
++        int transpLabelH = compactMasterVertical ? 9 : 11;
+@@ -14238,1 +14238,1 @@
+-        const int transpLabelH = juce::jmin (
++        transpLabelH = juce::jmin (
+
+--- Source/MainComponent.cpp
++++ Source/MainComponent.cpp
+@@ -883,6 +883,8 @@
+     sabrinaBypassButton.onClick = [this]
+     {
+         const bool active = sabrinaBypassButton.getToggleState();
+         if (sabrinaProcessor != nullptr)
+             sabrinaProcessor->setSabrinaBypassed (! active);
++        if (auto* timbres = dynamic_cast<TimbresEditor*> (dockedEditor.get()))
++            timbres->sabrinaToggleBtn.setToggleState (active, juce::dontSendNotification);
+     };
+
+--- Source/SabrinaSafeLoad.c
++++ Source/SabrinaSafeLoad.c
+@@ -1,0 +1,2 @@
++#if defined(_WIN32) || defined(WIN32)
++
+@@ -37,0 +39,2 @@
++
++#endif /* defined(_WIN32) || defined(WIN32) */

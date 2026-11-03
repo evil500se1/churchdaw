@@ -26,6 +26,12 @@ param(
     [int] $MinimumVersionCode = 0,
     [string] $UpdateMessage = '',
     [string] $UpdatePolicyPrivateKey = '',
+    [string] $UpdatePolicyPublicKey = '',
+    # O key_id do envelope PRECISA parear com a chave privada usada: o
+    # default do assinador (churchdaw-update-2026-08) nao casa com a
+    # private 2026-01 do ChurchDAW-Secrets e faz o gate de update
+    # reprovar (assinatura invalida) e abandona clientes antigos.
+    [string] $UpdatePolicyKeyId = 'churchdaw-update-2026-01',
     [string] $PreviousPolicy = '',
 
     [string] $PfxPath = '',
@@ -207,6 +213,21 @@ $versionCode =
     [int] $versionParts[1] * 100 +
     [int] $versionParts[2]
 
+# PISO HISTORICO: o CMakeLists pode elevar o version code acima da formula
+# (ex.: 1.6.3 publicada como 10610). O updater compara CODIGOS, entao a
+# politica precisa usar o MESMO code que o binario compilado. Le o piso do
+# CMakeLists para nunca divergir.
+$cmakeText = [IO.File]::ReadAllText($cmakeLists)
+$floorMatches = [regex]::Matches(
+    $cmakeText,
+    '(?m)^\s*set\(CHURCHDAW_VERSION_CODE_FLOOR\s+([0-9]+)\s*\)')
+if ($floorMatches.Count -ge 1) {
+    $floor = [int] $floorMatches[0].Groups[1].Value
+    if ($floor -gt $versionCode) {
+        $versionCode = $floor
+    }
+}
+
 $hasSigningIdentity =
     -not [string]::IsNullOrWhiteSpace($PfxPath) -or
     -not [string]::IsNullOrWhiteSpace($Thumbprint) -or
@@ -335,6 +356,8 @@ $configureArguments = @(
     '-DCHURCHDAW_LICENSE_API_BASE=https://churchdaw.com/api/v1',
     '-DCHURCHDAW_BUILD_INSTALLER=ON',
     '-DCHURCHDAW_UPDATE_ALLOW_LOCALHOST=OFF',
+    "-DCHURCHDAW_UPDATE_REQUIRE_OS_SIGNATURE=$(
+        if ($ReleaseMode -eq 'Commercial') { 'ON' } else { 'OFF' })",
     '-DCHURCHDAW_UPDATE_POLICY_URL=https://churchdaw.com/app/desktop/update-policy-v1.json'
 )
 
@@ -357,6 +380,8 @@ $requiredCache = [ordered] @{
     CHURCHDAW_LICENSE_API_BASE = 'https://churchdaw.com/api/v1'
     CHURCHDAW_BUILD_INSTALLER = 'ON'
     CHURCHDAW_UPDATE_ALLOW_LOCALHOST = 'OFF'
+    CHURCHDAW_UPDATE_REQUIRE_OS_SIGNATURE =
+        $(if ($ReleaseMode -eq 'Commercial') { 'ON' } else { 'OFF' })
     CHURCHDAW_UPDATE_POLICY_URL =
         'https://churchdaw.com/app/desktop/update-policy-v1.json'
     CMAKE_GENERATOR = $CMakeGenerator
@@ -385,7 +410,7 @@ $null = Invoke-ReleaseCommand -FilePath $licenseVerifier `
     -Label 'license verifier tests'
 
 if ($audioTestsEnabled) {
-    Write-Host '== testes de audio/update (sem app comercial) ==' `
+    Write-Host '== testes de audio/update/ChurchCam (sem app comercial) ==' `
         -ForegroundColor Cyan
     $null = Invoke-ReleaseCommand -FilePath $cmake `
         -Arguments @(
@@ -394,18 +419,36 @@ if ($audioTestsEnabled) {
             'ChurchDAWReverbPitchTests',
             'ChurchDAWMasterLimiterTests',
             'ChurchDAWChannelToneTests',
+            'ChurchDAWNordSampleToneTests',
             'ChurchDAWMidiMappingSafetyTests',
             'ChurchDAWChannelRotaryTests',
             'ChurchDAWPadProcessorTests',
+            'ChurchDAWMobileBufferPolicyTests',
+            'ChurchDAWPadSynthProcessorTests',
+            'ChurchDAWPadSynthRenderProbe',
             'ChurchDAWLibraryPackPathTests',
+            'ChurchDAWTimbreDownloadTests',
             'ChurchDAWLiveScenesTests',
             'ChurchDAWSceneFileWriteProbe',
             'ChurchDAWPluginScanPolicyTests',
             'ChurchDAWAndroidStageLayoutTests',
             'ChurchDAWTimbreLoadStressTests',
             'ChurchDAWHostedInstrumentMidiRoutingTests',
+            'ChurchDAWMasterRouteAdversarialProbe',
+            'ChurchDAWZipDeleteProbe',
             'ChurchDAWReverbBoundsProbe',
             'ChurchDAWUpdatePolicyTests',
+            # O ctest abaixo roda TODOS os testes registrados. Portanto cada
+            # executavel/fixture precisa constar nesta lista; caso contrario o
+            # teste aparece como "Not Run" apesar de o codigo compilar em outro
+            # build local.
+            'ChurchDAWChildProcessReapTests',
+            'ChurchDAWPluginScanIntegrationTests',
+            'ChurchDAWVST3MultiClassCrashFixture',
+            'ChurchDAWSabrinaTests',
+            'ChurchDAWMixerStripCollapseTests',
+            'ChurchDAWEngineRealtimeTests',
+            'ChurchDAWStudioPreview',
             '--parallel', "$Parallel") `
         -LogPath (Join-Path $logsDir '04-build-extended-tests.log') `
         -Label 'build release extended tests'
@@ -418,6 +461,35 @@ if ($audioTestsEnabled) {
         -LogPath (Join-Path $logsDir '05-audio-tests-release.log') `
         -Label 'complete release tests'
 
+    # O StudioPreview nao esta registrado no ctest. Seus modos abaixo usam
+    # quadros e audio sinteticos, sem abrir camera, microfone ou sessao do app.
+    # NativeCapture mantem o executavel GUI em um pipeline, aguardando sua
+    # saida e preservando stdout/stderr e codigo de retorno no log.
+    $studioPreview = Resolve-UniqueBuildFile -Root $BuildDir `
+        -Name 'ChurchDAW Studio Preview.exe'
+    $null = Invoke-ReleaseCommand -FilePath $studioPreview `
+        -Arguments @('--self-test') `
+        -LogPath (Join-Path $logsDir '05b-churchcam-self-tests.log') `
+        -Label 'ChurchCam self tests'
+    $null = Invoke-ReleaseCommand -FilePath $studioPreview `
+        -Arguments @(
+            '--movie-writer-contract',
+            (Join-Path $BuildDir 'churchcam-contract')) `
+        -LogPath (Join-Path $logsDir '05c-churchcam-movie-writer-contract.log') `
+        -Label 'ChurchCam native movie writer contract'
+    $null = Invoke-ReleaseCommand -FilePath $studioPreview `
+        -Arguments @(
+            '--record-test',
+            (Join-Path $BuildDir 'churchcam-record-test-720p.mp4')) `
+        -LogPath (Join-Path $logsDir '05d-churchcam-recorder-720p.log') `
+        -Label 'ChurchCam Recorder 720p'
+    $null = Invoke-ReleaseCommand -FilePath $studioPreview `
+        -Arguments @(
+            '--record-test-fullhd',
+            (Join-Path $BuildDir 'churchcam-record-test-1080p.mp4')) `
+        -LogPath (Join-Path $logsDir '05e-churchcam-recorder-1080p.log') `
+        -Label 'ChurchCam Recorder 1080p'
+
     $null = Invoke-ReleaseCommand -FilePath $cmake `
         -Arguments @(
             '--build', $BuildDir, '--config', 'RelWithDebInfo',
@@ -425,6 +497,47 @@ if ($audioTestsEnabled) {
             '--parallel', "$Parallel") `
         -LogPath (Join-Path $logsDir '06-build-reverb-asan.log') `
         -Label 'build reverb bounds ASan'
+
+    # RUNTIME DO ASan NO PATH.
+    #
+    # O probe linka com /fsanitize=address dinamico, entao precisa achar
+    # clang_rt.asan_dynamic-x86_64.dll em tempo de execucao. Ela mora no bin do
+    # toolset MSVC e NAO esta no PATH de um shell comum: sem isto o ctest morre
+    # com 0xc0000135 (DLL nao encontrada) e o release inteiro aborta -- sem
+    # nenhum defeito no reverb, que passa normalmente na suite Release.
+    $asanRuntimeDir = $null
+    $asanDllName = 'clang_rt.asan_dynamic-x86_64.dll'
+
+    # 1) o toolset ativo, quando o script roda dentro de um Developer Prompt
+    if (-not [string]::IsNullOrWhiteSpace($env:VCToolsInstallDir)) {
+        $candidate = Join-Path $env:VCToolsInstallDir 'bin\Hostx64\x64'
+        if (Test-Path (Join-Path $candidate $asanDllName)) {
+            $asanRuntimeDir = (Resolve-Path $candidate).Path
+        }
+    }
+    # 2) varredura das instalacoes do Visual Studio (inclui Build Tools, que
+    #    ficam em "Program Files (x86)\...\2022\BuildTools\VC\Tools\MSVC\<ver>")
+    if (-not $asanRuntimeDir) {
+        foreach ($root in @(
+                "${env:ProgramFiles(x86)}\Microsoft Visual Studio",
+                "$env:ProgramFiles\Microsoft Visual Studio")) {
+            if (-not (Test-Path $root)) { continue }
+            $found = Get-ChildItem $root -Recurse -Filter $asanDllName -File `
+                -ErrorAction SilentlyContinue |
+                Where-Object { $_.DirectoryName -like '*Hostx64\x64' } |
+                Sort-Object FullName -Descending | Select-Object -First 1
+            if ($found) { $asanRuntimeDir = $found.DirectoryName; break }
+        }
+    }
+    if ($asanRuntimeDir) {
+        Write-Host "== runtime ASan: $asanRuntimeDir ==" -ForegroundColor Cyan
+        $env:PATH = "$asanRuntimeDir;$env:PATH"
+    } else {
+        throw ('Runtime do AddressSanitizer nao encontrada ' +
+               '(clang_rt.asan_dynamic-x86_64.dll). Instale o componente ' +
+               '"C++ AddressSanitizer" no Visual Studio Installer.')
+    }
+
     $null = Invoke-ReleaseCommand -FilePath $ctest `
         -Arguments @(
             '--test-dir', $BuildDir,
@@ -456,6 +569,7 @@ $appPe = Assert-ChurchDAWPeReleaseIdentity -Path $appBinary `
 $appAscii = [Text.Encoding]::ASCII.GetString(
     [IO.File]::ReadAllBytes($appBinary))
 foreach ($marker in @(
+    'CHURCHDAW_RELEASE_LICENSE_GATE=DESKTOP_ENABLED',
     'https://churchdaw.com/api/v1',
     '/auth/login',
     'churchdaw-lease+jwt',
@@ -521,12 +635,19 @@ if ($audioTestsEnabled) {
         WindowsInstaller = $appBinary
         WindowsInstallerUrl = $fixtureUrl
         PrivateKey = $UpdatePolicyPrivateKey
+        KeyId = $UpdatePolicyKeyId
         ReleaseMode = $ReleaseMode
         ExpectedWindowsPublisher = $signingPolicy.ExpectedPublisher
         ExpectedWindowsSignerThumbprints =
             $signingPolicy.ExpectedSignerThumbprints
         WindowsVerificationLogPath =
             (Join-Path $logsDir '10-update-fixture-authenticode.log')
+    }
+    if (-not [string]::IsNullOrWhiteSpace($UpdatePolicyPublicKey)) {
+        # A chave publica de conferencia PRECISA parear com a privada usada;
+        # sem isto o assinador cai no default do ChurchDAW-Secrets (chave
+        # antiga) e recusa assinaturas feitas com a rotacao 2026-08.
+        $fixtureCommon.PublicKey = $UpdatePolicyPublicKey
     }
     if (-not $hasSigningIdentity) {
         $fixtureCommon.AllowUnsignedWindowsInstallerForTest = $true
@@ -671,6 +792,7 @@ if ($PolicySerial -gt 0) {
             "https://churchdaw.com/app/desktop/$(
                 [IO.Path]::GetFileName($stagedInstaller))"
         PrivateKey = $UpdatePolicyPrivateKey
+        KeyId = $UpdatePolicyKeyId
         PreviousPolicy = $PreviousPolicy
         Output = $policyPath
         ReleaseMode = $ReleaseMode
@@ -682,6 +804,9 @@ if ($PolicySerial -gt 0) {
     }
     if (-not $hasSigningIdentity) {
         $policyArguments.AllowUnsignedWindowsInstallerForTest = $true
+    }
+    if (-not [string]::IsNullOrWhiteSpace($UpdatePolicyPublicKey)) {
+        $policyArguments.PublicKey = $UpdatePolicyPublicKey
     }
     $policyResult = & (Join-Path $PSScriptRoot `
         'SignDesktopUpdatePolicy.ps1') @policyArguments
@@ -740,6 +865,10 @@ $manifest = [ordered] @{
         update_localhost_disabled = $true
         license_tests = 'passed'
         audio_tests = if ($audioTestsEnabled) { 'passed' } else { 'skipped-test-mode' }
+        churchcam_self_tests = if ($audioTestsEnabled) { 'passed' } else { 'skipped-test-mode' }
+        churchcam_movie_writer_contract = if ($audioTestsEnabled) { 'passed' } else { 'skipped-test-mode' }
+        churchcam_recorder_720p = if ($audioTestsEnabled) { 'passed' } else { 'skipped-test-mode' }
+        churchcam_recorder_1080p = if ($audioTestsEnabled) { 'passed' } else { 'skipped-test-mode' }
         reverb_bounds_asan = if ($audioTestsEnabled) { 'passed' } else { 'skipped-test-mode' }
         update_policy_tests = if ($audioTestsEnabled) { 'passed' } else { 'skipped-test-mode' }
         pe_x64 = $true

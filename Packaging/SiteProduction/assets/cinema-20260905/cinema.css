@@ -1,0 +1,40 @@
+/* ChurchDAW / Afterglow. Blender footage; the product captures remain real. */
+.cinema{position:relative;isolation:isolate;overflow:hidden;background:#090a0d}
+.cinema-inner{--max:1440px;position:relative;min-height:760px;display:grid;grid-template-columns:46% 54%;align-items:center}
+.cinema-copy{position:relative;z-index:2;padding:78px 0 100px;pointer-events:none}
+.cinema-copy a{pointer-events:auto}
+.cinema-copy .release-pill{font-size:12px;letter-spacing:.07em;margin-bottom:36px;gap:10px}
+.cinema h1{font-size:clamp(58px,5.7vw,88px);font-weight:560;line-height:1.075;letter-spacing:-.064em;max-width:700px}
+.cinema h1 em{display:inline;font-family:Georgia,"Times New Roman",serif;font-weight:400;letter-spacing:-.066em;color:#ff7c96}
+.cinema-description{font-size:17px;line-height:1.85;max-width:410px;color:#b4b1bd;margin-top:32px}
+.cinema .hero-actions{gap:14px 23px;margin-top:32px}
+.cinema .button-primary{box-shadow:0 6px 30px #bb214926;border-color:#db4161;background:#c93253;font-size:14px;min-height:54px;padding:14px 22px}
+.cinema .button-primary:hover{background:#df4264;border-color:#ee6582;box-shadow:0 8px 38px #d5315040}
+.cinema .text-link{font-size:14px}
+.cinema-platforms{font-size:13px;color:#9794a1;margin-top:27px}
+.cinema-art{position:relative;z-index:1;min-width:0;width:calc(100% + 150px);margin-left:-95px;margin-right:-55px;aspect-ratio:6/5;align-self:center}
+.cinema-poster,.cinema-video{width:100%;height:100%;object-fit:contain;position:absolute;inset:0;mask-image:linear-gradient(90deg,transparent 0%,#000 14%,#000 96%,transparent 100%);-webkit-mask-image:linear-gradient(90deg,transparent 0%,#000 14%,#000 96%,transparent 100%)}
+.cinema-art::after{content:"";position:absolute;inset:0;pointer-events:none;background:linear-gradient(0deg,#090a0d 1%,transparent 20%,transparent 84%,#090a0d 100%)}
+.cinema-video{opacity:0;transition:opacity .45s}
+.cinema-art.has-video .cinema-video{opacity:1}
+.cinema-caption{position:absolute;left:19%;right:7%;bottom:8%;z-index:3;display:flex;justify-content:space-between;gap:16px;color:#bbb0bd;font-size:12px;letter-spacing:.10em}
+.cinema-caption>span:first-child{display:flex;gap:10px;align-items:center}
+.cinema-caption b{font-weight:400;color:#705762}
+.cinema-caption .status-dot{width:5px;height:5px;box-shadow:0 0 10px #ff60805c}
+.cinema-caption-note{font-size:12px;letter-spacing:0;color:#928693}
+.cinema-toggle{position:absolute;z-index:4;bottom:0;right:7%;min-height:44px;padding:8px 12px;display:flex;align-items:center;gap:9px;background:#17121a;border:1px solid #4b303e;color:#c8b9c5;border-radius:6px;font-size:12px;transition:background .2s,border-color .2s}
+.cinema-toggle:hover{background:#281722;border-color:#a34665;color:white}
+.cinema-toggle-icon{font-size:12px;width:14px;text-align:center}
+.cinema-end{--max:1440px;display:flex;justify-content:space-between;align-items:center;gap:24px;padding-bottom:35px;margin-top:-17px;position:relative;z-index:2}
+.cinema-scroll{display:flex;align-items:center;gap:13px;font-size:13px;color:#b1a9b7}
+.cinema-scroll:hover{color:#ff7c96}
+.cinema-scroll>span{font-size:21px;line-height:1;color:#ff7c96}
+.cinema-end>span{font-size:12px;letter-spacing:.1em;color:#8e818f}
+.proof-bar{padding-block:27px;border-color:#2d232d}
+.cam-section{padding-top:108px}
+@media(min-width:1600px){.cinema-inner{min-height:820px}.cinema-art{width:calc(100% + 190px);margin-left:-110px}.cinema h1{font-size:92px}}
+@media(max-width:1190px){.cinema-inner{min-height:660px;grid-template-columns:47% 53%}.cinema-copy{padding-block:68px 85px}.cinema h1{font-size:64px}.cinema-copy .release-pill{font-size:11px;gap:8px;margin-bottom:28px}.cinema-art{width:calc(100% + 170px);margin-left:-90px}.cinema-description{font-size:16px;max-width:350px}.cinema .hero-actions{gap:8px 18px}.cinema .button-primary{font-size:13px;padding-inline:17px}.cinema-caption{bottom:10%;left:23%;right:11%;font-size:10px}.cinema-caption-note{display:none}.cinema-toggle{right:11%;bottom:0}.cinema-end>span{font-size:10px}.cinema-platforms{font-size:12px}}
+@media(max-width:900px){.cinema-inner{display:flex;flex-direction:column;align-items:stretch;min-height:0}.cinema-copy{padding:56px 0 0;max-width:650px}.cinema h1{font-size:clamp(58px,9vw,80px);max-width:750px}.cinema-description{max-width:520px;font-size:17px;margin-top:24px}.cinema .hero-actions{gap:16px 25px;margin-top:27px}.cinema .button-primary{font-size:14px;padding-inline:22px}.cinema-copy .release-pill{font-size:12px}.cinema-art{width:min(800px,calc(100% + 80px));margin:-80px -40px -7px 0;align-self:flex-end;pointer-events:none;max-width:none}.cinema-poster,.cinema-video{mask-image:linear-gradient(90deg,transparent,#000 9%,#000 96%,transparent);-webkit-mask-image:linear-gradient(90deg,transparent,#000 9%,#000 96%,transparent)}.cinema-toggle{pointer-events:auto;right:10%;bottom:1%}.cinema-caption{left:12%;right:10%;font-size:12px}.cinema-caption-note{display:inline;font-size:12px}.cinema-platforms{font-size:13px;margin-top:20px}.cinema-end{margin-top:22px;padding-bottom:27px}.cinema-end>span{display:none}.cam-section{padding-top:80px}}
+@media(max-width:600px){.cinema-copy{padding-top:37px}.cinema-copy .release-pill{font-size:10px;gap:7px;letter-spacing:.03em;margin-bottom:25px}.cinema h1{font-size:clamp(48px,11.8vw,67px);letter-spacing:-.06em;line-height:1.08}.cinema-description{font-size:16px;line-height:1.8;margin-top:23px;max-width:390px}.cinema .hero-actions{gap:10px 15px;margin-top:25px}.cinema .button-primary{font-size:13px;padding:12px 16px;min-height:50px;gap:12px}.cinema .text-link{font-size:13px;gap:8px}.cinema-platforms{font-size:12px;line-height:1.8;margin-top:19px;max-width:300px}.cinema-art{width:calc(100% + 54px);margin:-17px -27px 0;align-self:center}.cinema-caption{left:11%;right:10%;bottom:8%;font-size:10px;letter-spacing:.075em}.cinema-caption>span:first-child{gap:7px}.cinema-caption-note{display:none}.cinema-toggle{right:9%;bottom:-5%;min-height:44px;font-size:12px;padding-inline:10px}.cinema-end{margin-top:37px;margin-bottom:0;padding-bottom:25px}.cinema-scroll{font-size:12px;max-width:48%;gap:9px;line-height:1.6}.proof-bar{font-size:12px;padding-block:22px}.cam-section{padding-top:64px}}
+@media(max-width:360px){.cinema h1{font-size:44px}.cinema-copy .release-pill{font-size:9px}.cinema .hero-actions{align-items:flex-start;flex-direction:column;gap:9px}.cinema-art{margin-top:0}.cinema-toggle{font-size:11px}.cinema-caption{font-size:9px}}
+@media(prefers-reduced-motion:reduce){.cinema-video{transition:none}.cinema-toggle{transition:none}.cinema .button-primary{transition:none}}

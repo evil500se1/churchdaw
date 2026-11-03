@@ -25,6 +25,7 @@ public:
 
     ChurchOrganLayout::Page getActivePage() const noexcept;
     void showPage (ChurchOrganLayout::Page);
+    void setHeaderRightInset (int insetPx);
 
     // Read-only geometry probes used by the isolated UI harness.
     ChurchOrganLayout::Shell getShellLayoutForTesting() const noexcept;

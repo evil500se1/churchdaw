@@ -27,6 +27,8 @@ namespace churchorgan
                 0.00f, 0.88f, 0.62f, 0.50f,
                 0.70f, 0.25f, 0.35f, 0.15f
             }};
+        constexpr std::uint32_t transistorVibratoIntentVersion = 1;
+        constexpr float legacyVibratoDepthTolerance = 1.0e-6f;
 
         constexpr std::array<float, pipeOrganManualCount>
             defaultPipeSwell {{ 1.0f, 0.86f, 1.0f }};
@@ -326,6 +328,8 @@ namespace churchorgan
         const juce::MidiBuffer& midi,
         juce::AudioBuffer<float>* reverbSend) noexcept
     {
+        juce::ScopedNoDenormals noDenormals;
+
         if (insideProcess_.exchange (
                 1, std::memory_order_acq_rel) != 0)
         {
@@ -987,9 +991,11 @@ namespace churchorgan
                 std::memory_order_relaxed);
         }
         transistorVibratoEnabled_.store (
-            1, std::memory_order_relaxed);
+            transistorDefaultVibratoEnabled ? 1u : 0u,
+            std::memory_order_relaxed);
         transistorVibratoDepth_.store (
-            0.55f, std::memory_order_relaxed);
+            transistorDefaultVibratoDepth,
+            std::memory_order_relaxed);
         transistorDrive_.store (
             0.18f, std::memory_order_relaxed);
         transistorStereoWidth_.store (
@@ -2390,6 +2396,13 @@ namespace churchorgan
             transistorVibratoEnabled_.load (
                 std::memory_order_acquire) != 0,
             nullptr);
+        // Version 1 marks the switch as intentional. Older states have no
+        // marker because vibrato used to be enabled implicitly by the
+        // factory, alongside the channel rotary.
+        state.setProperty (
+            "vibratoIntentVersion",
+            static_cast<int> (transistorVibratoIntentVersion),
+            nullptr);
         state.setProperty (
             "vibratoDepth",
             transistorVibratoDepth_.load(),
@@ -2725,17 +2738,32 @@ namespace churchorgan
                 static_cast<std::uint32_t> (
                     TransistorOrganProfile::germanCombo)),
             std::memory_order_release);
+        const auto vibratoEnabled = static_cast<bool> (
+            state.getProperty (
+                "vibratoEnabled",
+                transistorDefaultVibratoEnabled));
+        const auto vibratoDepth = stateFloat (
+            state,
+            "vibratoDepth",
+            transistorDefaultVibratoDepth,
+            0.0f,
+            1.0f);
+        const auto vibratoIntentVersion = stateUInt (
+            state,
+            "vibratoIntentVersion",
+            0,
+            transistorVibratoIntentVersion);
+        const bool legacyFactoryVibrato =
+            vibratoIntentVersion == 0
+            && vibratoEnabled
+            && std::abs (
+                   vibratoDepth
+                   - transistorDefaultVibratoDepth)
+                   <= legacyVibratoDepthTolerance;
         transistorVibratoEnabled_.store (
-            static_cast<bool> (
-                state.getProperty (
-                    "vibratoEnabled", true))
-                ? 1u
-                : 0u,
+            vibratoEnabled && ! legacyFactoryVibrato ? 1u : 0u,
             std::memory_order_release);
-        transistorVibratoDepth_.store (
-            stateFloat (
-                state, "vibratoDepth",
-                0.55f, 0.0f, 1.0f));
+        transistorVibratoDepth_.store (vibratoDepth);
         transistorDrive_.store (
             stateFloat (
                 state, "drive",

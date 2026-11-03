@@ -1,0 +1,828 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>ChurchDAW — DAW para igrejas no Windows, macOS e Android</title>
+  <meta name="description" content="ChurchDAW é a estação de performance worship para Windows, macOS e Android: mixer de 14 canais, timbres, cenas, pad contínuo e MIDI Learn em um único ecossistema.">
+  <meta name="author" content="Igor Teixeira">
+  <meta name="theme-color" content="#090a0d">
+  <meta name="color-scheme" content="dark">
+  <meta name="robots" content="index,follow,max-image-preview:large">
+  <link rel="canonical" href="https://churchdaw.com/">
+  <link rel="icon" type="image/png" href="favicon.png">
+  <link rel="apple-touch-icon" href="app-icon-192.png">
+  <link rel="preload" as="image" href="assets/churchdaw-mac-stage.webp" type="image/webp">
+
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="ChurchDAW">
+  <meta property="og:locale" content="pt_BR">
+  <meta property="og:title" content="ChurchDAW — DAW para igrejas">
+  <meta property="og:description" content="Seu setup de louvor pronto antes do primeiro acorde. Para Windows, Macs Intel, Apple Silicon e Android.">
+  <meta property="og:url" content="https://churchdaw.com/">
+  <meta property="og:image" content="https://churchdaw.com/assets/og-churchdaw.jpg">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:image:alt" content="ChurchDAW aberto no Windows, macOS e em um tablet Android sobre um teclado musical">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="ChurchDAW — DAW para igrejas">
+  <meta name="twitter:description" content="ChurchDAW para Windows, macOS e Android: timbres, cenas, pad contínuo e MIDI Learn para tocar ao vivo.">
+  <meta name="twitter:image" content="https://churchdaw.com/assets/og-churchdaw.jpg">
+
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "SoftwareApplication",
+    "name": "ChurchDAW",
+    "applicationCategory": "MultimediaApplication",
+    "operatingSystem": "Windows 10, Windows 11, macOS 10.15 or later, Android 7.0 or later",
+    "softwareVersion": "Windows 1.6.25 / macOS 1.6.25 / Android 1.6.24",
+    "description": "Estação de performance worship para igrejas com mixer de 14 canais, timbres nativos, cenas, plugins, pad contínuo e mapeamento MIDI.",
+    "image": "https://churchdaw.com/assets/og-churchdaw.jpg",
+    "author": {"@type": "Person", "name": "Igor Teixeira"},
+    "offers": {
+      "@type": "Offer",
+      "price": "129.99",
+      "priceCurrency": "BRL",
+      "availability": "https://schema.org/InStock",
+      "url": "https://churchdaw.com/"
+    }
+  }
+  </script>
+
+  <style>
+    :root {
+      --bg: #090a0d;
+      --bg-soft: #0d0f13;
+      --panel: #12151a;
+      --panel-2: #171a20;
+      --line: rgba(255,255,255,.10);
+      --line-strong: rgba(255,255,255,.17);
+      --text: #f5f6f8;
+      --muted: #a8adb7;
+      --faint: #767d89;
+      --red: #ef264c;
+      --red-deep: #a90f2e;
+      --red-soft: rgba(239,38,76,.12);
+      --green: #64d698;
+      --blue: #6ebcff;
+      --amber: #f0b85a;
+      --max: 1280px;
+      --radius: 22px;
+      --shadow: 0 30px 90px rgba(0,0,0,.46);
+      --display: "Bahnschrift", "Arial Narrow", "Roboto Condensed", "Segoe UI", sans-serif;
+      --body: "Segoe UI", -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+    }
+
+    *, *::before, *::after { box-sizing: border-box; }
+    html { scroll-behavior: smooth; background: var(--bg); }
+    body {
+      margin: 0;
+      color: var(--text);
+      background:
+        radial-gradient(circle at 8% 8%, rgba(194,17,48,.12), transparent 25rem),
+        radial-gradient(circle at 92% 38%, rgba(37,65,94,.10), transparent 30rem),
+        var(--bg);
+      font-family: var(--body);
+      font-size: 17px;
+      line-height: 1.62;
+      -webkit-font-smoothing: antialiased;
+      overflow-x: hidden;
+    }
+
+    img { display: block; max-width: 100%; }
+    a { color: inherit; }
+    button, a { -webkit-tap-highlight-color: transparent; }
+    button { font: inherit; }
+    :focus-visible { outline: 2px solid var(--red); outline-offset: 4px; }
+    ::selection { background: rgba(239,38,76,.35); color: #fff; }
+
+    .skip-link {
+      position: fixed; left: 16px; top: 12px; z-index: 100;
+      padding: 10px 14px; border-radius: 8px; background: #fff; color: #111;
+      transform: translateY(-160%); transition: transform .2s ease;
+    }
+    .skip-link:focus { transform: translateY(0); }
+
+    .shell { width: min(calc(100% - 40px), var(--max)); margin-inline: auto; }
+    .section { padding: 110px 0; position: relative; }
+    .section + .section { border-top: 1px solid rgba(255,255,255,.055); }
+    .section-head { max-width: 790px; margin-bottom: 44px; }
+    .eyebrow {
+      display: inline-flex; align-items: center; gap: 10px;
+      color: #d7dae1; font: 700 .76rem/1 var(--display);
+      letter-spacing: .19em; text-transform: uppercase;
+    }
+    .eyebrow::before { content: ""; width: 30px; height: 2px; background: var(--red); border-radius: 99px; }
+    h1, h2, h3 { margin: 0; font-family: var(--display); text-wrap: balance; }
+    h1 { font-size: clamp(3.2rem, 6.2vw, 6.7rem); line-height: .91; letter-spacing: -.047em; }
+    h2 { font-size: clamp(2.2rem, 4.5vw, 4.8rem); line-height: .98; letter-spacing: -.035em; }
+    h3 { font-size: 1.22rem; line-height: 1.22; letter-spacing: -.01em; }
+    p { margin: 0; }
+    .lede { margin-top: 22px; max-width: 65ch; color: var(--muted); font-size: clamp(1.04rem, 1.5vw, 1.22rem); }
+    .red { color: var(--red); }
+    .muted { color: var(--muted); }
+
+    .topbar {
+      position: sticky; top: 0; z-index: 50;
+      border-bottom: 1px solid rgba(255,255,255,.08);
+      background: rgba(9,10,13,.82); backdrop-filter: blur(18px) saturate(135%);
+    }
+    .nav { min-height: 72px; display: flex; align-items: center; gap: 28px; }
+    .brand { display: inline-flex; align-items: center; gap: 11px; text-decoration: none; flex: none; }
+    .brand img { width: 42px; height: 42px; border-radius: 50%; box-shadow: 0 0 22px rgba(239,38,76,.18); }
+    .brand-word { font: 800 1.3rem/1 var(--display); letter-spacing: -.03em; }
+    .brand-word b { color: var(--red); }
+    .nav-links { display: flex; align-items: center; gap: 27px; margin-left: auto; }
+    .nav-links a { color: #c6cad2; text-decoration: none; font-size: .9rem; font-weight: 600; }
+    .nav-links a:hover { color: #fff; }
+    .nav-version {
+      padding: 6px 10px; border: 1px solid var(--line); border-radius: 999px;
+      color: #aeb4be; font: 650 .71rem/1 var(--display); letter-spacing: .08em; text-transform: uppercase;
+    }
+    .menu-button {
+      display: none; width: 44px; height: 44px; margin-left: auto;
+      border: 1px solid var(--line); border-radius: 11px; background: var(--panel); color: #fff;
+    }
+
+    .button {
+      display: inline-flex; align-items: center; justify-content: center; gap: 11px;
+      min-height: 50px; padding: 12px 21px; border: 1px solid transparent; border-radius: 11px;
+      font: 750 .94rem/1 var(--display); letter-spacing: .015em; text-decoration: none;
+      transition: transform .18s ease, border-color .18s ease, background .18s ease, box-shadow .18s ease;
+    }
+    .button:hover { transform: translateY(-2px); }
+    .button-primary { background: linear-gradient(180deg, #f22b51, #c31336); color: #fff; box-shadow: 0 12px 32px rgba(220,20,57,.25); }
+    .button-primary:hover { box-shadow: 0 16px 40px rgba(220,20,57,.36); }
+    .button-secondary { background: rgba(255,255,255,.06); border-color: var(--line-strong); color: #fff; }
+    .button-secondary:hover { background: rgba(255,255,255,.09); border-color: rgba(255,255,255,.28); }
+    .button-small { min-height: 42px; padding: 9px 16px; font-size: .85rem; }
+    .button .arrow { font-size: 1.1em; transition: transform .18s ease; }
+    .button:hover .arrow { transform: translateX(3px); }
+
+    .hero { padding: 28px 0 0; }
+    .hero-card {
+      position: relative; min-height: min(780px, calc(100vh - 100px)); overflow: hidden;
+      border: 1px solid var(--line); border-radius: 28px; background: #07080a; box-shadow: var(--shadow);
+      isolation: isolate;
+    }
+    .hero-media { position: absolute; inset: 0; z-index: -2; }
+    .hero-media img { width: 100%; height: 100%; object-fit: cover; object-position: center; }
+    .hero-card::before {
+      content: ""; position: absolute; inset: 0; z-index: -1;
+      background:
+        linear-gradient(90deg, rgba(4,5,7,.97) 0%, rgba(5,6,8,.86) 31%, rgba(5,6,8,.18) 66%, rgba(5,6,8,.12) 100%),
+        linear-gradient(0deg, rgba(4,5,7,.70), transparent 36%);
+    }
+    .hero-copy { width: min(650px, 54%); padding: clamp(70px, 8vw, 122px) clamp(36px, 6vw, 84px); }
+    .release-pill {
+      display: inline-flex; align-items: center; gap: 10px; margin-bottom: 30px;
+      padding: 8px 12px 8px 9px; border: 1px solid rgba(100,214,152,.24); border-radius: 999px;
+      background: rgba(13,32,24,.56); color: #bcf1d3; font-size: .78rem; font-weight: 650;
+    }
+    .release-pill i { width: 8px; height: 8px; border-radius: 50%; background: var(--green); box-shadow: 0 0 14px rgba(100,214,152,.75); }
+    .hero h1 span { display: block; color: var(--red); }
+    .hero-copy > p { margin-top: 26px; max-width: 57ch; color: #b9bec8; font-size: clamp(1.02rem, 1.6vw, 1.23rem); }
+    .hero-actions { display: flex; flex-wrap: wrap; gap: 11px; margin-top: 33px; }
+    .hero-meta { display: flex; flex-wrap: wrap; gap: 18px 26px; margin-top: 29px; color: #9ca3ae; font-size: .82rem; }
+    .hero-meta span { display: inline-flex; align-items: center; gap: 8px; }
+    .hero-meta span::before { content: "✓"; color: var(--green); font-weight: 800; }
+
+    .proof-bar {
+      display: grid; grid-template-columns: repeat(5, 1fr); margin-top: 18px;
+      border: 1px solid var(--line); border-radius: 17px; overflow: hidden; background: rgba(18,21,26,.78);
+    }
+    .proof { padding: 21px 22px; border-right: 1px solid var(--line); }
+    .proof:last-child { border-right: 0; }
+    .proof strong { display: block; color: #fff; font: 780 1.08rem/1.15 var(--display); }
+    .proof span { display: block; margin-top: 6px; color: var(--faint); font-size: .76rem; line-height: 1.3; }
+
+    .platform-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; }
+    .platform-card {
+      position: relative; overflow: hidden; border: 1px solid var(--line); border-radius: var(--radius);
+      background: linear-gradient(145deg, rgba(24,27,33,.96), rgba(13,15,19,.98)); box-shadow: 0 18px 60px rgba(0,0,0,.24);
+    }
+    .platform-media { aspect-ratio: 16 / 10; overflow: hidden; background: #08090b; }
+    .platform-media img { width: 100%; height: 100%; object-fit: cover; transition: transform .65s cubic-bezier(.2,.7,.2,1); }
+    .platform-card:hover .platform-media img { transform: scale(1.025); }
+    .platform-body { padding: 30px; }
+    .platform-top { display: flex; align-items: center; justify-content: space-between; gap: 18px; }
+    .platform-label { display: flex; align-items: center; gap: 12px; }
+    .platform-glyph {
+      display: grid; place-items: center; width: 43px; height: 43px;
+      border: 1px solid var(--line-strong); border-radius: 11px; background: rgba(255,255,255,.055);
+      font: 800 .65rem/1 var(--display); letter-spacing: .06em;
+    }
+    .platform-card.windows .platform-glyph { color: var(--blue); }
+    .platform-card.mac .platform-glyph { color: #f0f2f6; }
+    .platform-card.android {
+      grid-column: 1 / -1; display: grid; grid-template-columns: minmax(0, 1.16fr) minmax(360px, .84fr);
+    }
+    .platform-card.android .platform-media { min-height: 420px; aspect-ratio: auto; }
+    .platform-card.android .platform-media img { object-position: center; }
+    .platform-card.android .platform-body { display: flex; flex-direction: column; justify-content: center; }
+    .platform-card.android .platform-glyph { color: var(--green); }
+    .platform-version { color: var(--green); font: 700 .72rem/1 var(--display); letter-spacing: .08em; text-transform: uppercase; }
+    .platform-body > p { margin-top: 19px; color: var(--muted); font-size: .96rem; }
+    .platform-list { display: grid; gap: 8px; margin: 22px 0 25px; padding: 0; list-style: none; }
+    .platform-list li { display: flex; gap: 9px; color: #c7cbd3; font-size: .87rem; }
+    .platform-list li::before { content: "✓"; color: var(--green); font-weight: 800; }
+    .platform-actions { display: flex; flex-wrap: wrap; gap: 10px; }
+    .platform-note { margin-top: 13px; color: var(--faint); font-size: .73rem; }
+
+    .product-stage {
+      padding: clamp(16px, 2vw, 26px); border: 1px solid var(--line); border-radius: 26px;
+      background: linear-gradient(145deg, #15181d, #0d0f12); box-shadow: var(--shadow);
+    }
+    .window-bar { display: flex; align-items: center; justify-content: space-between; gap: 15px; padding: 0 4px 15px; }
+    .traffic { display: flex; gap: 7px; }
+    .traffic i { width: 9px; height: 9px; border-radius: 50%; background: #434852; }
+    .traffic i:first-child { background: var(--red); }
+    .window-title { color: var(--faint); font: 650 .7rem/1 var(--display); letter-spacing: .12em; text-transform: uppercase; }
+    .product-stage img { width: 100%; border: 1px solid rgba(255,255,255,.08); border-radius: 13px; }
+    .stage-caption { display: flex; justify-content: space-between; gap: 20px; padding: 17px 4px 0; color: var(--faint); font-size: .78rem; }
+    .stage-caption strong { color: #d9dce2; font-weight: 600; }
+
+    .feature-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; }
+    .feature {
+      min-height: 245px; padding: 27px; border: 1px solid var(--line); border-radius: 17px;
+      background: linear-gradient(145deg, rgba(23,26,32,.94), rgba(13,15,19,.94));
+      transition: transform .2s ease, border-color .2s ease, background .2s ease;
+    }
+    .feature:hover { transform: translateY(-3px); border-color: rgba(239,38,76,.30); background: linear-gradient(145deg, rgba(29,30,36,.98), rgba(16,17,21,.98)); }
+    .feature-index { display: block; margin-bottom: 42px; color: var(--red); font: 750 .77rem/1 var(--display); letter-spacing: .14em; }
+    .feature p { margin-top: 13px; color: var(--muted); font-size: .9rem; line-height: 1.55; }
+
+    .split { display: grid; grid-template-columns: 1.08fr .92fr; align-items: center; gap: clamp(38px, 7vw, 92px); }
+    .split-media { position: relative; }
+    .split-media::before {
+      content: ""; position: absolute; width: 58%; height: 58%; right: -7%; bottom: -8%; z-index: -1;
+      border-radius: 50%; background: rgba(201,19,53,.15); filter: blur(70px);
+    }
+    .split-media img { border: 1px solid var(--line-strong); border-radius: 20px; box-shadow: var(--shadow); }
+    .checks { display: grid; gap: 18px; margin: 29px 0 0; padding: 0; list-style: none; }
+    .checks li { display: grid; grid-template-columns: 28px 1fr; gap: 12px; color: var(--muted); font-size: .94rem; }
+    .checks li::before {
+      content: "✓"; display: grid; place-items: center; width: 24px; height: 24px;
+      border-radius: 7px; color: #fff; background: rgba(239,38,76,.16); border: 1px solid rgba(239,38,76,.32); font-weight: 800;
+    }
+    .checks strong { color: #fff; }
+
+    .compat-card {
+      display: grid; grid-template-columns: 1.2fr .8fr; gap: 54px; align-items: center;
+      padding: clamp(35px, 6vw, 78px); border: 1px solid rgba(239,38,76,.23); border-radius: 26px;
+      background:
+        radial-gradient(circle at 95% 10%, rgba(239,38,76,.14), transparent 24rem),
+        linear-gradient(135deg, #15171c, #0c0e11);
+      box-shadow: var(--shadow);
+    }
+    .compat-card h2 { max-width: 12ch; }
+    .compat-card p { margin-top: 21px; max-width: 58ch; color: var(--muted); }
+    .compat-list { display: grid; gap: 12px; }
+    .compat-item { padding: 19px 20px; border: 1px solid var(--line); border-radius: 13px; background: rgba(255,255,255,.035); }
+    .compat-item span { display: block; color: var(--faint); font: 700 .69rem/1 var(--display); letter-spacing: .13em; text-transform: uppercase; }
+    .compat-item strong { display: block; margin-top: 9px; font: 720 1.03rem/1.3 var(--display); }
+    .compat-item small { display: block; margin-top: 5px; color: var(--muted); font-size: .75rem; }
+
+    .download-panel {
+      display: grid; grid-template-columns: .78fr 1.22fr; gap: 60px; align-items: center;
+      padding: clamp(32px, 5vw, 66px); border: 1px solid var(--line); border-radius: 24px;
+      background: linear-gradient(145deg, #171a20, #0d0f12); box-shadow: var(--shadow);
+    }
+    .price { margin: 16px 0 10px; font: 800 clamp(3.1rem, 6vw, 5.8rem)/.9 var(--display); letter-spacing: -.05em; }
+    .price sup { position: relative; top: -.35em; font-size: .34em; letter-spacing: 0; color: var(--muted); }
+    .price-copy { color: var(--muted); max-width: 42ch; }
+    .price-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 27px; }
+    .downloads { display: grid; gap: 11px; }
+    .download-row {
+      display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 17px;
+      padding: 17px 18px; border: 1px solid var(--line); border-radius: 13px;
+      background: rgba(255,255,255,.035); text-decoration: none; transition: border-color .18s ease, background .18s ease, transform .18s ease;
+    }
+    .download-row:hover { transform: translateX(3px); border-color: rgba(239,38,76,.35); background: rgba(255,255,255,.055); }
+    .download-os { display: grid; place-items: center; width: 43px; height: 43px; border-radius: 11px; background: #20242b; font: 800 .62rem/1 var(--display); letter-spacing: .05em; }
+    .download-row strong { display: block; font: 720 .98rem/1.2 var(--display); }
+    .download-row small { display: block; margin-top: 5px; color: var(--faint); font-size: .73rem; }
+    .download-arrow { color: var(--red); font-size: 1.25rem; }
+    .download-foot { margin-top: 13px; color: var(--faint); font-size: .72rem; }
+
+    .update-card {
+      position: relative; isolation: isolate; overflow: hidden;
+      display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(280px, .75fr); gap: clamp(34px, 6vw, 82px);
+      padding: clamp(34px, 6vw, 76px); border: 1px solid rgba(100,214,152,.22); border-radius: 28px;
+      background:
+        radial-gradient(circle at 8% 4%, rgba(100,214,152,.15), transparent 28rem),
+        radial-gradient(circle at 94% 92%, rgba(239,38,76,.14), transparent 24rem),
+        linear-gradient(135deg, #15191c 0%, #0b0d10 58%, #101217 100%);
+      box-shadow: var(--shadow);
+    }
+    .update-card::before {
+      content: ""; position: absolute; inset: 0; z-index: -1; pointer-events: none;
+      background-image: linear-gradient(rgba(255,255,255,.022) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,.022) 1px, transparent 1px);
+      background-size: 42px 42px; mask-image: linear-gradient(110deg, #000, transparent 76%);
+    }
+    .update-status {
+      display: inline-flex; align-items: center; gap: 9px; width: fit-content;
+      padding: 8px 12px; border: 1px solid rgba(100,214,152,.25); border-radius: 999px;
+      background: rgba(100,214,152,.075); color: #bdf1d4;
+      font: 750 .72rem/1 var(--display); letter-spacing: .12em; text-transform: uppercase;
+    }
+    .update-status::before {
+      content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--green);
+      box-shadow: 0 0 16px rgba(100,214,152,.85);
+    }
+    .update-card h2 { max-width: 12ch; margin-top: 24px; }
+    .update-intro { max-width: 62ch; margin-top: 22px; color: var(--muted); font-size: 1.02rem; }
+    .update-benefits {
+      display: grid; grid-template-columns: 1fr 1fr; gap: 10px 20px;
+      margin: 27px 0 0; padding: 0; list-style: none;
+    }
+    .update-benefits li { display: flex; align-items: flex-start; gap: 9px; color: #d0d4db; font-size: .88rem; }
+    .update-benefits li::before { content: "✓"; color: var(--green); font-weight: 850; }
+    .update-actions { display: flex; flex-wrap: wrap; gap: 11px; margin-top: 30px; }
+    .button-whatsapp {
+      border-color: rgba(100,214,152,.36); background: linear-gradient(180deg, rgba(40,194,104,.20), rgba(24,133,72,.15)); color: #d8f8e5;
+      box-shadow: inset 0 1px rgba(255,255,255,.06), 0 12px 30px rgba(13,110,57,.12);
+    }
+    .button-whatsapp:hover { border-color: rgba(100,214,152,.62); background: linear-gradient(180deg, rgba(40,194,104,.28), rgba(24,133,72,.21)); }
+    .button-whatsapp svg { width: 19px; height: 19px; fill: currentColor; flex: none; }
+    .update-note { margin-top: 15px; color: var(--faint); font-size: .76rem; }
+    .update-version {
+      align-self: center; position: relative; padding: 28px; border: 1px solid var(--line-strong); border-radius: 20px;
+      background: linear-gradient(155deg, rgba(255,255,255,.075), rgba(255,255,255,.025));
+      box-shadow: inset 0 1px rgba(255,255,255,.07), 0 22px 52px rgba(0,0,0,.28);
+    }
+    .update-version::before {
+      content: "APK"; position: absolute; right: 22px; top: 20px; color: rgba(255,255,255,.07);
+      font: 900 3.7rem/1 var(--display); letter-spacing: -.07em;
+    }
+    .update-version-label { color: var(--faint); font: 750 .67rem/1 var(--display); letter-spacing: .16em; text-transform: uppercase; }
+    .update-version-number { display: block; margin-top: 15px; font: 850 clamp(3rem, 6vw, 5.2rem)/.88 var(--display); letter-spacing: -.065em; }
+    .update-version-number b { color: var(--green); }
+    .update-version-meta { display: grid; gap: 0; margin-top: 25px; border: 1px solid var(--line); border-radius: 13px; overflow: hidden; }
+    .update-version-meta span { display: flex; justify-content: space-between; gap: 18px; padding: 12px 14px; color: var(--faint); font-size: .72rem; }
+    .update-version-meta span + span { border-top: 1px solid var(--line); }
+    .update-version-meta strong { color: #e7e9ed; font-weight: 700; }
+
+    .faq-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    details { border: 1px solid var(--line); border-radius: 14px; background: rgba(19,22,27,.82); }
+    summary { position: relative; padding: 20px 50px 20px 21px; cursor: pointer; list-style: none; font: 700 .98rem/1.35 var(--display); }
+    summary::-webkit-details-marker { display: none; }
+    summary::after { content: "+"; position: absolute; right: 20px; top: 17px; color: var(--red); font-size: 1.35rem; }
+    details[open] summary::after { content: "−"; }
+    details p { padding: 0 21px 21px; color: var(--muted); font-size: .88rem; }
+
+    footer { padding: 52px 0 90px; border-top: 1px solid var(--line); background: #07080a; }
+    .footer-grid { display: grid; grid-template-columns: 1.1fr .9fr; gap: 40px; align-items: end; }
+    .footer-brand { display: flex; align-items: center; gap: 12px; }
+    .footer-brand img { width: 50px; height: 50px; border-radius: 50%; }
+    .footer-copy { margin-top: 16px; max-width: 58ch; color: var(--faint); font-size: .78rem; }
+    .footer-links { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 17px 24px; }
+    .footer-links a { color: var(--muted); text-decoration: none; font-size: .82rem; }
+    .footer-links a:hover { color: #fff; }
+    .copyright { margin-top: 30px; padding-top: 22px; border-top: 1px solid rgba(255,255,255,.06); color: #676e79; font-size: .72rem; }
+
+    .mobile-buy { display: none; }
+    .reveal { opacity: 0; transform: translateY(22px); transition: opacity .65s ease, transform .65s cubic-bezier(.2,.7,.2,1); }
+    .reveal.visible { opacity: 1; transform: none; }
+
+    @media (max-width: 1040px) {
+      .nav-links { display: none; }
+      .menu-button { display: grid; place-items: center; }
+      .nav.open { flex-wrap: wrap; padding-bottom: 15px; }
+      .nav.open .nav-links { order: 4; display: grid; width: 100%; gap: 0; margin: 0; border: 1px solid var(--line); border-radius: 13px; overflow: hidden; background: var(--panel); }
+      .nav.open .nav-links a { padding: 14px 16px; border-bottom: 1px solid var(--line); }
+      .nav.open .nav-links a:last-child { border-bottom: 0; }
+      .hero-card { min-height: 690px; }
+      .hero-copy { width: 64%; }
+      .proof-bar { grid-template-columns: repeat(3, 1fr); }
+      .proof:nth-child(3) { border-right: 0; }
+      .proof:nth-child(-n+3) { border-bottom: 1px solid var(--line); }
+      .feature-grid { grid-template-columns: repeat(2, 1fr); }
+      .split { grid-template-columns: 1fr; }
+      .split-copy { max-width: 760px; }
+      .compat-card, .download-panel, .update-card { grid-template-columns: 1fr; }
+    }
+
+    @media (max-width: 760px) {
+      body { font-size: 16px; }
+      .shell { width: min(calc(100% - 24px), var(--max)); }
+      .section { padding: 76px 0; }
+      .nav { min-height: 64px; gap: 12px; }
+      .brand img { width: 38px; height: 38px; }
+      .brand-word { font-size: 1.15rem; }
+      .nav-version { display: none; }
+      .nav > .button { display: none; }
+      .hero { padding-top: 12px; }
+      .hero-card { display: flex; flex-direction: column; min-height: 0; border-radius: 20px; }
+      .hero-media { position: relative; height: 48vw; min-height: 235px; order: 1; }
+      .hero-media img { object-position: 63% center; }
+      .hero-card::before { background: linear-gradient(0deg, #08090b 0%, rgba(8,9,11,.06) 55%); }
+      .hero-copy { width: 100%; padding: 32px 24px 36px; order: 2; }
+      .hero h1 { font-size: clamp(2.9rem, 14vw, 4.25rem); }
+      .release-pill { margin-bottom: 21px; }
+      .hero-actions { display: grid; grid-template-columns: 1fr; }
+      .hero-actions .button { width: 100%; }
+      .hero-meta { display: grid; gap: 10px; }
+      .proof-bar { grid-template-columns: 1fr 1fr; }
+      .proof { border-bottom: 1px solid var(--line); }
+      .proof:nth-child(odd) { border-right: 1px solid var(--line); }
+      .proof:nth-child(even) { border-right: 0; }
+      .proof:last-child { grid-column: 1 / -1; border-bottom: 0; border-right: 0; }
+      .platform-grid, .feature-grid, .faq-grid { grid-template-columns: 1fr; }
+      .platform-card.android { grid-column: auto; grid-template-columns: 1fr; }
+      .platform-card.android .platform-media { min-height: 0; aspect-ratio: 16 / 10; }
+      .platform-body { padding: 22px; }
+      .platform-top { align-items: flex-start; }
+      .feature { min-height: 210px; }
+      .feature-index { margin-bottom: 28px; }
+      .stage-caption { display: block; }
+      .stage-caption span { display: block; margin-top: 5px; }
+      .compat-card { padding: 31px 24px; }
+      .download-panel { padding: 29px 20px; gap: 38px; }
+      .update-card { padding: 33px 23px; gap: 34px; border-radius: 21px; }
+      .update-card h2 { max-width: 13ch; }
+      .update-version { padding: 23px; }
+      .download-row { grid-template-columns: auto 1fr auto; padding: 14px; }
+      .footer-grid { grid-template-columns: 1fr; }
+      .footer-links { justify-content: flex-start; }
+      footer { padding-bottom: 108px; }
+      .mobile-buy {
+        position: fixed; left: 10px; right: 10px; bottom: 10px; z-index: 45;
+        display: flex; align-items: center; justify-content: space-between; gap: 12px;
+        padding: 9px 9px 9px 14px; border: 1px solid var(--line-strong); border-radius: 14px;
+        background: rgba(13,15,19,.92); backdrop-filter: blur(16px); box-shadow: 0 15px 50px rgba(0,0,0,.48);
+      }
+      .mobile-buy strong { font: 800 .92rem/1 var(--display); }
+      .mobile-buy small { display: block; margin-top: 4px; color: var(--faint); font-size: .65rem; }
+    }
+
+    @media (max-width: 430px) {
+      .proof-bar { grid-template-columns: 1fr; }
+      .proof, .proof:nth-child(odd), .proof:nth-child(even) { grid-column: auto; border-right: 0; border-bottom: 1px solid var(--line); }
+      .proof:last-child { grid-column: auto; border-bottom: 0; }
+      .platform-actions { display: grid; }
+      .update-benefits { grid-template-columns: 1fr; }
+      .update-actions { display: grid; }
+      .button { width: 100%; }
+      .download-os { width: 38px; height: 38px; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      html { scroll-behavior: auto; }
+      *, *::before, *::after { animation: none !important; transition: none !important; }
+      .reveal { opacity: 1; transform: none; }
+    }
+  </style>
+</head>
+
+<body>
+  <a class="skip-link" href="#conteudo">Pular para o conteúdo</a>
+
+  <header class="topbar">
+    <nav class="nav shell" aria-label="Navegação principal">
+      <a class="brand" href="#inicio" aria-label="ChurchDAW — início">
+        <img src="assets/churchdaw-logo.webp" width="512" height="512" alt="">
+        <span class="brand-word">CHURCH<b>DAW</b></span>
+      </a>
+          <span class="nav-version">Windows 1.6.25 · macOS 1.6.25 · Android 1.6.24</span>
+      <div class="nav-links" id="nav-links">
+        <a href="#plataformas">Plataformas</a>
+        <a href="#interface">Interface</a>
+        <a href="#recursos">Recursos</a>
+        <a href="#atualizacao">Atualização</a>
+        <a href="#compatibilidade">Compatibilidade</a>
+        <a href="#duvidas">Dúvidas</a>
+      </div>
+      <a class="button button-primary button-small" href="https://wa.me/5562981278461?text=Oi%20Igor!%20Quero%20conhecer%20o%20ChurchDAW." target="_blank" rel="noreferrer">Falar no WhatsApp</a>
+      <button class="menu-button" type="button" aria-controls="nav-links" aria-expanded="false" aria-label="Abrir menu">☰</button>
+    </nav>
+  </header>
+
+  <main id="conteudo">
+    <section class="hero" id="inicio" aria-labelledby="hero-title">
+      <div class="hero-card shell">
+        <div class="hero-media">
+          <img src="assets/churchdaw-mac-stage.webp" width="1536" height="1024" alt="ChurchDAW aberto em um notebook sobre um teclado em um palco de igreja" fetchpriority="high">
+        </div>
+        <div class="hero-copy">
+            <span class="release-pill"><i aria-hidden="true"></i> Windows 1.6.25 · macOS 1.6.25 · Android 1.6.24</span>
+          <h1 id="hero-title">Seu setup de louvor.<span>Pronto para tocar.</span></h1>
+          <p>Mixer ao vivo com 14 canais, timbres nativos, plugins, cenas, pad contínuo e MIDI Learn — em um aplicativo construído para o culto.</p>
+          <div class="hero-actions">
+            <a class="button button-primary" href="https://churchdaw.com/app/desktop/ChurchDAW-1.6.25-r2-Setup.exe" download>Baixar para Windows <span class="arrow">↓</span></a>
+                <a class="button button-secondary" href="https://churchdaw.com/app/desktop/ChurchDAW-1.6.25.dmg" download>Baixar para macOS <span class="arrow">↓</span></a>
+            <a class="button button-secondary" href="https://churchdaw.com/app/android/ChurchDAW-1.6.24-r2-signed.apk" download>Baixar para Android <span class="arrow">↓</span></a>
+          </div>
+          <div class="hero-meta">
+            <span>Pagamento único de R$ 129,99</span>
+            <span>Atualização automática</span>
+            <span>Windows, Mac e Android</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="proof-bar shell" aria-label="Principais recursos">
+        <div class="proof"><strong>14 canais</strong><span>8 visíveis por vez</span></div>
+        <div class="proof"><strong>Cenas ao vivo</strong><span>Troca instantânea</span></div>
+        <div class="proof"><strong>MIDI Learn</strong><span>Knobs e faders</span></div>
+        <div class="proof"><strong>VST3 + AU</strong><span>Plugins no desktop</span></div>
+        <div class="proof"><strong>Pad contínuo</strong><span>12 tons naturais</span></div>
+      </div>
+    </section>
+
+    <section class="section" id="plataformas" aria-labelledby="platform-title">
+      <div class="shell">
+        <div class="section-head reveal">
+          <span class="eyebrow">Windows + macOS + Android</span>
+          <h2 id="platform-title" style="margin-top:18px">Três plataformas.<br><span class="red">A mesma experiência.</span></h2>
+          <p class="lede">O mesmo fluxo de palco no computador ou no tablet. Escolha o equipamento que você já usa e continue tocando.</p>
+        </div>
+
+        <div class="platform-grid">
+          <article class="platform-card windows reveal">
+            <div class="platform-media">
+              <img src="assets/churchdaw-windows-studio.webp" width="1536" height="1024" alt="ChurchDAW para Windows aberto em um notebook conectado a teclado e interface de áudio" loading="lazy">
+            </div>
+            <div class="platform-body">
+              <div class="platform-top">
+                <div class="platform-label"><span class="platform-glyph">WIN</span><h3>ChurchDAW para Windows</h3></div>
+                <span class="platform-version">1.6.25</span>
+              </div>
+              <p>Baixa latência com ASIO, plugins VST3 de 64 bits e integração completa com controladores MIDI.</p>
+              <ul class="platform-list">
+                <li>Windows 10 ou 11, 64 bits</li>
+                <li>ASIO, WASAPI e interfaces USB</li>
+                <li>Scanner seguro de instrumentos VST3</li>
+              </ul>
+              <div class="platform-actions">
+                <a class="button button-primary button-small" href="https://churchdaw.com/app/desktop/ChurchDAW-1.6.25-r2-Setup.exe" download>Baixar instalador EXE <span class="arrow">↓</span></a>
+              </div>
+              <p class="platform-note">Instalador oficial · aproximadamente 14,8 MB</p>
+            </div>
+          </article>
+
+          <article class="platform-card mac reveal">
+            <div class="platform-media">
+              <img src="assets/churchdaw-mac-stage.webp" width="1536" height="1024" alt="ChurchDAW para macOS aberto em um notebook sobre um teclado no palco" loading="lazy">
+            </div>
+            <div class="platform-body">
+              <div class="platform-top">
+                <div class="platform-label"><span class="platform-glyph">MAC</span><h3>ChurchDAW para macOS</h3></div>
+                <span class="platform-version">1.6.25 Universal</span>
+              </div>
+              <p>Um único aplicativo para Macs Intel e Apple Silicon, com CoreAudio, VST3 e Audio Unit.</p>
+              <ul class="platform-list">
+                <li>Intel: macOS 10.15 Catalina ou superior</li>
+                <li>Apple Silicon: macOS 11 Big Sur ou superior</li>
+                <li>Compatível com M1, M2, M3 e M4</li>
+              </ul>
+              <div class="platform-actions">
+                <a class="button button-secondary button-small" href="https://churchdaw.com/app/desktop/ChurchDAW-1.6.25.dmg" download>Baixar instalador DMG <span class="arrow">↓</span></a>
+              </div>
+              <p class="platform-note">Build Universal · aproximadamente 17,9 MB</p>
+            </div>
+          </article>
+
+          <article class="platform-card android reveal">
+            <div class="platform-media">
+              <img src="assets/churchdaw-android-live.webp" width="1600" height="900" alt="ChurchDAW para Android aberto em um tablet sobre um teclado em um palco de igreja" loading="lazy">
+            </div>
+            <div class="platform-body">
+              <div class="platform-top">
+                <div class="platform-label"><span class="platform-glyph">APK</span><h3>ChurchDAW para Android</h3></div>
+                <span class="platform-version">1.6.24</span>
+              </div>
+              <p>Performance touch com timbres nativos, cenas, pad contínuo e mapeamento MIDI — pronta para acompanhar seu teclado sem depender de notebook.</p>
+              <ul class="platform-list">
+                <li>Android 7.0 ou superior</li>
+                <li>Interface otimizada para tablet e controle por toque</li>
+                <li>MIDI por USB e Bluetooth LE</li>
+              </ul>
+              <div class="platform-actions">
+                <a class="button button-primary button-small" href="https://churchdaw.com/app/android/ChurchDAW-1.6.24-r2-signed.apk" download>Baixar APK oficial <span class="arrow">↓</span></a>
+              </div>
+              <p class="platform-note">APK oficial · aproximadamente 28,2 MB</p>
+            </div>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="atualizacao" aria-labelledby="update-title">
+      <div class="shell update-card reveal">
+        <div>
+          <span class="update-status">Atualização disponível</span>
+          <h2 id="update-title">Mais leve.<br><span class="red">Pronto para o palco.</span></h2>
+          <p class="update-intro">A versão 1.6.24 para Android melhora a estabilidade e o desempenho, inclusive ao trabalhar com buffer baixo — sem mudar a qualidade do seu som.</p>
+          <ul class="update-benefits">
+            <li>Áudio mais estável</li>
+            <li>Melhor desempenho</li>
+            <li>Menos travamentos e cortes</li>
+            <li>Qualidade sonora mantida</li>
+          </ul>
+          <div class="update-actions">
+            <a class="button button-primary" href="https://churchdaw.com/app/android/ChurchDAW-1.6.24-r2-signed.apk" download>Baixar atualização <span class="arrow">↓</span></a>
+            <a class="button button-whatsapp" href="https://chat.whatsapp.com/BvxFPY6mraJ1BUetTjwLXO?s=cl&amp;p=i&amp;ilr=2&amp;amv=1" target="_blank" rel="noreferrer" aria-label="Entrar no grupo oficial do ChurchDAW no WhatsApp">
+              <svg viewBox="0 0 32 32" aria-hidden="true"><path d="M19.11 17.21c-.27-.14-1.6-.79-1.85-.88-.25-.09-.43-.14-.61.14-.18.27-.7.88-.86 1.06-.16.18-.32.2-.59.07-.27-.14-1.15-.42-2.19-1.35-.81-.72-1.36-1.62-1.52-1.89-.16-.27-.02-.42.12-.55.12-.12.27-.32.41-.48.14-.16.18-.27.27-.45.09-.18.05-.34-.02-.48-.07-.14-.61-1.47-.84-2.01-.22-.53-.45-.46-.61-.47h-.52c-.18 0-.48.07-.73.34-.25.27-.95.93-.95 2.26 0 1.33.97 2.62 1.1 2.8.14.18 1.9 2.9 4.61 4.07.64.28 1.15.45 1.54.57.65.21 1.24.18 1.71.11.52-.08 1.6-.66 1.83-1.29.23-.63.23-1.17.16-1.29-.07-.11-.25-.18-.52-.32m-3.04 8.39h-.01a12.52 12.52 0 0 1-6.38-1.75l-.46-.27-4.74 1.24 1.27-4.62-.3-.47a12.46 12.46 0 0 1-1.91-6.65C3.54 6.18 9.16.56 16.08.56a12.43 12.43 0 0 1 8.87 3.68 12.44 12.44 0 0 1 3.67 8.88c0 6.91-5.63 12.48-12.55 12.48m10.67-23.16A14.96 14.96 0 0 0 16.08 0C7.78 0 1.03 6.75 1.03 15.05c0 2.65.69 5.24 2 7.52L.9 30.34l7.95-2.08a15.05 15.05 0 0 0 7.22 1.84h.01c8.3 0 15.05-6.75 15.05-15.05 0-4.02-1.56-7.8-4.39-10.61"/></svg>
+              Entrar no grupo oficial <span class="arrow">→</span>
+            </a>
+          </div>
+          <p class="update-note">Pode instalar por cima da versão atual. Não precisa apagar o ChurchDAW nem configurar tudo novamente.</p>
+        </div>
+
+        <aside class="update-version" aria-label="Detalhes da atualização Android">
+          <span class="update-version-label">ChurchDAW Android</span>
+          <span class="update-version-number">1.6.<b>24</b></span>
+          <div class="update-version-meta">
+            <span>Formato <strong>APK oficial</strong></span>
+            <span>Instalação <strong>Por cima da atual</strong></span>
+            <span>Qualidade do áudio <strong>Mantida</strong></span>
+          </div>
+        </aside>
+      </div>
+    </section>
+
+    <section class="section" id="interface" aria-labelledby="interface-title">
+      <div class="shell">
+        <div class="section-head reveal">
+          <span class="eyebrow">Feito para tocar</span>
+          <h2 id="interface-title" style="margin-top:18px">Tudo que importa,<br><span class="red">visível no palco.</span></h2>
+          <p class="lede">Volumes, timbres, MIDI, cenas, efeitos e master em uma única tela. Sem abrir cinco janelas no meio do culto.</p>
+        </div>
+
+        <figure class="product-stage reveal">
+          <div class="window-bar">
+            <span class="traffic" aria-hidden="true"><i></i><i></i><i></i></span>
+            <span class="window-title">ChurchDAW · Mixer ao vivo</span>
+          </div>
+          <img src="assets/churchdaw-mixer.webp" width="1672" height="941" alt="Interface real do ChurchDAW mostrando cenas, sete canais visíveis, faders, controles MIDI e master" loading="lazy">
+          <figcaption class="stage-caption"><strong>Interface real do ChurchDAW</strong><span>14 canais no projeto · 8 visíveis por vez · navegação lateral</span></figcaption>
+        </figure>
+      </div>
+    </section>
+
+    <section class="section" id="recursos" aria-labelledby="features-title">
+      <div class="shell">
+        <div class="section-head reveal">
+          <span class="eyebrow">Fluxo completo</span>
+          <h2 id="features-title" style="margin-top:18px">Menos configuração.<br><span class="red">Mais música.</span></h2>
+        </div>
+
+        <div class="feature-grid">
+          <article class="feature reveal"><span class="feature-index">01 · MIXER</span><h3>14 canais independentes</h3><p>Monte pianos, pads, órgãos, strings, bells e plugins com volume, oitava, MIDI e efeitos por canal.</p></article>
+          <article class="feature reveal"><span class="feature-index">02 · CENAS</span><h3>Um toque por momento</h3><p>Salve abertura, louvor, transição, ministração e altar. Troque o conjunto inteiro sem reconstruir o setup.</p></article>
+          <article class="feature reveal"><span class="feature-index">03 · MIDI</span><h3>Mapeamento que aprende</h3><p>Clique no controle, mova o knob ou fader físico e pronto. O mapeamento fica salvo para o próximo culto.</p></article>
+          <article class="feature reveal"><span class="feature-index">04 · TIMBRES</span><h3>Biblioteca preparada</h3><p>Pianos acústicos e elétricos, pads, órgãos, cordas, ambiências, leads e bells organizados por categoria.</p></article>
+          <article class="feature reveal"><span class="feature-index">05 · PLUGINS</span><h3>Seus instrumentos também entram</h3><p>Use VST3 de 64 bits no Windows. No Mac, carregue VST3 e Audio Unit dentro do próprio ChurchDAW.</p></article>
+          <article class="feature reveal"><span class="feature-index">06 · SEGURANÇA</span><h3>PANIC quando precisa</h3><p>Notas presas, pedal fantasma ou plugin sustentando som: um botão encerra tudo sem fechar o aplicativo.</p></article>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" aria-labelledby="pad-title">
+      <div class="shell split">
+        <div class="split-media reveal">
+          <img src="assets/churchdaw-pad-editor.webp" width="1672" height="941" alt="Editor real de pads do ChurchDAW com forma de onda, loop, filtro, reverb e controle de doze tons" loading="lazy">
+        </div>
+        <div class="split-copy reveal">
+          <span class="eyebrow">Pad e ambiência</span>
+          <h2 id="pad-title" style="margin-top:18px">O ambiente certo.<br><span class="red">No tom certo.</span></h2>
+          <p class="lede">Edite seus próprios pads por sample e mantenha o pad contínuo pronto nos 12 tons da música.</p>
+          <ul class="checks">
+            <li><span><strong>Editor visual de samples:</strong> ajuste início, fim, loop, crossfade, filtro, reverb e volume.</span></li>
+            <li><span><strong>Pad contínuo:</strong> sustains e drones com troca rápida de tom durante a ministração.</span></li>
+            <li><span><strong>Controle ao vivo:</strong> transpose e oitava sem sair da área de performance.</span></li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="compatibilidade" aria-labelledby="compat-title">
+      <div class="shell compat-card reveal">
+        <div>
+          <span class="eyebrow">Seu computador ainda serve</span>
+          <h2 id="compat-title" style="margin-top:18px">Até aquele Mac antigo pode <span class="red">voltar para o culto.</span></h2>
+          <p>O ChurchDAW mantém compatibilidade com macOS Catalina em Macs Intel. Isso inclui muitos MacBook Air, MacBook Pro, iMac e Mac mini de 2012 que receberam o Catalina.</p>
+        </div>
+        <div class="compat-list">
+          <div class="compat-item"><span>Mac Intel</span><strong>macOS 10.15 Catalina+</strong><small>Build x86_64 nativo</small></div>
+          <div class="compat-item"><span>Apple Silicon</span><strong>macOS 11 Big Sur+</strong><small>M1, M2, M3 e M4</small></div>
+          <div class="compat-item"><span>Windows</span><strong>Windows 10 ou 11</strong><small>64 bits · 8 GB de RAM recomendados</small></div>
+          <div class="compat-item"><span>Android</span><strong>Android 7.0 ou superior</strong><small>Aplicativo otimizado para dispositivos ARM64</small></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="downloads" aria-labelledby="downloads-title">
+      <div class="shell download-panel reveal">
+        <div>
+          <span class="eyebrow">Licença ChurchDAW</span>
+          <h2 id="downloads-title" style="margin-top:18px">Uma vez.<br><span class="red">Sem mensalidade.</span></h2>
+          <p class="price"><sup>R$</sup>129<sup>,99</sup></p>
+          <p class="price-copy">Pagamento único para um dispositivo ativo. Baixe o instalador agora e fale com a gente para ativar sua licença.</p>
+          <div class="price-actions">
+            <a class="button button-primary" href="https://wa.me/5562981278461?text=Oi%20Igor!%20Quero%20comprar%20a%20licen%C3%A7a%20do%20ChurchDAW." target="_blank" rel="noreferrer">Comprar pelo WhatsApp <span class="arrow">→</span></a>
+          </div>
+        </div>
+
+        <div>
+          <div class="downloads">
+            <a class="download-row" href="https://churchdaw.com/app/desktop/ChurchDAW-1.6.25-r2-Setup.exe" download>
+              <span class="download-os">WIN</span><span><strong>ChurchDAW para Windows</strong><small>Versão 1.6.25 · EXE · Windows 10/11</small></span><span class="download-arrow">↓</span>
+            </a>
+          <a class="download-row" href="https://churchdaw.com/app/desktop/ChurchDAW-1.6.25.dmg" download>
+            <span class="download-os">MAC</span><span><strong>ChurchDAW para macOS</strong><small>Versão 1.6.25 · DMG Universal · Intel + Apple Silicon</small></span><span class="download-arrow">↓</span>
+            </a>
+            <a class="download-row" href="https://churchdaw.com/app/android/ChurchDAW-1.6.24-r2-signed.apk" download>
+              <span class="download-os">APK</span><span><strong>ChurchDAW para Android</strong><small>Versão 1.6.24 · APK oficial</small></span><span class="download-arrow">↓</span>
+            </a>
+          </div>
+          <p class="download-foot">Os instaladores são baixados diretamente do servidor oficial ChurchDAW. A versão desktop verifica novas atualizações automaticamente.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="duvidas" aria-labelledby="faq-title">
+      <div class="shell">
+        <div class="section-head reveal">
+          <span class="eyebrow">Perguntas frequentes</span>
+          <h2 id="faq-title" style="margin-top:18px">Antes de levar<br><span class="red">para o palco.</span></h2>
+        </div>
+        <div class="faq-grid">
+          <details class="reveal"><summary>Preciso do Ableton ou MainStage?</summary><p>Não. O ChurchDAW é um aplicativo independente. Você instala, seleciona sua interface e seu teclado MIDI e toca diretamente.</p></details>
+          <details class="reveal"><summary>Quais plugins são compatíveis?</summary><p>No Windows, instrumentos VST3 de 64 bits. No macOS, instrumentos VST3 e Audio Unit. Plugins VST2 antigos não são suportados.</p></details>
+          <details class="reveal"><summary>Existe versão para Android?</summary><p>Sim. O APK oficial traz a experiência de performance por toque com timbres e bibliotecas nativas, cenas, pad contínuo e MIDI. VST3 e Audio Unit continuam sendo recursos das versões desktop.</p></details>
+          <details class="reveal"><summary>Funciona em Mac antigo?</summary><p>Sim, desde que o Mac Intel rode macOS 10.15 Catalina ou superior. Em Apple Silicon, o mínimo é macOS 11 Big Sur.</p></details>
+          <details class="reveal"><summary>O ChurchDAW funciona offline?</summary><p>Depois da ativação e do download da biblioteca, você pode tocar offline dentro do período seguro da licença. Uma conexão periódica revalida o acesso.</p></details>
+          <details class="reveal"><summary>O pagamento é mensal?</summary><p>Não. A licença custa R$ 129,99 em pagamento único, sem assinatura mensal.</p></details>
+          <details class="reveal"><summary>Posso mapear meu controlador MIDI?</summary><p>Sim. O modo MIDI Learn permite selecionar o controle na tela e mover o knob, botão, pedal ou fader físico que você deseja usar.</p></details>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="shell">
+      <div class="footer-grid">
+        <div>
+          <div class="footer-brand">
+            <img src="assets/churchdaw-logo.webp" width="512" height="512" alt="Logo ChurchDAW" loading="lazy">
+            <span class="brand-word">CHURCH<b>DAW</b><br><small style="font-size:.58em;color:var(--faint);letter-spacing:.15em">DAW PARA IGREJAS</small></span>
+          </div>
+          <p class="footer-copy">As telas exibidas são capturas reais do aplicativo, inseridas em cenas de apresentação. Marcas de terceiros pertencem aos seus respectivos proprietários e são citadas apenas para indicar compatibilidade.</p>
+        </div>
+        <div class="footer-links">
+          <a href="#plataformas">Windows, macOS e Android</a>
+          <a href="#downloads">Downloads</a>
+          <a href="#duvidas">Dúvidas</a>
+          <a href="https://wa.me/5562981278461?text=Oi%20Igor!%20Quero%20saber%20mais%20sobre%20o%20ChurchDAW." target="_blank" rel="noreferrer">WhatsApp (62) 98127-8461</a>
+        </div>
+      </div>
+      <p class="copyright">© <span id="year">2026</span> ChurchDAW · Igor Teixeira. Todos os direitos reservados.</p>
+    </div>
+  </footer>
+
+  <div class="mobile-buy" aria-label="Comprar ChurchDAW">
+    <span><strong>R$ 129,99</strong><small>pagamento único</small></span>
+    <a class="button button-primary button-small" href="https://wa.me/5562981278461?text=Oi%20Igor!%20Quero%20comprar%20o%20ChurchDAW." target="_blank" rel="noreferrer">Comprar</a>
+  </div>
+
+  <script>
+    (() => {
+      const nav = document.querySelector('.nav');
+      const menu = document.querySelector('.menu-button');
+      const links = document.querySelectorAll('.nav-links a');
+      menu?.addEventListener('click', () => {
+        const open = nav.classList.toggle('open');
+        menu.setAttribute('aria-expanded', String(open));
+        menu.textContent = open ? '×' : '☰';
+        menu.setAttribute('aria-label', open ? 'Fechar menu' : 'Abrir menu');
+      });
+      links.forEach(link => link.addEventListener('click', () => {
+        nav.classList.remove('open');
+        menu?.setAttribute('aria-expanded', 'false');
+        if (menu) { menu.textContent = '☰'; menu.setAttribute('aria-label', 'Abrir menu'); }
+      }));
+
+      document.getElementById('year').textContent = String(new Date().getFullYear());
+
+      const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      const reveals = document.querySelectorAll('.reveal');
+      if (reduceMotion || !('IntersectionObserver' in window)) {
+        reveals.forEach(el => el.classList.add('visible'));
+      } else {
+        const observer = new IntersectionObserver(entries => {
+          entries.forEach(entry => {
+            if (entry.isIntersecting) {
+              entry.target.classList.add('visible');
+              observer.unobserve(entry.target);
+            }
+          });
+        }, { threshold: .12, rootMargin: '0px 0px -4% 0px' });
+        reveals.forEach(el => observer.observe(el));
+      }
+    })();
+  </script>
+</body>
+</html>

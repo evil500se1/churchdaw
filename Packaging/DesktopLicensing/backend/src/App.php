@@ -10,7 +10,9 @@ final class App
     private Database $database;
     private AuthService $auth;
     private PaymentService $payments;
+    private WooviPaymentService $wooviPayments;
     private WebSessionService $sessions;
+    private Mailer $mailer;
     private LicenseService $licenses;
     private TrialService $trials;
     private LibraryDownloadService $libraryDownloads;
@@ -27,6 +29,7 @@ final class App
         $crypto = new Crypto($this->config);
         $limiter = new RateLimiter($database, $crypto);
         $mailer = new Mailer($this->config, $database, $crypto);
+        $this->mailer = $mailer;
         $audit = new AuditLog($database, $crypto);
         $this->licenses = new LicenseService($this->config, $database, $crypto);
         $this->trials = new TrialService(
@@ -55,6 +58,14 @@ final class App
             new MercadoPagoClient($this->config),
             $mailer
         );
+        $this->wooviPayments = new WooviPaymentService(
+            $this->config,
+            $database,
+            $crypto,
+            $limiter,
+            new WooviClient($this->config),
+            $mailer
+        );
         $this->sessions = new WebSessionService(
             $this->config,
             $database,
@@ -69,6 +80,96 @@ final class App
         );
         $this->adminViews = new AdminViews($this->config);
         $this->views = new Views($this->config);
+        $this->scheduleQueueTick();
+    }
+
+    /**
+     * TICK OPORTUNISTICO DAS FILAS.
+     *
+     * A conta da hospedagem NAO tem shell nem cron ativo — descoberto em
+     * 19/08/2026 com 11 webhooks parados e 41 e-mails represados (o mais
+     * antigo de 31/07). Sem worker, um cliente que paga fica sem licenca e
+     * sem e-mail por tempo indeterminado.
+     *
+     * Cada requisicao passa a drenar um pedaco da fila DEPOIS de responder:
+     * o visitante nao espera nada e o site vira o proprio agendador. Os crons
+     * continuam validos quando existirem — o lock impede sobreposicao.
+     */
+    private function scheduleQueueTick(): void
+    {
+        register_shutdown_function(function (): void {
+            if (function_exists('fastcgi_finish_request')) {
+                fastcgi_finish_request();
+            } elseif (function_exists('litespeed_finish_request')) {
+                litespeed_finish_request();
+            }
+
+            try {
+                $this->runQueueTick();
+            } catch (\Throwable $error) {
+                error_log('ChurchDAW tick: ' . $error->getMessage());
+            }
+        });
+    }
+
+    private function runQueueTick(): void
+    {
+        $pdo = $this->database->pdo();
+
+        // Uma unica execucao por vez no servidor inteiro. Timeout 0 = quem
+        // nao pegar a trava simplesmente desiste (a proxima visita tenta).
+        if ((int) $pdo->query(
+            "SELECT GET_LOCK('churchdaw_queue_tick', 0)"
+        )->fetchColumn() !== 1) {
+            return;
+        }
+
+        try {
+            $pending = $pdo->query(
+                "SELECT
+                    (SELECT COUNT(*) FROM webhook_events
+                      WHERE status = 'received'
+                         OR (status = 'failed' AND attempts < 10
+                             AND (next_attempt_at IS NULL
+                                  OR next_attempt_at <= CURRENT_TIMESTAMP(6))))
+                        AS webhooks,
+                    (SELECT COUNT(*) FROM email_jobs
+                      WHERE status = 'queued'
+                         OR (status = 'failed' AND attempts < 10))
+                        AS emails,
+                    (SELECT COUNT(*) FROM orders
+                      WHERE status IN ('creating', 'pending',
+                                       'provider_ambiguous')
+                        AND created_at < DATE_SUB(CURRENT_TIMESTAMP(6),
+                                                  INTERVAL 10 MINUTE)
+                        AND (provider_reconciled_at IS NULL
+                             OR provider_reconciled_at
+                                < DATE_SUB(CURRENT_TIMESTAMP(6),
+                                           INTERVAL 15 MINUTE)))
+                        AS orders_to_check"
+            )->fetch();
+
+            if (!is_array($pending)) {
+                return;
+            }
+
+            // Lotes pequenos: a resposta ja saiu, mas o processo ainda ocupa
+            // um worker do PHP. Fila grande e drenada em varias visitas.
+            if ((int) $pending['webhooks'] > 0) {
+                $this->payments->processPendingWebhooks(5);
+                $this->wooviPayments->processPendingWebhooks(5);
+            }
+
+            if ((int) $pending['emails'] > 0) {
+                $this->mailer->processPending(5);
+            }
+
+            if ((int) $pending['orders_to_check'] > 0) {
+                $this->wooviPayments->reconcilePending(3);
+            }
+        } finally {
+            $pdo->query("SELECT RELEASE_LOCK('churchdaw_queue_tick')");
+        }
     }
 
     public function run(): never
@@ -144,10 +245,7 @@ final class App
                     $request->requestId
                 ),
                 'GET /compra/sucesso' => Response::html(
-                    $this->views->message(
-                        'Pagamento recebido',
-                        'Assim que o pagamento for confirmado, sua licença aparecerá na conta. Confirme também seu e-mail.'
-                    ),
+                    $this->views->purchaseSuccess(),
                     200,
                     $request->requestId
                 ),
@@ -196,7 +294,13 @@ final class App
                 'POST /api/v1/auth/email/verify' => $this->verifyEmail($request),
                 'POST /api/v1/checkout/start' =>
                     $this->startCheckout($request),
+                'POST /api/v1/checkout/status' => Response::json(
+                    $this->wooviPayments->status($request),
+                    200,
+                    $request->requestId
+                ),
                 'POST /api/v1/webhooks/mercado-pago' => $this->mercadoPagoWebhook($request),
+                'POST /api/v1/webhooks/woovi' => $this->wooviWebhook($request),
                 'POST /api/v1/web/login' => Response::json(
                     $this->sessions->login($request),
                     200,
@@ -321,11 +425,29 @@ final class App
         }
         if ($request->method === 'POST'
             && preg_match(
+                '#^/admin/licenses/([0-9a-f-]{36})/policy$#i',
+                $request->path,
+                $match
+            )) {
+            $this->admin->updateLicensePolicy($request, $match[1]);
+            Response::redirect('/admin', 303, $request->requestId);
+        }
+        if ($request->method === 'POST'
+            && preg_match(
                 '#^/admin/licenses/([0-9a-f-]{36})/revoke$#i',
                 $request->path,
                 $match
             )) {
             $this->admin->revokeLicense($request, $match[1]);
+            Response::redirect('/admin', 303, $request->requestId);
+        }
+        if ($request->method === 'POST'
+            && preg_match(
+                '#^/admin/licenses/([0-9a-f-]{36})/reactivate$#i',
+                $request->path,
+                $match
+            )) {
+            $this->admin->reactivateLicense($request, $match[1]);
             Response::redirect('/admin', 303, $request->requestId);
         }
         if ($request->method === 'POST'
@@ -346,6 +468,24 @@ final class App
             $this->admin->resetCustomerAccess($request, $match[1]);
             Response::redirect('/admin', 303, $request->requestId);
         }
+        if ($request->method === 'POST'
+            && preg_match(
+                '#^/admin/users/([0-9a-f-]{36})/password$#i',
+                $request->path,
+                $match
+            )) {
+            $this->admin->setCustomerPassword($request, $match[1]);
+            Response::redirect('/admin', 303, $request->requestId);
+        }
+        if ($request->method === 'POST'
+            && preg_match(
+                '#^/admin/users/([0-9a-f-]{36})/status$#i',
+                $request->path,
+                $match
+            )) {
+            $this->admin->setCustomerStatus($request, $match[1]);
+            Response::redirect('/admin', 303, $request->requestId);
+        }
         throw new ApiException(404, 'NOT_FOUND', 'Rota inexistente.');
     }
 
@@ -359,7 +499,9 @@ final class App
             );
         }
         Response::json(
-            $this->payments->startCheckout($request),
+            $this->config->string('checkout.provider') === 'woovi'
+                ? $this->wooviPayments->startCheckout($request)
+                : $this->payments->startCheckout($request),
             201,
             $request->requestId
         );
@@ -378,6 +520,7 @@ final class App
             'release' => $this->config->string('app.release'),
             'schema' => $schema,
             'checkout_enabled' => $this->config->bool('checkout.enabled'),
+            'checkout_provider' => $this->config->string('checkout.provider'),
             'time' => gmdate(DATE_ATOM),
         ], $schema['ready'] ? 200 : 503, $request->requestId);
     }
@@ -417,6 +560,27 @@ final class App
         $dataId = (string) ($_GET['data_id'] ?? $_GET['id'] ?? '');
         $this->payments->receiveMercadoPagoWebhook($request, $dataId);
         Response::empty(200, $request->requestId);
+    }
+
+    private function wooviWebhook(Request $request): never
+    {
+        $correlationId = $this->wooviPayments->receiveWebhook($request);
+
+        // Handshake/probe de cadastro: nada a liberar.
+        if ($correlationId === null) {
+            Response::empty(200, $request->requestId);
+        }
+
+        // 200 PRIMEIRO (a Woovi reenvia se a resposta demorar), liberacao
+        // logo em seguida — o cliente ve a licenca em segundos em vez de
+        // esperar a janela de 15 minutos do cron da hospedagem.
+        Response::emptyThen(
+            200,
+            $request->requestId,
+            function () use ($correlationId): void {
+                $this->wooviPayments->settleWebhookNow($correlationId);
+            }
+        );
     }
 
     private function logout(Request $request): never

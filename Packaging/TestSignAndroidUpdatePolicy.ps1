@@ -8,7 +8,7 @@ $openssl = 'C:\Program Files\Git\usr\bin\openssl.exe'
 
 if ([string]::IsNullOrWhiteSpace($PrivateKey)) {
     $PrivateKey = Join-Path $env:USERPROFILE (
-        'ChurchDAW-Secrets\churchdaw-update-policy-private.pem'
+        'ChurchDAW-Secrets\churchdaw-update-policy-private-2026-08.pem'
     )
 }
 
@@ -34,6 +34,7 @@ $catalogFixtureV1 =
 $catalogFixtureV2 =
     '{"schema_version":1,"libraries":[{"id":"fixture-a"},{"id":"fixture-b"}]}'
 $utf8 = [Text.UTF8Encoding]::new($false)
+$utf8Bom = [Text.UTF8Encoding]::new($true)
 $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
 $passed = [Collections.Generic.List[string]]::new()
 
@@ -246,6 +247,47 @@ try {
         )
     }
     $passed.Add('payload de 13 campos vinculado ao manifesto fixture')
+
+    $lineEndingFixture = @(
+        '{',
+        '  "schema_version": 1,',
+        '  "libraries": [{"id": "fixture-a"}]',
+        '}'
+    ) -join "`n"
+    $lineEndingFixture += "`n"
+    [IO.File]::WriteAllText($catalogManifest, $lineEndingFixture, $utf8)
+    $lineEndingLfHash = (
+        Get-FileHash -LiteralPath $catalogManifest -Algorithm SHA256
+    ).Hash.ToLowerInvariant()
+    $lineEndingLfOutput = Copy-Seed -Name 'catalogo-lf'
+    Invoke-ExpectedSuccess `
+        -Arguments (New-SignArguments `
+            -Output $lineEndingLfOutput `
+            -PolicySerial 101) `
+        -Name 'catalogo LF normalizado'
+    $lineEndingLfPayload = Get-SignedPayload -Path $lineEndingLfOutput
+
+    $lineEndingCrLf = $lineEndingFixture.Replace("`n", "`r`n")
+    [IO.File]::WriteAllText(
+        $catalogManifest,
+        $lineEndingCrLf,
+        $utf8Bom
+    )
+    $lineEndingCrLfOutput = Copy-Seed -Name 'catalogo-crlf-bom'
+    Invoke-ExpectedSuccess `
+        -Arguments (New-SignArguments `
+            -Output $lineEndingCrLfOutput `
+            -PolicySerial 101) `
+        -Name 'catalogo CRLF com BOM normalizado'
+    $lineEndingCrLfPayload = Get-SignedPayload -Path $lineEndingCrLfOutput
+    if ([string] $lineEndingLfPayload.catalog_sha256 -cne
+            $lineEndingLfHash -or
+        [string] $lineEndingCrLfPayload.catalog_sha256 -cne
+            $lineEndingLfHash) {
+        throw 'LF, CRLF e BOM nao produziram o mesmo hash de catalogo'
+    }
+    $passed.Add('hash do catalogo independe de LF, CRLF e BOM')
+    [IO.File]::WriteAllText($catalogManifest, $catalogFixtureV1, $utf8)
 
     $normalOutput = Copy-Seed -Name 'normal-valida'
     Invoke-ExpectedSuccess `

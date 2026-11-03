@@ -49,6 +49,19 @@ public:
     bool isConnected() const noexcept { return output != nullptr; }
     bool isListening() const noexcept { return input != nullptr; }   // pads/faders chegando?
 
+    // A porta DAW ainda existe na lista de dispositivos? O output/input
+    // continuam nao-nulos mesmo depois de o teclado ser desplugado (objeto
+    // morto), entao isConnected() sozinho nao detecta a remocao. Este teste
+    // e o que permite ao timer recriar o LaunchkeyControl no replug.
+    static bool isDawPortAvailable()
+    {
+        for (const auto& d : juce::MidiOutput::getAvailableDevices())
+            if (isDawPort (d.name))
+                return true;
+
+        return false;
+    }
+
     // A porta DAW e a SEGUNDA do aparelho. Publico porque o resto do app precisa
     // manter essa porta FORA da entrada MIDI normal (senao pad vira nota tocada,
     // e a porta fica ocupada — o Windows abre MIDI em modo exclusivo).

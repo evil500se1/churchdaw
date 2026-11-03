@@ -20,11 +20,11 @@ int main (int argc, char** argv)
             "uso: probe <update-policy-v2.json> <manifest.json> <unix-time>");
 
     const juce::String officialApkUrl =
-        "https://churchdaw.com/app/android/ChurchDAW-1.5.0-signed.apk";
+        "https://churchdaw.com/app/android/ChurchDAW-1.6.24-r2-signed.apk";
     if (! ChurchDAWServices::isSafeWebsiteUpdateUrl (officialApkUrl))
         return fail ("URL oficial do APK foi rejeitada");
     if (ChurchDAWServices::isSafeWebsiteUpdateUrl (
-            "https://churchdaw.com/app/android/ChurchDAW-1.5.0.apk")
+            "https://churchdaw.com/app/android/ChurchDAW-1.6.24-r2.apk")
         || ChurchDAWServices::isSafeWebsiteUpdateUrl (
             officialApkUrl + "?arquivo=outro")
         || ChurchDAWServices::isSafeWebsiteUpdateUrl (
@@ -32,6 +32,10 @@ int main (int argc, char** argv)
         || ChurchDAWServices::isSafeWebsiteUpdateUrl (
             "https://example.com/app/android/ChurchDAW-1.5.0-signed.apk"))
         return fail ("filtro de URL aceitou query, CRLF ou host externo");
+
+    if (! ChurchDAWServices::isSafeAndroidUpdateUrl (
+            ChurchDAWServices::defaultPlayStoreUrl))
+        return fail ("ficha oficial da Play Store foi rejeitada");
 
     const juce::String publicBasePartUrl =
         "https://churchdaw.com/app/android/packs/"
@@ -57,7 +61,7 @@ int main (int argc, char** argv)
         ChurchDAWServices::currentVersionCode + 1;
     futurePolicy.playStoreUrl =
         "https://churchdaw.com/app/android/"
-        "ChurchDAW-9.9.9-signed.apk";
+        "ChurchDAW-9.9.9-r1-signed.apk";
 
     if (ChurchDAWServices::requiredUpdateDownloadUrl (
             futurePolicy, futurePolicy.latestVersionCode)
@@ -67,8 +71,7 @@ int main (int argc, char** argv)
     futurePolicy.playStoreUrl =
         "https://example.com/app/android/ChurchDAW-9.9.9-signed.apk";
     if (ChurchDAWServices::requiredUpdateDownloadUrl (
-            futurePolicy, futurePolicy.latestVersionCode)
-            != ChurchDAWServices::defaultPlayStoreUrl)
+            futurePolicy, futurePolicy.latestVersionCode).isNotEmpty())
         return fail ("gate aceitou URL externa como download obrigatorio");
 
     using UpdateDecision =
@@ -77,7 +80,8 @@ int main (int argc, char** argv)
     futurePolicy.minimumVersionCode =
         ChurchDAWServices::currentVersionCode - 1;
     futurePolicy.playStoreUrl =
-        "https://churchdaw.com/app/android/ChurchDAW-9.9.9-signed.apk";
+        "https://churchdaw.com/app/android/"
+        "ChurchDAW-9.9.9-r1-signed.apk";
 
     if (ChurchDAWServices::decideAndroidUpdatePrompt (
             futurePolicy, ChurchDAWServices::currentVersionCode,
@@ -165,6 +169,44 @@ int main (int argc, char** argv)
 
     if (! manifest.valid)
         return fail ("catalogo invalido: " + manifestError);
+
+    // Validação explicita de normalizeManifestText e paridade SHA-256 no probe
+    const juce::String rawManifestText = manifestFile.loadFileAsString();
+    const juce::String normalizedDirect = ChurchDAWServices::normalizeManifestText (
+        juce::String::fromUTF8 ("\xef\xbb\xbf") + juce::String ("a\r\nb\rc"));
+    if (normalizedDirect != "a\nb\nc")
+        return fail ("normalizeManifestText falhou no probe");
+
+    const juce::String manifestLF = rawManifestText.replace ("\r\n", "\n").replace ("\r", "\n");
+    const juce::String manifestCRLF = manifestLF.replace ("\n", "\r\n");
+    juce::String manifestMixed = manifestLF;
+    manifestMixed = manifestMixed.replaceSection (manifestMixed.indexOfChar ('\n'), 1, "\r\n");
+    const juce::String manifestBOM = juce::String::fromUTF8 ("\xef\xbb\xbf") + manifestCRLF;
+
+    const auto normLF = ChurchDAWServices::normalizeManifestText (manifestLF);
+    const auto normCRLF = ChurchDAWServices::normalizeManifestText (manifestCRLF);
+    const auto normMixed = ChurchDAWServices::normalizeManifestText (manifestMixed);
+    const auto normBOM = ChurchDAWServices::normalizeManifestText (manifestBOM);
+
+    const auto hashLF = juce::SHA256 (normLF.toRawUTF8(), (size_t) normLF.getNumBytesAsUTF8()).toHexString().toLowerCase();
+    const auto hashCRLF = juce::SHA256 (normCRLF.toRawUTF8(), (size_t) normCRLF.getNumBytesAsUTF8()).toHexString().toLowerCase();
+    const auto hashMixed = juce::SHA256 (normMixed.toRawUTF8(), (size_t) normMixed.getNumBytesAsUTF8()).toHexString().toLowerCase();
+    const auto hashBOM = juce::SHA256 (normBOM.toRawUTF8(), (size_t) normBOM.getNumBytesAsUTF8()).toHexString().toLowerCase();
+
+    if (hashLF != policy.catalogSha256 || hashCRLF != policy.catalogSha256 || hashMixed != policy.catalogSha256 || hashBOM != policy.catalogSha256)
+        return fail ("paridade de hash SHA-256 entre line endings falhou no probe");
+
+    juce::String errCRLF, errLF, errMixed, errBOM;
+    if (! ChurchDAWServices::parseManifest (manifestCRLF, errCRLF, policy.catalogSha256).valid
+         || ! ChurchDAWServices::parseManifest (manifestLF, errLF, policy.catalogSha256).valid
+         || ! ChurchDAWServices::parseManifest (manifestMixed, errMixed, policy.catalogSha256).valid
+         || ! ChurchDAWServices::parseManifest (manifestBOM, errBOM, policy.catalogSha256).valid)
+        return fail ("parseManifest com variantes de line endings/BOM falhou no probe");
+
+    juce::String wrongHashErr;
+    if (ChurchDAWServices::parseManifest (manifestCRLF, wrongHashErr, "0000000000000000000000000000000000000000000000000000000000000000").valid
+         || wrongHashErr != "Manifesto nao corresponde ao SHA-256 assinado")
+        return fail ("parseManifest aceitou hash incorreto ou devolveu mensagem de erro errada");
 
     // Um catálogo indisponível nunca pode apagar visualmente um pack que já foi
     // instalado. O painel reconstrói seu card a partir deste marker local.

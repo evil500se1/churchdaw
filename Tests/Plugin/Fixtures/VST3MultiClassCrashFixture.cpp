@@ -84,12 +84,36 @@ public:
     }
 
     tresult PLUGIN_API setIoMode (IoMode) override { return kResultOk; }
-    int32 PLUGIN_API getBusCount (MediaType, BusDirection) override { return 0; }
 
-    tresult PLUGIN_API getBusInfo (MediaType, BusDirection, int32,
-                                   BusInfo&) override
+    int32 PLUGIN_API getBusCount (MediaType type,
+                                  BusDirection direction) override
     {
-        return kInvalidArgument;
+        if (type == kAudio && direction == kOutput)
+            return 1;
+
+        if (type == kEvent && direction == kInput)
+            return 1;
+
+        return 0;
+    }
+
+    tresult PLUGIN_API getBusInfo (MediaType type,
+                                   BusDirection direction,
+                                   int32 index,
+                                   BusInfo& info) override
+    {
+        if (index != 0
+             || getBusCount (type, direction) != 1)
+            return kInvalidArgument;
+
+        std::memset (&info, 0, sizeof (info));
+        info.mediaType = type;
+        info.direction = direction;
+        info.channelCount = type == kAudio ? 2 : 16;
+        info.busType = kMain;
+        info.flags = BusInfo::kDefaultActive;
+        info.name[0] = type == kAudio ? (TChar) 'O' : (TChar) 'M';
+        return kResultTrue;
     }
 
     tresult PLUGIN_API getRoutingInfo (RoutingInfo&, RoutingInfo&) override
@@ -97,27 +121,38 @@ public:
         return kNotImplemented;
     }
 
-    tresult PLUGIN_API activateBus (MediaType, BusDirection, int32,
+    tresult PLUGIN_API activateBus (MediaType type,
+                                    BusDirection direction,
+                                    int32 index,
                                     TBool) override
     {
-        return kResultFalse;
+        return index == 0 && getBusCount (type, direction) == 1
+            ? kResultTrue : kInvalidArgument;
     }
 
     tresult PLUGIN_API setActive (TBool) override { return kResultOk; }
     tresult PLUGIN_API setState (IBStream*) override { return kResultOk; }
     tresult PLUGIN_API getState (IBStream*) override { return kResultOk; }
 
-    tresult PLUGIN_API setBusArrangements (SpeakerArrangement*, int32 numInputs,
-                                           SpeakerArrangement*, int32 numOutputs) override
+    tresult PLUGIN_API setBusArrangements (
+        SpeakerArrangement*, int32 numInputs,
+        SpeakerArrangement* outputs, int32 numOutputs) override
     {
-        return numInputs == 0 && numOutputs == 0 ? kResultTrue
-                                                 : kResultFalse;
+        return numInputs == 0 && numOutputs == 1
+             && outputs != nullptr
+             && outputs[0] == SpeakerArr::kStereo
+            ? kResultTrue : kResultFalse;
     }
 
-    tresult PLUGIN_API getBusArrangement (BusDirection, int32,
-                                          SpeakerArrangement&) override
+    tresult PLUGIN_API getBusArrangement (BusDirection direction,
+                                          int32 index,
+                                          SpeakerArrangement& arrangement) override
     {
-        return kInvalidArgument;
+        if (direction != kOutput || index != 0)
+            return kInvalidArgument;
+
+        arrangement = SpeakerArr::kStereo;
+        return kResultTrue;
     }
 
     tresult PLUGIN_API canProcessSampleSize (int32 symbolicSampleSize) override

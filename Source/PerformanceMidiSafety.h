@@ -528,4 +528,27 @@ namespace ChurchDAWPerformanceMidiSafety
                 juce::MidiMessage::allSoundOff (channel), samplePosition);
         }
     }
+
+    // Keeps every deliberate PANIC on one ordered boundary. The caller owns
+    // the concrete engines/UI; this small orchestration seam lets the focused
+    // safety test prove that no engine is skipped or reset twice.
+    template <typename StopContinuousPad,
+              typename RefreshContinuousPadUI,
+              typename RequestPadSynthPanic,
+              typename ResetMidiTransport>
+    inline void performGlobalPanic (
+        StopContinuousPad&& stopContinuousPad,
+        RefreshContinuousPadUI&& refreshContinuousPadUI,
+        RequestPadSynthPanic&& requestPadSynthPanic,
+        ResetMidiTransport&& resetMidiTransport,
+        bool padSynthAlreadyRequested = false)
+    {
+        stopContinuousPad();
+        refreshContinuousPadUI();
+
+        if (! padSynthAlreadyRequested)
+            requestPadSynthPanic();
+
+        resetMidiTransport();
+    }
 }

@@ -18,6 +18,35 @@ final class Crypto
         return self::base64UrlEncode(random_bytes($bytes));
     }
 
+    public function deriveRefreshToken(
+        string $tokenId,
+        string $familyId,
+        string $userId,
+        string $licenseId,
+        string $deviceId
+    ): string {
+        $key = base64_decode(
+            $this->config->string('app.encryption_key'),
+            true
+        );
+        if ($key === false
+            || strlen($key) !== SODIUM_CRYPTO_SECRETBOX_KEYBYTES) {
+            throw new RuntimeException('Chave de criptografia invalida.');
+        }
+
+        $material = implode("\0", [
+            'churchdaw-refresh-v2',
+            $tokenId,
+            $familyId,
+            $userId,
+            $licenseId,
+            $deviceId,
+        ]);
+        $digest = hash_hmac('sha256', $material, $key, true);
+        sodium_memzero($key);
+        return self::base64UrlEncode($digest);
+    }
+
     public static function uuid(): string
     {
         $bytes = random_bytes(16);

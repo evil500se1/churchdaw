@@ -52,11 +52,16 @@ public final class ChurchDAWActivity extends Activity {
         super.onCreate(savedInstanceState);
         getWindow().setSoftInputMode(
             WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
+        // A tela do celular nao pode apagar sozinha durante o culto: o musico
+        // toca de olho no app e nao pode ficar tocando a tela pra mantê-la
+        // acesa. FLAG_KEEP_SCREEN_ON mantem o display ligado enquanto a
+        // activity estiver visivel.
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         ChurchDAWAudioDeviceBridge.initialize(getApplicationContext());
         ChurchDAWLicenseBridge.initialize(this);
-        // BLE MIDI: pede CONNECT/SCAN cedo (API 31+). Sem isso o MidiManager
-        // omite teclados Bluetooth e o app parece "sem MIDI".
-        ChurchDAWMidiBleBridge.requestMidiBlePermissions(this, 0x41DA);
+        // BLE MIDI: a permissao CONNECT/SCAN (API 31+) agora e pedida sob
+        // demanda no painel Audio/MIDI Bluetooth, evitando modal do sistema em
+        // cima do cold start (que disparava onPause e reiniciava o gate).
     }
 
     @Override

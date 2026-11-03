@@ -27,7 +27,7 @@ $ErrorActionPreference = 'Stop'
 $openssl = 'C:\Program Files\Git\usr\bin\openssl.exe'
 $packageId = 'com.churchdaw.app'
 $playStoreUrl = $UpdateApkUrl
-$keyId = 'churchdaw-update-2026-01'
+$keyId = 'churchdaw-update-2026-08'
 $publicKey = Join-Path $PSScriptRoot 'AndroidUpdatePolicyPublicKey.pem'
 
 function Get-RequiredPositiveInt64Property {
@@ -311,7 +311,7 @@ function Read-VerifiedPreviousPolicy {
 
 if ([string]::IsNullOrWhiteSpace($PrivateKey)) {
     $PrivateKey = Join-Path $env:USERPROFILE (
-        'ChurchDAW-Secrets\churchdaw-update-policy-private.pem'
+        'ChurchDAW-Secrets\churchdaw-update-policy-private-2026-08.pem'
     )
 }
 
@@ -366,9 +366,30 @@ $now = [DateTimeOffset]::UtcNow
 $issuedAt = $now.ToUnixTimeSeconds()
 $expiresAt = $now.AddDays($ValidDays).ToUnixTimeSeconds()
 $catalogManifestFullPath = [IO.Path]::GetFullPath($CatalogManifest)
-$catalogSha256 = (
-    Get-FileHash -LiteralPath $catalogManifestFullPath -Algorithm SHA256
-).Hash.ToLowerInvariant()
+$strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
+try {
+    $catalogText = $strictUtf8.GetString(
+        [IO.File]::ReadAllBytes($catalogManifestFullPath)
+    )
+}
+catch {
+    throw "Manifesto do catalogo nao e UTF-8 valido: $($_.Exception.Message)"
+}
+if ($catalogText.Length -gt 0 -and
+    $catalogText[0] -eq [char] 0xfeff) {
+    $catalogText = $catalogText.Substring(1)
+}
+$catalogText = $catalogText.Replace("`r`n", "`n").Replace("`r", "`n")
+$catalogBytes = [Text.UTF8Encoding]::new($false).GetBytes($catalogText)
+$catalogHasher = [Security.Cryptography.SHA256]::Create()
+try {
+    $catalogSha256 = [BitConverter]::ToString(
+        $catalogHasher.ComputeHash($catalogBytes)
+    ).Replace('-', '').ToLowerInvariant()
+}
+finally {
+    $catalogHasher.Dispose()
+}
 $payloadObject = [ordered] @{
     schema_version = 2
     package_id = $packageId

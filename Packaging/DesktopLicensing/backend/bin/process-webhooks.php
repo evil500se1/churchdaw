@@ -14,6 +14,8 @@ use ChurchDAW\Licensing\Mailer;
 use ChurchDAW\Licensing\MercadoPagoClient;
 use ChurchDAW\Licensing\PaymentService;
 use ChurchDAW\Licensing\RateLimiter;
+use ChurchDAW\Licensing\WooviClient;
+use ChurchDAW\Licensing\WooviPaymentService;
 
 $root = dirname(__DIR__);
 require $root . '/src/autoload.php';
@@ -22,17 +24,28 @@ $config = Config::load($root);
 $config->assertRuntimeReady();
 $database = new Database($config);
 $crypto = new Crypto($config);
+$limiter = new RateLimiter($database, $crypto);
+$mailer = new Mailer($config, $database, $crypto);
 $payments = new PaymentService(
     $config,
     $database,
     $crypto,
-    new RateLimiter($database, $crypto),
+    $limiter,
     new MercadoPagoClient($config),
-    new Mailer($config, $database, $crypto)
+    $mailer
+);
+$woovi = new WooviPaymentService(
+    $config,
+    $database,
+    $crypto,
+    $limiter,
+    new WooviClient($config),
+    $mailer
 );
 
 $limit = isset($argv[1]) ? (int) $argv[1] : 25;
-$processed = $payments->processPendingWebhooks($limit);
+$processed = $payments->processPendingWebhooks($limit)
+    + $woovi->processPendingWebhooks($limit);
 echo "PROCESSED {$processed}\n";
 
 $queueState = $database->pdo()->query(

@@ -80,17 +80,14 @@ void OpenGLTexture::create (const int w, const int h, const void* pixels, GLenum
     glPixelStorei (GL_UNPACK_ALIGNMENT, 1);
     JUCE_CHECK_OPENGL_ERROR
 
-    if (! tryAllocTexture (w, h, type))
+    if (! tryAllocTexture (w, h, type, &width, &height))
     {
         // Completely failed to create a workable texture
         jassertfalse;
         return;
     }
 
-    GLint detectedWidth{}, detectedHeight{};
-    glGetTexLevelParameteriv (GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &detectedWidth);
-    glGetTexLevelParameteriv (GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &detectedHeight);
-    std::tie (width, height) = std::tie (detectedWidth, detectedHeight);
+    // ChurchDAW ES 3.0 texture allocation: dimensions returned by allocator.
 
     if (width < w || height < h)
     {

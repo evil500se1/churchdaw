@@ -1,0 +1,48 @@
+{
+    "schema_version":  1,
+    "status":  "published",
+    "failure":  "",
+    "version":  "1.6.25",
+    "version_code":  10632,
+    "policy_serial":  31,
+    "minimum_version_code":  10632,
+    "rollback_confirmed":  false,
+    "events":  [
+                   {
+                       "utc":  "2026-08-15T23:03:15.8834515Z",
+                       "step":  "inputs",
+                       "status":  "verified",
+                       "detail":  "windows=510b5b903e0e3f10a1cdd43d479ec047588dd36eafd28acf0621c0af33d80ab6;mac=bc72e400d45e9c62cff484a4ab01fc72038ba93997bbd51e4454d7305563e84c;previous=428e4f45a4a8a462a93a4daad0196006f2222647de351ffadc22fa4817635ff7;release=eb15b14702e4f29e8ab40b1aedf669436c2fb09564c530970dbce46f2ba83542"
+                   },
+                   {
+                       "utc":  "2026-08-15T23:03:15.8949462Z",
+                       "step":  "windows-authenticode",
+                       "status":  "emergency-unsigned",
+                       "detail":  "Recuperacao do auto-update: remover apenas a assinatura Authenticode self-signed que WinVerifyTrust recusava; integridade mantida por policy RS256 e SHA-256."
+                   },
+                   {
+                       "utc":  "2026-08-15T23:03:24.4346479Z",
+                       "step":  "ftps-preflight",
+                       "status":  "passed",
+                       "detail":  "/app/desktop"
+                   },
+                   {
+                       "utc":  "2026-08-15T23:03:39.0189875Z",
+                       "step":  "artifact",
+                       "status":  "uploaded",
+                       "detail":  "ChurchDAW-1.6.25-r2-Setup.exe"
+                   },
+                   {
+                       "utc":  "2026-08-15T23:03:42.0793451Z",
+                       "step":  "artifact",
+                       "status":  "reused-identical",
+                       "detail":  "ChurchDAW-1.6.25.dmg"
+                   },
+                   {
+                       "utc":  "2026-08-15T23:03:51.8097491Z",
+                       "step":  "policy-last",
+                       "status":  "confirmed",
+                       "detail":  "serial=31;sha=eb15b14702e4f29e8ab40b1aedf669436c2fb09564c530970dbce46f2ba83542"
+                   }
+               ]
+}

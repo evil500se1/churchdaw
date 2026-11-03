@@ -57,6 +57,11 @@ param(
     [ValidateRange(1, 180)]
     [int] $ValidDays = 90,
     [string] $PrivateKey = '',
+    [string] $PublicKey = '',
+    [string] $PreviousPublicKey = '',
+    [switch] $AllowEmergencyKeyRollback,
+    [ValidateSet('churchdaw-update-2026-01', 'churchdaw-update-2026-08')]
+    [string] $KeyId = 'churchdaw-update-2026-08',
     [string] $PreviousPolicy = '',
     [string] $Output = ''
 )
@@ -66,9 +71,31 @@ Set-StrictMode -Version 3.0
 . (Join-Path $PSScriptRoot 'WindowsRelease.Common.ps1')
 $openssl = 'C:\Program Files\Git\usr\bin\openssl.exe'
 $productId = 'com.churchdaw.app'
-$keyId = 'churchdaw-update-2026-01'
+$keyId = $KeyId
 $requiredHostSuffix = 'churchdaw.com'
-$publicKey = Join-Path $PSScriptRoot 'AndroidUpdatePolicyPublicKey.pem'
+$script:publicKey = $PublicKey
+if ([string]::IsNullOrWhiteSpace($script:publicKey)) {
+    $candidates = @(
+        'C:\Users\administrator\ChurchDAW-Secrets\churchdaw-update-policy-public.pem',
+        (Join-Path $PSScriptRoot 'churchdaw-update-policy-public.pem'),
+        (Join-Path $PSScriptRoot 'AndroidUpdatePolicyPublicKey.pem')
+    )
+    foreach ($cand in $candidates) {
+        if (Test-Path $cand) {
+            $script:publicKey = $cand
+            break
+        }
+    }
+}
+$publicKey = $script:publicKey
+$script:previousPublicKey = $PreviousPublicKey
+if ([string]::IsNullOrWhiteSpace($script:previousPublicKey)) {
+    $candidate = Join-Path $PSScriptRoot `
+        'AndroidUpdatePolicyPublicKey-2026-01.pem'
+    if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+        $script:previousPublicKey = $candidate
+    }
+}
 
 function Assert-TrustedUrl {
     param([string] $Url, [string] $Label)
@@ -162,9 +189,11 @@ function Read-VerifiedPreviousPolicy {
         -not (Test-JsonInteger $envelopeSchema) -or
         [long] $envelopeSchema -ne 1 -or
         $envelopeAlgorithm -isnot [string] -or
-        [string] $envelopeAlgorithm -cne 'SHA256withRSA' -or
         $envelopeKeyId -isnot [string] -or
-        [string] $envelopeKeyId -cne $keyId -or
+        -not @(
+            'churchdaw-update-2026-01',
+            'churchdaw-update-2026-08'
+        ).Contains([string] $envelopeKeyId) -or
         $envelopePayload -isnot [string] -or
         $envelopeSignature -isnot [string]) {
         throw 'Envelope anterior tem metadados invalidos'
@@ -181,10 +210,34 @@ function Read-VerifiedPreviousPolicy {
     [IO.File]::WriteAllBytes($payloadFile, $payloadBytes)
     [IO.File]::WriteAllBytes($signatureFile, $signatureBytes)
 
+    $verificationPublicKey = ''
+    if ([string] $envelopeKeyId -ceq $keyId) {
+        $verificationPublicKey = $script:publicKey
+    }
+    elseif ([string] $envelopeKeyId -ceq 'churchdaw-update-2026-01' -and
+            $keyId -ceq 'churchdaw-update-2026-08') {
+        $verificationPublicKey = $script:previousPublicKey
+    }
+    elseif ([string] $envelopeKeyId -ceq 'churchdaw-update-2026-08' -and
+            $keyId -ceq 'churchdaw-update-2026-01' -and
+            $AllowEmergencyKeyRollback) {
+        $verificationPublicKey = $script:previousPublicKey
+    }
+    else {
+        throw ('Rotacao de chave invalida: a politica anterior usa ' +
+               "'$envelopeKeyId' e a nova usa '$keyId'")
+    }
+    if ([string]::IsNullOrWhiteSpace($verificationPublicKey) -or
+        -not (Test-Path -LiteralPath $verificationPublicKey -PathType Leaf)) {
+        throw ('Chave publica da politica anterior nao encontrada para ' +
+               "'$envelopeKeyId'")
+    }
+
     $saved = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'
-        & $openssl dgst -sha256 -verify $publicKey -signature $signatureFile $payloadFile | Out-Null
+        & $openssl dgst -sha256 -verify $verificationPublicKey `
+            -signature $signatureFile $payloadFile | Out-Null
         $code = $LASTEXITCODE
     }
     finally { $ErrorActionPreference = $saved }
@@ -234,8 +287,13 @@ function Read-VerifiedPreviousPolicy {
 
 #------------------------------------------------------------------ validacoes
 if ([string]::IsNullOrWhiteSpace($PrivateKey)) {
+    $privateName = if ($keyId -ceq 'churchdaw-update-2026-08') {
+        'churchdaw-update-policy-private-2026-08.pem'
+    } else {
+        'churchdaw-update-policy-private.pem'
+    }
     $PrivateKey = Join-Path $env:USERPROFILE `
-        'ChurchDAW-Secrets\churchdaw-update-policy-private.pem'
+        (Join-Path 'ChurchDAW-Secrets' $privateName)
 }
 
 if ([string]::IsNullOrWhiteSpace($Output)) {
@@ -261,6 +319,17 @@ if ($AllowRollbackPolicyWithoutInstaller -and $Mode -ne 'rollback') {
 }
 if ($UpdateMessage.IndexOfAny([char[]] "`0`r`n") -ge 0) {
     throw 'A mensagem nao pode conter NUL nem quebras de linha'
+}
+if ($AllowEmergencyKeyRollback -and
+    ($keyId -cne 'churchdaw-update-2026-01' -or
+     $ReleaseMode -cne 'Test' -or
+     $Mode -cne 'normal')) {
+    throw ('-AllowEmergencyKeyRollback exige a chave 2026-01, ' +
+           '-ReleaseMode Test e -Mode normal')
+}
+if ($AllowEmergencyKeyRollback) {
+    Write-Warning ('Compatibilidade emergencial: a nova policy volta a usar ' +
+                   'a chave 2026-01 para atender clientes antigos.')
 }
 
 if (-not (Test-Path -LiteralPath $openssl -PathType Leaf)) {
@@ -408,8 +477,8 @@ try {
                    "($expectedPolicySerial)")
         }
         if ($Mode -eq 'normal' -and
-            [long] $LatestVersionCode -le $previous.LatestVersionCode) {
-            throw ("Politica normal deve aumentar latest_version_code acima " +
+            [long] $LatestVersionCode -lt $previous.LatestVersionCode) {
+            throw ("Politica normal nao pode reduzir latest_version_code abaixo " +
                    "de $($previous.LatestVersionCode)")
         }
         if ($Mode -eq 'normal' -and
@@ -422,13 +491,18 @@ try {
                 throw ("Rollback deve revogar exatamente o serial anterior " +
                        "($($previous.PolicySerial))")
             }
-            if ([long] $LatestVersionCode -ge $previous.LatestVersionCode) {
-                throw ("Rollback deve reduzir latest_version_code abaixo de " +
+            if ([long] $LatestVersionCode -gt $previous.LatestVersionCode) {
+                throw ("Rollback nao pode aumentar latest_version_code acima de " +
                        "$($previous.LatestVersionCode)")
             }
             if ([long] $MinimumVersionCode -gt $previous.MinimumVersionCode) {
                 throw ("Rollback nao pode aumentar minimum_version_code acima de " +
                        "$($previous.MinimumVersionCode)")
+            }
+            if ([long] $LatestVersionCode -eq $previous.LatestVersionCode -and
+                [long] $MinimumVersionCode -eq $previous.MinimumVersionCode) {
+                throw ('Rollback precisa reduzir latest_version_code ou ' +
+                       'minimum_version_code')
             }
         }
     }

@@ -143,6 +143,30 @@ namespace churchorgan
         OrganParameterId id,
         float normalisedValue) noexcept;
 
+    struct alignas(64) AlignedOrganParameterValue
+    {
+        std::atomic<std::uint32_t> atomicValue { 0 };
+        char cachePadding[60] {};
+
+        AlignedOrganParameterValue() noexcept = default;
+        AlignedOrganParameterValue (std::uint32_t val) noexcept : atomicValue (val) {}
+
+        std::uint32_t load (std::memory_order order = std::memory_order_seq_cst) const noexcept
+        {
+            return atomicValue.load (order);
+        }
+
+        void store (std::uint32_t val, std::memory_order order = std::memory_order_seq_cst) noexcept
+        {
+            atomicValue.store (val, order);
+        }
+
+        std::uint32_t exchange (std::uint32_t val, std::memory_order order = std::memory_order_seq_cst) noexcept
+        {
+            return atomicValue.exchange (val, order);
+        }
+    };
+
     // Ponte de parâmetros independente da UI. Cada parâmetro é deliberadamente
     // atômico e independente: o callback recebe um snapshot válido sem mutex,
     // alocação ou seqlock com payload não-atômico.
@@ -172,7 +196,8 @@ namespace churchorgan
         static std::uint32_t floatBits (float value) noexcept;
         static float bitsFloat (std::uint32_t value) noexcept;
 
-        std::array<std::atomic<std::uint32_t>, organParameterCount> values_ {};
-        std::atomic<std::uint32_t> revision_ { 0 };
+        std::array<AlignedOrganParameterValue, organParameterCount> values_ {};
+        alignas(64) std::atomic<std::uint32_t> revision_ { 0 };
     };
 }
+

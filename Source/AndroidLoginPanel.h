@@ -64,8 +64,6 @@ public:
         forgotButton.setExplicitFocusOrder (4);
         loginButton.setExplicitFocusOrder (5);
         trialButton.setExplicitFocusOrder (6);
-        buyButton.setExplicitFocusOrder (7);
-        supportButton.setExplicitFocusOrder (8);
 
         configureLabel (emailLabel, "E-MAIL", false);
         configureLabel (passwordLabel, "SENHA", false);
@@ -78,10 +76,6 @@ public:
         configureButton (trialButton, false);
         configureButton (manageButton, false);
         configureLink (forgotButton);
-        configureLink (buyButton);
-        configureLink (supportButton);
-        buyButton.setHighContrast (true);
-        supportButton.setHighContrast (true);
 
         showPasswordButton.setTitle ("Mostrar senha");
         showPasswordButton.setDescription (
@@ -100,8 +94,6 @@ public:
                  static_cast<juce::Component*> (&libraryStatusLabel),
                  static_cast<juce::Component*> (&trialButton),
                  static_cast<juce::Component*> (&statusLabel),
-                 static_cast<juce::Component*> (&buyButton),
-                 static_cast<juce::Component*> (&supportButton),
                  static_cast<juce::Component*> (&manageButton) })
             addAndMakeVisible (*component);
 
@@ -140,16 +132,6 @@ public:
             if (onTrial != nullptr)
                 onTrial();
         };
-        buyButton.onClick = [this]
-        {
-            if (onBuy != nullptr)
-                onBuy();
-        };
-        supportButton.onClick = [this]
-        {
-            if (onSupport != nullptr)
-                onSupport();
-        };
         manageButton.onClick = [this]
         {
             if (onManageActivation != nullptr)
@@ -178,8 +160,6 @@ public:
         juce::String email, juce::String password)> onLogin;
     std::function<void()> onTrial;
     std::function<void (juce::String email)> onForgotPassword;
-    std::function<void()> onBuy;
-    std::function<void()> onSupport;
     std::function<void()> onManageActivation;
 
     WindowClass getWindowClassForTesting() const noexcept
@@ -1164,25 +1144,11 @@ private:
     {
         if (area.isEmpty())
             return;
-        const int combinedWidth =
-            juce::jmin (176, area.getWidth());
+
         area = area.withSizeKeepingCentre (
-            combinedWidth, area.getHeight());
-        auto left = area.removeFromLeft (
-            juce::roundToInt (
-                static_cast<float> (combinedWidth) * 0.62f));
-        buyButton.setBounds (left);
-        buyButton.setVisible (true);
+            juce::jmin (220, area.getWidth()), area.getHeight());
         if (manageButton.isVisible())
-        {
             manageButton.setBounds (area);
-            supportButton.setVisible (false);
-        }
-        else
-        {
-            supportButton.setBounds (area);
-            supportButton.setVisible (true);
-        }
     }
 
     void hideAllFormComponents()
@@ -1204,8 +1170,6 @@ private:
                  static_cast<juce::Component*> (&libraryStatusLabel),
                  static_cast<juce::Component*> (&trialButton),
                  static_cast<juce::Component*> (&statusLabel),
-                 static_cast<juce::Component*> (&buyButton),
-                 static_cast<juce::Component*> (&supportButton),
                  static_cast<juce::Component*> (&manageButton) })
             component->setVisible (false);
         manageButton.setVisible (
@@ -1234,9 +1198,7 @@ private:
                  static_cast<juce::Component*> (&loginButton),
                  static_cast<juce::Component*> (&libraryStatusLabel),
                  static_cast<juce::Component*> (&trialButton),
-                 static_cast<juce::Component*> (&buyButton),
-                 static_cast<juce::Component*> (&manageButton),
-                 static_cast<juce::Component*> (&supportButton) })
+                 static_cast<juce::Component*> (&manageButton) })
         {
             if (! component->isVisible())
                 continue;
@@ -1252,9 +1214,7 @@ private:
                 isPrimaryAction
                 || component == &showPasswordButton
                 || component == &forgotButton
-                || component == &buyButton
-                || component == &manageButton
-                || component == &supportButton;
+                || component == &manageButton;
             const bool tooSmall =
                 (isEditor && bounds.getHeight() < 50)
                 || (isPrimaryAction
@@ -1598,8 +1558,6 @@ private:
                  static_cast<juce::Component*> (&passwordEditor),
                  static_cast<juce::Component*> (&showPasswordButton),
                  static_cast<juce::Component*> (&forgotButton),
-                 static_cast<juce::Component*> (&buyButton),
-                 static_cast<juce::Component*> (&supportButton),
                  static_cast<juce::Component*> (&trialButton) })
             component->setEnabled (! busy);
 
@@ -1715,11 +1673,6 @@ private:
     LibraryActionButton trialButton {
         "Preparar biblioteca"
     };
-    LinkButton buyButton {
-        juce::String::fromUTF8 (
-            "Comprar licen\xc3\xa7" "a \xc2\xb7")
-    };
-    LinkButton supportButton { "Suporte" };
     juce::TextButton manageButton {
         "Trocar aparelho ativo"
     };

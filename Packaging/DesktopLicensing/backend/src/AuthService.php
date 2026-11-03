@@ -63,12 +63,16 @@ final class AuthService
             throw new ApiException(401, 'INVALID_CREDENTIALS', 'E-mail, senha ou licenca invalidos.');
         }
 
+        // A posse da senha definida no checkout e suficiente para entrar.
+        // Mantemos o timestamp apenas como estado legado, sem bloquear o
+        // cliente que acabou de pagar por falta de confirmacao de e-mail.
         if ($user['email_verified_at'] === null) {
-            throw new ApiException(
-                403,
-                'EMAIL_NOT_VERIFIED',
-                'Confirme o e-mail enviado para sua conta.'
-            );
+            $this->database->pdo()->prepare(
+                'UPDATE users
+                 SET email_verified_at = CURRENT_TIMESTAMP(6)
+                 WHERE id = :id AND email_verified_at IS NULL'
+            )->execute(['id' => $user['id']]);
+            $user['email_verified_at'] = gmdate('Y-m-d H:i:s.u');
         }
 
         if ($replacementHash !== null) {
@@ -302,7 +306,10 @@ final class AuthService
             $pdo->prepare(
                 'UPDATE users
                  SET password_hash = :password_hash,
-                     password_changed_at = CURRENT_TIMESTAMP(6)
+                     password_changed_at = CURRENT_TIMESTAMP(6),
+                     email_verified_at = COALESCE(
+                         email_verified_at, CURRENT_TIMESTAMP(6)
+                     )
                  WHERE id = :user_id'
             )->execute([
                 'password_hash' => $passwordHash,

@@ -81,6 +81,9 @@ jobs:
           [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]] \
             || { echo "Checkout nao esta limpo" >&2; exit 1; }
 
+      - name: Testar rejeicao de instaladores macOS incompletos
+        run: python3 Tests/DesktopUpdate/MacReleasePipelineTests.py
+
       - name: Construir, assinar e notarizar sem atalhos
         env:
           MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}

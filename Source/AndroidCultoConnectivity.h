@@ -13,6 +13,7 @@ namespace ChurchDAWAndroidCulto
 inline bool isOfflineCultoPackId (const juce::String& id) noexcept
 {
     return id.equalsIgnoreCase ("pad-continuo")
+        || id.equalsIgnoreCase ("pad-continuos")
         || id.equalsIgnoreCase ("culto-offline")
         || id.equalsIgnoreCase ("culto-offline-v1");
 }
@@ -37,14 +38,16 @@ inline juce::String descriptionHintForPack (const juce::String& id,
                                             const juce::String& catalogDescription)
 {
     if (isOfflineCultoPackId (id))
-        return "Pacote leve para culto sem Wi-Fi: pads A–G. "
-               "Baixe o Church Live depois se quiser pianos e a biblioteca completa.";
+        return juce::String::fromUTF8 (
+            u8"Pacote leve para culto sem Wi-Fi: pads A–G. "
+            u8"Baixe o Church Live depois se quiser pianos e a biblioteca completa.");
 
     if (isHeavyLibraryPackId (id))
         return catalogDescription.isNotEmpty()
                  ? catalogDescription
-                 : juce::String ("Biblioteca completa (vários GB). "
-                                 "Para culto rápido use o pack Culto offline.");
+                 : juce::String::fromUTF8 (
+                     u8"Biblioteca completa (vários GB). "
+                     u8"Para culto rápido use o pack Culto offline.");
 
     return catalogDescription;
 }

@@ -312,8 +312,10 @@ inline void deriveKey (const juce::String& productSecret,
 {
     SHA256 s;
 
+    const juce::String normalisedLicense = licenseKey.trim().toUpperCase();
+
     const auto secret = productSecret.toRawUTF8();
-    const auto lic    = licenseKey.trim().toUpperCase().toRawUTF8();
+    const auto lic    = normalisedLicense.toRawUTF8();
     const auto buyer  = buyerId.toRawUTF8();
 
     s.update (secret, std::strlen (secret));

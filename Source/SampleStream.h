@@ -5,6 +5,10 @@
 #include <memory>
 #include <vector>
 
+#if JUCE_ANDROID
+ #include "AndroidPerformance.h"
+#endif
+
 //==============================================================================
 // LEITURA DOS SAMPLES DIRETO DO DISCO, EM VEZ DE TUDO NA MEMORIA.
 //
@@ -62,10 +66,24 @@ public:
     // As janelas precisam se SOBREPOR. Sem isso, o bloco que atravessa a emenda
     // nunca cabe inteiro nem na janela antiga nem na nova: acquire() exige o
     // bloco completo para a interpolacao Hermite e devolvia "passou", inserindo
-    // um bloco de silencio exatamente a cada troca de janela. 8192 samples
-    // cobrem com folga varios blocos mesmo com transposicao e custam apenas
-    // cerca de 14% de leituras adicionais.
-    static constexpr int windowOverlap = 4096;
+    // um bloco de silencio exatamente a cada troca de janela. O motor reserva
+    // blocos de ate 8192 samples e pede mais 4 para a Hermite; por isso 4096 nao
+    // cobria nem o pior bloco 1:1. A voz aumenta esta sobreposicao dinamicamente
+    // quando a transposicao percorre mais samples de origem no mesmo bloco.
+    static constexpr int windowOverlap = 8192 + 4;
+
+    // Uma janela precisa sustentar pelo menos um bloco inteiro depois que a
+    // voz migra para ela, enquanto o worker reaproveita a janela anterior para
+    // montar a continuacao. Com apenas dois buffers, spans maiores que metade
+    // da janela podem atravessar mais de uma emenda no mesmo bloco. O renderer
+    // divide esses blocos antes de chamar acquire().
+    static constexpr int maxContinuousSpan = (windowSamples + 4) / 2;
+
+    static_assert (windowOverlap > 0 && windowOverlap < windowSamples,
+                   "A sobreposicao precisa caber dentro da janela");
+    static_assert (maxContinuousSpan >= windowOverlap
+                    && maxContinuousSpan < windowSamples,
+                   "O span continuo precisa preservar progresso com duas janelas");
 
     //== Uma fonte no disco. Uma por ZONA; varias vozes podem apontar para ela. ==
     struct Source
@@ -118,13 +136,14 @@ public:
             int index = -1;
         };
 
-        // Trocado pela thread de audio no note-on. A thread de leitura segura
-        // uma copia enquanto decodifica, portanto o Source continua vivo mesmo
-        // se o timbre for substituido e as zonas antigas forem liberadas.
-        //
-        // std::atomic_load/store para shared_ptr existem desde C++11 e evitam a
-        // corrida entre copiar o ponteiro e destruir o ultimo dono.
-        std::shared_ptr<const Source> source;
+        // A thread de audio publica apenas o endereco possuido pela Zone. O
+        // shared_ptr antigo incrementava/decrementava refcount em note-on/off e
+        // podia destruir Source/File dentro do callback. workerSource e o
+        // hazard pointer que impede o coletor de liberar a Zone durante decode.
+        std::atomic<const Source*> source { nullptr };
+        std::atomic<const Source*> workerSource { nullptr };
+        static_assert (std::atomic<const Source*>::is_always_lock_free,
+                       "ponteiros do streamer precisam ser lock-free");
 
         // Seqlock de geracao: par = fonte estavel, impar = restart/stop trocando
         // source + pedido. A thread de leitura so aceita snapshots com o mesmo
@@ -139,12 +158,31 @@ public:
         mutable std::atomic<int> windowAccess[2] { 0, 0 }; // -1 escritor, 0 livre, +1 leitor
 
         std::atomic<int>  live { -1 };            // indice que o audio pode ler
+        // Ultima janela efetivamente escolhida pelo audio. Diferente de live,
+        // que aponta para a publicacao mais recente, este valor continua valido
+        // entre callbacks e impede o worker de reciclar o trecho ainda tocado.
+        mutable std::atomic<int> playingWindow { -1 };
         std::atomic<juce::int64> wantStart { noRequest };
+        std::atomic<bool>* ownerWakeNeeded = nullptr;
 
         // so a thread de leitura toca nestes
         std::unique_ptr<juce::AudioFormatReader> reader;
         const Source* readerSource = nullptr;
         int readerGeneration = -1;
+
+        // Backoff de falha, tocado exclusivamente pela thread de leitura. O
+        // pedido continua em wantStart para poder ser retentado, mas um arquivo
+        // temporariamente indisponivel nao e reaberto milhares de vezes/segundo.
+        const Source* retrySource = nullptr;
+        juce::int64 retryStart = noRequest;
+        int retryGeneration = -1;
+        int retryFailures = 0;
+        double retryNotBeforeMs = 0.0;
+
+        // Somente a thread de audio toca neste valor. acquire() observa o span
+        // real do bloco (ja convertido pela ratio) e prefetch() usa o maior da
+        // nota, para a proxima janela conter inteira a emenda mesmo transposta.
+        mutable int requiredOverlap = windowOverlap;
 
         // JANELAS ALOCADAS SOB DEMANDA.
         //
@@ -164,6 +202,9 @@ public:
         {
             for (auto& b : buf)
                 b.setSize (0, 0, false, false, false);
+
+            playingWindow.store (-1, std::memory_order_release);
+            requiredOverlap = windowOverlap;
         }
 
         // So a thread de leitura chama. Devolve false se a alocacao falhar,
@@ -189,22 +230,25 @@ public:
         }
 
         // Chamado pela thread de AUDIO no note-on.
-        void restart (std::shared_ptr<const Source> s) noexcept
+        void restart (const Source* s) noexcept
         {
             generation.fetch_add (1, std::memory_order_acq_rel); // impar: escrita
             live.store (-1, std::memory_order_release);
+            playingWindow.store (-1, std::memory_order_release);
             wantStart.store (noRequest, std::memory_order_release);
-            std::atomic_store_explicit (&source, std::move (s), std::memory_order_release);
+            source.store (s, std::memory_order_release);
+            requiredOverlap = windowOverlap;
             generation.fetch_add (1, std::memory_order_release); // par: snapshot pronto
         }
 
         void stop() noexcept
         {
             generation.fetch_add (1, std::memory_order_acq_rel); // impar: escrita
-            std::atomic_store_explicit (&source, std::shared_ptr<const Source>(),
-                                        std::memory_order_release);
+            source.store (nullptr, std::memory_order_release);
             live.store (-1, std::memory_order_release);
+            playingWindow.store (-1, std::memory_order_release);
             wantStart.store (noRequest, std::memory_order_release);
+            requiredOverlap = windowOverlap;
             generation.fetch_add (1, std::memory_order_release); // par: snapshot pronto
         }
 
@@ -227,9 +271,19 @@ public:
         {
             readAccess.reset();
 
-            // Onde a nota esta, para a thread de leitura nunca escrever por cima
-            // da janela que estamos tocando (ver escolha do destino em fill()).
-            playPos.store (pos, std::memory_order_release);
+            if (needed <= 0 || needed > maxContinuousSpan)
+            {
+                lastFailReason = 3;
+                return false;
+            }
+
+            // Nao diminui durante a nota: blocos de tamanho variavel nao podem
+            // fazer uma continuacao ja pronta deixar de coincidir no bloco
+            // seguinte. O teto de metade da janela garante que um callback nao
+            // precise atravessar duas emendas; o renderer subdivide acima dele.
+            requiredOverlap = juce::jlimit (
+                windowOverlap, maxContinuousSpan,
+                juce::jmax (requiredOverlap, needed));
 
             const int gen = generation.load (std::memory_order_acquire);
 
@@ -294,6 +348,7 @@ public:
                 r = buf[i].getReadPointer (juce::jmin (1, buf[i].getNumChannels() - 1));
                 readAccess.owner = this;
                 readAccess.index = i;
+                playingWindow.store (i, std::memory_order_release);
                 return true;
             }
 
@@ -307,22 +362,19 @@ public:
                 windowAccess[index].store (0, std::memory_order_release);
         }
 
-        // Ultima posicao tocada, publicada pela thread de audio.
-        mutable std::atomic<juce::int64> playPos { 0 };
-
         // Pede a PROXIMA janela assim que esta janela entra em uso. Esperar a
         // metade deixava apenas ~336 ms para uma rajada de dezenas de FLACs no
         // Android; acordes sustentados conseguiam chegar ao fim antes do worker.
         // O pedido imediato dobra a antecedencia sem aumentar a RAM.
-        void prefetch (juce::int64 pos, const ReadAccess& currentRead) noexcept
+        bool prefetch (juce::int64 pos, const ReadAccess& currentRead) noexcept
         {
             if (wantStart.load (std::memory_order_acquire) != noRequest)
-                return;   // ja ha um pedido em andamento
+                return false;   // ja ha um pedido em andamento
 
             const int gen = generation.load (std::memory_order_acquire);
 
             if ((gen & 1) != 0)
-                return;
+                return false;
 
             // Pede a continuacao da janela que esta TOCANDO agora -- nao da
             // "atual" segundo o ponteiro live, que depois da correcao acima pode
@@ -331,25 +383,25 @@ public:
 
             if (! juce::isPositiveAndBelow (i, 2)
                  || winValid[i] <= 0 || winGen[i] != gen)
-                return;
+                return false;
 
             {
                 const auto s   = winStart[i];
                 const auto end = s + winValid[i];
 
                 if (pos < s || pos >= end)
-                    return;
+                    return false;
 
                 // A ultima janela pode ser menor que windowSamples; nesse caso
                 // ela ja termina junto com o arquivo e nao existe continuacao.
                 if (winValid[i] < windowSamples)
-                    return;
+                    return false;
 
                 // Ja existe a continuacao SOBREPOSTA carregada? Entao nao ha o
                 // que pedir. Comecar antes do fim garante que o bloco que cruza
                 // a emenda caiba inteiro na janela nova.
                 const int other = 1 - i;
-                const auto nextStart = end - windowOverlap;
+                const auto nextStart = end - requiredOverlap;
                 bool continuationReady = false;
                 int expected = 0;
 
@@ -365,13 +417,13 @@ public:
                 }
                 else if (expected == -1)
                 {
-                    return;   // o produtor ja esta preenchendo a continuacao
+                    return false;   // o produtor ja esta preenchendo a continuacao
                 }
 
                 if (continuationReady)
-                    return;
+                    return false;
 
-                request (nextStart);
+                return request (nextStart);
             }
         }
 
@@ -389,9 +441,31 @@ public:
             // trocar wantStart enquanto o worker lia; ao terminar, ele ja nao
             // conseguia limpar o pedido e fazia uma leitura extra/desalinhada.
             juce::int64 expected = noRequest;
-            return wantStart.compare_exchange_strong (expected, start,
+            if (! wantStart.compare_exchange_strong (expected, start,
                                                      std::memory_order_acq_rel,
-                                                     std::memory_order_relaxed);
+                                                     std::memory_order_relaxed))
+                return false;
+
+            if (ownerWakeNeeded != nullptr)
+                ownerWakeNeeded->store (true, std::memory_order_release);
+            return true;
+        }
+
+        // Primeira janela sobrepoe o fim do preload pelo pior span que este
+        // callback pode consumir. Usar a constante antiga aqui deixava um
+        // buraco quando transposicao x bloco percorria mais de 8196 amostras.
+        bool requestFirstWindow (juce::int64 preloadEnd, int needed) noexcept
+        {
+            if (preloadEnd <= 0 || needed <= 0 || needed > maxContinuousSpan)
+                return false;
+
+            requiredOverlap = juce::jlimit (
+                windowOverlap, maxContinuousSpan,
+                juce::jmax (requiredOverlap, needed));
+
+            return request (juce::jmax (
+                (juce::int64) 0,
+                preloadEnd - (juce::int64) requiredOverlap));
         }
     };
 
@@ -409,6 +483,30 @@ public:
         stopThread (-1);
     }
 
+    // O dono chama isto antes de destruir Zones. Assim nenhum decoder conserva
+    // um hazard para Source durante a ordem reversa de destruicao dos membros.
+    void shutdown() noexcept
+    {
+        stopThread (-1);
+
+        for (auto& stream : streams)
+            stream->workerSource.store (nullptr, std::memory_order_release);
+    }
+
+    bool referencesSource (const Source* sourceToFind) const noexcept
+    {
+        if (sourceToFind == nullptr)
+            return false;
+
+        for (const auto& stream : streams)
+            if (stream->source.load (std::memory_order_acquire) == sourceToFind
+                 || stream->workerSource.load (std::memory_order_acquire)
+                        == sourceToFind)
+                return true;
+
+        return false;
+    }
+
     void prepare (int numVoices)
     {
         stopThread (-1);
@@ -419,6 +517,7 @@ public:
         for (int i = 0; i < numVoices; ++i)
         {
             auto v = std::make_unique<VoiceStream>();
+            v->ownerWakeNeeded = &wakeNeeded;
             v->prepare();
             streams.push_back (std::move (v));
         }
@@ -432,16 +531,43 @@ public:
     VoiceStream& stream (int voiceIndex) noexcept   { return *streams[(size_t) voiceIndex]; }
     int numStreams() const noexcept                 { return (int) streams.size(); }
 
-    // Acorda a thread de leitura. Chamado no fim do bloco de audio, uma vez --
-    // nao por voz.
-    void wake() noexcept { notify(); }
+    // Marca que ha trabalho urgente para a thread de leitura.
+    void signalWorkNeeded() noexcept { wakeNeeded.store (true, std::memory_order_release); }
 
+    // Acorda a thread de leitura. Chamado no fim do bloco de audio, uma vez --
+    // nao por voz. Evita syscalls no kernel se nao houver janelas requisitadas.
+    void wake() noexcept
+    {
+        if (wakeNeeded.exchange (false, std::memory_order_acq_rel))
+            notify();
+    }
+
+   #if CHURCHDAW_INTERNAL_AUDIO_TEST_HOOKS
+    juce::uint64 getWorkerPassCountForTest() const noexcept { return workerPassCount.load(); }
+   #endif
 private:
+   #if CHURCHDAW_INTERNAL_AUDIO_TEST_HOOKS
+    std::atomic<juce::uint64> workerPassCount { 0 };
+   #endif
+    std::atomic<bool> wakeNeeded { true };
+
     void run() override
     {
+       #if JUCE_ANDROID
+        // O decoder FLAC termina cada janela mais cedo nos nucleos grandes,
+        // reduzindo a chance de faltar dados sem elevar sua prioridade acima
+        // da thread de audio. Falha de afinidade apenas mantem o padrao.
+        churchdaw::androidPerformance::prepareFastCoreMask();
+        churchdaw::androidPerformance::pinCurrentThreadToFastCores();
+       #endif
+
         while (! threadShouldExit())
         {
+           #if CHURCHDAW_INTERNAL_AUDIO_TEST_HOOKS
+            workerPassCount.fetch_add (1, std::memory_order_relaxed);
+           #endif
             bool didWork = false;
+            bool hasActiveStream = false;
 
             for (auto& sp : streams)
             {
@@ -450,50 +576,164 @@ private:
 
                 if (fill (*sp))
                     didWork = true;
+                hasActiveStream = hasActiveStream
+                    || sp->source.load (std::memory_order_acquire) != nullptr;
             }
 
-            // Idle curto: acorda rapido quando uma nota pede janela (menos
-            // "buraco" no ataque). Sem voice limit — so a thread de disco.
+            // First-window requests explicitly notify the worker. Keep the
+            // 2 ms fallback during active streaming/prefetch, but avoid 500
+            // complete voice scans per second when every voice is stopped.
             if (! didWork)
-                wait (2);
+                wait (hasActiveStream ? 2 : 100);
         }
     }
 
     // Enche UMA janela pendente. O wrapper noexcept e a reserva explicita
     // garantem que um decoder/alloc que lance excecao nao encerre para sempre a
     // thread de streaming nem deixe windowAccess preso em -1.
+    static void releaseReservedWindow (VoiceStream& v, int& reservedWindow,
+                                       bool invalidate) noexcept
+    {
+        const int index = reservedWindow;
+
+        if (! juce::isPositiveAndBelow (index, 2))
+            return;
+
+        if (invalidate)
+        {
+            v.winStart[index] = 0;
+            v.winValid[index] = 0;
+            v.winGen[index] = -1;
+        }
+
+        // Depois deste ponto o audio pode reservar a janela; nenhum acesso aos
+        // metadados/buffer dela e permitido.
+        reservedWindow = -1;
+        v.windowAccess[index].store (0, std::memory_order_release);
+    }
+
+    static void discardReader (VoiceStream& v) noexcept
+    {
+        v.reader.reset();
+        v.readerSource = nullptr;
+        v.readerGeneration = -1;
+    }
+
+    static void clearRetry (VoiceStream& v) noexcept
+    {
+        v.retrySource = nullptr;
+        v.retryStart = VoiceStream::noRequest;
+        v.retryGeneration = -1;
+        v.retryFailures = 0;
+        v.retryNotBeforeMs = 0.0;
+    }
+
+    static bool retryIsDeferred (VoiceStream& v, int generation,
+                                 const Source* source,
+                                 juce::int64 start) noexcept
+    {
+        if (v.retryGeneration != generation
+             || v.retrySource != source
+             || v.retryStart != start)
+        {
+            clearRetry (v);
+            return false;
+        }
+
+        return juce::Time::getMillisecondCounterHiRes()
+                 < v.retryNotBeforeMs;
+    }
+
+    static void finishRequest (VoiceStream& v,
+                               juce::int64& claimedStart) noexcept
+    {
+        auto expected = VoiceStream::requestInProgress;
+        v.wantStart.compare_exchange_strong (
+            expected, VoiceStream::noRequest, std::memory_order_acq_rel);
+        claimedStart = VoiceStream::noRequest;
+    }
+
+    static void restoreRequest (VoiceStream& v, juce::int64 start,
+                                juce::int64& claimedStart) noexcept
+    {
+        auto expected = VoiceStream::requestInProgress;
+        v.wantStart.compare_exchange_strong (
+            expected, start, std::memory_order_acq_rel);
+        claimedStart = VoiceStream::noRequest;
+    }
+
+    // Rearma somente o pedido que ESTA funcao reclamou. Se restart()/stop() ja
+    // publicou outra geracao ou o audio conseguiu colocar trabalho novo, o CAS
+    // falha e nada e apagado. O backoff exponencial limita uma falha persistente
+    // a quatro tentativas por segundo, sem atrasar a primeira repeticao curta.
+    static void rearmRequestForRetry (
+        VoiceStream& v, int generation,
+        const Source* source,
+        juce::int64 start, juce::int64& claimedStart) noexcept
+    {
+        const bool sameRequest =
+            v.retryGeneration == generation
+            && v.retrySource == source
+            && v.retryStart == start;
+
+        const bool stillCurrent =
+            generation >= 0 && (generation & 1) == 0
+            && start >= 0 && source != nullptr
+            && v.generation.load (std::memory_order_acquire) == generation
+            && v.source.load (std::memory_order_acquire) == source;
+
+        auto expected = VoiceStream::requestInProgress;
+        const bool restored = stillCurrent
+            && v.wantStart.compare_exchange_strong (
+                   expected, start, std::memory_order_acq_rel,
+                   std::memory_order_relaxed);
+
+        claimedStart = VoiceStream::noRequest;
+
+        if (! restored)
+        {
+            if (! sameRequest)
+                clearRetry (v);
+
+            return;
+        }
+
+        v.retryGeneration = generation;
+        v.retrySource = source;
+        v.retryStart = start;
+        v.retryFailures = sameRequest ? juce::jmin (v.retryFailures + 1, 8) : 1;
+
+        const int delayMs = juce::jmin (
+            250, 2 << juce::jmin (v.retryFailures - 1, 7));
+        v.retryNotBeforeMs =
+            juce::Time::getMillisecondCounterHiRes() + (double) delayMs;
+    }
+
     bool fill (VoiceStream& v) noexcept
     {
         int reservedWindow = -1;
+        int claimedGeneration = -1;
+        juce::int64 claimedStart = VoiceStream::noRequest;
+        const Source* claimedSource = nullptr;
 
         try
         {
-            return fillImpl (v, reservedWindow);
+            return fillImpl (v, reservedWindow, claimedGeneration,
+                             claimedStart, claimedSource);
         }
         catch (...)
         {
-            if (juce::isPositiveAndBelow (reservedWindow, 2))
-            {
-                v.winStart[reservedWindow] = 0;
-                v.winValid[reservedWindow] = 0;
-                v.winGen[reservedWindow] = -1;
-                v.windowAccess[reservedWindow].store (0, std::memory_order_release);
-            }
-
-            // Nao reutiliza um reader que acabou de falhar. O pedido reclamado
-            // volta a "nenhum"; se a voz ainda precisar dele, o callback de
-            // audio pedira novamente sem apagar um pedido de uma nova geracao.
-            v.reader.reset();
-            v.readerSource = nullptr;
-            v.readerGeneration = -1;
-            auto expected = VoiceStream::requestInProgress;
-            v.wantStart.compare_exchange_strong (
-                expected, VoiceStream::noRequest, std::memory_order_acq_rel);
+            releaseReservedWindow (v, reservedWindow, true);
+            discardReader (v);
+            rearmRequestForRetry (v, claimedGeneration, claimedSource,
+                                  claimedStart, claimedStart);
             return false;
         }
     }
 
-    bool fillImpl (VoiceStream& v, int& reservedWindow)
+    bool fillImpl (VoiceStream& v, int& reservedWindow,
+                   int& claimedGeneration, juce::int64& claimedStart,
+                   const Source*& claimedSource)
     {
         // Snapshot coerente de {geracao, Source, pedido}. restart()/stop() deixam
         // generation impar durante a troca; qualquer mistura e descartada antes
@@ -503,14 +743,33 @@ private:
         if ((gen & 1) != 0)
             return false;
 
-        const auto src = std::atomic_load_explicit (&v.source, std::memory_order_acquire);
+        const auto src = v.source.load (std::memory_order_acquire);
+
+        // Hazard protocol: publique antes de confirmar o snapshot. Se source
+        // mudou nesse intervalo, src pode ser apenas um valor antigo e nao sera
+        // desreferenciado. Se nao mudou, o coletor ve workerSource e conserva a
+        // Zone ate esta funcao terminar.
+        v.workerSource.store (src, std::memory_order_release);
+        const juce::ScopeGuard clearWorkerSource { [&v]
+        {
+            v.workerSource.store (nullptr, std::memory_order_release);
+        } };
         const auto want = v.wantStart.load (std::memory_order_acquire);
         const int confirmedGen = v.generation.load (std::memory_order_acquire);
 
-        if (confirmedGen != gen || (confirmedGen & 1) != 0)
+        if (confirmedGen != gen || (confirmedGen & 1) != 0
+             || v.source.load (std::memory_order_acquire) != src)
             return true;
 
         if (want < 0)
+        {
+            if (want == VoiceStream::noRequest)
+                clearRetry (v);
+
+            return false;
+        }
+
+        if (retryIsDeferred (v, gen, src, want))
             return false;
 
         // Reclama o pedido antes do decode. restart() pode substituir -2 por -1
@@ -523,49 +782,43 @@ private:
                 std::memory_order_acq_rel, std::memory_order_relaxed))
             return false;
 
-        auto finishRequest = [&v]() noexcept
-        {
-            auto expected = VoiceStream::requestInProgress;
-            v.wantStart.compare_exchange_strong (
-                expected, VoiceStream::noRequest, std::memory_order_acq_rel);
-        };
+        claimedGeneration = gen;
+        claimedStart = want;
+        claimedSource = src;
 
-        auto restoreRequest = [&v, want]() noexcept
-        {
-            auto expected = VoiceStream::requestInProgress;
-            v.wantStart.compare_exchange_strong (
-                expected, want, std::memory_order_acq_rel);
-        };
-
-        // A copia atomica segura a vida da fonte ate o fim. Esta segunda
-        // validacao fecha restart() entre o snapshot e o claim do pedido.
+        // O hazard segura a vida da fonte ate o fim. Esta segunda validacao
+        // fecha restart() entre o snapshot e o claim do pedido.
         if (v.generation.load (std::memory_order_acquire) != gen
-             || std::atomic_load_explicit (
-                    &v.source, std::memory_order_acquire) != src)
+             || v.source.load (std::memory_order_acquire) != src)
         {
-            finishRequest();
+            finishRequest (v, claimedStart);
             return true;
         }
 
         if (src == nullptr || ! src->isValid())
         {
-            finishRequest();
+            finishRequest (v, claimedStart);
             return false;
         }
 
         // Reaproveita o leitor enquanto a fonte nao muda: abrir um FLAC custa
         // parse de cabecalho e seek, e fazer isso por janela seria pagar o preco
         // varias vezes por segundo em cada voz.
-        if (v.reader == nullptr || v.readerSource != src.get() || v.readerGeneration != gen)
+        if (v.reader == nullptr || v.readerSource != src || v.readerGeneration != gen)
         {
+            discardReader (v);
             v.reader.reset (formats.createReaderFor (src->file));
-            v.readerSource = src.get();
-            v.readerGeneration = gen;
+
+            if (v.reader != nullptr)
+            {
+                v.readerSource = src;
+                v.readerGeneration = gen;
+            }
         }
 
         if (v.reader == nullptr)
         {
-            finishRequest();
+            rearmRequestForRetry (v, gen, src, want, claimedStart);
             return false;
         }
 
@@ -574,7 +827,7 @@ private:
         // de leitura — a de audio so le janela ja publicada.
         if (! v.garantirJanelas())
         {
-            finishRequest();
+            rearmRequestForRetry (v, gen, src, want, claimedStart);
             return false;
         }
 
@@ -591,6 +844,17 @@ private:
             if (v.windowAccess[candidate].compare_exchange_strong (
                     expected, -1, std::memory_order_acquire, std::memory_order_relaxed))
             {
+                // windowAccess protege apenas durante a leitura fisica deste
+                // callback. playingWindow preserva a escolha entre callbacks:
+                // sem esta segunda checagem o worker podia sobrescrever A logo
+                // depois de seu ReadAccess ser solto, embora a proxima posicao
+                // da voz ainda dependesse de A.
+                if (v.playingWindow.load (std::memory_order_acquire) == candidate)
+                {
+                    v.windowAccess[candidate].store (0, std::memory_order_release);
+                    continue;
+                }
+
                 reservedWindow = candidate;
                 break;
             }
@@ -600,50 +864,63 @@ private:
         // a fila; em no maximo um callback uma janela sera liberada.
         if (reservedWindow < 0)
         {
-            restoreRequest();
+            restoreRequest (v, want, claimedStart);
             return false;
         }
-
-        auto releaseWindow = [&v, &reservedWindow] (bool invalidate) noexcept
-        {
-            const int index = reservedWindow;
-
-            if (! juce::isPositiveAndBelow (index, 2))
-                return;
-
-            if (invalidate)
-            {
-                v.winStart[index] = 0;
-                v.winValid[index] = 0;
-                v.winGen[index] = -1;
-            }
-
-            // Depois deste ponto o audio pode reservar a janela; nenhum acesso
-            // aos metadados/buffer dela e permitido.
-            reservedWindow = -1;
-            v.windowAccess[index].store (0, std::memory_order_release);
-        };
 
         const auto remaining = src->totalSamples - want;
 
         if (remaining <= 0)
         {
-            releaseWindow (true);
-            finishRequest();
+            releaseReservedWindow (v, reservedWindow, true);
+            clearRetry (v);
+            finishRequest (v, claimedStart);
             return false;
         }
 
         const int toRead = (int) juce::jmin ((juce::int64) windowSamples, remaining);
 
+        // AudioFormatReader considera leitura alem do EOF um sucesso e preenche
+        // com zeros. Source normalmente vem do mesmo reader, mas arquivo
+        // truncado/substituido entre carga e playback nao pode virar uma janela
+        // silenciosa marcada como valida.
+        const auto readerLength = v.reader->lengthInSamples;
+        const bool rangeFitsReader =
+            src->fileOffset >= 0 && readerLength >= 0
+            && src->fileOffset <= readerLength
+            && want <= readerLength - src->fileOffset
+            && (juce::int64) toRead
+                   <= readerLength - src->fileOffset - want;
+
+        if (! rangeFitsReader)
+        {
+            releaseReservedWindow (v, reservedWindow, true);
+            discardReader (v);
+            rearmRequestForRetry (v, gen, src, want, claimedStart);
+            return false;
+        }
+
         v.buf[reservedWindow].clear();
-        v.reader->read (&v.buf[reservedWindow], 0, toRead,
-                        src->fileOffset + want, true, true);
+        const bool readOk = v.reader->read (
+            &v.buf[reservedWindow], 0, toRead,
+            src->fileOffset + want, true, true);
+
+        if (! readOk)
+        {
+            // read() pode deixar dados parciais no buffer. A janela fica
+            // explicitamente invalida antes de liberar a reserva, o decoder e
+            // descartado, e exatamente este pedido volta para retry.
+            releaseReservedWindow (v, reservedWindow, true);
+            discardReader (v);
+            rearmRequestForRetry (v, gen, src, want, claimedStart);
+            return false;
+        }
 
         // Revalida TODOS os membros do snapshot enquanto a janela ainda esta
         // exclusivamente reservada. Resultado velho fica explicitamente
         // invalido; nunca recebe o carimbo da nota nova.
         const auto currentSource =
-            std::atomic_load_explicit (&v.source, std::memory_order_acquire);
+            v.source.load (std::memory_order_acquire);
         const bool stillCurrent =
             v.generation.load (std::memory_order_acquire) == gen
             && currentSource == src
@@ -652,8 +929,8 @@ private:
 
         if (! stillCurrent)
         {
-            releaseWindow (true);
-            finishRequest();
+            releaseReservedWindow (v, reservedWindow, true);
+            finishRequest (v, claimedStart);
             return true;
         }
 
@@ -664,9 +941,10 @@ private:
 
         // Publica metadados + amostras. acquire() so le depois de trocar 0 por
         // +1 com memoria acquire, portanto ve um quadro completo e coerente.
-        releaseWindow (false);
+        releaseReservedWindow (v, reservedWindow, false);
         v.live.store (completedWindow, std::memory_order_release);
-        finishRequest();
+        clearRetry (v);
+        finishRequest (v, claimedStart);
         return true;
     }
 

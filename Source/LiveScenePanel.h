@@ -227,7 +227,13 @@ public:
 
             preenchida[i] = cena.preenchida;
             nomes[i] = cena.nome;
-            b->setButtonText (ChurchDAWLive::rotuloDaCena (cena, i));
+            // A cena vazia nao deve aparecer como um numero solto: no palco
+            // isso parece uma memoria ja gravada. Mantemos rotuloDaCena()
+            // intacto para o estado/compatibilidade, mas damos contexto visual
+            // ao botao que o musico realmente toca.
+            b->setButtonText (cena.nome.isNotEmpty()
+                                  ? cena.nome
+                                  : juce::String ("Cena ") + juce::String (i + 1));
 
             // Tres estados visiveis, e a diferenca importa no escuro:
             // vazia (apagada), gravada (cinza) e a que esta tocando (vermelha).
@@ -266,6 +272,37 @@ public:
     }
 
     bool estaArmadoParaGravar() const { return gravarBtn.getToggleState(); }
+
+    // O shell desktop desenha as mesmas cenas fora deste componente. Estes
+    // metodos mantem uma unica semantica visual quando a acao nasceu la: a
+    // borda ambar e o texto SALVAR precisam apontar para o mesmo slot que o
+    // MainComponent vai usar no botao superior.
+    void selecionarDestinoNovo (int indice)
+    {
+        if (! juce::isPositiveAndBelow (indice, (int) preenchida.size())
+             || preenchida[(size_t) indice])
+            return;
+
+        interacao.selecionarSemAcionar (indice);
+        atualizarAcoes();
+        repaint();
+    }
+
+    void selecionarCenaAtiva (int indice)
+    {
+        interacao.selecionada = juce::isPositiveAndBelow (
+                                     indice, ChurchDAWLive::numeroDeCenas)
+                                 ? indice : -1;
+        atualizarAcoes();
+        repaint();
+    }
+
+    void limparSelecao()
+    {
+        interacao.selecionada = -1;
+        atualizarAcoes();
+        repaint();
+    }
 
     // Recado de palco vindo de fora (ex.: o motor desistiu de esperar o timbre).
     void avisar (juce::String texto) { mostrarAviso (std::move (texto)); }

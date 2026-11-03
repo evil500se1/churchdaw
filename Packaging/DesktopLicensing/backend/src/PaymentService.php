@@ -298,7 +298,7 @@ final class PaymentService
         $limit = max(1, min(100, $limit));
         $statement = $this->database->pdo()->query(
             "SELECT id FROM webhook_events
-             WHERE attempts < 10
+             WHERE provider = 'mercado_pago' AND attempts < 10
                AND (
                     status = 'received'
                     OR (
@@ -1397,18 +1397,25 @@ final class PaymentService
                 }
 
                 if (!is_array($orderLicense)) {
+                    $activationPolicy = (string) (
+                        $order['activation_policy'] ?? 'platform_bundle'
+                    );
                     $pdo->prepare(
                         "INSERT INTO licenses
                             (id, user_id, product_code, order_id, status,
-                             max_active_devices)
+                             max_active_devices, activation_policy)
                          VALUES
                             (:id, :user_id, :product_code, :order_id,
-                             'active', 1)"
+                             'active', :max_active_devices,
+                             :activation_policy)"
                     )->execute([
                         'id' => Crypto::uuid(),
                         'user_id' => $order['user_id'],
                         'product_code' => $order['product_code'],
                         'order_id' => $orderId,
+                        'max_active_devices' =>
+                            $activationPolicy === 'platform_bundle' ? 3 : 1,
+                        'activation_policy' => $activationPolicy,
                     ]);
                 }
                 $settledStatus = $netPaidCents === $totalCents
@@ -2741,6 +2748,14 @@ final class PaymentService
                         'Nao foi possivel usar esta conta.'
                     );
                 }
+                if ($user['email_verified_at'] === null) {
+                    $pdo->prepare(
+                        'UPDATE users
+                         SET email_verified_at = CURRENT_TIMESTAMP(6)
+                         WHERE id = :id AND email_verified_at IS NULL'
+                    )->execute(['id' => $user['id']]);
+                    $user['email_verified_at'] = gmdate('Y-m-d H:i:s.u');
+                }
                 $licensed = $pdo->prepare(
                     "SELECT COUNT(*) FROM licenses
                      WHERE user_id = :user_id
@@ -2785,12 +2800,15 @@ final class PaymentService
                     'id' => Crypto::uuid(),
                     'email' => $email,
                     'display_name' => $displayName,
+                    'email_verified_at' => gmdate('Y-m-d H:i:s.u'),
                 ];
                 $pdo->prepare(
                     "INSERT INTO users
-                        (id, email, display_name, password_hash, status)
+                        (id, email, display_name, password_hash, status,
+                         email_verified_at)
                      VALUES
-                        (:id, :email, :display_name, :password_hash, 'active')"
+                        (:id, :email, :display_name, :password_hash, 'active',
+                         CURRENT_TIMESTAMP(6))"
                 )->execute([
                     'id' => $user['id'],
                     'email' => $email,
@@ -2934,14 +2952,16 @@ final class PaymentService
             $currency = $this->config->string('product.currency');
             $pdo->prepare(
                 "INSERT INTO orders
-                    (id, user_id, product_code, provider, idempotency_key,
+                    (id, user_id, product_code, plan_code, activation_policy,
+                     provider, idempotency_key,
                      expected_amount_cents, currency, status,
                      reserves_checkout_slot,
                      checkout_claim_token, checkout_claimed_at,
                      terms_version, privacy_version, accepted_at,
                      acceptance_ip_hash)
                  VALUES
-                    (:id, :user_id, :product_code, 'mercado_pago', :idempotency_key,
+                    (:id, :user_id, :product_code, 'complete',
+                     'platform_bundle', 'mercado_pago', :idempotency_key,
                      :amount_cents, :currency, 'creating', 1,
                      :checkout_claim_token, CURRENT_TIMESTAMP(6),
                      :terms_version, :privacy_version, CURRENT_TIMESTAMP(6),

@@ -8,11 +8,11 @@ import android.net.Uri;
 import android.os.Build;
 
 /**
- * Ponte do gate nativo para a distribuicao direta do ChurchDAW.
+ * Ponte do gate nativo para a distribuicao oficial do ChurchDAW.
  *
- * A policy recebida pelo C++ ja foi verificada com RSA antes de esta classe
- * receber a URL. Esta ponte abre somente um APK HTTPS no dominio oficial. A
- * confirmacao final de instalacao pertence ao Android e nunca e simulada.
+ * A policy recebida pelo C++ ja foi verificada com RSA. Builds instaladas pelo
+ * site abrem somente o APK assinado no churchdaw.com. Se o instalador original
+ * foi a Google Play, a atualizacao permanece na ficha oficial da loja.
  */
 public final class ChurchDAWUpdateBridge {
     public static final int ELIGIBILITY_QUERY_FAILED = 0;
@@ -20,6 +20,9 @@ public final class ChurchDAWUpdateBridge {
     public static final int ELIGIBILITY_NOT_REQUIRED = 2;
 
     private static final String APP_PACKAGE = "com.churchdaw.app";
+    private static final String PLAY_STORE_PACKAGE = "com.android.vending";
+    private static final String PLAY_STORE_URL =
+        "https://play.google.com/store/apps/details?id=" + APP_PACKAGE;
     private static final String UPDATE_PREFS = "churchdaw_update_bridge";
     private static final String REQUIRED_VERSION_KEY = "confirmed_required_version";
 
@@ -47,9 +50,8 @@ public final class ChurchDAWUpdateBridge {
     }
 
     /**
-     * O candidato somente chega aqui apos policy RSA valida. O servidor deve
-     * publicar o APK antes de elevar minimum_version_code; a tela nativa fica
-     * bloqueada enquanto o Android instala a versao nova.
+     * O candidato somente chega aqui apos policy RSA valida. O processo de
+     * release verifica a disponibilidade antes de elevar minimum_version_code.
      */
     public static int queryImmediateUpdateEligibilityBlocking(
             Activity activity, int requiredVersionCode) {
@@ -67,12 +69,17 @@ public final class ChurchDAWUpdateBridge {
             : ELIGIBILITY_CONFIRMED;
     }
 
-    /** Abre o APK oficial para download/instalacao confirmada pelo Android. */
+    /** Abre somente o APK oficial ou a ficha exata do pacote na Google Play. */
     public static boolean openWebsiteUpdate(Activity activity, String updateUrl) {
         if (activity == null
                 || !APP_PACKAGE.equals(activity.getPackageName())
-                || !isOfficialApkUrl(updateUrl)) {
+                || (!isOfficialApkUrl(updateUrl)
+                    && !isOfficialPlayStoreUrl(updateUrl))) {
             return false;
+        }
+
+        if (isOfficialPlayStoreUrl(updateUrl) || wasInstalledFromPlay(activity)) {
+            return openPlayStore(activity);
         }
 
         try {
@@ -85,12 +92,12 @@ public final class ChurchDAWUpdateBridge {
         }
     }
 
-    /** Mantido para a Activity; nao existe fluxo pendente de loja para retomar. */
+    /** Mantido para a Activity; a instalacao ocorre fora deste processo. */
     public static void resumeImmediateUpdate(Activity activity) {
-        // A instalacao ocorre no navegador/instalador do sistema.
+        // A instalacao e controlada pelo Android ou pela Google Play.
     }
 
-    /** Mantido para a Activity; o instalador do sistema nao retorna por este fluxo. */
+    /** Mantido para a Activity; este fluxo nao usa startActivityForResult. */
     public static void handleActivityResult(Activity activity, int requestCode, int resultCode) {
         // Sem acao.
     }
@@ -123,8 +130,39 @@ public final class ChurchDAWUpdateBridge {
         return Math.max(1, Math.min(1000000000, versionCode));
     }
 
+    private static boolean openPlayStore(Activity activity) {
+        try {
+            final Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(PLAY_STORE_URL));
+            intent.addCategory(Intent.CATEGORY_BROWSABLE);
+            intent.setPackage(PLAY_STORE_PACKAGE);
+            activity.startActivity(intent);
+            return true;
+        } catch (RuntimeException ignored) {
+            try {
+                final Intent browserIntent = new Intent(
+                    Intent.ACTION_VIEW, Uri.parse(PLAY_STORE_URL));
+                browserIntent.addCategory(Intent.CATEGORY_BROWSABLE);
+                activity.startActivity(browserIntent);
+                return true;
+            } catch (RuntimeException ignoredAgain) {
+                return false;
+            }
+        }
+    }
+
+    @SuppressWarnings("deprecation")
+    private static boolean wasInstalledFromPlay(Activity activity) {
+        try {
+            return PLAY_STORE_PACKAGE.equals(
+                activity.getPackageManager().getInstallerPackageName(APP_PACKAGE));
+        } catch (RuntimeException ignored) {
+            return false;
+        }
+    }
+
     private static boolean isOfficialApkUrl(String value) {
-        if (value == null || value.length() < 45 || value.length() > 320) {
+        if (value == null || value.length() < 45 || value.length() > 320
+                || value.indexOf('\r') >= 0 || value.indexOf('\n') >= 0) {
             return false;
         }
 
@@ -135,14 +173,19 @@ public final class ChurchDAWUpdateBridge {
             return false;
         }
 
-        final String path = uri.getPath();
+        final String path = uri.getEncodedPath();
         return "https".equals(uri.getScheme())
             && "churchdaw.com".equals(uri.getHost())
+            && uri.getUserInfo() == null
             && uri.getPort() == -1
             && uri.getQuery() == null
             && uri.getFragment() == null
             && path != null
-            && path.startsWith("/app/android/ChurchDAW-")
-            && path.endsWith("-signed.apk");
+            && path.matches(
+                "^/app/android/ChurchDAW-[A-Za-z0-9._+\\-]{1,64}-signed\\.apk$");
+    }
+
+    private static boolean isOfficialPlayStoreUrl(String value) {
+        return PLAY_STORE_URL.equals(value);
     }
 }

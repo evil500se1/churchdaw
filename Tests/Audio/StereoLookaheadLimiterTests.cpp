@@ -860,6 +860,168 @@ bool testMasterPunchAndZeroDbGainStaging()
     return passed;
 }
 
+bool testMasterPunchBypassAndStereoRamp()
+{
+    constexpr double sampleRate = 48000.0;
+    constexpr int blockSize = 256;
+    MasterProcessor master;
+    StereoLookaheadLimiter reference;
+    master.setPunch (false);
+    master.setAutoEq (false);
+    master.setMasterDb (0.0f);
+    master.prepareToPlay (sampleRate, blockSize);
+    reference.prepare (sampleRate, blockSize);
+    juce::AudioBuffer<float> subject (2, blockSize);
+    juce::AudioBuffer<float> expected (2, blockSize);
+    juce::MidiBuffer midi;
+    float bypassError = 0.0f;
+    int64_t position = 0;
+
+    for (int block = 0; block < 24; ++block)
+    {
+        for (int sample = 0; sample < blockSize; ++sample, ++position)
+        {
+            const float value =
+                0.21f * std::sin (0.017f * (float) position)
+              + 0.11f * std::cos (0.071f * (float) position);
+            subject.setSample (0, sample, value);
+            subject.setSample (1, sample, value);
+            expected.setSample (0, sample, value);
+            expected.setSample (1, sample, value);
+        }
+
+        master.processBlock (subject, midi);
+        reference.process (expected);
+
+        for (int channel = 0; channel < 2; ++channel)
+            for (int sample = 0; sample < blockSize; ++sample)
+                bypassError = juce::jmax (
+                    bypassError,
+                    std::abs (subject.getSample (channel, sample)
+                              - expected.getSample (channel, sample)));
+    }
+
+    master.setPunch (true);
+    float stereoError = 0.0f;
+
+    for (int block = 0; block < 3; ++block)
+    {
+        for (int sample = 0; sample < blockSize; ++sample, ++position)
+        {
+            const float value =
+                0.18f * std::sin (0.023f * (float) position)
+              + 0.08f * std::cos (0.083f * (float) position);
+            subject.setSample (0, sample, value);
+            subject.setSample (1, sample, value);
+        }
+
+        master.processBlock (subject, midi);
+
+        for (int sample = 0; sample < blockSize; ++sample)
+            stereoError = juce::jmax (
+                stereoError,
+                std::abs (subject.getSample (0, sample)
+                          - subject.getSample (1, sample)));
+    }
+
+    const float makeup = master.getPunchMakeupCurrentForTest();
+    const bool passed = bypassError <= 1.0e-7f
+                     && stereoError <= 1.0e-7f
+                     && makeup >= 0.999f;
+
+    std::cout << "Master Punch bypass/ramp: bypassError="
+              << bypassError << " stereoError=" << stereoError
+              << " makeupAfter16ms=" << makeup
+              << " -> " << (passed ? "PASS" : "FAIL") << '\n';
+    return passed;
+}
+
+bool testMasterAutoEqBypassContinuityAndNoResidual()
+{
+    constexpr double sampleRate = 48000.0;
+    constexpr int blockSize = 64;
+    constexpr float steadyInput = 0.18f;
+    MasterProcessor master;
+    master.setPunch (false);
+    master.setAutoEq (true);
+    master.setMasterDb (0.0f);
+    master.prepareToPlay (sampleRate, blockSize);
+
+    juce::AudioBuffer<float> buffer (2, blockSize);
+    juce::MidiBuffer midi;
+    float previous = 0.0f;
+
+    // Deixa os biquads e o lookahead em regime permanente. Em DC, o low shelf
+    // do Auto EQ produz uma diferenca grande o bastante para revelar um hard
+    // bypass como um degrau inequivoco.
+    for (int block = 0; block < 256; ++block)
+    {
+        for (int channel = 0; channel < 2; ++channel)
+            for (int sample = 0; sample < blockSize; ++sample)
+                buffer.setSample (channel, sample, steadyInput);
+
+        master.processBlock (buffer, midi);
+        previous = buffer.getSample (0, blockSize - 1);
+    }
+
+    master.setAutoEq (false);
+    float maximumSwitchStep = 0.0f;
+
+    for (int block = 0; block < 24; ++block)
+    {
+        for (int channel = 0; channel < 2; ++channel)
+            for (int sample = 0; sample < blockSize; ++sample)
+                buffer.setSample (channel, sample, steadyInput);
+
+        master.processBlock (buffer, midi);
+
+        for (int sample = 0; sample < blockSize; ++sample)
+        {
+            const float current = buffer.getSample (0, sample);
+            maximumSwitchStep = juce::jmax (
+                maximumSwitchStep, std::abs (current - previous));
+            previous = current;
+        }
+    }
+
+    // Com o bypass desligado, alimenta silencio por tempo suficiente para um
+    // caminho sempre quente zerar naturalmente todo o estado IIR e o limiter.
+    // Um hard bypass congela o estado da ultima amostra DC e o ressuscita aqui.
+    for (int block = 0; block < 800; ++block)
+    {
+        buffer.clear();
+        master.processBlock (buffer, midi);
+    }
+
+    master.setAutoEq (true);
+    float reenabledSilencePeak = 0.0f;
+    bool finite = true;
+
+    for (int block = 0; block < 32; ++block)
+    {
+        buffer.clear();
+        master.processBlock (buffer, midi);
+
+        for (int channel = 0; channel < 2; ++channel)
+            for (int sample = 0; sample < blockSize; ++sample)
+            {
+                const float current = buffer.getSample (channel, sample);
+                finite = finite && std::isfinite (current);
+                reenabledSilencePeak = juce::jmax (
+                    reenabledSilencePeak, std::abs (current));
+            }
+    }
+
+    const bool passed = finite
+                     && maximumSwitchStep <= 0.002f
+                     && reenabledSilencePeak <= 1.0e-7f;
+    std::cout << "Master Auto EQ transition: max step="
+              << maximumSwitchStep
+              << " re-enabled silence peak=" << reenabledSilencePeak
+              << " -> " << (passed ? "PASS" : "FAIL") << '\n';
+    return passed;
+}
+
 bool testMasterPunchOversizedCallback()
 {
     MasterProcessor processor;
@@ -932,6 +1094,10 @@ int main()
     if (! testInternalDetectorChunking())
         ++failures;
     if (! testMasterPunchAndZeroDbGainStaging())
+        ++failures;
+    if (! testMasterPunchBypassAndStereoRamp())
+        ++failures;
+    if (! testMasterAutoEqBypassContinuityAndNoResidual())
         ++failures;
     if (! testMasterPunchOversizedCallback())
         ++failures;

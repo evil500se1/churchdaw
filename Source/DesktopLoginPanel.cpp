@@ -20,15 +20,17 @@ DesktopLoginPanel::DesktopLoginPanel (juce::Image logoImage)
     setWantsKeyboardFocus (true);
     setTitle ("Acesso ao ChurchDAW");
     setDescription (
-        "Entre na conta usada na compra e ative este computador.");
+        "Entre com seu e-mail ou chave de licenca e ative este computador.");
 
-    configureEditor (emailEditor, "E-mail", "voce@exemplo.com");
+    configureEditor (emailEditor, "E-mail ou chave de licenca",
+                     "voce@exemplo.com ou CHD-...");
     configureEditor (passwordEditor, "Senha", "Sua senha");
     emailEditor.setInputRestrictions (254);
     passwordEditor.setInputRestrictions (256);
     passwordEditor.setPasswordCharacter (0x2022);
 
-    emailLabel.setText ("E-MAIL", juce::dontSendNotification);
+    emailLabel.setText ("E-MAIL OU CHAVE DE LICENCA",
+                        juce::dontSendNotification);
     passwordLabel.setText ("SENHA", juce::dontSendNotification);
 
     for (auto* label : { &emailLabel, &passwordLabel })
@@ -101,8 +103,13 @@ DesktopLoginPanel::DesktopLoginPanel (juce::Image logoImage)
 
     forgotButton.onClick = [this]
     {
-        if (onForgotPassword != nullptr)
-            onForgotPassword (emailEditor.getText().trim());
+        const auto identifier =
+            ChurchDAWDesktopLicensing::normaliseLoginIdentifier (
+                emailEditor.getText());
+        if (onForgotPassword != nullptr
+            && identifier.kind
+                 == ChurchDAWDesktopLicensing::LoginIdentifierKind::email)
+            onForgotPassword (identifier.value);
     };
 
     buyButton.onClick = [this]
@@ -113,7 +120,13 @@ DesktopLoginPanel::DesktopLoginPanel (juce::Image logoImage)
 
     manageButton.onClick = [this]
     {
-        if (onManageActivation != nullptr)
+        if (state
+              == ChurchDAWDesktopLicensing::State::clientUpdateRequired)
+        {
+            if (onUpdateClient != nullptr)
+                onUpdateClient();
+        }
+        else if (onManageActivation != nullptr)
             onManageActivation();
     };
 
@@ -132,17 +145,45 @@ void DesktopLoginPanel::applySnapshot (
         emailEditor.setText (next.email, false);
 
     statusLabel.setText (next.message, juce::dontSendNotification);
+    const bool errorState =
+        (ChurchDAWDesktopLicensing::isTerminalState (next.state)
+         && next.state
+              != ChurchDAWDesktopLicensing::State::licensePending)
+        || next.state
+               == ChurchDAWDesktopLicensing::State::activationConflict;
+    const bool pendingState =
+        next.state == ChurchDAWDesktopLicensing::State::licensePending;
+    const bool onlineState =
+        next.state == ChurchDAWDesktopLicensing::State::activeOnline;
+    const bool offlineState =
+        next.state == ChurchDAWDesktopLicensing::State::activeOffline;
+
     statusLabel.setColour (
         juce::Label::textColourId,
-        next.state == ChurchDAWDesktopLicensing::State::activationConflict
-            || next.state == ChurchDAWDesktopLicensing::State::revoked
-            ? juce::Colour (0xffff6b79)
-            : (next.state == ChurchDAWDesktopLicensing::State::active
-                 ? NordLookAndFeel::greenOk()
-                 : NordLookAndFeel::txtSecondary()));
+        errorState ? juce::Colour (0xffff6b79)
+                   : (pendingState
+                        ? juce::Colour (0xffffc857)
+                        : (onlineState
+                             ? NordLookAndFeel::greenOk()
+                             : (offlineState
+                                  ? juce::Colour (0xffffc857)
+                                  : NordLookAndFeel::txtSecondary()))));
 
-    manageButton.setVisible (
-        next.state == ChurchDAWDesktopLicensing::State::activationConflict);
+    const bool actionRequired =
+        next.state == ChurchDAWDesktopLicensing::State::activationConflict
+        || next.state
+             == ChurchDAWDesktopLicensing::State::passwordChangeRequired
+        || next.state
+             == ChurchDAWDesktopLicensing::State::clientUpdateRequired;
+    manageButton.setVisible (actionRequired);
+    if (next.state
+          == ChurchDAWDesktopLicensing::State::passwordChangeRequired)
+        manageButton.setButtonText ("Alterar senha na minha conta");
+    else if (next.state
+               == ChurchDAWDesktopLicensing::State::clientUpdateRequired)
+        manageButton.setButtonText ("Baixar atualizacao obrigatoria");
+    else
+        manageButton.setButtonText ("Gerenciar computadores");
 
     if (next.state != ChurchDAWDesktopLicensing::State::signingIn)
         passwordEditor.clear();
@@ -245,7 +286,7 @@ void DesktopLoginPanel::paint (juce::Graphics& g)
         g.setColour (NordLookAndFeel::txtSecondary());
         g.setFont (juce::Font (juce::FontOptions (13.5f)));
         g.drawFittedText (
-            "Entre com a conta usada na compra do ChurchDAW.",
+            "Entre com o e-mail da compra ou com sua chave de licenca.",
             top, juce::Justification::centredLeft, 2, 0.86f);
 
         if (busy)
@@ -336,24 +377,35 @@ void DesktopLoginPanel::submit()
 
     auto password = passwordEditor.getText();
     passwordEditor.clear();
+    const auto identifier =
+        ChurchDAWDesktopLicensing::normaliseLoginIdentifier (
+            emailEditor.getText());
 
-    if (onLogin != nullptr)
-        onLogin (emailEditor.getText().trim(),
+    if (onLogin != nullptr
+        && ChurchDAWDesktopLicensing::loginCredentialsAreValid (
+            identifier, password.length()))
+        onLogin (identifier.value,
                  std::move (password),
                  rememberToggle.getToggleState());
 }
 
 void DesktopLoginPanel::updateControls()
 {
-    const auto email = emailEditor.getText().trim();
-    const bool fieldsValid = email.containsChar ('@')
-                          && passwordEditor.getText().length() >= 8;
+    const auto identifier =
+        ChurchDAWDesktopLicensing::normaliseLoginIdentifier (
+            emailEditor.getText());
+    const bool fieldsValid =
+        ChurchDAWDesktopLicensing::loginCredentialsAreValid (
+            identifier, passwordEditor.getText().length());
 
     emailEditor.setEnabled (! busy);
     passwordEditor.setEnabled (! busy);
     showPasswordButton.setEnabled (! busy);
     rememberToggle.setEnabled (! busy);
-    forgotButton.setEnabled (! busy);
+    forgotButton.setEnabled (
+        ! busy
+        && identifier.kind
+             == ChurchDAWDesktopLicensing::LoginIdentifierKind::email);
     buyButton.setEnabled (! busy);
     loginButton.setEnabled (! busy && fieldsValid);
 

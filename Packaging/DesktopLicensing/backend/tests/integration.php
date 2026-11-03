@@ -3,6 +3,7 @@
 declare(strict_types=1);
 
 use ChurchDAW\Licensing\ApiException;
+use ChurchDAW\Licensing\AdminService;
 use ChurchDAW\Licensing\AuditLog;
 use ChurchDAW\Licensing\AuthService;
 use ChurchDAW\Licensing\Config;
@@ -13,11 +14,14 @@ use ChurchDAW\Licensing\Mailer;
 use ChurchDAW\Licensing\MigrationState;
 use ChurchDAW\Licensing\PasswordPolicy;
 use ChurchDAW\Licensing\PaymentProvider;
+use ChurchDAW\Licensing\PaymentProviderException;
 use ChurchDAW\Licensing\PaymentService;
 use ChurchDAW\Licensing\RateLimiter;
 use ChurchDAW\Licensing\Request;
 use ChurchDAW\Licensing\TrialService;
 use ChurchDAW\Licensing\WebSessionService;
+use ChurchDAW\Licensing\WooviPaymentService;
+use ChurchDAW\Licensing\WooviProvider;
 
 $root = dirname(__DIR__);
 require $root . '/src/autoload.php';
@@ -60,7 +64,8 @@ function loginRequest(
     string $password,
     string $installationId,
     string $deviceSecret,
-    string $label
+    string $label,
+    string $platform = 'windows'
 ): Request {
     return Request::fromValues('POST', '/api/v1/auth/login', [], [
         'email' => $email,
@@ -68,7 +73,7 @@ function loginRequest(
         'installation_id' => $installationId,
         'device_secret' => $deviceSecret,
         'device_label' => $label,
-        'platform' => 'windows',
+        'platform' => $platform,
     ], '127.0.0.11');
 }
 
@@ -160,6 +165,23 @@ function androidProofRequest(
         'timestamp' => $timestamp,
         'proof' => base64_encode($signature),
     ], $ip);
+}
+
+function wooviCheckoutRequest(
+    string $email,
+    string $password,
+    string $idempotencyKey,
+    string $planCode = 'complete'
+): Request {
+    return Request::fromValues('POST', '/api/v1/checkout/start', [
+        'idempotency-key' => $idempotencyKey,
+    ], [
+        'display_name' => 'Cliente Woovi Teste',
+        'email' => $email,
+        'password' => $password,
+        'plan_code' => $planCode,
+        'accept_terms' => true,
+    ], '127.0.0.61');
 }
 
 final class FakePaymentProvider implements PaymentProvider
@@ -322,6 +344,71 @@ final class FakePaymentProvider implements PaymentProvider
     }
 }
 
+final class FakeWooviProvider implements WooviProvider
+{
+    public int $createCalls = 0;
+    public int $chargeCalls = 0;
+    public bool $timeoutAfterCreate = false;
+    public string $paymentBaseUrl = 'https://app.woovi.com/pay/';
+    public string $imageBaseUrl =
+        'https://api.woovi.com/openpix/charge/brcode/image/';
+
+    /** @var array<string, array<string, mixed>> */
+    public array $charges = [];
+
+    public function createCharge(array $payload): array
+    {
+        ++$this->createCalls;
+        $orderId = (string) ($payload['correlationID'] ?? '');
+        if (isset($this->charges[$orderId])) {
+            return ['charge' => $this->charges[$orderId]];
+        }
+        $charge = [
+            'correlationID' => $orderId,
+            'value' => (int) ($payload['value'] ?? 0),
+            'status' => 'ACTIVE',
+            'identifier' => 'woovi-' . str_replace('-', '', $orderId),
+            'brCode' => str_repeat('0', 64) . $orderId,
+            'paymentLinkUrl' =>
+                $this->paymentBaseUrl . rawurlencode($orderId),
+            'qrCodeImage' =>
+                $this->imageBaseUrl . rawurlencode($orderId) . '.png',
+            'expiresDate' => gmdate(DATE_ATOM, time() + 1800),
+        ];
+        $this->charges[$orderId] = $charge;
+        if ($this->timeoutAfterCreate) {
+            $this->timeoutAfterCreate = false;
+            throw new PaymentProviderException(
+                'timeout ambiguo Woovi no teste',
+                true
+            );
+        }
+        return ['charge' => $charge];
+    }
+
+    public function charge(string $correlationId): array
+    {
+        ++$this->chargeCalls;
+        if (!isset($this->charges[$correlationId])) {
+            throw new PaymentProviderException(
+                'cobranca Woovi fake ausente',
+                false
+            );
+        }
+        return ['charge' => $this->charges[$correlationId]];
+    }
+
+    public function verifyWebhookSignature(string $payload, string $signature): bool
+    {
+        return $payload !== '' && $signature === 'valid-woovi-signature';
+    }
+}
+
+putenv('ADMIN_ENABLED=1');
+putenv('ADMIN_USERNAME=integration-admin');
+putenv('ADMIN_PASSWORD_HASH=' . PasswordPolicy::hash(
+    'senha administrativa exclusiva de integracao'
+));
 $config = Config::load($root);
 $config->assertRuntimeReady();
 $database = new Database($config);
@@ -344,11 +431,12 @@ $generatedSlots = (int) $pdo->query(
            (table_name = 'orders' AND column_name = 'open_slot')
            OR (table_name = 'licenses' AND column_name = 'active_slot')
            OR (table_name = 'activations' AND column_name = 'active_slot')
+           OR (table_name = 'activations' AND column_name = 'active_platform')
        )
        AND UPPER(extra) LIKE '%STORED GENERATED%'"
 )->fetchColumn();
 expect(
-    $generatedSlots === 3,
+    $generatedSlots === 4,
     'slots comerciais nao sao colunas STORED GENERATED'
 );
 $slotTriggers = (int) $pdo->query(
@@ -397,6 +485,7 @@ $audit = new AuditLog($database, $crypto);
 $licenses = new LicenseService($config, $database, $crypto);
 $auth = new AuthService($database, $limiter, $licenses, $mailer, $audit);
 $trials = new TrialService($config, $database, $crypto, $limiter);
+$admin = new AdminService($config, $database, $crypto, $limiter);
 
 expectApi(
     fn () => $auth->resetPassword(Request::fromValues(
@@ -413,6 +502,294 @@ expectApi(
 );
 
 $suffix = substr(hash('sha256', Crypto::randomToken(16)), 0, 12);
+
+// O painel deve aplicar exatamente a senha escolhida pelo administrador, sem
+// gerar codigo aleatorio, e exigir confirmacao antes de criar a conta.
+$adminToken = Crypto::randomToken(32);
+$adminCsrf = Crypto::randomToken(24);
+$adminIp = '127.0.0.90';
+$adminUserAgent = 'ChurchDAW admin integration';
+$pdo->prepare(
+    "INSERT INTO admin_sessions
+        (id, token_hash, csrf_hash, csrf_ciphertext, ip_hash,
+         user_agent_hash, expires_at)
+     VALUES
+        (:id, :token_hash, :csrf_hash, :csrf_ciphertext, :ip_hash,
+         :user_agent_hash, DATE_ADD(CURRENT_TIMESTAMP(6), INTERVAL 1 HOUR))"
+)->execute([
+    'id' => Crypto::uuid(),
+    'token_hash' => Crypto::tokenHash($adminToken),
+    'csrf_hash' => Crypto::tokenHash($adminCsrf),
+    'csrf_ciphertext' => $crypto->encrypt($adminCsrf),
+    'ip_hash' => $crypto->hashIp($adminIp),
+    'user_agent_hash' => hash('sha256', $adminUserAgent),
+]);
+$_COOKIE['__Host-churchdaw_admin'] = $adminToken;
+$adminEmail = "admin-issued-{$suffix}@example.test";
+$adminPassword = '12345678';
+$adminRequest = static fn (
+    string $chosen,
+    string $confirmation,
+    string $activationPolicy = 'platform_bundle'
+): Request =>
+    Request::fromValues(
+        'POST',
+        '/admin/licenses/issue',
+        ['user-agent' => $adminUserAgent],
+        [
+            'csrf_token' => $adminCsrf,
+            'email' => $adminEmail,
+            'display_name' => 'Cliente do Painel',
+            'customer_password' => $chosen,
+            'customer_password_confirmation' => $confirmation,
+            'activation_policy' => $activationPolicy,
+        ],
+        $adminIp
+    );
+expectApi(
+    fn () => $admin->issueLicense($adminRequest(
+        $adminPassword,
+        'confirmacao diferente 2026'
+    )),
+    'PASSWORD_MISMATCH'
+);
+$adminIssued = $admin->issueLicense($adminRequest(
+    $adminPassword,
+    $adminPassword
+));
+$adminUserHash = $pdo->prepare(
+    'SELECT password_hash FROM users WHERE email = :email LIMIT 1'
+);
+$adminUserHash->execute(['email' => $adminEmail]);
+expect(
+    password_verify($adminPassword, (string) $adminUserHash->fetchColumn()),
+    'painel nao salvou a senha escolhida pelo administrador'
+);
+expect(
+    ($adminIssued['temporary_code'] ?? null) === null,
+    'painel ainda devolveu senha automatica'
+);
+$adminUpdatedPassword = '87654321';
+$adminExisting = $admin->issueLicense($adminRequest(
+    $adminUpdatedPassword,
+    $adminUpdatedPassword
+));
+$adminUserHash->execute(['email' => $adminEmail]);
+expect(
+    ($adminExisting['already_active'] ?? false) === true
+        && password_verify(
+            $adminUpdatedPassword,
+            (string) $adminUserHash->fetchColumn()
+        ),
+    'painel nao atualizou a senha escolhida para conta existente'
+);
+$adminUser = $pdo->prepare(
+    'SELECT id, status FROM users WHERE email = :email LIMIT 1'
+);
+$adminUser->execute(['email' => $adminEmail]);
+$adminUserRow = $adminUser->fetch();
+expect(is_array($adminUserRow), 'cliente administrativo nao foi localizado');
+$adminUserId = (string) $adminUserRow['id'];
+$adminChosenReplacement = 'abcdefgh';
+$admin->setCustomerPassword(
+    Request::fromValues(
+        'POST',
+        "/admin/users/{$adminUserId}/password",
+        ['user-agent' => $adminUserAgent],
+        [
+            'csrf_token' => $adminCsrf,
+            'customer_password' => $adminChosenReplacement,
+            'customer_password_confirmation' => $adminChosenReplacement,
+        ],
+        $adminIp
+    ),
+    $adminUserId
+);
+$adminUserHash->execute(['email' => $adminEmail]);
+expect(
+    password_verify(
+        $adminChosenReplacement,
+        (string) $adminUserHash->fetchColumn()
+    ),
+    'painel nao aceitou senha de oito caracteres para cliente existente'
+);
+
+$adminLicenseId = (string) ($adminIssued['license_id'] ?? '');
+$adminLicensePolicy = $pdo->prepare(
+    'SELECT activation_policy, max_active_devices
+     FROM licenses WHERE id = :id LIMIT 1'
+);
+$adminLicensePolicy->execute(['id' => $adminLicenseId]);
+$adminLicensePolicyRow = $adminLicensePolicy->fetch();
+expect(
+    is_array($adminLicensePolicyRow)
+        && $adminLicensePolicyRow['activation_policy'] === 'platform_bundle'
+        && (int) $adminLicensePolicyRow['max_active_devices'] === 3,
+    'painel nao criou o pacote de tres plataformas por padrao'
+);
+$adminPolicyRequest = static fn (string $policy): Request =>
+    Request::fromValues(
+        'POST',
+        "/admin/licenses/{$adminLicenseId}/policy",
+        ['user-agent' => $adminUserAgent],
+        [
+            'csrf_token' => $adminCsrf,
+            'activation_policy' => $policy,
+        ],
+        $adminIp
+    );
+$admin->updateLicensePolicy(
+    $adminPolicyRequest('single_device'),
+    $adminLicenseId
+);
+$adminLicensePolicy->execute(['id' => $adminLicenseId]);
+$singlePolicyRow = $adminLicensePolicy->fetch();
+expect(
+    is_array($singlePolicyRow)
+        && $singlePolicyRow['activation_policy'] === 'single_device'
+        && (int) $singlePolicyRow['max_active_devices'] === 1,
+    'painel nao converteu a licenca para um aparelho'
+);
+$admin->updateLicensePolicy(
+    $adminPolicyRequest('platform_bundle'),
+    $adminLicenseId
+);
+
+$adminWindowsSecret = Crypto::randomToken(32);
+$adminMacSecret = Crypto::randomToken(32);
+$auth->login(loginRequest(
+    $adminEmail,
+    $adminChosenReplacement,
+    'admin-windows-' . $suffix,
+    $adminWindowsSecret,
+    'Windows do pacote',
+    'windows'
+));
+$auth->login(loginRequest(
+    $adminEmail,
+    $adminChosenReplacement,
+    'admin-macos-' . $suffix,
+    $adminMacSecret,
+    'Mac do pacote',
+    'macos'
+));
+$adminAndroidKey = androidKeyPair();
+$auth->login(androidLoginRequest(
+    $adminEmail,
+    $adminChosenReplacement,
+    'admin-android-' . $suffix,
+    $adminAndroidKey['encoded'],
+    'admin-android-fingerprint-' . $suffix,
+    'Android do pacote'
+));
+$adminActivePlatforms = $pdo->prepare(
+    "SELECT GROUP_CONCAT(platform ORDER BY platform SEPARATOR ',')
+     FROM activations
+     WHERE license_id = :license_id AND status = 'active'"
+);
+$adminActivePlatforms->execute(['license_id' => $adminLicenseId]);
+expect(
+    $adminActivePlatforms->fetchColumn() === 'android,macos,windows',
+    'pacote nao manteve uma ativacao simultanea por plataforma'
+);
+expectApi(
+    fn () => $auth->login(loginRequest(
+        $adminEmail,
+        $adminChosenReplacement,
+        'admin-windows-extra-' . $suffix,
+        Crypto::randomToken(32),
+        'Segundo Windows',
+        'windows'
+    )),
+    'ACTIVATION_LIMIT'
+);
+expectApi(
+    fn () => $admin->updateLicensePolicy(
+        $adminPolicyRequest('single_device'),
+        $adminLicenseId
+    ),
+    'LICENSE_HAS_MULTIPLE_DEVICES'
+);
+$adminDashboard = $admin->dashboard(Request::fromValues(
+    'GET',
+    '/admin',
+    ['user-agent' => $adminUserAgent],
+    [],
+    $adminIp
+));
+$adminDashboardLicense = null;
+foreach (($adminDashboard['licenses'] ?? []) as $dashboardLicense) {
+    if (is_array($dashboardLicense)
+        && ($dashboardLicense['license_id'] ?? '') === $adminLicenseId) {
+        $adminDashboardLicense = $dashboardLicense;
+        break;
+    }
+}
+expect(
+    is_array($adminDashboardLicense)
+        && count($adminDashboardLicense['devices'] ?? []) === 3,
+    'painel nao agrupou as tres vagas na mesma licenca'
+);
+$admin->revokeLicense(
+    Request::fromValues(
+        'POST',
+        "/admin/licenses/{$adminLicenseId}/revoke",
+        ['user-agent' => $adminUserAgent],
+        ['csrf_token' => $adminCsrf, 'reason' => 'Teste de reativacao'],
+        $adminIp
+    ),
+    $adminLicenseId
+);
+$admin->reactivateLicense(
+    Request::fromValues(
+        'POST',
+        "/admin/licenses/{$adminLicenseId}/reactivate",
+        ['user-agent' => $adminUserAgent],
+        ['csrf_token' => $adminCsrf],
+        $adminIp
+    ),
+    $adminLicenseId
+);
+$adminLicenseStatus = $pdo->prepare(
+    'SELECT status FROM licenses WHERE id = :id LIMIT 1'
+);
+$adminLicenseStatus->execute(['id' => $adminLicenseId]);
+expect(
+    $adminLicenseStatus->fetchColumn() === 'active',
+    'painel nao reativou a licenca revogada'
+);
+
+foreach (['blocked', 'active'] as $customerStatus) {
+    $admin->setCustomerStatus(
+        Request::fromValues(
+            'POST',
+            "/admin/users/{$adminUserId}/status",
+            ['user-agent' => $adminUserAgent],
+            ['csrf_token' => $adminCsrf, 'status' => $customerStatus],
+            $adminIp
+        ),
+        $adminUserId
+    );
+    $adminUser->execute(['email' => $adminEmail]);
+    $row = $adminUser->fetch();
+    expect(
+        is_array($row) && (string) $row['status'] === $customerStatus,
+        'painel nao atualizou o status do cliente'
+    );
+}
+$adminDashboardData = $admin->dashboard(Request::fromValues(
+    'GET',
+    '/admin',
+    ['user-agent' => $adminUserAgent],
+    [],
+    $adminIp
+));
+expect(
+    count($adminDashboardData['events'] ?? []) >= 4,
+    'painel nao carregou o historico administrativo'
+);
+unset($_COOKIE['__Host-churchdaw_admin']);
+
 $email = "desktop-{$suffix}@example.test";
 $password = 'frase longa exclusiva 2026';
 $userId = Crypto::uuid();
@@ -510,17 +887,41 @@ $refreshed = $auth->refresh(refreshRequest($installationA, $secretA, $refreshOne
 $refreshTwo = (string) $refreshed['refresh_token'];
 expect($refreshTwo !== $refreshOne, 'refresh token rotacionado');
 expectApi(
-    fn () => $auth->refresh(refreshRequest($installationA, $secretA, $refreshOne)),
-    'SESSION_REUSED'
+    fn () => $auth->refresh(refreshRequest(
+        $installationA,
+        Crypto::randomToken(32),
+        $refreshOne
+    )),
+    'INVALID_DEVICE_PROOF'
+);
+$retryRequest = refreshRequest($installationA, $secretA, $refreshOne);
+$retryRecovered = $auth->refresh($retryRequest);
+expect(
+    (string) $retryRecovered['refresh_token'] === $refreshTwo,
+    'retry idempotente recuperou o mesmo refresh token'
+);
+expectApi(
+    fn () => $auth->refresh($retryRequest),
+    'REPLAY_DETECTED'
 );
 $familyStatus = $pdo->prepare(
     'SELECT COUNT(*) FROM refresh_tokens
      WHERE family_id = :family_id AND revoked_at IS NULL'
 );
 $familyStatus->execute(['family_id' => $familyId]);
-expect((int) $familyStatus->fetchColumn() === 0, 'reuso revogou a familia e persistiu');
+expect((int) $familyStatus->fetchColumn() > 0, 'retry valido preservou a familia');
+
+$advanced = $auth->refresh(refreshRequest($installationA, $secretA, $refreshTwo));
+$refreshThree = (string) $advanced['refresh_token'];
+expect($refreshThree !== $refreshTwo, 'replacement ativo continuou a rotacao');
 expectApi(
-    fn () => $auth->refresh(refreshRequest($installationA, $secretA, $refreshTwo)),
+    fn () => $auth->refresh(refreshRequest($installationA, $secretA, $refreshOne)),
+    'SESSION_REUSED'
+);
+$familyStatus->execute(['family_id' => $familyId]);
+expect((int) $familyStatus->fetchColumn() === 0, 'reuso apos avancar revogou a familia e persistiu');
+expectApi(
+    fn () => $auth->refresh(refreshRequest($installationA, $secretA, $refreshThree)),
     'INVALID_SESSION'
 );
 
@@ -591,6 +992,82 @@ expect(
         && (int) $androidRefreshedClaims['exp']
             === (int) $androidRefreshedClaims['offline_until'],
     'refresh Android renova lease de biblioteca com expiracao'
+);
+
+// Reinstalar remove a chave privada do Android Keystore. Mesmo quando o
+// installation_id permanece igual, o login autenticado precisa registrar a
+// chave publica nova e revogar as sessoes ligadas a chave anterior.
+$androidReinstallKeys = androidKeyPair();
+$androidReinstallLogin = $auth->login(androidLoginRequest(
+    $email,
+    $password,
+    $androidInstallation,
+    $androidReinstallKeys['encoded'],
+    $androidFingerprint,
+    'TANK3 reinstalado / Android'
+));
+expectApi(
+    fn () => $auth->refresh(androidProofRequest(
+        '/api/v1/auth/refresh',
+        $androidInstallation,
+        $androidKeys['private'],
+        (string) $androidRefreshed['refresh_token']
+    )),
+    'INVALID_SESSION'
+);
+$androidReinstallRefresh = $auth->refresh(androidProofRequest(
+    '/api/v1/auth/refresh',
+    $androidInstallation,
+    $androidReinstallKeys['private'],
+    (string) $androidReinstallLogin['refresh_token']
+));
+expect(
+    (string) $androidReinstallRefresh['refresh_token']
+        !== (string) $androidReinstallLogin['refresh_token'],
+    'reinstalacao Android com mesmo id nao aceitou a chave nova'
+);
+
+// Se o APK vier assinado por outro certificado, Android 8+ pode fornecer um
+// ANDROID_ID diferente. O login com e-mail e senha transfere atomicamente a
+// unica vaga Android; a instalacao antiga nao continua autorizada.
+$androidChangedInstallation = 'android-reinstalled-' . $suffix;
+$androidChangedKeys = androidKeyPair();
+$androidChangedLogin = $auth->login(androidLoginRequest(
+    $email,
+    $password,
+    $androidChangedInstallation,
+    $androidChangedKeys['encoded'],
+    'android-id:changed-cert:' . $suffix,
+    'TANK3 atualizado / Android'
+));
+$androidChangedClaims = compactClaims(
+    (string) $androidChangedLogin['lease_token']
+);
+expect(
+    $androidChangedClaims['installation_id'] === $androidChangedInstallation,
+    'reinstalacao Android com novo id nao recebeu a vaga da licenca'
+);
+expectApi(
+    fn () => $auth->refresh(androidProofRequest(
+        '/api/v1/auth/refresh',
+        $androidInstallation,
+        $androidReinstallKeys['private'],
+        (string) $androidReinstallRefresh['refresh_token']
+    )),
+    'INVALID_SESSION'
+);
+$activeAndroid = $pdo->prepare(
+    "SELECT COUNT(*)
+     FROM activations a
+     JOIN devices d ON d.id = a.device_id
+     WHERE a.license_id = :license_id
+       AND a.status = 'active'
+       AND d.platform = 'android'"
+);
+$activeAndroid->execute(['license_id' => $licenseId]);
+expect(
+    (int) $activeAndroid->fetchColumn() === 1,
+    'reinstalacao deixou mais de uma ativacao Android ativa'
 );
 
 $trialInstallation = 'trial-installation-' . $suffix;
@@ -667,6 +1144,9 @@ expectApi(
 );
 
 $webSessions = new WebSessionService($config, $database, $crypto, $limiter);
+$pdo->prepare(
+    'UPDATE users SET email_verified_at = NULL WHERE id = :id'
+)->execute(['id' => $userId]);
 $webLogin = $webSessions->login(Request::fromValues(
     'POST',
     '/api/v1/web/login',
@@ -674,6 +1154,13 @@ $webLogin = $webSessions->login(Request::fromValues(
     ['email' => $email, 'password' => $password],
     '127.0.0.13'
 ));
+expect(
+    (int) $pdo->query(
+        "SELECT email_verified_at IS NOT NULL FROM users
+         WHERE id = " . $pdo->quote($userId)
+    )->fetchColumn() === 1,
+    'login web nao pode bloquear conta sem confirmacao de e-mail'
+);
 $csrfRow = $pdo->prepare(
     'SELECT csrf_hash, csrf_ciphertext FROM web_sessions
      WHERE user_id = :user_id ORDER BY created_at DESC LIMIT 1'
@@ -974,7 +1461,10 @@ expect(
             === 499.0,
     'retry preservou o preco e a moeda gravados no pedido'
 );
-expect($retry['email_verification_sent'] === true, 'verificacao reenviada no retry');
+expect(
+    $retry['email_verification_sent'] === false,
+    'checkout nao deve exigir nem reenviar confirmacao de e-mail'
+);
 
 $paymentSeed = random_int(810000000000, 819999999990);
 $merchantOrderSeed = random_int(910000000000, 919999999990);
@@ -2179,7 +2669,8 @@ expect(
     'worker consultou payment e merchant order uma vez'
 );
 $paidLicense = $pdo->prepare(
-    'SELECT l.id, l.user_id, l.status, l.active_slot
+    'SELECT l.id, l.user_id, l.status, l.active_slot,
+            l.activation_policy, l.max_active_devices
      FROM licenses l WHERE l.order_id = :order_id LIMIT 1'
 );
 $paidLicense->execute(['order_id' => $checkout['order_id']]);
@@ -2187,8 +2678,10 @@ $paidLicenseRow = $paidLicense->fetch();
 expect(
     is_array($paidLicenseRow)
         && $paidLicenseRow['status'] === 'active'
-        && (int) $paidLicenseRow['active_slot'] === 1,
-    'dois pagamentos concederam uma unica licenca'
+        && (int) $paidLicenseRow['active_slot'] === 1
+        && $paidLicenseRow['activation_policy'] === 'platform_bundle'
+        && (int) $paidLicenseRow['max_active_devices'] === 3,
+    'pagamento nao concedeu o pacote de tres plataformas'
 );
 $splitRows = $pdo->prepare(
     'SELECT COUNT(*) AS payment_count,
@@ -2205,7 +2698,7 @@ expect(
 );
 
 $pdo->prepare(
-    'UPDATE users SET email_verified_at = CURRENT_TIMESTAMP(6) WHERE id = :id'
+    'UPDATE users SET email_verified_at = NULL WHERE id = :id'
 )->execute(['id' => $paidLicenseRow['user_id']]);
 $buyerSecret = Crypto::randomToken(32);
 $buyerInstallation = 'buyer-installation-' . $suffix;
@@ -2216,6 +2709,13 @@ $buyerLogin = $auth->login(loginRequest(
     $buyerSecret,
     'PC do comprador'
 ));
+expect(
+    (int) $pdo->query(
+        "SELECT email_verified_at IS NOT NULL FROM users
+         WHERE id = " . $pdo->quote((string) $paidLicenseRow['user_id'])
+    )->fetchColumn() === 1,
+    'login do aplicativo nao pode bloquear cliente pago sem confirmacao'
+);
 
 $provider->payments[$paymentA] = [
     'id' => $paymentA,
@@ -3010,6 +3510,344 @@ expect(
     'reconciliacao posterior limpou o erro sem repetir cobranca'
 );
 
+$wooviProvider = new FakeWooviProvider();
+$wooviService = new WooviPaymentService(
+    $config,
+    $database,
+    $crypto,
+    $limiter,
+    $wooviProvider,
+    $mailer
+);
+$wooviPassword = 'Senha Woovi segura #2026';
+$wooviBundleEmail = "woovi-bundle-{$suffix}@example.test";
+$wooviBundle = $wooviService->startCheckout(wooviCheckoutRequest(
+    $wooviBundleEmail,
+    $wooviPassword,
+    'woovi-bundle-' . $suffix,
+    'complete'
+));
+expect(
+    $wooviBundle['plan_code'] === 'complete'
+        && $wooviBundle['status'] === 'pending'
+        && strlen((string) $wooviBundle['pix_copy_paste']) >= 40,
+    'Woovi criou Pix do pacote completo'
+);
+$wooviOrderState = $pdo->prepare(
+    'SELECT plan_code, activation_policy, expected_amount_cents, status
+     FROM orders WHERE id = :id'
+);
+$wooviOrderState->execute(['id' => $wooviBundle['order_id']]);
+$wooviBundleOrder = $wooviOrderState->fetch();
+expect(
+    is_array($wooviBundleOrder)
+        && $wooviBundleOrder['plan_code'] === 'complete'
+        && $wooviBundleOrder['activation_policy'] === 'platform_bundle'
+        && (int) $wooviBundleOrder['expected_amount_cents'] === 19990
+        && $wooviBundleOrder['status'] === 'pending',
+    'pedido Woovi preservou plano, preco e politica multiplataforma'
+);
+$wooviProvider->charges[$wooviBundle['order_id']]['status'] = 'COMPLETED';
+$wooviProvider->charges[$wooviBundle['order_id']]['transactionID'] =
+    'tx-' . str_replace('-', '', (string) $wooviBundle['order_id']);
+$wooviProvider->charges[$wooviBundle['order_id']]['paidAt'] = gmdate(DATE_ATOM);
+$wooviPaid = $wooviService->status(Request::fromValues(
+    'POST',
+    '/api/v1/checkout/status',
+    [],
+    [
+        'order_id' => $wooviBundle['order_id'],
+        'checkout_token' => $wooviBundle['checkout_token'],
+    ],
+    '127.0.0.62'
+));
+expect(
+    $wooviPaid['paid'] === true && $wooviPaid['license_issued'] === true,
+    'polling Woovi liberou a licenca automaticamente'
+);
+$wooviLicense = $pdo->prepare(
+    'SELECT l.*, u.id AS customer_id, u.email_verified_at
+     FROM licenses l JOIN users u ON u.id = l.user_id
+     WHERE l.order_id = :order_id'
+);
+$wooviLicense->execute(['order_id' => $wooviBundle['order_id']]);
+$wooviBundleLicense = $wooviLicense->fetch();
+expect(
+    is_array($wooviBundleLicense)
+        && (int) $wooviBundleLicense['max_active_devices'] === 3
+        && $wooviBundleLicense['activation_policy'] === 'platform_bundle'
+        && $wooviBundleLicense['email_verified_at'] !== null,
+    'pagamento completo emitiu tres vagas por plataforma'
+);
+$auth->login(loginRequest(
+    $wooviBundleEmail,
+    $wooviPassword,
+    'woovi-win-' . $suffix,
+    str_repeat('w', 48),
+    'PC Woovi',
+    'windows'
+));
+$auth->login(loginRequest(
+    $wooviBundleEmail,
+    $wooviPassword,
+    'woovi-mac-' . $suffix,
+    str_repeat('m', 48),
+    'Mac Woovi',
+    'macos'
+));
+$wooviAndroidKey = androidKeyPair();
+$auth->login(androidLoginRequest(
+    $wooviBundleEmail,
+    $wooviPassword,
+    'woovi-android-' . $suffix,
+    $wooviAndroidKey['encoded'],
+    hash('sha256', 'woovi-android-' . $suffix),
+    'Android Woovi',
+    '127.0.0.63'
+));
+expectApi(
+    fn (): array => $auth->login(loginRequest(
+        $wooviBundleEmail,
+        $wooviPassword,
+        'woovi-win-extra-' . $suffix,
+        str_repeat('x', 48),
+        'Segundo PC',
+        'windows'
+    )),
+    'ACTIVATION_LIMIT'
+);
+$wooviActivePlatforms = $pdo->prepare(
+    "SELECT GROUP_CONCAT(platform ORDER BY platform SEPARATOR ',')
+     FROM activations WHERE license_id = :license_id AND status = 'active'"
+);
+$wooviActivePlatforms->execute(['license_id' => $wooviBundleLicense['id']]);
+expect(
+    $wooviActivePlatforms->fetchColumn() === 'android,macos,windows',
+    'pacote completo manteve exatamente uma vaga por plataforma'
+);
+
+$wooviSingleEmail = "woovi-single-{$suffix}@example.test";
+$wooviSingle = $wooviService->startCheckout(wooviCheckoutRequest(
+    $wooviSingleEmail,
+    $wooviPassword,
+    'woovi-single-' . $suffix,
+    'single'
+));
+$wooviProvider->charges[$wooviSingle['order_id']]['status'] = 'COMPLETED';
+$wooviProvider->charges[$wooviSingle['order_id']]['transactionID'] =
+    'tx-' . str_replace('-', '', (string) $wooviSingle['order_id']);
+$wooviProvider->charges[$wooviSingle['order_id']]['paidAt'] = gmdate(DATE_ATOM);
+$wooviService->reconcileOrder((string) $wooviSingle['order_id']);
+$wooviLicense->execute(['order_id' => $wooviSingle['order_id']]);
+$wooviSingleLicense = $wooviLicense->fetch();
+expect(
+    is_array($wooviSingleLicense)
+        && (int) $wooviSingleLicense['max_active_devices'] === 1
+        && $wooviSingleLicense['activation_policy'] === 'single_device',
+    'plano individual emitiu uma unica vaga'
+);
+
+$wooviProvider->paymentBaseUrl = 'https://woovi-sandbox.com/pay/';
+$wooviProvider->imageBaseUrl =
+    'https://api.woovi-sandbox.com/openpix/charge/brcode/image/';
+$wooviSandbox = $wooviService->startCheckout(wooviCheckoutRequest(
+    "woovi-sandbox-{$suffix}@example.test",
+    $wooviPassword,
+    'woovi-sandbox-' . $suffix,
+    'single'
+));
+expect(
+    str_starts_with(
+        (string) $wooviSandbox['checkout_url'],
+        'https://woovi-sandbox.com/pay/'
+    ),
+    'checkout Woovi sandbox aceitou o host oficial de pagamento'
+);
+$wooviProvider->charges[$wooviSandbox['order_id']]['status'] = 'EXPIRED';
+$wooviService->reconcileOrder((string) $wooviSandbox['order_id']);
+$wooviProvider->paymentBaseUrl = 'https://app.woovi.com/pay/';
+$wooviProvider->imageBaseUrl =
+    'https://api.woovi.com/openpix/charge/brcode/image/';
+
+// Pausar novas vendas nunca pode descartar a confirmacao de um Pix que ja
+// estava aberto. O webhook continua exigindo a assinatura e a liquidacao
+// consulta a cobranca diretamente no provedor antes de emitir a licenca.
+$wooviWebhook = $wooviService->startCheckout(wooviCheckoutRequest(
+    "woovi-webhook-{$suffix}@example.test",
+    $wooviPassword,
+    'woovi-webhook-' . $suffix,
+    'single'
+));
+$wooviWebhookTransaction =
+    'tx-' . str_replace('-', '', (string) $wooviWebhook['order_id']);
+$wooviProvider->charges[$wooviWebhook['order_id']]['status'] = 'COMPLETED';
+$wooviProvider->charges[$wooviWebhook['order_id']]['transactionID'] =
+    $wooviWebhookTransaction;
+$wooviProvider->charges[$wooviWebhook['order_id']]['paidAt'] = gmdate(DATE_ATOM);
+$wooviWebhookBody = [
+    'event' => 'OPENPIX:CHARGE_COMPLETED',
+    'charge' => [
+        'correlationID' => $wooviWebhook['order_id'],
+        'transactionID' => $wooviWebhookTransaction,
+    ],
+];
+$checkoutEnabledBeforeWebhookTest = getenv('CHECKOUT_ENABLED');
+putenv('CHECKOUT_ENABLED=0');
+$checkoutPausedConfig = Config::load($root);
+expect(
+    !$checkoutPausedConfig->bool('checkout.enabled'),
+    'fixture realmente pausou a abertura de novos checkouts'
+);
+$checkoutPausedWooviService = new WooviPaymentService(
+    $checkoutPausedConfig,
+    $database,
+    $crypto,
+    $limiter,
+    $wooviProvider,
+    $mailer
+);
+expectApi(
+    fn () => $checkoutPausedWooviService->receiveWebhook(
+        Request::fromValues(
+            'POST',
+            '/api/v1/webhooks/woovi',
+            ['x-webhook-signature' => 'invalid-woovi-signature'],
+            $wooviWebhookBody,
+            '127.0.0.64'
+        )
+    ),
+    'INVALID_WEBHOOK_SIGNATURE'
+);
+$webhookCountBeforeProbe = (int) $pdo->query(
+    "SELECT COUNT(*) FROM webhook_events WHERE provider = 'woovi'"
+)->fetchColumn();
+$checkoutPausedWooviService->receiveWebhook(Request::fromValues(
+    'POST',
+    '/api/v1/webhooks/woovi',
+    ['x-webhook-signature' => 'valid-woovi-signature'],
+    [
+        'data_criacao' => gmdate(DATE_ATOM),
+        'event' => 'OPENPIX:CHARGE_COMPLETED',
+    ],
+    '127.0.0.64'
+));
+expect(
+    (int) $pdo->query(
+        "SELECT COUNT(*) FROM webhook_events WHERE provider = 'woovi'"
+    )->fetchColumn() === $webhookCountBeforeProbe,
+    'probe assinado de cadastro Woovi respondeu sem criar evento financeiro'
+);
+expectApi(
+    fn () => $checkoutPausedWooviService->receiveWebhook(
+        Request::fromValues(
+            'POST',
+            '/api/v1/webhooks/woovi',
+            ['x-webhook-signature' => 'valid-woovi-signature'],
+            [
+                'data_criacao' => gmdate(DATE_ATOM),
+                'evento' => 'payload_financeiro_disfarcado',
+                'event' => 'OPENPIX:CHARGE_COMPLETED',
+            ],
+            '127.0.0.64'
+        )
+    ),
+    'INVALID_WEBHOOK'
+);
+$wooviProbeReturn = $checkoutPausedWooviService->receiveWebhook(
+    Request::fromValues(
+        'POST',
+        '/api/v1/webhooks/woovi',
+        ['x-webhook-signature' => 'valid-woovi-signature'],
+        [
+            'data_criacao' => gmdate(DATE_ATOM),
+            'event' => 'OPENPIX:CHARGE_COMPLETED',
+        ],
+        '127.0.0.64'
+    )
+);
+expect(
+    $wooviProbeReturn === null,
+    'probe de cadastro Woovi nao pede liberacao imediata'
+);
+$wooviWebhookReturn = $checkoutPausedWooviService->receiveWebhook(
+    Request::fromValues(
+        'POST',
+        '/api/v1/webhooks/woovi',
+        ['x-webhook-signature' => 'valid-woovi-signature'],
+        $wooviWebhookBody,
+        '127.0.0.64'
+    )
+);
+// Contrato da liberacao IMEDIATA (19/08/2026): o webhook devolve o pedido
+// para o App liberar logo depois do 200, sem esperar a janela do cron.
+expect(
+    $wooviWebhookReturn === (string) $wooviWebhook['order_id'],
+    'webhook Woovi devolve o correlationId para liberacao imediata'
+);
+$checkoutPausedWooviService->settleWebhookNow($wooviWebhookReturn);
+expect(
+    (int) $pdo->query(
+        "SELECT COUNT(*) FROM webhook_events
+         WHERE provider = 'woovi' AND status = 'received'"
+    )->fetchColumn() === 0,
+    'liberacao imediata marcou o evento Woovi como processado'
+);
+expect(
+    $checkoutPausedWooviService->processPendingWebhooks(10) === 0,
+    'worker nao reprocessa evento Woovi ja liberado na hora'
+);
+$wooviLicense->execute(['order_id' => $wooviWebhook['order_id']]);
+expect(
+    is_array($wooviLicense->fetch()),
+    'webhook assinado emitiu a licenca sem depender do polling do cliente'
+);
+if ($checkoutEnabledBeforeWebhookTest === false) {
+    putenv('CHECKOUT_ENABLED');
+} else {
+    putenv('CHECKOUT_ENABLED=' . $checkoutEnabledBeforeWebhookTest);
+}
+
+$wooviAmbiguousEmail = "woovi-ambiguous-{$suffix}@example.test";
+$wooviAmbiguousKey = 'woovi-ambiguous-' . $suffix;
+$createCallsBeforeAmbiguous = $wooviProvider->createCalls;
+$wooviProvider->timeoutAfterCreate = true;
+try {
+    $wooviService->startCheckout(wooviCheckoutRequest(
+        $wooviAmbiguousEmail,
+        $wooviPassword,
+        $wooviAmbiguousKey,
+        'complete'
+    ));
+    throw new RuntimeException('FAIL: timeout Woovi ambiguo nao propagou');
+} catch (PaymentProviderException $error) {
+    expect(
+        $error->operationMayHaveSucceeded,
+        'timeout Woovi foi classificado como ambiguo'
+    );
+}
+$ambiguousOrder = $pdo->prepare(
+    "SELECT o.id, o.status FROM orders o
+     JOIN users u ON u.id = o.user_id WHERE u.email = :email"
+);
+$ambiguousOrder->execute(['email' => $wooviAmbiguousEmail]);
+$ambiguousRow = $ambiguousOrder->fetch();
+expect(
+    is_array($ambiguousRow) && $ambiguousRow['status'] === 'provider_ambiguous',
+    'timeout Woovi preservou pedido ambiguo para conciliacao'
+);
+$wooviRecovered = $wooviService->startCheckout(wooviCheckoutRequest(
+    $wooviAmbiguousEmail,
+    $wooviPassword,
+    $wooviAmbiguousKey,
+    'complete'
+));
+expect(
+    $wooviRecovered['order_id'] === $ambiguousRow['id']
+        && strlen((string) $wooviRecovered['pix_copy_paste']) >= 40
+        && $wooviProvider->createCalls === $createCallsBeforeAmbiguous + 1,
+    'retry Woovi conciliou a cobranca existente sem duplicar Pix'
+);
+
 putenv('MAIL_ENABLED=1');
 $mailConfig = Config::load($root);
 $mailConfig->assertRuntimeReady();
@@ -3063,4 +3901,4 @@ try {
     putenv('MAIL_ENABLED=0');
 }
 
-echo "PASS: SQL suportado, login, PC unico, lease, refresh, transferencia, CSRF, claim, ambiguidade, reconciliacao, split, webhook assincrono, reembolso, mediacao, chargeback, entitlement unico e e-mail cifrado\n";
+echo "PASS: SQL suportado, login, vagas por plataforma, Woovi Pix, polling, conciliacao sem duplicidade, lease, refresh, transferencia, CSRF, webhook assincrono, reembolso, mediacao, chargeback, entitlement unico e e-mail cifrado\n";

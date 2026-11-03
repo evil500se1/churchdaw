@@ -103,6 +103,26 @@ int main()
         TonewheelOrganEngine::maximumBlockCapacity + 1;
     require (! invalid.prepare (bad), "oversized block rejected");
 
+    // Vintage leakage/hum remain part of the played tone, but an idle organ
+    // must not behave like an open microphone on the master bus.
+    TonewheelOrganEngine idleNoise;
+    require (idleNoise.prepare (spec), "idle-noise engine prepare");
+    idleNoise.parameters().setPlain (
+        OrganParameterId::tonewheelProfile, 2.0f);
+    idleNoise.parameters().setPlain (
+        OrganParameterId::leakage, 1.0f);
+    idleNoise.parameters().setPlain (
+        OrganParameterId::hum, 1.0f);
+    idleNoise.parameters().setPlain (
+        OrganParameterId::rotaryMix, 0.0f);
+    std::array<float, 1024> idleLeft {};
+    std::array<float, 1024> idleRight {};
+    require (idleNoise.render ({
+                 idleLeft.data(), idleRight.data(), idleLeft.size() }),
+             "idle-noise render");
+    require (energy (idleLeft) == 0.0 && energy (idleRight) == 0.0,
+             "idle organ is exactly silent with no active/releasing notes");
+
     TonewheelOrganEngine control;
     TonewheelOrganEngine offset;
     require (control.prepare (spec), "control prepare");
@@ -294,6 +314,55 @@ int main()
                  "sustain tail render");
     require (sustained.diagnostics().activeUpperNotes == 0,
              "sustain releases note");
+
+    // O adaptador envia o mesmo CC64 aos tres manuais. O manual de pedal usa
+    // um segundo mapa de teclas fisicas para implementar mono/poly e, antes da
+    // correcao, ignorava completamente o sustain.
+    for (const bool polyphonic : { false, true })
+    {
+        TonewheelOrganEngine pedalSustain;
+        require (pedalSustain.prepare (spec),
+                 "pedal sustain prepare");
+        configureNeutral (pedalSustain);
+        pedalSustain.parameters().setPlain (
+            OrganParameterId::pedalMode,
+            polyphonic ? 1.0f : 0.0f);
+        require (pedalSustain.queueNoteOn (
+                     Manual::pedal, 36, 100, 0),
+                 "pedal sustain note on");
+        require (pedalSustain.queueSustain (
+                     Manual::pedal, true, 64),
+                 "pedal sustain down");
+        require (pedalSustain.queueNoteOff (
+                     Manual::pedal, 36, 128),
+                 "pedal sustain note off");
+
+        std::array<float, 1024> pedalLeft {};
+        std::array<float, 1024> pedalRight {};
+        require (pedalSustain.render ({
+                     pedalLeft.data(), pedalRight.data(),
+                     pedalLeft.size() }),
+                 "pedal sustain held render");
+        require (
+            pedalSustain.diagnostics().activePedalNotes > 0,
+            polyphonic
+                ? "poly pedal sustain holds note"
+                : "mono pedal sustain holds note");
+
+        require (pedalSustain.queueSustain (
+                     Manual::pedal, false, 0),
+                 "pedal sustain release");
+        for (int block = 0; block < 20; ++block)
+            require (pedalSustain.render ({
+                         pedalLeft.data(), pedalRight.data(),
+                         pedalLeft.size() }),
+                     "pedal sustain tail render");
+        require (
+            pedalSustain.diagnostics().activePedalNotes == 0,
+            polyphonic
+                ? "poly pedal sustain releases note"
+                : "mono pedal sustain releases note");
+    }
 
     TonewheelOrganEngine extreme;
     require (extreme.prepare (spec), "extreme prepare");

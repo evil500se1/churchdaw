@@ -36,6 +36,10 @@
 
 #include <juce_audio_processors_headless/format_types/juce_AudioUnitPluginFormatImpl.h>
 
+#if JUCE_IOS
+ #import <AVFAudio/AVFAudio.h>
+#endif
+
 namespace juce
 {
 
@@ -119,6 +123,65 @@ bool AudioUnitPluginFormatHeadless::requiresUnblockedMessageThreadDuringCreation
 StringArray AudioUnitPluginFormatHeadless::searchPathsForPlugins (const FileSearchPath&, bool /*recursive*/, bool allowPluginsWhichRequireAsynchronousInstantiation)
 {
     StringArray result;
+
+    const auto isWantedType = [] (const AudioComponentDescription& desc)
+    {
+        return desc.componentType == kAudioUnitType_MusicDevice
+            || desc.componentType == kAudioUnitType_MusicEffect
+            || desc.componentType == kAudioUnitType_Effect
+            || desc.componentType == kAudioUnitType_Generator
+            || desc.componentType == kAudioUnitType_Panner
+            || desc.componentType == kAudioUnitType_Mixer
+            || desc.componentType == kAudioUnitType_MIDIProcessor;
+    };
+
+   #if JUCE_IOS
+    // PATCH ChurchDAW (18/ago/2026): no iOS, AudioComponentFindNext NAO
+    // enumera extensoes AUv3 de OUTROS apps — so componentes da Apple e do
+    // proprio bundle. O registro de extensoes do sistema (bs-16i, Ravenscroft
+    // etc.) e consultado pelo AVAudioUnitComponentManager, o mesmo caminho
+    // dos hosts reais (AUM, Cubasis, GarageBand). Consultar o manager tambem
+    // popula o registro do processo, de modo que os AudioComponentFindNext
+    // seguintes (instanciacao) passam a resolver essas descricoes.
+    @autoreleasepool
+    {
+        // componentsPassingTest com YES incondicional e o wildcard REAL: o
+        // matchingDescription com struct zerada devolvia apenas os
+        // componentes da Apple em campo (iPad do dono, 18/ago) — as
+        // extensoes de terceiros so vieram por este caminho.
+        NSArray<AVAudioUnitComponent*>* components =
+            [[AVAudioUnitComponentManager sharedAudioUnitComponentManager]
+                componentsPassingTest: ^BOOL (AVAudioUnitComponent*, BOOL*)
+                {
+                    return YES;
+                }];
+
+        Logger::writeToLog ("AUV3_SCAN: manager devolveu "
+                            + String ((int) components.count)
+                            + " componente(s)");
+
+        for (AVAudioUnitComponent* component in components)
+        {
+            const AudioComponentDescription desc = [component audioComponentDescription];
+
+            Logger::writeToLog ("AUV3_SCAN: "
+                                + nsStringToJuce (component.manufacturerName)
+                                + " / " + nsStringToJuce (component.name)
+                                + (isWantedType (desc) ? String()
+                                                       : String (" [tipo ignorado]")));
+
+            if (! isWantedType (desc))
+                continue;
+
+            // Todo AUv3 requer instanciacao assincrona; sem a permissao, o
+            // iOS nao tem o que listar (nao existem AUv2 de terceiros aqui).
+            if (allowPluginsWhichRequireAsynchronousInstantiation
+                 || ! AudioUnitFormatHelpers::isPluginAUv3 (desc))
+                result.addIfNotAlreadyThere (AudioUnitFormatHelpers::createPluginIdentifier (desc));
+        }
+    }
+   #endif
+
     AudioComponent comp = nullptr;
 
     for (;;)
@@ -134,16 +197,10 @@ StringArray AudioUnitPluginFormatHeadless::searchPathsForPlugins (const FileSear
         if (AudioComponentGetDescription (comp, &desc) != noErr)
             continue;
 
-        if (desc.componentType == kAudioUnitType_MusicDevice
-             || desc.componentType == kAudioUnitType_MusicEffect
-             || desc.componentType == kAudioUnitType_Effect
-             || desc.componentType == kAudioUnitType_Generator
-             || desc.componentType == kAudioUnitType_Panner
-             || desc.componentType == kAudioUnitType_Mixer
-             || desc.componentType == kAudioUnitType_MIDIProcessor)
+        if (isWantedType (desc))
         {
             if (allowPluginsWhichRequireAsynchronousInstantiation || ! AudioUnitFormatHelpers::isPluginAUv3 (desc))
-                result.add (AudioUnitFormatHelpers::createPluginIdentifier (desc));
+                result.addIfNotAlreadyThere (AudioUnitFormatHelpers::createPluginIdentifier (desc));
         }
     }
 

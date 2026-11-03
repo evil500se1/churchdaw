@@ -115,6 +115,16 @@ foreach ($requiredFile in @(
     Assert-AndroidCondition (Test-Path -LiteralPath $requiredFile) "Arquivo Android ausente: $requiredFile"
 }
 
+$generatedMetadataFiles = @(Get-ChildItem -LiteralPath (
+    Join-Path $ProjectRoot 'Builds\Android\app\src\main') -Recurse -File |
+    Where-Object {
+        $_.Name.StartsWith('._', [StringComparison]::Ordinal) -or
+        $_.Name -ceq '.DS_Store'
+    })
+Assert-AndroidCondition ($generatedMetadataFiles.Count -eq 0) (
+    'Projeto Android gerado contem metadados AppleDouble/.DS_Store'
+)
+
 $requiredLauncherResources = @(
     'values\colors.xml',
     'drawable\ic_launcher_foreground.xml',
@@ -189,8 +199,16 @@ Assert-AndroidCondition (
     [string] $launcherBackground.'#text' -match '^#(?:1[0-9A-Fa-f]{5}|[0-9A-Fa-f]{8})$'
 ) "Fundo opaco escuro/vermelho do launcher nao esta definido"
 
-[xml] $projectXml = Get-Content -LiteralPath $projectFile -Raw
+$projectRaw = Get-Content -LiteralPath $projectFile -Raw
+[xml] $projectXml = $projectRaw
 $generatedCmake = Get-Content -LiteralPath $generatedCmakeFile -Raw
+$generatedGradle = Get-Content -LiteralPath $generatedGradleFile -Raw
+$textureSource = Get-Content -LiteralPath (Join-Path $ProjectRoot `
+    'JUCE\modules\juce_opengl\opengl\juce_OpenGLTexture.cpp') -Raw
+Assert-AndroidCondition (
+    $textureSource.Contains('ChurchDAW ES 3.0 texture allocation') -and
+    $textureSource.Contains('tryAllocTexture (w, h, type, &width, &height)')
+) 'Compatibilidade de imagens OpenGL ES 3.0 ausente; aplique ApplyAndroidOpenGLCompatibility.ps1'
 $project = $projectXml.JUCERPROJECT
 $android = $project.EXPORTFORMATS.ANDROIDSTUDIO
 $androidProjectFilePaths = @(
@@ -203,6 +221,10 @@ $versionCodeText = [string] $android.androidVersionCode
 $versionCode = 0
 
 foreach ($requiredAndroidSource in @(
+    'Source\SoundFontEngine.cpp',
+    'Source\Plugins\Sabrina\SabrinaProcessor.cpp',
+    'Source\Studio\StudioCamera_android.cpp',
+    'Source\Studio\StudioMovieWriter_android.cpp',
     'Source\SampleStream.h',
     'Source\WorshipReverb.h',
     'Source\StereoLookaheadLimiter.h',
@@ -241,6 +263,23 @@ Assert-AndroidCondition (
     [string] $android.androidPushNotifications -eq '0'
 ) "Push notifications foram ativadas sem necessidade no ChurchDAW.jucer"
 Assert-AndroidCondition (
+    $projectRaw.Contains('JUCE_USE_ANDROID_OBOE_STABILIZED_CALLBACK=0') -and
+    -not $projectRaw.Contains('JUCE_USE_ANDROID_OBOE_STABILIZED_CALLBACK=1')
+) (
+    'StabilizedCallback de benchmark nao pode entrar no release: ele ocupa ' +
+    'CPU deliberadamente dentro do callback de audio'
+)
+Assert-AndroidCondition (
+    $generatedCmake.Contains('JUCE_USE_ANDROID_OBOE_STABILIZED_CALLBACK=0') -and
+    -not $generatedCmake.Contains('JUCE_USE_ANDROID_OBOE_STABILIZED_CALLBACK=1')
+) 'CMake Android gerado ainda contem o callback de benchmark; regenere pelo Projucer'
+Assert-AndroidCondition (
+    -not $generatedCmake.Contains('CHURCHDAW_ANDROID_UI_QA')
+) 'CMake Android ainda contem bypass visual de QA; regenere antes de assinar'
+Assert-AndroidCondition (
+    -not $generatedGradle.Contains('applicationIdSuffix ".qa"')
+) 'Gradle Android ainda gera pacote paralelo de QA; regenere antes de assinar'
+Assert-AndroidCondition (
     [string] $android.androidManifestCustomXmlElements -match
         'android\.hardware\.wifi.+android:required="false"'
 ) "Wi-Fi nao esta marcado como feature opcional no ChurchDAW.jucer"
@@ -257,6 +296,18 @@ Assert-AndroidCondition (
 Assert-AndroidCondition (
     [string] $android.androidDependencies -notmatch 'com\.google\.android\.play:app-update'
 ) "ChurchDAW.jucer ainda depende de Play Core"
+
+Assert-AndroidCondition (
+    [string] $android.cameraPermissionNeeded -eq '1' -and
+    [string] $android.microphonePermissionNeeded -eq '1' -and
+    [string] $android.androidEnableContentSharing -eq '1'
+) 'ChurchCam exige camera/microfone opcionais e o provider de compartilhamento'
+foreach ($feature in @('camera', 'camera.autofocus', 'microphone')) {
+    Assert-AndroidCondition (
+        [string] $android.androidManifestCustomXmlElements -match
+            ('android:name="android.hardware.' + [regex]::Escape($feature) + '" android:required="false"')
+    ) "ChurchCam nao deve tornar hardware obrigatorio: $feature"
+}
 
 $services = Get-Content -LiteralPath $servicesFile -Raw
 $cppVersionCode = [int] (Get-RequiredRegexValue $services `
@@ -395,6 +446,7 @@ Assert-AndroidCondition (
 Assert-AndroidCondition (
     $signedPolicyVerifierSource.Contains('SHA256withRSA') -and
     $signedPolicyVerifierSource.Contains('RSA_3072_SIGNATURE_BYTES = 384') -and
+    $signedPolicyVerifierSource.Contains('churchdaw-update-2026-08') -and
     $signedPolicyVerifierSource.Contains('churchdaw-update-2026-01') -and
     $services.Contains('ChurchDAWSignedPolicyVerifier') -and
     $services.Contains('verifyAndroidSignedPolicyEnvelope')
@@ -552,7 +604,7 @@ Assert-AndroidCondition (
     @($updateEnvelope.PSObject.Properties).Count -eq 5 -and
     [int] $updateEnvelope.schema_version -eq 2 -and
     [string] $updateEnvelope.algorithm -eq 'SHA256withRSA' -and
-    [string] $updateEnvelope.key_id -eq 'churchdaw-update-2026-01'
+    [string] $updateEnvelope.key_id -eq 'churchdaw-update-2026-08'
 ) "Envelope da politica assinada possui schema/algoritmo/chave inesperados"
 
 try {
@@ -583,27 +635,100 @@ Assert-AndroidCondition (
     [int] $updatePolicy.revokes_policy_serial -eq 0
 ) "Payload assinado nao e uma politica normal valida"
 
-$catalogSha256 = (
+$catalogRawSha256 = (
     Get-FileHash -LiteralPath $CatalogManifest -Algorithm SHA256
 ).Hash.ToLowerInvariant()
-Assert-AndroidCondition (
-    [string] $updatePolicy.catalog_sha256 -cmatch '^[0-9a-f]{64}$' -and
-    [string] $updatePolicy.catalog_sha256 -ceq $catalogSha256
-) "SHA-256 assinado do catalogo diverge do manifesto publicado"
 
-$embeddedKeyExpression = [regex]::Match(
+# Politicas publicadas antes da normalizacao cross-platform assinaram os bytes
+# CRLF gerados no Windows. O mesmo JSON pode chegar ao workspace com LF (Git,
+# macOS) ou BOM sem que o conteudo tenha mudado. Reproduza apenas essas
+# variacoes de transporte e continue exigindo que uma delas corresponda ao
+# SHA-256 que veio dentro do payload RSA assinado.
+$strictCatalogUtf8 = [Text.UTF8Encoding]::new($false, $true)
+$catalogRawBytes = [IO.File]::ReadAllBytes($CatalogManifest)
+$catalogUtf8Offset = if (
+    $catalogRawBytes.Length -ge 3 -and
+    $catalogRawBytes[0] -eq 0xef -and
+    $catalogRawBytes[1] -eq 0xbb -and
+    $catalogRawBytes[2] -eq 0xbf
+) { 3 } else { 0 }
+$catalogText = $strictCatalogUtf8.GetString(
+    $catalogRawBytes,
+    $catalogUtf8Offset,
+    $catalogRawBytes.Length - $catalogUtf8Offset
+)
+$normalizedCatalogText = $catalogText.Replace("`r`n", "`n").Replace("`r", "`n")
+$catalogHashProbeFolder = Join-Path ([IO.Path]::GetTempPath()) (
+    'churchdaw-catalog-hash-' + [Guid]::NewGuid().ToString('N')
+)
+$normalizedCatalogProbe = Join-Path $catalogHashProbeFolder 'manifest-lf.json'
+$crlfCatalogProbe = Join-Path $catalogHashProbeFolder 'manifest-crlf.json'
+try {
+    New-Item -ItemType Directory -Path $catalogHashProbeFolder | Out-Null
+    $utf8WithoutBom = [Text.UTF8Encoding]::new($false)
+    [IO.File]::WriteAllText(
+        $normalizedCatalogProbe,
+        $normalizedCatalogText,
+        $utf8WithoutBom
+    )
+    [IO.File]::WriteAllText(
+        $crlfCatalogProbe,
+        $normalizedCatalogText.Replace("`n", "`r`n"),
+        $utf8WithoutBom
+    )
+    $normalizedCatalogSha256 = (
+        Get-FileHash -LiteralPath $normalizedCatalogProbe -Algorithm SHA256
+    ).Hash.ToLowerInvariant()
+    $crlfCatalogSha256 = (
+        Get-FileHash -LiteralPath $crlfCatalogProbe -Algorithm SHA256
+    ).Hash.ToLowerInvariant()
+}
+finally {
+    Remove-Item -LiteralPath $catalogHashProbeFolder -Recurse -Force `
+        -ErrorAction SilentlyContinue
+}
+$acceptedCatalogHashes = @(
+    $catalogRawSha256,
+    $normalizedCatalogSha256,
+    $crlfCatalogSha256
+) | Select-Object -Unique
+$signedCatalogSha256 = [string] $updatePolicy.catalog_sha256
+$catalogHashMatches = $acceptedCatalogHashes -ccontains $signedCatalogSha256
+Assert-AndroidCondition (
+    $signedCatalogSha256 -cmatch '^[0-9a-f]{64}$' -and
+    $catalogHashMatches
+) (
+    'SHA-256 assinado do catalogo diverge do manifesto publicado; ' +
+    "assinado=$signedCatalogSha256 aceitos=" +
+    ($acceptedCatalogHashes -join ',')
+)
+
+$embeddedCurrentKeyExpression = [regex]::Match(
+    $signedPolicyVerifierSource,
+    '(?s)PUBLIC_KEY_DER_BASE64_2026_08\s*=\s*(?<value>.*?);'
+)
+Assert-AndroidCondition $embeddedCurrentKeyExpression.Success (
+    'Nao foi possivel extrair a chave publica Android atual do verificador Java'
+)
+$embeddedCurrentKeyChunks = [regex]::Matches(
+    $embeddedCurrentKeyExpression.Groups['value'].Value,
+    '"([^"]*)"'
+)
+$embeddedCurrentKeyBase64 = (
+    $embeddedCurrentKeyChunks | ForEach-Object { $_.Groups[1].Value }
+) -join ''
+$embeddedPreviousKeyExpression = [regex]::Match(
     $signedPolicyVerifierSource,
     '(?s)PUBLIC_KEY_DER_BASE64\s*=\s*(?<value>.*?);'
 )
-Assert-AndroidCondition $embeddedKeyExpression.Success (
-    'Nao foi possivel extrair a chave publica do verificador Java'
+Assert-AndroidCondition $embeddedPreviousKeyExpression.Success (
+    'Nao foi possivel extrair a chave publica Android anterior do verificador Java'
 )
-$embeddedKeyChunks = [regex]::Matches(
-    $embeddedKeyExpression.Groups['value'].Value,
-    '"([^"]*)"'
-)
-$embeddedKeyBase64 = (
-    $embeddedKeyChunks | ForEach-Object { $_.Groups[1].Value }
+$embeddedPreviousKeyBase64 = (
+    [regex]::Matches(
+        $embeddedPreviousKeyExpression.Groups['value'].Value,
+        '"([^"]*)"'
+    ) | ForEach-Object { $_.Groups[1].Value }
 ) -join ''
 $publicKeyBase64 = (
     (Get-Content -LiteralPath $updatePolicyPublicKeyFile -Raw) `
@@ -612,8 +737,9 @@ $publicKeyBase64 = (
         -replace '\s', ''
 )
 Assert-AndroidCondition (
-    $embeddedKeyBase64 -eq $publicKeyBase64
-) "Chave publica Java diverge da chave usada para validar a hospedagem"
+    $embeddedCurrentKeyBase64 -eq $publicKeyBase64 -and
+    $embeddedPreviousKeyBase64 -ne $embeddedCurrentKeyBase64
+) "Chave publica Android atual diverge da chave usada para validar a hospedagem"
 
 $openssl = 'C:\Program Files\Git\usr\bin\openssl.exe'
 Assert-AndroidCondition (Test-Path -LiteralPath $openssl -PathType Leaf) (
@@ -670,13 +796,13 @@ if ($null -ne $catalog) {
     Assert-AndroidCondition (
         [int] $updatePolicy.latest_version_code -eq
             [int] $catalog.latest_version_code -and
-        [int] $updatePolicy.minimum_version_code -eq
-            [int] $catalog.minimum_version_code -and
+        [int] $catalog.minimum_version_code -le
+            [int] $updatePolicy.minimum_version_code -and
         [string] $updatePolicy.latest_version_name -eq
             [string] $catalog.latest_version_name -and
         [string] $updatePolicy.play_store_url -eq
             [string] $catalog.play_store_url
-    ) "Politica assinada e envelope legado do catalogo estao divergentes"
+    ) "Politica assinada e catalogo possuem release ou piso incompativel"
 }
 
 Assert-AndroidCondition (
@@ -845,6 +971,7 @@ if (-not [string]::IsNullOrWhiteSpace($Bundle)) {
             'ChurchDAWActivity',
             'ChurchDAWUpdateBridge',
             'ChurchDAWSignedPolicyVerifier',
+            'churchdaw-update-2026-08',
             'churchdaw-update-2026-01',
             'getInstalledVersionCode',
             'resumeImmediateUpdate',

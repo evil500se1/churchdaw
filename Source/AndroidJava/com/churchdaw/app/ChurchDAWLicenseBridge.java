@@ -55,6 +55,7 @@ public final class ChurchDAWLicenseBridge {
     private static final String KEY_ID = "churchdaw-2026-01";
     private static final SecureRandom RANDOM = new SecureRandom();
     private static volatile Context applicationContext;
+    private static volatile int cachedBootCount = Integer.MIN_VALUE;
 
     private static final String LICENSE_PUBLIC_KEY_DER_BASE64 =
         "MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEAxHPtoU+l4R4cHBRZ/vkP"
@@ -672,7 +673,7 @@ public final class ChurchDAWLicenseBridge {
                 .putLong(TRUSTED_WALL_KEY, epochSeconds)
                 .putLong(TRUSTED_ELAPSED_KEY, SystemClock.elapsedRealtime() / 1000L)
                 .putInt(TRUSTED_BOOT_KEY, bootCount())
-                .commit();
+                .apply();
         } catch (Exception ignored) {
         }
     }
@@ -805,10 +806,16 @@ public final class ChurchDAWLicenseBridge {
     }
 
     private static int bootCount() {
+        final int cached = cachedBootCount;
+        if (cached != Integer.MIN_VALUE)
+            return cached;
         try {
-            return Settings.Global.getInt(
+            final int resolved = Settings.Global.getInt(
                 requireContext().getContentResolver(), Settings.Global.BOOT_COUNT);
+            cachedBootCount = resolved;
+            return resolved;
         } catch (Exception ignored) {
+            cachedBootCount = -1;
             return -1;
         }
     }

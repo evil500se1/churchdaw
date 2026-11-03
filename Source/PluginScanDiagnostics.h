@@ -35,7 +35,8 @@ enum class ScanPhase : int
     discovery = 1,
     validation = 2,
     vst3Inventory = 3,
-    vst3ClassValidation = 4
+    vst3ClassValidation = 4,
+    enumeration = 5
 };
 
 inline juce::String toString (ScanPhase phase)
@@ -46,6 +47,7 @@ inline juce::String toString (ScanPhase phase)
         case ScanPhase::validation:           return "validation";
         case ScanPhase::vst3Inventory:        return "vst3_inventory";
         case ScanPhase::vst3ClassValidation:  return "vst3_class_validation";
+        case ScanPhase::enumeration:          return "enumeration";
     }
 
     return "unknown";
@@ -95,7 +97,8 @@ inline bool deserialiseRequest (const juce::MemoryBlock& block,
     if (rawPhase != (int) ScanPhase::discovery
          && rawPhase != (int) ScanPhase::validation
          && rawPhase != (int) ScanPhase::vst3Inventory
-         && rawPhase != (int) ScanPhase::vst3ClassValidation)
+         && rawPhase != (int) ScanPhase::vst3ClassValidation
+         && rawPhase != (int) ScanPhase::enumeration)
     {
         error = "invalid scanner phase";
         return false;
@@ -457,9 +460,23 @@ inline EnvironmentReport collectEnvironment (
         }
 
         const auto lowerArchitecture = report.pluginArchitecture.toLowerCase();
-        report.architectureCompatible =
-            lowerArchitecture.startsWith ("unknown")
-             || lowerArchitecture.contains (report.processArchitecture.toLowerCase());
+        const bool isAudioUnit = identifier.startsWithIgnoreCase ("AudioUnit:")
+            || (description != nullptr && description->pluginFormatName.containsIgnoreCase ("AudioUnit"))
+            || bundle.hasFileExtension (".component");
+
+        const bool is32Bit = lowerArchitecture.contains ("32-bit")
+                          || lowerArchitecture.contains ("i386")
+                          || lowerArchitecture.contains ("ppc");
+
+        // No macOS, Audio Units x86_64 sao hospedados transparentemente em processos
+        // arm64 atraves do servico AUHostingServiceXPC da Apple. Alem disso, se o
+        // processo roda sob Rosetta ou o host possui slice x86_64, plugins x86_64
+        // sao compativeis.
+        report.architectureCompatible = ! is32Bit
+            && (isAudioUnit
+                || lowerArchitecture.startsWith ("unknown")
+                || lowerArchitecture.contains (report.processArchitecture.toLowerCase())
+                || (report.rosetta && lowerArchitecture.contains ("x86_64")));
 
         const bool readable = executable.hasReadAccess();
         const bool executableByProcess = ::access (

@@ -1,12 +1,114 @@
 #include "../../Source/TimbresProcessor.h"
+#include "../../Source/PadSynthProcessor.h"
+#include "../../Source/MainComponent.h"
 
+#include <algorithm>
 #include <array>
+#include <atomic>
+#include <cmath>
 #include <functional>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
+
+#if defined (CHURCHDAW_INTERNAL_AUDIO_TEST_HOOKS)
+struct PadSynthProcessorTestAccess
+{
+    static int activeVoiceCount (const PadSynthProcessor& synth) noexcept
+    {
+        return (int) std::count_if (
+            synth.voices.begin(), synth.voices.end(),
+            [] (const auto& voice) { return voice.active; });
+    }
+
+    static int keyDownVoiceCount (const PadSynthProcessor& synth,
+                                  int note, int channel) noexcept
+    {
+        return (int) std::count_if (
+            synth.voices.begin(), synth.voices.end(),
+            [note, channel] (const auto& voice)
+            {
+                return voice.active && voice.keyDown
+                    && voice.note == note && voice.channel == channel;
+            });
+    }
+
+    static bool reusedFilterCoefficientsMatchReference() noexcept
+    {
+        auto referenceStage = [] (float input, float cutoff, float resonance,
+                                  double sampleRate,
+                                  PadSynthProcessor::FilterState& state,
+                                  int type) noexcept
+        {
+            cutoff = juce::jlimit (
+                30.0f, (float) sampleRate * 0.44f, cutoff);
+            const float q = juce::jmap (
+                juce::jlimit (0.0f, 1.0f, resonance), 0.55f, 7.5f);
+            const float g = std::tan (
+                juce::MathConstants<float>::pi * cutoff
+                / (float) sampleRate);
+            const float r = 1.0f / q;
+            const float hp = (input - (r + g) * state.s1 - state.s2)
+                           / (1.0f + r * g + g * g);
+            const float bp = g * hp + state.s1;
+            state.s1 = g * hp + bp;
+            const float lp = g * bp + state.s2;
+            state.s2 = g * bp + lp;
+            if (type == 2) return hp;
+            if (type == 3) return bp;
+            return lp;
+        };
+
+        uint32_t noise = 0x72b6a941u;
+        for (int type = 0; type < 4; ++type)
+            for (int i = 0; i < 4096; ++i)
+            {
+                noise ^= noise << 13;
+                noise ^= noise >> 17;
+                noise ^= noise << 5;
+                const float input = (float) (int32_t) noise
+                                  / (float) INT32_MAX;
+                const float cutoff = 30.0f
+                    + (float) (i % 4000) * 4.9f;
+                const float resonance = (float) (i % 101) / 100.0f;
+
+                PadSynthProcessor::FilterState oldFirst, oldSecond;
+                PadSynthProcessor::FilterState newFirst, newSecond;
+                oldFirst.s1 = newFirst.s1 = 0.13f;
+                oldFirst.s2 = newFirst.s2 = -0.07f;
+                oldSecond.s1 = newSecond.s1 = 0.04f;
+                oldSecond.s2 = newSecond.s2 = -0.02f;
+
+                const float oldOnce = referenceStage (
+                    input, cutoff, resonance, 48000.0, oldFirst, type);
+                const float oldValue = type == 0
+                    ? referenceStage (oldOnce, cutoff, resonance,
+                                      48000.0, oldSecond, 1)
+                    : oldOnce;
+
+                const float filterR = 1.0f / juce::jmap (
+                    juce::jlimit (0.0f, 1.0f, resonance), 0.55f, 7.5f);
+                const auto coefficients =
+                    PadSynthProcessor::filterCoefficients (
+                        cutoff, filterR, 48000.0);
+                const float newValue = PadSynthProcessor::processFilter (
+                    input, coefficients, newFirst, newSecond, type);
+
+                if (oldValue != newValue
+                     || oldFirst.s1 != newFirst.s1
+                     || oldFirst.s2 != newFirst.s2
+                     || oldSecond.s1 != newSecond.s1
+                     || oldSecond.s2 != newSecond.s2)
+                    return false;
+            }
+
+        return true;
+    }
+};
+#endif
 
 namespace
 {
@@ -580,6 +682,382 @@ public:
 private:
     int failures = 0;
 };
+
+void setPadParameter (PadSynthProcessor& synth, const juce::String& id,
+                      float actualValue, TestContext& test)
+{
+    auto* parameter = synth.parameter (id);
+    test.expect (parameter != nullptr,
+                 "parametro PadSynth ausente: " + id.toStdString());
+
+    if (parameter != nullptr)
+        parameter->setValueNotifyingHost (
+            parameter->convertTo0to1 (actualValue));
+}
+
+void configurePadSynthVoiceFixture (PadSynthProcessor& synth,
+                                    float releaseSeconds,
+                                    TestContext& test)
+{
+    synth.setEngineEnabled (true);
+    setPadParameter (synth, "padMasterDb", -24.0f, test);
+    setPadParameter (synth, "padChorusMix", 0.0f, test);
+    setPadParameter (synth, "padReverbMix", 0.0f, test);
+    setPadParameter (synth, "padDelayMix", 0.0f, test);
+    setPadParameter (synth, "padMacroMaster", 0.5f, test);
+    setPadParameter (synth, "padFadeIn", 0.01f, test);
+    setPadParameter (synth, "padFadeOut", 0.01f, test);
+    setPadParameter (synth, "padToneLow", 0.0f, test);
+    setPadParameter (synth, "padToneMid", 0.0f, test);
+    setPadParameter (synth, "padToneHigh", 0.0f, test);
+    setPadParameter (synth, "padHoldMode", 0.0f, test);
+    setPadParameter (synth, "padToggleMode", 0.0f, test);
+
+    for (int layer = 0; layer < PadSynthProcessor::numLayers; ++layer)
+    {
+        const auto prefix = "padL" + juce::String (layer + 1);
+        setPadParameter (synth, prefix + "Enabled", layer == 0 ? 1.0f : 0.0f, test);
+        setPadParameter (synth, prefix + "Osc1Wave", 0.0f, test);
+        setPadParameter (synth, prefix + "Osc2Wave", 0.0f, test);
+        setPadParameter (synth, prefix + "Osc1Oct", 0.0f, test);
+        setPadParameter (synth, prefix + "Osc2Oct", 0.0f, test);
+        setPadParameter (synth, prefix + "Osc2Tune", 0.0f, test);
+        setPadParameter (synth, prefix + "Osc1Level", 1.0f, test);
+        setPadParameter (synth, prefix + "Osc2Level", 0.0f, test);
+        setPadParameter (synth, prefix + "SubLevel", 0.0f, test);
+        setPadParameter (synth, prefix + "NoiseLevel", 0.0f, test);
+        setPadParameter (synth, prefix + "Cutoff", 18000.0f, test);
+        setPadParameter (synth, prefix + "Resonance", 0.0f, test);
+        setPadParameter (synth, prefix + "FilterEnv", 0.0f, test);
+        setPadParameter (synth, prefix + "Attack", 0.003f, test);
+        setPadParameter (synth, prefix + "Decay", 0.02f, test);
+        setPadParameter (synth, prefix + "Sustain", 1.0f, test);
+        setPadParameter (synth, prefix + "Release", releaseSeconds, test);
+        setPadParameter (synth, prefix + "Pan", 0.0f, test);
+        setPadParameter (synth, prefix + "LfoDepth", 0.0f, test);
+    }
+
+    synth.prepareToPlay (48000.0, 256);
+}
+
+juce::AudioBuffer<float> renderPadSynth (
+    PadSynthProcessor& synth, juce::MidiBuffer midi = {},
+    int numSamples = 256)
+{
+    juce::AudioBuffer<float> audio (2, numSamples);
+    audio.clear();
+    synth.processBlock (audio, midi);
+    return audio;
+}
+
+float maximumMagnitude (const juce::AudioBuffer<float>& audio) noexcept
+{
+    float maximum = 0.0f;
+
+    for (int channel = 0; channel < audio.getNumChannels(); ++channel)
+        maximum = juce::jmax (
+            maximum,
+            audio.getMagnitude (channel, 0, audio.getNumSamples()));
+
+    return maximum;
+}
+
+void addRepeatedNoteOns (juce::MidiBuffer& midi, int count,
+                         int note, int samplePosition)
+{
+    for (int i = 0; i < count; ++i)
+        midi.addEvent (juce::MidiMessage::noteOn (
+                           1, note, (juce::uint8) 110),
+                       samplePosition);
+}
+
+void testPadSynthStealsWithDeclick (TestContext& test)
+{
+    PadSynthProcessor reference;
+    PadSynthProcessor stealing;
+    configurePadSynthVoiceFixture (reference, 0.20f, test);
+    configurePadSynthVoiceFixture (stealing, 0.20f, test);
+
+    juce::MidiBuffer initialNotes;
+    addRepeatedNoteOns (initialNotes, PadSynthProcessor::maxVoices,
+                        69, 0);
+    renderPadSynth (reference, initialNotes);
+    renderPadSynth (stealing, initialNotes);
+
+    test.expect (
+        PadSynthProcessorTestAccess::activeVoiceCount (stealing)
+            == PadSynthProcessor::maxVoices,
+        "fixture deve ocupar as 24 vozes do PadSynth");
+
+    const auto uninterrupted = renderPadSynth (reference);
+    juce::MidiBuffer twentyFifth;
+    constexpr int stealSample = 45;
+    twentyFifth.addEvent (
+        juce::MidiMessage::noteOn (1, 69, (juce::uint8) 110),
+        stealSample);
+    const auto withSteal = renderPadSynth (stealing, twentyFifth);
+
+    const float eventError = std::abs (
+        withSteal.getSample (0, stealSample)
+          - uninterrupted.getSample (0, stealSample));
+    const float oneVoiceAtEvent = std::abs (
+        uninterrupted.getSample (0, stealSample))
+        / (float) PadSynthProcessor::maxVoices;
+    const float tolerance = juce::jmax (0.0005f,
+                                        oneVoiceAtEvent * 0.35f);
+
+    test.expect (
+        eventError <= tolerance,
+        "25a voz nao pode remover a amostra anterior da voz roubada sem declique");
+    test.expect (
+        PadSynthProcessorTestAccess::activeVoiceCount (stealing)
+            == PadSynthProcessor::maxVoices,
+        "roubo com declique deve respeitar o limite fixo de 24 vozes");
+}
+
+void testPadSynthDuplicateNoteOffReleasesOneInstance (TestContext& test)
+{
+    PadSynthProcessor synth;
+    configurePadSynthVoiceFixture (synth, 0.04f, test);
+
+    juce::MidiBuffer repeated;
+    addRepeatedNoteOns (repeated, 2, 60, 0);
+    renderPadSynth (synth, repeated);
+    test.expect (
+        PadSynthProcessorTestAccess::keyDownVoiceCount (synth, 60, 1) == 2,
+        "dois NoteOn iguais devem criar duas instancias pressionadas");
+
+    juce::MidiBuffer firstRelease;
+    firstRelease.addEvent (juce::MidiMessage::noteOff (1, 60), 0);
+    renderPadSynth (synth, firstRelease);
+    test.expect (
+        PadSynthProcessorTestAccess::keyDownVoiceCount (synth, 60, 1) == 1,
+        "um NoteOff deve liberar somente uma das instancias iguais");
+
+    juce::AudioBuffer<float> heldAudio;
+    for (int block = 0; block < 64; ++block)
+        heldAudio = renderPadSynth (synth);
+
+    test.expect (
+        maximumMagnitude (heldAudio) > 0.0001f,
+        "a segunda instancia deve continuar soando apos o primeiro NoteOff");
+
+    juce::MidiBuffer secondRelease;
+    secondRelease.addEvent (juce::MidiMessage::noteOff (1, 60), 0);
+    renderPadSynth (synth, secondRelease);
+    for (int block = 0; block < 64; ++block)
+        renderPadSynth (synth);
+
+    test.expect (
+        PadSynthProcessorTestAccess::activeVoiceCount (synth) == 0,
+        "o segundo NoteOff deve encerrar a instancia restante");
+}
+
+void testPadSynthDisabledEngineStillAdvancesReleases (TestContext& test)
+{
+    PadSynthProcessor synth;
+    configurePadSynthVoiceFixture (synth, 0.10f, test);
+
+    juce::MidiBuffer noteOn;
+    noteOn.addEvent (
+        juce::MidiMessage::noteOn (1, 64, (juce::uint8) 110), 0);
+    renderPadSynth (synth, noteOn);
+    for (int block = 0; block < 16; ++block)
+        renderPadSynth (synth);
+
+    synth.setEngineEnabled (false);
+    juce::MidiBuffer noteOff;
+    noteOff.addEvent (juce::MidiMessage::noteOff (1, 64), 0);
+    renderPadSynth (synth, noteOff);
+    for (int block = 0; block < 160; ++block)
+        renderPadSynth (synth);
+
+    test.expect (
+        PadSynthProcessorTestAccess::activeVoiceCount (synth) == 0,
+        "engineGain zero deve continuar avancando envelopes ate liberar vozes");
+
+    synth.setEngineEnabled (true);
+    float restartPeak = 0.0f;
+    for (int block = 0; block < 12; ++block)
+        restartPeak = juce::jmax (
+            restartPeak, maximumMagnitude (renderPadSynth (synth)));
+
+    test.expect (
+        restartPeak < 0.00001f,
+        "religar PadSynth sem MIDI nao pode ressuscitar voz congelada");
+}
+
+struct IdleAppGraphMetrics
+{
+    double peak = 0.0;
+    double rms = 0.0;
+    double authorisedInputPeak = 0.0;
+    double authorisedInputRms = 0.0;
+};
+
+void testDesktopInputStartupPolicy (TestContext& test)
+{
+    juce::XmlElement disabledChain ("CHAIN");
+    disabledChain.setAttribute ("inputEnabled", false);
+    juce::XmlElement enabledChain ("CHAIN");
+    enabledChain.setAttribute ("inputEnabled", true);
+
+    test.expect (
+        ! ChurchDAWAudioInputPolicy::isExplicitlyAuthorised (
+            &disabledChain)
+         && ChurchDAWAudioInputPolicy::isExplicitlyAuthorised (
+             &enabledChain)
+         && ! ChurchDAWAudioInputPolicy::isExplicitlyAuthorised (nullptr),
+        "startup deve abrir input somente com autorizacao persistida explicita");
+
+    juce::XmlElement staleSetup ("DEVICESETUP");
+    staleSetup.setAttribute ("audioInputDeviceName", "ASIO4ALL v2");
+    staleSetup.setAttribute ("audioOutputDeviceName", "ASIO4ALL v2");
+    ChurchDAWAudioInputPolicy::applyToSavedSetup (&staleSetup, false);
+    test.expect (
+        staleSetup.getStringAttribute ("audioDeviceInChans") == "0"
+         && staleSetup.getStringAttribute ("audioInputDeviceName")
+                == "ASIO4ALL v2",
+        "setup salvo sem mascara deve virar zero canais sem apagar o device escolhido");
+
+    juce::XmlElement explicitSetup ("DEVICESETUP");
+    explicitSetup.setAttribute ("audioInputDeviceName", "Interface do usuario");
+    explicitSetup.setAttribute ("audioDeviceInChans", "1010");
+    ChurchDAWAudioInputPolicy::applyToSavedSetup (&explicitSetup, true);
+    test.expect (
+        explicitSetup.getStringAttribute ("audioDeviceInChans") == "1010"
+         && explicitSetup.getStringAttribute ("audioInputDeviceName")
+                == "Interface do usuario",
+        "entrada autorizada deve preservar device e mascara explicitos");
+
+    juce::AudioDeviceManager::AudioDeviceSetup runtime;
+    runtime.inputDeviceName = "ASIO4ALL v2";
+    runtime.useDefaultInputChannels = true;
+    runtime.inputChannels.setRange (0, 2, true);
+    ChurchDAWAudioInputPolicy::disableRuntimeChannels (runtime);
+    test.expect (
+        ChurchDAWAudioInputPolicy::runtimeSetupIsBlocked (runtime)
+         && runtime.inputDeviceName == "ASIO4ALL v2",
+        "runtime bloqueado deve ter mascara zero sem perder a preferencia do usuario");
+}
+
+IdleAppGraphMetrics testIdleAppGraphAndInputIsolation (TestContext& test)
+{
+    constexpr double sampleRate = 48000.0;
+    constexpr int blockSize = 256;
+    using Graph = juce::AudioProcessorGraph;
+    using IO = Graph::AudioGraphIOProcessor;
+
+    Graph graph;
+    graph.setPlayConfigDetails (2, 2, sampleRate, blockSize);
+
+    const auto input = graph.addNode (
+        std::make_unique<IO> (IO::audioInputNode));
+    const auto output = graph.addNode (
+        std::make_unique<IO> (IO::audioOutputNode));
+    const auto timbres = graph.addNode (
+        std::make_unique<TimbresProcessor>());
+    const auto pad = graph.addNode (
+        std::make_unique<PadProcessor>());
+    const auto padSynth = graph.addNode (
+        std::make_unique<PadSynthProcessor>());
+    const auto master = graph.addNode (
+        std::make_unique<MasterProcessor>());
+
+    test.expect (input != nullptr && output != nullptr
+                 && timbres != nullptr && pad != nullptr
+                 && padSynth != nullptr && master != nullptr,
+                 "fixture do grafo Windows deve criar todos os nos nativos");
+
+    if (input == nullptr || output == nullptr || timbres == nullptr
+         || pad == nullptr || padSynth == nullptr || master == nullptr)
+        return {};
+
+    const auto connectStereo = [&] (Graph::NodeID source,
+                                    Graph::NodeID destination,
+                                    const char* label)
+    {
+        for (int channel = 0; channel < 2; ++channel)
+            test.expect (
+                graph.addConnection (
+                    { { source, channel }, { destination, channel } }),
+                std::string ("falha na aresta ") + label
+                    + " canal " + std::to_string (channel));
+    };
+
+    connectStereo (timbres->nodeID, master->nodeID,
+                   "timbres->master");
+    connectStereo (pad->nodeID, master->nodeID,
+                   "pad->master");
+    connectStereo (padSynth->nodeID, master->nodeID,
+                   "padSynth->master");
+    connectStereo (master->nodeID, output->nodeID,
+                   "master->output");
+
+    graph.rebuild();
+    graph.prepareToPlay (sampleRate, blockSize);
+
+    juce::AudioBuffer<float> audio (2, blockSize);
+    juce::MidiBuffer midi;
+    double phase = 0.0;
+    const double phaseStep = juce::MathConstants<double>::twoPi
+                           * 997.0 / sampleRate;
+
+    const auto renderAndMeasure = [&] (int blocks)
+    {
+        double peak = 0.0;
+        double squareSum = 0.0;
+        juce::uint64 samples = 0;
+
+        for (int block = 0; block < blocks; ++block)
+        {
+            for (int sample = 0; sample < blockSize; ++sample)
+            {
+                const float value = (float) (0.25 * std::sin (phase));
+                phase += phaseStep;
+                if (phase >= juce::MathConstants<double>::twoPi)
+                    phase -= juce::MathConstants<double>::twoPi;
+                audio.setSample (0, sample, value);
+                audio.setSample (1, sample, -value);
+            }
+
+            midi.clear();
+            graph.processBlock (audio, midi);
+
+            for (int channel = 0; channel < audio.getNumChannels(); ++channel)
+                for (int sample = 0; sample < audio.getNumSamples(); ++sample)
+                {
+                    const double value = audio.getSample (channel, sample);
+                    peak = std::max (peak, std::abs (value));
+                    squareSum += value * value;
+                    ++samples;
+                }
+        }
+
+        return std::pair<double, double> {
+            peak,
+            samples > 0 ? std::sqrt (squareSum / (double) samples) : 0.0
+        };
+    };
+
+    // O buffer externo contem uma senoide forte como se viesse do microfone.
+    // Sem a aresta input->master, somente os motores ociosos podem aparecer.
+    const auto idle = renderAndMeasure (375); // 2 s
+
+    connectStereo (input->nodeID, master->nodeID,
+                   "input->master positive control");
+    graph.rebuild();
+    const auto authorised = renderAndMeasure (96);
+    graph.releaseResources();
+
+    test.expect (idle.first <= 1.0e-7 && idle.second <= 1.0e-8,
+                 "grafo ocioso/desautorizado deve ser silencio digital");
+    test.expect (authorised.first >= 0.05 && authorised.second >= 0.01,
+                 "controle positivo deve provar que a mesma entrada passa quando autorizada");
+
+    return { idle.first, idle.second,
+             authorised.first, authorised.second };
+}
 
 int controllerCount (
     const CapturedBlock& block,
@@ -1487,8 +1965,6 @@ void testRetriggerDepthAndNextPhraseRecentres (
     (void) fixture.processEmpty();
     constexpr int bentPitch = 10000;
     constexpr int retriggeredNote = 60;
-    constexpr int failClosedSample =
-        Fixture::maximumBlockSize - 1;
     *transpose = 0;
 
     juce::MidiBuffer retrigger;
@@ -1516,47 +1992,53 @@ void testRetriggerDepthAndNextPhraseRecentres (
         pitchWheelCount (
             retriggered, bentPitch, 1, 1)
                 == 1
-         && hasControllerOnEveryChannelExactlyOnce (
-            retriggered, 64, 0,
-            failClosedSample)
-         && hasControllerOnEveryChannelExactlyOnce (
-                retriggered, 120, 0,
-                failClosedSample)
-         && hasControllerOnEveryChannelExactlyOnce (
-                retriggered, 123, 0,
-                failClosedSample)
-         && hasPitchWheelOnEveryChannelExactlyOnce (
-                retriggered, 8192,
-                failClosedSample)
-         && failClosedBoundaryIsLast (
-                retriggered,
-                failClosedSample),
-        "2x NoteOn/1x NoteOff ambíguo deve falhar "
-        "fechado com sustain off, centros e CC120/123");
+         && hasNoteOn (
+                retriggered, 1, retriggeredNote, 2)
+         && hasNoteOn (
+                retriggered, 1, retriggeredNote, 3)
+         && hasNoteOff (
+                retriggered, 1, retriggeredNote, 4)
+         && controllerCount (retriggered, 120) == 0
+         && controllerCount (retriggered, 123) == 0,
+        "2x NoteOn/1x NoteOff deve encaminhar uma liberação FIFO sem PANIC");
     test.expect (
-        fixture.plugin->activeVoiceCount() == 0
+        fixture.plugin->activeVoiceCount() == 1
          && fixture.plugin->pitchWheelForChannel (
-                1) == 8192,
-        "fail-closed deve zerar vozes, ledger observável "
-        "e pitch do plugin");
+                1) == bentPitch
+         && fixture.host->getPhysicalKeyDepthForTest (
+                retriggeredNote, 1) == 1,
+        "primeiro NoteOff deve consumir apenas a geração mais antiga");
 
-    // O fail-closed local agenda um PANIC no callback seguinte para reconciliar
-    // também o guard global e todos os outros destinos MIDI.
-    const auto& reconciliation =
+    const auto& noReconciliationPanic =
         fixture.processEmpty();
     test.expect (
         controllerCount (
-            reconciliation, 120, -1, 0)
-                == 16
+            noReconciliationPanic, 120) == 0
          && controllerCount (
-                reconciliation, 123, -1, 0)
-                == 16
+                noReconciliationPanic, 123) == 0
          && fixture.plugin->activeVoiceCount()
-                == 0
+                == 1
          && fixture.plugin->pitchWheelForChannel (
-                1) == 8192,
-        "callback seguinte deve reconciliar PANIC "
-        "sem deixar nota ou bend presos");
+                1) == bentPitch,
+        "retrigger legítimo não deve agendar PANIC no callback seguinte");
+
+    juce::MidiBuffer finalRetriggerRelease;
+    finalRetriggerRelease.addEvent (
+        juce::MidiMessage::noteOff (
+            1, retriggeredNote),
+        5);
+    const auto& retriggerReleased = fixture.process (
+        std::move (finalRetriggerRelease));
+    test.expect (
+        hasNoteOff (
+            retriggerReleased, 1, retriggeredNote, 5)
+         && controllerCount (retriggerReleased, 120) == 0
+         && controllerCount (retriggerReleased, 123) == 0
+         && fixture.plugin->activeVoiceCount() == 0
+         && fixture.plugin->pitchWheelForChannel (1) == bentPitch
+         && fixture.host->getPhysicalKeyDepthForTest (
+                retriggeredNote, 1) == 0,
+        "segundo NoteOff deve encerrar a geração restante sem PANIC");
 
     constexpr int nextTranspose = 7;
     constexpr int nextPhraseOutput =
@@ -1572,7 +2054,9 @@ void testRetriggerDepthAndNextPhraseRecentres (
         fixture.process (
             std::move (nextPhrase));
     test.expect (
-        hasNoteOn (
+        pitchWheelCount (
+                centredPhrase, 8192, 6, 1) == 1
+         && hasNoteOn (
                 centredPhrase, 1,
                 nextPhraseOutput, 6)
          && fixture.plugin
@@ -1580,7 +2064,7 @@ void testRetriggerDepthAndNextPhraseRecentres (
                     1) == 8192
          && fixture.plugin->pitchWheelForChannel (
                 1) == 8192,
-        "frase após reconciliação deve começar "
+        "frase nova após o segundo NoteOff deve começar "
         "centrada e com ledger novo");
 
     juce::MidiBuffer nextRelease;
@@ -1599,6 +2083,151 @@ void testRetriggerDepthAndNextPhraseRecentres (
                 == 0,
         "NoteOff da nova frase deve usar somente "
         "a transposição nova e não deixar nota presa");
+}
+
+void testPerLayerOctaveRoutingLedgerAndState (
+    TestContext& test)
+{
+    auto host = std::make_unique<TimbresProcessor>();
+
+    auto layerA = std::make_unique<CapturingPlugin>();
+    auto* captureA = layerA.get();
+    auto layerB = std::make_unique<CapturingPlugin>();
+    auto* captureB = layerB.get();
+
+    const bool installedA = host->installInstrumentForTest (
+        0, std::move (layerA));
+    const bool installedB = host->installInstrumentForTest (
+        1, std::move (layerB));
+
+    auto* octaveA = findParameter<juce::AudioParameterInt> (
+        *host, "oct0");
+    auto* octaveB = findParameter<juce::AudioParameterInt> (
+        *host, "oct1");
+
+    test.expect (
+        installedA && installedB
+         && captureA != nullptr && captureB != nullptr,
+        "dois plugins devem ser instalados para provar oitavas independentes");
+    test.expect (
+        octaveA != nullptr && octaveB != nullptr
+         && host->getLayerOctaveParam (0) == octaveA
+         && host->getLayerOctaveParam (1) == octaveB,
+        "oct0/oct1 devem existir e apontar para os canais corretos");
+
+    if (! installedA || ! installedB
+         || octaveA == nullptr || octaveB == nullptr)
+        return;
+
+    host->prepareToPlay (
+        Fixture::sampleRate,
+        Fixture::maximumBlockSize);
+
+    auto processHost = [&] (juce::MidiBuffer midi)
+    {
+        juce::AudioBuffer<float> audio (
+            2, Fixture::maximumBlockSize);
+        audio.clear();
+        host->processBlock (audio, midi);
+    };
+
+    // Consome sincronizacao inicial de pitch/sustain dos dois plugins.
+    {
+        juce::MidiBuffer empty;
+        processHost (std::move (empty));
+    }
+
+    *octaveA = 1;
+    *octaveB = -1;
+
+    juce::MidiBuffer firstPress;
+    firstPress.addEvent (
+        juce::MidiMessage::noteOn (
+            1, 60, (juce::uint8) 110),
+        5);
+    processHost (std::move (firstPress));
+
+    test.expect (
+        hasNoteOn (captureA->lastBlock(), 1, 72, 5)
+         && ! hasNoteOn (captureA->lastBlock(), 1, 48, 5)
+         && hasNoteOn (captureB->lastBlock(), 1, 48, 5)
+         && ! hasNoteOn (captureB->lastBlock(), 1, 72, 5),
+        "a mesma nota deve chegar +1 oitava somente em A e -1 somente em B");
+
+    // Mudar os controles enquanto a tecla esta presa nao pode mudar o destino
+    // do NoteOff: cada layer precisa usar a nota gravada no seu proprio ledger.
+    *octaveA = -2;
+    *octaveB = 2;
+
+    juce::MidiBuffer firstRelease;
+    firstRelease.addEvent (
+        juce::MidiMessage::noteOff (1, 60),
+        9);
+    processHost (std::move (firstRelease));
+
+    test.expect (
+        hasNoteOff (captureA->lastBlock(), 1, 72, 9)
+         && hasNoteOff (captureB->lastBlock(), 1, 48, 9)
+         && captureA->activeVoiceCount() == 0
+         && captureB->activeVoiceCount() == 0,
+        "NoteOff deve seguir a oitava do NoteOn e nao deixar nota presa");
+
+    juce::MidiBuffer nextPress;
+    nextPress.addEvent (
+        juce::MidiMessage::noteOn (
+            1, 64, (juce::uint8) 105),
+        11);
+    processHost (std::move (nextPress));
+
+    test.expect (
+        hasNoteOn (captureA->lastBlock(), 1, 40, 11)
+         && hasNoteOn (captureB->lastBlock(), 1, 88, 11),
+        "a frase seguinte deve usar imediatamente as novas oitavas por canal");
+
+    juce::MidiBuffer nextRelease;
+    nextRelease.addEvent (
+        juce::MidiMessage::noteOff (1, 64),
+        13);
+    processHost (std::move (nextRelease));
+    test.expect (
+        hasNoteOff (captureA->lastBlock(), 1, 40, 13)
+         && hasNoteOff (captureB->lastBlock(), 1, 88, 13)
+         && captureA->activeVoiceCount() == 0
+         && captureB->activeVoiceCount() == 0,
+        "a nova frase deve encerrar nas novas oitavas sem vazamento entre canais");
+
+    // Round-trip de projeto sem depender de plugin externo: os oito parametros
+    // precisam sobreviver ao formato de estado do proprio TimbresProcessor.
+    auto stateSource = std::make_unique<TimbresProcessor>();
+    auto* savedOctaveA = stateSource->getLayerOctaveParam (0);
+    auto* savedOctaveB = stateSource->getLayerOctaveParam (1);
+    test.expect (
+        savedOctaveA != nullptr && savedOctaveB != nullptr,
+        "parametros de oitava devem existir na origem do round-trip");
+
+    if (savedOctaveA == nullptr || savedOctaveB == nullptr)
+        return;
+
+    *savedOctaveA = -4;
+    *savedOctaveB = 3;
+    juce::MemoryBlock state;
+    stateSource->getStateInformation (state);
+
+    auto restored = std::make_unique<TimbresProcessor>();
+    restored->setStateInformation (
+        state.getData(), (int) state.getSize());
+    const auto* restoredOctaveA =
+        restored->getLayerOctaveParam (0);
+    const auto* restoredOctaveB =
+        restored->getLayerOctaveParam (1);
+
+    test.expect (
+        state.getSize() > 0
+         && restoredOctaveA != nullptr
+         && restoredOctaveB != nullptr
+         && (int) *restoredOctaveA == -4
+         && (int) *restoredOctaveB == 3,
+        "save/load deve preservar oitavas independentes por canal");
 }
 
 void testHotLoadPitchCentresStayOnTargetLayer (
@@ -1877,6 +2506,195 @@ void testPluginLifecycleAndFailureContainment (
     test.expect (
         ! host->isSuspended(),
         "teste deve liberar explicitamente a suspensão externa");
+}
+
+void testInsertMidiMappingRetirementAndCallbackDrain (
+    TestContext& test)
+{
+    constexpr int slot = 0;
+    constexpr int capacity =
+        TimbresProcessor::retainedInsertGenerationCapacityForTest();
+    static_assert (capacity == 8,
+                   "the bounded retirement proof and test must agree");
+
+    auto host = std::make_unique<TimbresProcessor>();
+    host->prepareToPlay (
+        Fixture::sampleRate, Fixture::maximumBlockSize);
+
+    std::array<std::shared_ptr<PluginLifecycleState>, capacity + 2>
+        states;
+    std::array<juce::AudioPluginInstance*, capacity> leased {};
+    for (auto& state : states)
+        state = std::make_shared<PluginLifecycleState>();
+
+    for (int generation = 0; generation < capacity; ++generation)
+    {
+        const bool installed = host->installInsertForTest (
+            slot, std::make_unique<CapturingPlugin> (
+                2, states[(size_t) generation]));
+        leased[(size_t) generation] =
+            host->acquireInsertForMidiMapping (slot);
+        test.expect (
+            installed && leased[(size_t) generation] != nullptr
+             && host->insertMappingReaderCountForTest (
+                    slot, leased[(size_t) generation]) == 1,
+            "each physical insert generation must own one nested-safe lease record");
+    }
+
+    auto* const eighth = host->getInsert (slot);
+    const bool ninthInstalled = host->installInsertForTest (
+        slot, std::make_unique<CapturingPlugin> (
+            2, states[(size_t) capacity]));
+    test.expect (
+        ! ninthInstalled
+         && host->getInsert (slot) == eighth
+         && host->retainedInsertGenerationCountForTest (slot) == capacity
+         && host->retiredInsertGenerationCountForTest (slot)
+                == capacity - 1
+         && states[(size_t) capacity]->prepareCalls == 1
+         && states[(size_t) capacity]->releaseCalls == 1
+         && states[(size_t) capacity]->destructorCalls == 1,
+        "ninth occupied generation must fail before publication and preserve current insert");
+
+    host->releaseInsertForMidiMapping (slot, leased[0]);
+    leased[0] = nullptr;
+    host->serviceRetiredInsertProcessors();
+    test.expect (
+        states[0]->releaseCalls == 1
+         && states[0]->destructorCalls == 1
+         && host->retainedInsertGenerationCountForTest (slot)
+                == capacity - 1,
+        "released generation must be reclaimed exactly once");
+
+    const bool reusedAfterCleanup = host->installInsertForTest (
+        slot, std::make_unique<CapturingPlugin> (
+            2, states[(size_t) capacity + 1]));
+    auto* const reusable = host->getInsert (slot);
+    auto* const nestedFirst =
+        host->acquireInsertForMidiMapping (slot);
+    auto* const nestedSecond =
+        host->acquireInsertForMidiMapping (slot);
+    test.expect (
+        reusedAfterCleanup && reusable != eighth
+         && nestedFirst == reusable && nestedSecond == reusable
+         && host->insertMappingReaderCountForTest (
+                slot, reusable) == 2
+         && host->retainedInsertGenerationCountForTest (slot) == capacity,
+        "cleanup must make the fixed record reusable and nested leases must count depth");
+
+    host->unloadInsert (slot);
+    test.expect (
+        host->getInsert (slot) == nullptr
+         && host->retiredInsertGenerationCountForTest (slot) == capacity
+         && states[(size_t) capacity + 1]->releaseCalls == 0
+         && states[(size_t) capacity + 1]->destructorCalls == 0,
+        "unload at capacity must retire active generation without allocating or destroying early");
+
+    host->releaseInsertForMidiMapping (slot, nestedFirst);
+    host->serviceRetiredInsertProcessors();
+    test.expect (
+        host->insertMappingReaderCountForTest (
+            slot, reusable) == 1
+         && states[(size_t) capacity + 1]->destructorCalls == 0,
+        "first nested release must not reclaim the still-leased generation");
+    host->releaseInsertForMidiMapping (slot, nestedSecond);
+    host->serviceRetiredInsertProcessors();
+    test.expect (
+        states[(size_t) capacity + 1]->releaseCalls == 1
+         && states[(size_t) capacity + 1]->destructorCalls == 1
+         && host->retainedInsertGenerationCountForTest (slot)
+                == capacity - 1,
+        "last nested release must reclaim exactly once without counter underflow");
+
+    for (int generation = 1; generation < capacity; ++generation)
+        host->releaseInsertForMidiMapping (
+            slot, leased[(size_t) generation]);
+    host->serviceRetiredInsertProcessors();
+    bool everyRetiredDestroyedOnce = true;
+    for (int generation = 1; generation < capacity; ++generation)
+        everyRetiredDestroyedOnce = everyRetiredDestroyedOnce
+            && states[(size_t) generation]->releaseCalls == 1
+            && states[(size_t) generation]->destructorCalls == 1;
+    test.expect (
+        everyRetiredDestroyedOnce
+         && host->retainedInsertGenerationCountForTest (slot) == 0
+         && host->retiredInsertGenerationCountForTest (slot) == 0
+         && host->canDestroyWithoutBlockingOnMidiMapping(),
+        "full retirement set did not drain/reuse without leaks or duplicate destruction");
+
+    // Hold a real callback-gate lease on another thread while the message
+    // thread swaps and unloads. Both operations must return without waiting;
+    // listener retirement happens while the old raw pointer is still alive,
+    // and destruction is deferred until the callback exits.
+    ChurchDAWMidiMapping::ParameterCallbackLifetimeGate callbackGate;
+    auto callbackHost = std::make_unique<TimbresProcessor>();
+    callbackHost->setMidiMappingParameterCallbackGate (&callbackGate);
+    callbackHost->prepareToPlay (
+        Fixture::sampleRate, Fixture::maximumBlockSize);
+    auto callbackA = std::make_shared<PluginLifecycleState>();
+    auto callbackB = std::make_shared<PluginLifecycleState>();
+    test.expect (
+        callbackHost->installInsertForTest (
+            slot, std::make_unique<CapturingPlugin> (2, callbackA)),
+        "callback-drain fixture A must install");
+
+    bool retirementRanOnMessageThread = true;
+    bool retirementSawLiveRawPointer = true;
+    int listenerRetireCalls = 0;
+    callbackHost->setInsertParameterListenerWillRetireCallback (
+        [&] (int retiredSlot, juce::AudioPluginInstance*)
+        {
+            retirementRanOnMessageThread = retirementRanOnMessageThread
+                && retiredSlot == slot
+                && juce::MessageManager::getInstance()
+                       ->isThisTheMessageThread();
+            retirementSawLiveRawPointer = retirementSawLiveRawPointer
+                && (listenerRetireCalls == 0
+                        ? callbackA->destructorCalls == 0
+                        : callbackB->destructorCalls == 0);
+            ++listenerRetireCalls;
+        });
+
+    std::atomic<bool> callbackEntered { false };
+    std::atomic<bool> releaseCallback { false };
+    std::thread callbackThread ([&]
+    {
+        auto callbackLease = callbackGate.tryEnter();
+        callbackEntered.store (
+            bool (callbackLease), std::memory_order_release);
+        while (! releaseCallback.load (std::memory_order_acquire))
+            std::this_thread::yield();
+    });
+    while (! callbackEntered.load (std::memory_order_acquire))
+        std::this_thread::yield();
+
+    const bool callbackSwapReturned = callbackHost->installInsertForTest (
+        slot, std::make_unique<CapturingPlugin> (2, callbackB));
+    callbackHost->unloadInsert (slot);
+    test.expect (
+        callbackSwapReturned
+         && callbackHost->getInsert (slot) == nullptr
+         && listenerRetireCalls == 2
+         && retirementRanOnMessageThread
+         && retirementSawLiveRawPointer
+         && callbackA->destructorCalls == 0
+         && callbackB->destructorCalls == 0
+         && ! callbackHost->canDestroyWithoutBlockingOnMidiMapping(),
+        "active callback blocked swap/unload or allowed early destruction/listener teardown");
+
+    releaseCallback.store (true, std::memory_order_release);
+    callbackThread.join();
+    callbackHost->serviceRetiredInsertProcessors();
+    test.expect (
+        callbackGate.isDrained()
+         && callbackA->releaseCalls == 1
+         && callbackA->destructorCalls == 1
+         && callbackB->releaseCalls == 1
+         && callbackB->destructorCalls == 1
+         && callbackHost->canDestroyWithoutBlockingOnMidiMapping(),
+        "callback release/cleanup did not destroy both retired generations exactly once");
+    callbackHost->setInsertParameterListenerWillRetireCallback ({});
+    callbackHost->setMidiMappingParameterCallbackGate (nullptr);
 }
 
 void testTransposeLedgerOverflowFailsClosed (
@@ -2813,10 +3631,59 @@ void testAsyncPluginCreationIsTwoPhaseAndRejectsStale (
 }
 }
 
-int main()
+int main (int argc, char* argv[])
 {
     juce::ScopedJuceInitialiser_GUI juce;
     TestContext test;
+
+    const bool idleAppGraphOnly = argc > 1
+        && juce::String (argv[1]) == "--idle-app-graph-only";
+    if (idleAppGraphOnly)
+    {
+        testDesktopInputStartupPolicy (test);
+        const auto metrics = testIdleAppGraphAndInputIsolation (test);
+
+        if (test.failureCount() != 0)
+        {
+            std::cerr << "APP_IDLE_SILENCE_FAILED "
+                      << test.failureCount()
+                      << " peak=" << metrics.peak
+                      << " rms=" << metrics.rms << '\n';
+            return 1;
+        }
+
+        std::cout << "APP_IDLE_SILENCE_OK"
+                  << " peak=" << metrics.peak
+                  << " rms=" << metrics.rms
+                  << " authorised_input_peak="
+                  << metrics.authorisedInputPeak
+                  << " authorised_input_rms="
+                  << metrics.authorisedInputRms << '\n';
+        return 0;
+    }
+
+    testPadSynthStealsWithDeclick (test);
+    testPadSynthDuplicateNoteOffReleasesOneInstance (test);
+    testPadSynthDisabledEngineStillAdvancesReleases (test);
+    test.expect (
+        PadSynthProcessorTestAccess::
+            reusedFilterCoefficientsMatchReference(),
+        "coeficientes reutilizados do filtro devem ser bit-identicos ao DSP anterior");
+
+    const bool padSynthOnly = argc > 1
+        && juce::String (argv[1]) == "--pad-synth-only";
+    if (padSynthOnly)
+    {
+        if (test.failureCount() != 0)
+        {
+            std::cerr << "PAD_SYNTH_PROCESSOR_FAILED "
+                      << test.failureCount() << '\n';
+            return 1;
+        }
+
+        std::cout << "PAD_SYNTH_PROCESSOR_OK\n";
+        return 0;
+    }
 
     testGlobalSustainBeforeInstallAndReprepare (
         test);
@@ -2838,9 +3705,13 @@ int main()
     testPanic (test);
     testRetriggerDepthAndNextPhraseRecentres (
         test);
+    testPerLayerOctaveRoutingLedgerAndState (
+        test);
     testHotLoadPitchCentresStayOnTargetLayer (
         test);
     testPluginLifecycleAndFailureContainment (
+        test);
+    testInsertMidiMappingRetirementAndCallbackDrain (
         test);
     testAsyncPluginCreationIsTwoPhaseAndRejectsStale (
         test);

@@ -10,7 +10,7 @@
 // No Android quem instala e a Play Store, e o ChurchDAWUpdateBridge.java fixa a
 // regra de ouro do projeto:
 //
-//     "o app nunca baixa nem executa um APK vindo da hospedagem"
+//     "o app nunca baixa nem encaminha um APK vindo da hospedagem"
 //
 // A loja confere a assinatura; o app so PEDE. No desktop nao existe loja, entao
 // esse trabalho volta para nos -- e junto volta o risco que a regra evitava: se
@@ -22,7 +22,8 @@
 //
 //   1) Assinatura RS256 nossa sobre o manifesto -- mesmo esquema, mesmo
 //      algoritmo e MESMA CHAVE que o Android ja usa
-//      (ChurchDAWSignedPolicyVerifier.java, key_id "churchdaw-update-2026-01",
+//      (ChurchDAWSignedPolicyVerifier.java, key_id rotacionado
+//      "churchdaw-update-2026-08" ou anterior "churchdaw-update-2026-01",
 //      RSA-3072, assinatura de 384 bytes sobre os bytes JSON do payload).
 //      A chave privada vive fora do projeto e fora da hospedagem, entao editar
 //      um JSON no servidor nao basta para inventar uma atualizacao obrigatoria.
@@ -50,21 +51,32 @@
 //
 // A TRAVA ANTI-TIJOLO
 // -------------------
-// O Android so arma o portao depois que a Play CONFIRMA existir versao
-// suficiente -- justamente para um numero digitado errado nao inutilizar o
-// aparelho de todo mundo. Aqui vale o mesmo: minimum_version_code sozinho NAO
+// O Android so arma o portao depois que a distribuicao oficial CONFIRMA existir
+// uma versao suficiente -- justamente para um numero digitado errado nao
+// inutilizar o aparelho de todo mundo. Aqui vale o mesmo: minimum_version_code sozinho NAO
 // bloqueia. O portao so arma depois que existe, para ESTA plataforma, um
 // instalador anunciado, baixado, com SHA-256 conferido contra a policy assinada
 // e de versao suficiente. Faltando qualquer elo, o app abre normalmente e
 // apenas avisa. Um erro nosso no servidor jamais pode deixar o comprador sem
 // instrumento no domingo de manha.
 //
-// A assinatura do sistema no instalador continua sendo CONFERIDA, mas deixou de
-// ser exigida -- ver CHURCHDAW_UPDATE_REQUIRE_OS_SIGNATURE abaixo. Assinatura
-// invalida ainda barra; ausencia de assinatura passa, sustentada pelo SHA-256.
+// A assinatura do sistema no instalador e configuravel -- ver
+// CHURCHDAW_UPDATE_REQUIRE_OS_SIGNATURE abaixo. O pipeline comercial Windows
+// compila com 1; somente builds locais/de teste usam 0. Em ambos os modos uma
+// assinatura adulterada continua barrada.
 //==============================================================================
 namespace ChurchDAWDesktopUpdate
 {
+
+#if defined (CHURCHDAW_UPDATE_TEST_STATE_DIR)
+inline juce::File updaterTestStateFile()
+{
+    static const auto stateName = "update-policy-test-" + juce::Uuid().toString() + ".json";
+    return juce::File (juce::String::fromUTF8 (CHURCHDAW_UPDATE_TEST_STATE_DIR))
+        .getChildFile (stateName);
+}
+#endif
+
 
 // Versao desta build como inteiro comparavel. Vem do CMake
 // (CHURCHDAW_VERSION_CODE = maior*10000 + menor*100 + correcao), portanto
@@ -77,6 +89,7 @@ namespace ChurchDAWDesktopUpdate
 #endif
 
 inline constexpr const char* policyKeyId      = "churchdaw-update-2026-01";
+inline constexpr const char* policyKeyIdCurrent = "churchdaw-update-2026-08";
 inline constexpr const char* policyAlgorithm  = "SHA256withRSA";
 inline constexpr const char* productId        = "com.churchdaw.app";
 
@@ -88,11 +101,9 @@ inline constexpr const char* requiredHostSuffix = "churchdaw.com";
 
 // ASSINATURA DO SISTEMA NO INSTALADOR: EXIGIDA OU APENAS CONFERIDA?
 // -----------------------------------------------------------------
-// A distribuicao do ChurchDAW e direta pelo churchdaw.com, sem certificado de
-// assinatura de codigo. Exigir Authenticode/Gatekeeper aqui tornava a
-// atualizacao obrigatoria impossivel: o app baixava, conferia o SHA-256, e
-// entao recusava o proprio instalador -- o comprador ficava travado sem poder
-// atualizar, que e exatamente o tijolo que este arquivo existe para evitar.
+// Releases comerciais precisam compilar com 1 e usar certificado publico de
+// assinatura de codigo. O CMake deixa 0 como padrao apenas para desenvolvimento
+// local, onde nao ha uma identidade comercial disponivel.
 //
 // Com 0, o elo que continua OBRIGATORIO e o forte: a policy assinada em
 // RSA-3072 (chave privada fora desta maquina) carrega o SHA-256 dos bytes
@@ -182,6 +193,11 @@ bool verifyUpdateRs256Signature (const juce::MemoryBlock& message,
                                  const juce::MemoryBlock& signature,
                                  juce::String& error);
 
+bool verifyUpdateRs256Signature (const juce::MemoryBlock& message,
+                                 const juce::MemoryBlock& signature,
+                                 const juce::String& keyId,
+                                 juce::String& error);
+
 // Verifica um envelope assinado no formato Base64 usado pelo Android
 // (payload + assinatura + key_id).
 //
@@ -197,6 +213,10 @@ bool verifySignedPolicyEnvelope (const juce::String& payloadBase64,
 bool parseSignedPolicy (const juce::String& envelopeJson,
                         Policy& policy,
                         juce::String& error);
+
+// Converte o formato IMF-fixdate usado pelo cabecalho HTTP Date, por exemplo
+// "Sat, 15 Aug 2026 12:34:56 GMT". Zero significa formato/valor rejeitado.
+juce::int64 parseHttpDateEpochSeconds (const juce::String& value);
 
 // Decide o que fazer com uma policy JA validada. Funcao pura -- sem rede, sem
 // relogio, sem disco -- para a regra anti-tijolo poder ser testada direto.
@@ -230,6 +250,8 @@ void rememberInstallerWasRun (const juce::String& installerSha256);
 // Entrega o instalador ao sistema. NAO instalamos por conta propria: quem
 // escreve em Program Files ou em /Applications e o instalador assinado, usando
 // a elevacao de privilegio do proprio sistema.
+juce::StringArray macGatekeeperAssessmentCommand (const juce::File& installer);
+
 bool launchInstaller (const juce::File& installer, juce::String& error);
 
 // O portao obrigatorio pode ser IMPOSTO agora? Falso durante apresentacao.

@@ -58,7 +58,7 @@ public:
                                   u8"Uma nova versão é necessária para continuar.");
         detail = reason + "\n"
                + juce::String::fromUTF8 (
-                   u8"O APK assinado será aberto no site oficial; confirme a instalação no Android para continuar.");
+                   u8"O APK assinado será aberto no churchdaw.com; instalações feitas pela loja usam a ficha oficial.");
         footnote = "v" + juce::String (ChurchDAWServices::currentVersionName)
                  + "  ->  v" + activeUpdatePolicy.latestVersionName;
         progress = 0.0f;
@@ -69,8 +69,8 @@ public:
             if (auto* self = safe.getComponent())
             {
                 self->detail = juce::String::fromUTF8 (
-                    u8"Abrindo o APK assinado no churchdaw.com. "
-                    u8"Depois do download, confirme a instalação exibida pelo Android.");
+                    u8"Abrindo a atualização oficial. No APK do churchdaw.com, "
+                    u8"confirme a instalação exibida pelo Android.");
                 self->primaryButton.setButtonText (
                     juce::String::fromUTF8 (u8"Abrindo atualização..."));
                 self->primaryButton.setEnabled (false);
@@ -95,8 +95,8 @@ public:
                         if (auto* current = safe.getComponent())
                         {
                             current->detail = juce::String::fromUTF8 (
-                                u8"A instalação ainda não foi concluída. Baixe o APK no site oficial, "
-                                u8"confirme no Android e abra o ChurchDAW novamente.");
+                                u8"A instalação ainda não foi concluída. Confirme a atualização no Android "
+                                u8"e abra o ChurchDAW novamente.");
                             current->primaryButton.setButtonText ("Tentar novamente");
                             current->primaryButton.setEnabled (true);
                             current->repaint();
@@ -123,7 +123,7 @@ public:
                                   u8"H\u00e1 uma nova vers\u00e3o dispon\u00edvel para seu aparelho.");
         detail = reason + "\n"
                + juce::String::fromUTF8 (
-                   u8"Voc\u00ea pode atualizar agora pelo site oficial ou continuar normalmente.");
+                   u8"Voc\u00ea pode atualizar agora pela distribui\u00e7\u00e3o oficial ou continuar normalmente.");
         footnote = "v" + juce::String (ChurchDAWServices::currentVersionName)
                  + "  ->  v" + activeUpdatePolicy.latestVersionName;
         progress = 0.0f;
@@ -134,7 +134,7 @@ public:
         {
             if (auto* self = safe.getComponent())
             {
-                if (! ChurchDAWServices::isSafeWebsiteUpdateUrl (
+                if (! ChurchDAWServices::isSafeAndroidUpdateUrl (
                         self->activeUpdatePolicy.playStoreUrl))
                 {
                     self->detail = juce::String::fromUTF8 (
@@ -146,7 +146,7 @@ public:
                 }
 
                 self->detail = juce::String::fromUTF8 (
-                    u8"Abrindo a atualiza\u00e7\u00e3o assinada no churchdaw.com. "
+                    u8"Abrindo a atualiza\u00e7\u00e3o assinada no churchdaw.com ou na loja oficial. "
                     u8"Se preferir instalar depois, volte e toque em Depois.");
                 self->primaryButton.setButtonText (
                     juce::String::fromUTF8 (u8"Abrindo atualiza\u00e7\u00e3o..."));
@@ -203,7 +203,7 @@ public:
         eyebrow = juce::String::fromUTF8 (u8"PRIMEIRA CONFIGURAÇÃO");
 
         const bool offlineCultoStarter = starterPack != nullptr
-            && (starterPack->id.equalsIgnoreCase ("pad-continuo")
+            && (ChurchDAWServices::isPadContinuoPackId (starterPack->id)
                 || starterPack->id.equalsIgnoreCase ("culto-offline")
                 || starterPack->id.equalsIgnoreCase ("culto-offline-v1"));
 

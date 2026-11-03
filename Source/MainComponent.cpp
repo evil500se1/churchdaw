@@ -1,6 +1,22 @@
 #include "MainComponent.h"
+#include "Studio/StudioPanel.h"
+#if JUCE_IOS || JUCE_ANDROID
+static constexpr bool churchstudioMobileHeader = true;
+#else
+static constexpr bool churchstudioMobileHeader = false;
+#endif
 #include "NordLookAndFeel.h"
+#include "ChurchDAWArtwork.h"
+#include "DesktopHeaderLayout.h"
+#include "PluginGalleryLayout.h"
+#include "PluginProductIdentity.h"
+#include "PluginPreviewLifecycle.h"
+#include "GuardedAudioDeviceSelector.h"
+#include "PluginCandidateSearch.h"
 #include "TimbresProcessor.h"
+#include "PadSynthProcessor.h"
+#include "PadEditorPanel.h"
+#include "PerformanceSessionPanel.h"
 #include "ChordDetect.h"
 #include "AboutPanel.h"
 #include "LibraryPanel.h"
@@ -8,9 +24,19 @@
 #include "AndroidCultoConnectivity.h"
 #if JUCE_ANDROID
  #include "AndroidAudioMidiCenter.h"
+ #include "AndroidPerformance.h"
+ #include <unistd.h>
+#endif
+#if JUCE_ANDROID || JUCE_IOS
+ #include "MobileAudioBufferPolicy.h"
 #endif
 #include "UiProfiler.h"
 #include "BinaryData.h"
+
+#include <cmath>
+
+static_assert (TimbresProcessor::numInserts == 2,
+               "MainComponent insert identity cache must cover every insert");
 
 // Instrumentos internos (sampler de timbres). Os rotulos sao os da CASA: os
 // acervos de origem nao aparecem na interface -- e clausula do acordo com o
@@ -24,6 +50,20 @@ static const char* const timbresLabels[numInternalLibs] = {
     "Church Live 2 (nativo)",
     "Church Live 3 - Pads (nativo)",
     "Church Live 4 (nativo)" };
+
+// Handshake de vida entre a thread de MIDI e a message thread. A thread de MIDI
+// resolve o TimbresProcessor por ponteiro cru (slots[i].proc.load() dentro de
+// getChurchLive) e chama metodos nele (getForcedMidiChannelForDevice); o atomic
+// so ordena a leitura do ponteiro, nao o tempo de vida do objeto. Sem este lock,
+// unloadSlot/ troca de slot destroem o processador em paralelo e a thread de
+// MIDI desreferencia memoria liberada — crash ao trocar o som do slot 0 com o
+// teclado ainda mandando notas (pedal, aftertouch, active sensing). A thread de
+// MIDI pega o lock no roteamento de canal de handleIncomingMidiMessage;
+// unloadSlot e a troca assincrona pegam o mesmo lock antes de graph.removeNode,
+// garantindo que nenhum callback de MIDI esteja dentro do trecho critico.
+// CriticalSection e reentrante e so e disputado numa troca de slot (gesto
+// manual, nao no meio de tocar) — bloqueio breve e aceitavel frente ao crash.
+namespace { juce::CriticalSection liveHandshakeLock; }
 
 #if JUCE_ANDROID
 static bool isProbablyRunningOnAndroidEmulator()
@@ -202,12 +242,26 @@ public:
                           DocumentWindow::minimiseButton | DocumentWindow::closeButton),
           closedCallback (std::move (onClosed))
     {
-        setUsingNativeTitleBar (true);
+        setUsingNativeTitleBar (false);
+        setTitleBarHeight (30);
+        setTitleBarTextCentred (false);
 
+        // Sem setResizable a janela nasce travada no tamanho que o plugin pede —
+        // um VSTi alto (Kontakt ~1000x750) ficava com o rodape fora da tela e
+        // sem como encolher. Respeita o flag do editor do plugin quando ele
+        // existe; o editor generico e sempre redimensionavel.
         if (auto* editor = node->getProcessor()->createEditorIfNeeded())
+        {
             setContentOwned (editor, true);
+            setResizable (editor->isResizable(), false);
+            setResizeLimits (200, 150, 3840, 2160);
+        }
         else
+        {
             setContentOwned (new juce::GenericAudioProcessorEditor (*node->getProcessor()), true);
+            setResizable (true, false);
+            setResizeLimits (200, 150, 2560, 1600);
+        }
 
         setVisible (true);
         toFront (true);
@@ -232,11 +286,21 @@ private:
 };
 
 //==============================================================================
-MainComponent::MainComponent()
+MainComponent::MainComponent (
+    bool safeModeToUse,
+    ChurchDAWMidiMapping::DeferredOwnerTeardownGate*
+        ownerTeardownGateToUse)
+    : safeMode (safeModeToUse),
+      ownerTeardownGate (ownerTeardownGateToUse),
+      midiLearnTouchTimer (*this)
 {
     setOpaque (true);
 
-   #if JUCE_ANDROID || JUCE_IOS
+    if (safeMode)
+        juce::Logger::writeToLog (
+            "SAFE_MODE: ChurchDAW iniciou sem restaurar plugins de terceiros");
+
+   #if JUCE_ANDROID
     // Liga o desenho pela GPU antes de qualquer componente existir, para nenhum
     // quadro chegar a passar pelo caminho de software. continuousRepainting
     // fica DESLIGADO de proposito: quem manda redesenhar continuam sendo os
@@ -283,21 +347,49 @@ MainComponent::MainComponent()
     options.filenameSuffix = "settings";
     options.folderName = "ChurchDAW";
     options.osxLibrarySubFolder = "Application Support";
+
+    // O Windows resolve userApplicationDataDirectory pela Known Folder API,
+    // portanto trocar APPDATA no processo nao isola os arquivos do JUCE. Este
+    // override explicito e usado apenas pelos testes manuais/automatizados de
+    // QA para que cenas, mapeamentos e a cadeia nunca encostem no perfil real.
+    const auto qaSettingsDir = juce::SystemStats::getEnvironmentVariable (
+                                   "CHURCHDAW_QA_SETTINGS_DIR", {})
+                                   .trim();
+    if (qaSettingsDir.isNotEmpty()
+        && juce::File::isAbsolutePath (qaSettingsDir))
+    {
+        options.folderName = qaSettingsDir;
+        juce::Logger::writeToLog ("QA: configuracoes isoladas em "
+                                  + qaSettingsDir);
+    }
+
     appProperties.setStorageParameters (options);
+    launchkeyMappingEnabled = appProperties.getUserSettings()->getBoolValue (
+        "launchkeyMappingEnabled", true);
 
    #if CHURCHDAW_HOSTS_PLUGINS
+    if (! safeMode)
+    {
     juce::addDefaultFormatsToManager (formatManager);
 
+   #if ! JUCE_IOS
     // Cada plugin e aberto num processo filho. Um VST que trava (o "Piano
     // V3" no Mac do cliente, 31/07) derruba so o filho: a varredura marca
     // aquele arquivo e continua, em vez de fechar o ChurchDAW no meio.
+    //
+    // No iOS NAO ha processo filho — e nao precisa: AUv3 roda em extensao
+    // isolada por desenho da Apple, entao o scan in-process ja e seguro.
     knownPlugins.setCustomScanner (
         std::make_unique<ChurchDAWPluginScan::ChurchDAWPluginScanner>());
+   #endif
 
     if (auto xml = appProperties.getUserSettings()->getXmlValue ("pluginList"))
         knownPlugins.recreateFromXml (*xml);
 
     auto* pluginSettings = appProperties.getUserSettings();
+    const int migratedPluginRoles =
+        ChurchDAWPluginScan::normalizarPapeisDaListaConhecida (
+            knownPlugins);
     const auto deadMansPedal = pluginSettings->getFile()
                                    .getSiblingFile ("PluginsComProblema.txt");
 
@@ -310,11 +402,15 @@ MainComponent::MainComponent()
     const bool policyDeadMansWriteOk = migratedDeadMansResult >= 0;
     const int migratedDeadMans = juce::jmax (0, migratedDeadMansResult);
 
-    if (migratedBlacklist > 0)
+    if (migratedBlacklist > 0 || migratedPluginRoles > 0)
     {
         if (auto migratedXml = knownPlugins.createXml())
             pluginSettings->setValue ("pluginList", migratedXml.get());
     }
+
+    // BigSky follows the same isolated scan/quarantine policy as every AU.
+    // Probing it here instantiated third-party code on the startup message
+    // thread, before the saved blacklist/dead-man barrier had been restored.
 
     // Blacklists anteriores misturavam crash real com arquitetura, licenca,
     // timeout e falha do host. NAO a libera no startup: um tipo crashante
@@ -449,15 +545,18 @@ MainComponent::MainComponent()
     pluginSettings->saveIfNeeded();
 
     if (legacyBlacklistCount > 0 || legacyDeadMansCount > 0
-         || migratedBlacklist > 0 || migratedDeadMans > 0)
+         || migratedBlacklist > 0 || migratedDeadMans > 0
+         || migratedPluginRoles > 0)
         juce::Logger::writeToLog (
             "PLUGIN_SCAN legacy_blacklist_pending retry="
             + juce::String (legacyBlacklistCount)
             + " legacy_dead_mans=" + juce::String (legacyDeadMansCount)
             + " policy_blacklist=" + juce::String (migratedBlacklist)
-            + " policy_dead_mans=" + juce::String (migratedDeadMans));
+            + " policy_dead_mans=" + juce::String (migratedDeadMans)
+            + " role_migrations=" + juce::String (migratedPluginRoles));
 
     knownPlugins.addChangeListener (this);
+    }
    #endif
     // No celular o formatManager fica sem formato nenhum de proposito. O resto
     // do codigo continua consultando knownPlugins normalmente -- ela so responde
@@ -477,6 +576,13 @@ MainComponent::MainComponent()
     }
 
     {
+        auto sabrinaNodePtr = graph.addNode (std::make_unique<SabrinaProcessor>());
+        sabrinaNode = sabrinaNodePtr->nodeID;
+        sabrinaProcessor = static_cast<SabrinaProcessor*> (sabrinaNodePtr->getProcessor());
+        sabrinaProcessor->setSabrinaBypassed (! sabrinaEnabled);
+    }
+
+    {
         auto padNodePtr = graph.addNode (std::make_unique<PadProcessor>());
         padNode = padNodePtr->nodeID;
         padProcessor = static_cast<PadProcessor*> (padNodePtr->getProcessor());
@@ -490,9 +596,53 @@ MainComponent::MainComponent()
         padProcessor->juce::AudioProcessor::addListener (this);
     }
 
+    {
+        auto padSynthNodePtr = graph.addNode (
+            std::make_unique<PadSynthProcessor>());
+        padSynthNode = padSynthNodePtr->nodeID;
+        padSynthProcessor = static_cast<PadSynthProcessor*> (
+            padSynthNodePtr->getProcessor());
+        padSynthProcessor->addListener (this);
+    }
+
+    // Os quatro knobs da barra lateral parecem parte da referencia e agora
+    // sao os mesmos parametros reais usados em Performance/PAD Editor.
+    {
+        const std::array<juce::AudioParameterFloat*, 4> macroParameters {
+            padSynthProcessor->macroAmbience, padSynthProcessor->macroReverb,
+            padSynthProcessor->macroDelay, padSynthProcessor->macroMaster
+        };
+        static constexpr const char* macroNames[] {
+            "Ambi\xc3\xaancia", "Reverb", "Delay", "Master"
+        };
+        for (int i = 0; i < 4; ++i)
+        {
+            auto& slider = desktopMacroSliders[(size_t) i];
+            slider.setSliderStyle (juce::Slider::RotaryHorizontalVerticalDrag);
+            slider.setTextBoxStyle (juce::Slider::NoTextBox, false, 0, 0);
+            slider.setRange (0.0, 1.0, 0.001);
+            slider.setDoubleClickReturnValue (true, 0.5);
+            slider.setColour (juce::Slider::rotarySliderFillColourId,
+                              NordLookAndFeel::nordRedBright());
+            slider.setColour (juce::Slider::rotarySliderOutlineColourId,
+                              juce::Colour (0xff343a44));
+            slider.setMouseCursor (juce::MouseCursor::PointingHandCursor);
+            slider.setTooltip (juce::String::fromUTF8 (macroNames[i]));
+            addChildComponent (slider);
+            desktopMacroAttachments[(size_t) i] =
+                std::make_unique<juce::SliderParameterAttachment> (
+                    *macroParameters[(size_t) i], slider);
+            ChurchDAWMidiLearnTarget::tag (
+                slider, *padSynthProcessor, *macroParameters[(size_t) i]);
+        }
+    }
+
     player.setProcessor (&graph);
 
-    auto savedAudio = appProperties.getUserSettings()->getXmlValue ("audioSetup");
+   #if ! CHURCHDAW_UI_PREVIEW
+    auto savedAudio = safeMode
+        ? std::unique_ptr<juce::XmlElement>()
+        : appProperties.getUserSettings()->getXmlValue ("audioSetup");
 
     // ZERO canais de ENTRADA no celular, e nao e economia: e o que faz haver som.
     //
@@ -505,15 +655,60 @@ MainComponent::MainComponent()
     // ao comprador uma permissao que o app nao usa -- alem de assustar, e o tipo
     // de coisa que faz a Play Store barrar.
    #if JUCE_ANDROID || JUCE_IOS
+    const bool initialAudioInputEnabled = false;
     const int numInputs = 0;
    #else
-    // No desktop a entrada e opcional e so entra no graph quando o usuario liga
-    // "Entrada de audio (guitarra/mic)" no painel Audio/MIDI.
-    const int numInputs = 2;
+    // Nao basta desconectar o node do grafo: abrir duas entradas no ASIO4ALL
+    // pode ativar monitoramento direto no driver/interface, fora do ChurchDAW,
+    // e produzir microfonia mesmo com o master digital em silencio. Abra canais
+    // fisicos somente quando o setup salvo pediu explicitamente a entrada.
+    const auto savedChainForAudio = safeMode
+        ? std::unique_ptr<juce::XmlElement>()
+        : appProperties.getUserSettings()->getXmlValue ("chain");
+    const bool initialAudioInputEnabled =
+        ChurchDAWAudioInputPolicy::isExplicitlyAuthorised (
+            savedChainForAudio.get());
+    const int numInputs = initialAudioInputEnabled ? 2 : 0;
    #endif
+
+    audioInputAuthorised.store (initialAudioInputEnabled,
+                                std::memory_order_release);
+    ChurchDAWAudioInputPolicy::applyToSavedSetup (
+        savedAudio.get(), initialAudioInputEnabled);
 
     const auto audioInitialiseError =
         deviceManager.initialise (numInputs, 2, savedAudio.get(), true);
+
+   #if ! JUCE_ANDROID && ! JUCE_IOS
+    // Cinto e suspensorio: alguns drivers normalizam o setup durante open().
+    // Reaplique a politica ao estado REAL antes de registrar o callback.
+    const bool startupInputPolicyOk = reconcileAudioInputPolicy();
+    const auto startupSetup = deviceManager.getAudioDeviceSetup();
+    const auto* startupDevice = deviceManager.getCurrentAudioDevice();
+
+   #if JUCE_WINDOWS || JUCE_MAC
+    // Sinal para a promocao: sem device aberto nao ha o que promover.
+    if (audioInitialiseError.isEmpty() && startupDevice != nullptr)
+        appProperties.getUserSettings()->setValue ("audioSetupHealthy", 1);
+    else
+        appProperties.getUserSettings()->setValue ("audioSetupHealthy", 0);
+   #endif
+    const int startupActiveInputs = startupDevice != nullptr
+        ? startupDevice->getActiveInputChannels().countNumberOfSetBits()
+        : 0;
+    juce::Logger::writeToLog (
+        "AUDIO_STARTUP input_authorised="
+        + juce::String (initialAudioInputEnabled ? 1 : 0)
+        + " setup_inputs="
+        + juce::String (startupSetup.inputChannels.countNumberOfSetBits())
+        + " active_inputs=" + juce::String (startupActiveInputs)
+        + " callback_input_forwarding="
+        + juce::String (initialAudioInputEnabled ? 1 : 0)
+        + " policy_ok=" + juce::String (startupInputPolicyOk ? 1 : 0)
+        + (audioInitialiseError.isEmpty()
+               ? juce::String()
+               : " initialise_error=\"" + audioInitialiseError + "\""));
+   #endif
 
    #if JUCE_IOS
     if (audioInitialiseError.isNotEmpty())
@@ -567,19 +762,13 @@ MainComponent::MainComponent()
                         ? deviceManager.getCurrentAudioDevice() : nullptr)
     {
         const auto sizes = dev->getAvailableBufferSizes();
+       #if JUCE_ANDROID || JUCE_IOS
+        androidAvailableBufferSizes = sizes;
+       #endif
         const auto rate  = dev->getCurrentSampleRate() > 0.0 ? dev->getCurrentSampleRate() : 48000.0;
 
-        int chosen = 0;
-
-        for (const auto s : sizes)
-            if (((double) s / rate) * 1000.0 >= 12.0)
-            {
-                chosen = s;
-                break;
-            }
-
-        if (chosen == 0 && ! sizes.isEmpty())
-            chosen = sizes.getLast();      // aparelho so oferece buffers curtos
+        const int chosen = ChurchDAWMobileAudio::chooseClosestBufferForTargetMs (
+            sizes.getRawDataPointer(), sizes.size(), rate, 12.0);
 
         if (auto setup = deviceManager.getAudioDeviceSetup();
             chosen > 0 && setup.bufferSize != chosen)
@@ -598,13 +787,146 @@ MainComponent::MainComponent()
         }
     }
    #endif
-    deviceManager.addAudioCallback (&player);
+
+   #if ! (JUCE_ANDROID || JUCE_IOS)
+    // Desktop: na primeira abertura (sem buffer salvo) o JUCE cai no WASAPI
+    // compartilhado, que oferece um UNICO tamanho de buffer e ainda soma o
+    // buffer do mixer do sistema — atraso que o tecladista sente e o painel
+    // Audio/MIDI nao deixa reduzir. Se ha ASIO (ou Windows Audio em modo Low
+    // Latency, que monta lista real de buffers), preferimos esse tipo e
+    // aplicamos o mesmo piso de ~10 ms do mobile. So vale como PADRAO DE
+    // PRIMEIRA ABERTURA; escolha salva do usuario nunca e tocada — todo o
+    // scan/corre aqui acontece ANTES de addAudioCallback, fora do caminho de
+    // audio. setCurrentAudioDeviceType reabre o driver, entao so fazemos isso
+    // quando ainda nao existe buffer persistido.
+    //
+    // "Ja tentei o ajuste" e "tenho buffer salvo" sao coisas DIFERENTES: se o
+    // driver preferido nao abrir, nada e persistido e o bloco repetiria em toda
+    // abertura, forcando ASIO por cima da escolha que o musico fez depois. Por
+    // isso a marca propria e gravada ANTES de qualquer troca, e o tipo
+    // anterior volta quando o preferido nao abre nenhum dispositivo.
+    tuneDesktopFirstRunAudio();
+   #endif
+    // MainComponent e a barreira entre o driver e o AudioProcessorPlayer: alem
+    // de medir a saida final, nunca encaminha ponteiros de entrada sem a
+    // autorizacao persistida pelo toggle de guitarra/mic.
+    deviceManager.addAudioCallback (this);
     deviceManager.addChangeListener (this);
+   #endif
 
     masterProcessor->addChangeListener (this);   // sincroniza o fader com o Church Live
     masterProcessor->addListener (this);         // MIDI Learn do master por parametro
 
-    // Habilita os dispositivos MIDI conectados, MENOS a porta DAW do Launchkey.
+    midiMapFileLock =
+        std::make_unique<ChurchDAWMidiMapping::MidiMapPairFileLock> (
+            arquivoDoMapaDeCCs(), arquivoDoMapaDeNotas());
+
+    // Recovery, both restores and the loaded revision are one indivisible
+    // startup snapshot. Without this outer lock, another ChurchDAW process
+    // could save between CC and note restore and this instance would combine
+    // two different generations before its first screen was shown.
+    {
+        ChurchDAWMidiMapping::MidiMapPairFileLock::ScopedAccess startupAccess (
+            *midiMapFileLock, 5000);
+        if (! startupAccess.isLocked())
+        {
+            midiMapPairRecoveryFailed = true;
+            juce::Logger::writeToLog (
+                "MIDI MAP: nao foi possivel obter snapshot exclusivo de inicializacao");
+        }
+        else
+        {
+            if (exigirQuartetoMidiInspecionavel ("startup antes do journal"))
+            {
+                midiMapPairRecoveryFailed =
+                    ! ChurchDAWMidiMapping::MidiMapPairRollback::recoverPendingTransaction (
+                        arquivoDoMapaDeCCs(), arquivoDoMapaDeNotas(),
+                        *midiMapFileLock);
+            }
+
+            if (! midiMapPairRecoveryFailed)
+                (void) exigirQuartetoMidiInspecionavel (
+                    "startup depois do journal");
+
+            if (! midiMapPairRecoveryFailed
+                 && ChurchDAWMidiMapping::midiMapPairHasFutureSchema (
+                        arquivoDoMapaDeCCs(), arquivoDoMapaDeNotas()))
+            {
+                // Future ownership is pair-wide. Do not repair/load the older
+                // half while the opposite half belongs to a newer ChurchDAW.
+                esquemaDeCCsDesconhecido = true;
+                esquemaDeNotasDesconhecido = true;
+                midiMapPairRecoveryFailed = true;
+                juce::Logger::writeToLog (
+                    "MIDI MAP: schema futuro detectado no par; ambos restores bloqueados");
+            }
+
+            if (! midiMapPairRecoveryFailed)
+            {
+                // Restaura antes de qualquer discovery. O cache de devices
+                // continua vazio; o refresh posterior faz rekey/perfis.
+                restoreMidiMap();
+                if (! midiMapPairRecoveryFailed)
+                {
+                    midiMapLifecycle.ccLoaded = true;
+                    restoreNoteMap();
+                }
+                if (! midiMapPairRecoveryFailed)
+                {
+                    midiMapLifecycle.noteLoaded = true;
+                    if (! midiMapDiskRevision.refresh (
+                            arquivoDoMapaDeCCs(), arquivoDoMapaDeNotas()))
+                        midiMapPairRecoveryFailed = true;
+                    else
+                        midiMapsLoaded = true;
+                }
+            }
+        }
+    }
+
+    if (midiMapPairRecoveryFailed)
+    {
+        midiMapPersistenceError.store (true, std::memory_order_release);
+        juce::Logger::writeToLog (
+            "MIDI MAP: snapshot/journal do par invalido; gravacao suspensa para proteger os mapas");
+    }
+
+    {
+        const juce::ScopedLock sl (mapLock);
+        const bool noteConflict =
+            ChurchDAWMidiMapping::midiMapCollectionsHaveConflictingNoteControls (
+                ccMappings, noteMappings);
+        const bool ccConflict =
+            ChurchDAWMidiMapping::midiMapCollectionsHaveConflictingCCControls (
+                ccMappings, ccActionMappings,
+                [] (const AcaoDeCC& action)
+                {
+                    return action.acao.kind != NoteActionKind::none;
+                });
+        if (noteConflict || ccConflict)
+        {
+            automaticControllerProfilesSuspended = true;
+            juce::Logger::writeToLog (
+                "MIDI MAP: conflito nota/comando detectado; mapas comuns suspensos, "
+                "mas Limpar/Importar continuam disponiveis para reparar");
+        }
+    }
+
+    if (pendingLegacyCCMigration && saveMidiMap())
+    {
+        // saveMidiMap only returns true after primary + last-good were both
+        // validated under the pair's interprocess lock.
+        appProperties.getUserSettings()->removeValue ("midiMap");
+        pendingLegacyCCMigration = false;
+    }
+    if (pendingLegacyNoteMigration && saveNoteMap())
+    {
+        appProperties.getUserSettings()->removeValue ("midiNoteMap");
+        pendingLegacyNoteMigration = false;
+    }
+
+    // Habilita os dispositivos MIDI conectados, MENOS a porta DAW do Launchkey
+    // quando o mapeamento automatico estiver ligado.
     //
     // Ela nao e um teclado: em modo DAW carrega pads e controles de superficie.
     // Deixando ela entrar como MIDI comum, apertar um pad tocava uma NOTA no
@@ -612,6 +934,7 @@ MainComponent::MainComponent()
     // deviceManager segurando a porta o LaunchkeyControl nao conseguia abri-la e
     // os faders/knobs/pads nem chegavam ao mapeamento.
     refreshMidiInputs();
+    rebuildControllerRoutesIfNeeded (true);
 
     // ... E DE NOVO SEMPRE QUE A LISTA MUDAR.
     //
@@ -625,15 +948,21 @@ MainComponent::MainComponent()
     // No Windows isso nunca apareceu porque a lista ja esta pronta na largada.
     // O ganho vale para o PC tambem: plugar o teclado com o app ABERTO passa a
     // funcionar sozinho, sem reiniciar.
+   #if ! CHURCHDAW_UI_PREVIEW
     const auto safeThis = juce::Component::SafePointer<MainComponent> (this);
-    midiListConnection = juce::MidiDeviceListConnection::make ([safeThis]
+    const auto midiLifetime = midiCallbackLifetime;
+    midiListConnection = juce::MidiDeviceListConnection::make ([safeThis, midiLifetime]
     {
-        juce::MessageManager::callAsync ([safeThis]
+        if (! midiLifetime->load())
+            return;
+        juce::MessageManager::callAsync ([safeThis, midiLifetime]
         {
-            if (auto* c = safeThis.getComponent())
+            if (midiLifetime->load())
+                if (auto* c = safeThis.getComponent())
                 c->refreshMidiInputs();
         });
     });
+   #endif
 
     // O MainComponent e o UNICO destinatario do MIDI, e repassa ao player.
     //
@@ -646,8 +975,6 @@ MainComponent::MainComponent()
     // AudioProcessorPlayer::handleIncomingMidiMessage so enfileira no
     // getMidiMessageCollector(), que continua publico e sendo esvaziado
     // pelo player, que segue registrado como callback de AUDIO.
-    restoreMidiMap();
-    restoreNoteMap();
     restaurarCenas();
 
     liveScenePanel.onCarregarCena = [this] (int i)
@@ -675,16 +1002,55 @@ MainComponent::MainComponent()
     liveButton.setWantsKeyboardFocus (false);
     liveButton.setClickingTogglesState (true);
     liveButton.setColour (juce::TextButton::buttonColourId, juce::Colours::transparentBlack);
-    liveButton.setColour (juce::TextButton::buttonOnColourId, NordLookAndFeel::nordRed());
+    // Live e um modo de trabalho; o vermelho fica reservado para a pagina
+    // principal Instrumentos. O azul-teal evita dois botoes parecendo ativos
+    // iguais e diferencia navegacao de estado de emergencia/gravacao.
+    liveButton.setColour (juce::TextButton::buttonOnColourId, juce::Colour (0xff3b6f8e));
     liveButton.setColour (juce::TextButton::textColourOffId, juce::Colours::white.withAlpha (0.88f));
     liveButton.setColour (juce::TextButton::textColourOnId, juce::Colours::white);
+    liveButton.setTooltip ("Abrir ou fechar o modo Live de cenas");
     liveButton.onClick = [this]
     {
         const bool aberto = liveButton.getToggleState();
 
+       #if ! JUCE_ANDROID && ! JUCE_IOS
+        // No shell desktop da referencia, LIVE e uma pagina principal (com
+        // MIXER / PERFORMANCE / SESSAO logo abaixo), nao o painel legado de
+        // dez botoes que ocupava a faixa de programa. As cenas ja vivem na
+        // sidebar fixa; manter os dois lugares repetia informacao e escondia a
+        // subnavegacao nova. Em layouts menores conservamos o fluxo touch
+        // antigo, onde essa faixa ainda e o seletor de cenas adequado.
+        if (desktopReferenceLayout)
+        {
+            liveScenePanel.setVisible (false);
+
+            if (mapButton.getToggleState() || midiLearnActive.load())
+                finishMidiLearn (true);
+            if (padEditorVisible)
+                closePadEditor();
+
+            showDesktopWorkspace (DesktopWorkspace::mixer);
+            oled.setVisible (false);
+
+            if ((! dockedNative || dockedEditor == nullptr) && slots[0].nodeID.uid != 0)
+                openEditorForSlot (0);
+
+            liveButton.setToggleState (true, juce::dontSendNotification);
+            resized();
+            repaint();
+            return;
+        }
+       #endif
+
+        if (aberto && desktopWorkspace != DesktopWorkspace::mixer)
+            showDesktopWorkspace (DesktopWorkspace::mixer);
+
+        if (aberto && padEditorVisible)
+            closePadEditor();
+
         // Nunca com o aprendizado ligado: os dois disputam a mesma faixa.
-        if (aberto && mapButton.getToggleState())
-            mapButton.setToggleState (false, juce::sendNotificationSync);
+        if (aberto && (mapButton.getToggleState() || midiLearnActive.load()))
+            finishMidiLearn (true);
 
         liveScenePanel.setVisible (aberto);
         oled.setVisible (! aberto && ! mapButton.getToggleState());
@@ -698,6 +1064,21 @@ MainComponent::MainComponent()
         resized();
     };
     addAndMakeVisible (liveButton);
+
+    for (auto* button : { &undoMixButton, &redoMixButton })
+    {
+        button->setColour (juce::TextButton::buttonColourId, juce::Colour (0xff191d24));
+        button->setColour (juce::TextButton::textColourOffId, NordLookAndFeel::txtSecondary());
+        addChildComponent (*button);
+    }
+    undoMixButton.setButtonText ("Desfazer");
+    redoMixButton.setButtonText ("Refazer");
+    undoMixButton.setTooltip ("Desfazer o ultimo ajuste de canal");
+    redoMixButton.setTooltip ("Refazer ajuste de canal");
+    undoMixButton.onClick = [this]
+    { if (auto* editor = dynamic_cast<TimbresEditor*> (dockedEditor.get())) editor->undoParameterEdit(); };
+    redoMixButton.onClick = [this]
+    { if (auto* editor = dynamic_cast<TimbresEditor*> (dockedEditor.get())) editor->redoParameterEdit(); };
 
     deviceManager.addMidiInputDeviceCallback ({}, this);
 
@@ -714,38 +1095,75 @@ MainComponent::MainComponent()
 
         if (auto* mobileDevice = deviceManager.getCurrentAudioDevice())
         {
+           #if JUCE_ANDROID || JUCE_IOS
+            // Reuse a leitura feita acima quando houver; do contrario, faca uma
+            // unica leitura para a rota atual e guarde-a para o tuner.
+            if (androidAvailableBufferSizes.isEmpty())
+                androidAvailableBufferSizes =
+                    mobileDevice->getAvailableBufferSizes();
+            const auto& available = androidAvailableBufferSizes;
+           #else
             const auto available = mobileDevice->getAvailableBufferSizes();
+           #endif
             const double rate = mobileDevice->getCurrentSampleRate() > 0.0
                                     ? mobileDevice->getCurrentSampleRate()
                                     : 48000.0;
 
-            for (const int candidate : available)
-                if (((double) candidate / rate) * 1000.0 >= 12.0)
-                {
-                    preferredMobileBuffer = candidate;
-                    break;
-                }
-
-            if (preferredMobileBuffer <= 0 && ! available.isEmpty())
-                preferredMobileBuffer = available.getLast();
+            preferredMobileBuffer =
+                ChurchDAWMobileAudio::chooseClosestBufferForTargetMs (
+                    available.getRawDataPointer(), available.size(), rate, 12.0);
         }
 
         if (preferredMobileBuffer > 0)
         {
            #if JUCE_ANDROID
-            // Schema 2: sobe o piso de 8 ms -> 12 ms e reaplica uma vez em
-            // aparelhos que ficaram em buffer baixo com muitos xruns.
+            // Schema 3 separa a escolha do musico do degrau temporario usado
+            // pelo tuner. Builds anteriores gravavam cada aumento por xrun em
+            // "bufferSize" e o aparelho reabria para sempre com latencia alta.
             auto* settings = appProperties.getUserSettings();
-            if (settings->getIntValue ("androidAdaptiveBufferSchema", 0) < 2)
+            if (settings->getIntValue ("androidAdaptiveBufferSchema", 0) < 3)
+            {
+                // Um preset existente e uma escolha explicita. Sem preset, o
+                // valor legado pode ser apenas o tuner antigo em 2048; cura-o
+                // voltando ao perfil Natural (~12 ms).
+                androidPreferredBufferSize =
+                    settings->containsKey ("androidPerfPreset")
+                        && wantedBuffer > 0
+                            ? wantedBuffer : preferredMobileBuffer;
+                settings->setValue ("androidAdaptiveBufferSchema", 3);
+                settings->setValue ("androidUserBufferSize",
+                                    androidPreferredBufferSize);
+                settings->setValue ("bufferSize",
+                                    androidPreferredBufferSize);
+            }
+            else
+                androidPreferredBufferSize = settings->getIntValue (
+                    "androidUserBufferSize",
+                    wantedBuffer > 0 ? wantedBuffer : preferredMobileBuffer);
+
+            if (androidPreferredBufferSize <= 0)
+                androidPreferredBufferSize = preferredMobileBuffer;
+
+            // Perfil Rapida (~8 ms) e intencional e nao recebe o piso Natural.
+            wantedBuffer = androidPreferredBufferSize;
+           #else
+            // Builds anteriores escolheram o primeiro buffer ACIMA de 12 ms.
+            // Na lista esparsa do iPad isso gravou 1024 / 21,33 ms. O iOS nao
+            // oferece seletor manual de buffer, portanto esta migracao unica
+            // pode corrigir o legado com seguranca; depois dela respeitamos o
+            // estado persistido e apenas o driver/tuner decide novos ajustes.
+            auto* settings = appProperties.getUserSettings();
+            if (settings->getIntValue ("iosMobileBufferSchema", 0) < 1)
             {
                 wantedBuffer = preferredMobileBuffer;
-                settings->setValue ("androidAdaptiveBufferSchema", 2);
-                settings->setValue ("bufferSize", preferredMobileBuffer);
+                settings->setValue ("bufferSize", wantedBuffer);
+                settings->setValue ("iosMobileBufferSchema", 1);
+                settings->saveIfNeeded();
             }
-           #endif
-
-            if (wantedBuffer < preferredMobileBuffer)
+            else if (wantedBuffer <= 0)
                 wantedBuffer = preferredMobileBuffer;
+            androidPreferredBufferSize = wantedBuffer > 0 ? wantedBuffer : preferredMobileBuffer;
+           #endif
         }
        #endif
         const double wantedRate = appProperties.getUserSettings()->getDoubleValue ("sampleRate", 0.0);
@@ -786,9 +1204,13 @@ MainComponent::MainComponent()
         }
     }
 
-   #if JUCE_ANDROID
-    androidLastXRunCount = deviceManager.getXRunCount();
+   #if JUCE_ANDROID || JUCE_IOS
+    androidLastXRunCount = deviceManager.getCurrentAudioDevice() != nullptr
+        ? juce::jmax (0, deviceManager.getCurrentAudioDevice()->getXRunCount())
+        : 0;
     androidLastBufferTuneMs = juce::Time::getMillisecondCounter();
+    androidXRunPressure = 0;
+    androidStableBufferWindows = 0;
    #endif
 
    #if JUCE_ANDROID || JUCE_IOS
@@ -836,6 +1258,32 @@ MainComponent::MainComponent()
    #endif
 
     // ---- cabecalho ----
+    addAndMakeVisible (liveCamButton);
+   #if JUCE_IOS || JUCE_ANDROID
+    liveCamButton.setButtonText ("ChurchCam");
+   #endif
+    liveCamButton.setComponentID ("navLiveCam");
+    liveCamButton.setTooltip (juce::String::fromUTF8 ("Live Cam: grave a DAW, sua webcam e o áudio da sessão."));
+    liveCamButton.onClick = [this]
+    {
+        if (auto* window = dynamic_cast<churchstudio::Window*> (liveCamWindow.getComponent())) { window->showStudio(); return; }
+        // A nonmodal desktop window keeps every mixer control usable while
+        // recording and stays outside the DAW component snapshot.
+        liveCamWindow = new churchstudio::Window (pianoVisualState, studioAudioTap, &deviceManager, this, appProperties.getUserSettings()
+           #if JUCE_IOS || JUCE_ANDROID
+            , studioMicrophoneTap, [safe = juce::Component::SafePointer<MainComponent> (this)] (bool enabled, int channel)
+            { return safe ? safe->setStudioMicrophoneEnabled (enabled, channel) : juce::Result::fail ("DAW encerrada."); }
+           #endif
+        );
+        liveCamButton.setToggleState (true, juce::dontSendNotification);
+        if (auto* liveWindow = dynamic_cast<churchstudio::Window*> (liveCamWindow.getComponent()))
+        {
+            auto safe = juce::Component::SafePointer<MainComponent> (this);
+            liveWindow->onRecordingChanged = [safe] (bool active) { if (safe) { safe->liveCamButton.getProperties().set ("recording", active); safe->liveCamButton.repaint(); } };
+            liveWindow->onClosed = [safe] { if (safe) { safe->liveCamButton.setToggleState (false, juce::dontSendNotification); safe->liveCamButton.getProperties().set ("recording", false); } };
+        }
+        liveCamWindow->toFront (true);
+    };
     addAndMakeVisible (audioSettingsButton);
     audioSettingsButton.setButtonText (juce::String::fromUTF8 ("\xc3\x81udio / MIDI"));   // Áudio / MIDI
     audioSettingsButton.setActiveSupplier ([this] { return audioPanel != nullptr; });
@@ -865,8 +1313,19 @@ MainComponent::MainComponent()
                          NordLookAndFeel::amberSolo().darker (0.30f));
     padButton.setColour (juce::TextButton::textColourOnId,
                          juce::Colours::black.withAlpha (0.88f));
-    padButton.setTooltip ("Abrir ou fechar o Pad Continuo");
-    padButton.onClick = [this] { showPadWindow(); };
+    // O Pad agora e uma pagina de produto completa. O antigo Pad Continuo
+    // permanece disponivel como ferramenta rapida dentro do editor.
+    padButton.setButtonText ("Pad");
+    padButton.setClickingTogglesState (true);
+    padButton.setColour (juce::TextButton::buttonOnColourId,
+                         juce::Colour (0xffc4112e));
+    padButton.setColour (juce::TextButton::textColourOnId,
+                         juce::Colours::white);
+    padButton.setTooltip (juce::String::fromUTF8 ("Abrir ou fechar o Pad Contínuo"));
+    padButton.onClick = [this]
+    {
+        showPadWindow();
+    };
 
     // card do Pad Continuo EMBUTIDO na DAW (oculto ate clicar em "Pad")
     padPanel = std::make_unique<PadPanel> (padProcessor);
@@ -875,7 +1334,8 @@ MainComponent::MainComponent()
         if (padPanel != nullptr)
             padPanel->setVisible (false);
 
-        padButton.setToggleState (false, juce::dontSendNotification);
+        if (! padEditorVisible)
+            padButton.setToggleState (false, juce::dontSendNotification);
 
         // FECHAR O CARD DESISTE DO MAPEAMENTO.
         //
@@ -897,6 +1357,23 @@ MainComponent::MainComponent()
     // entao a primeira pintura das etiquetas tem de acontecer aqui, senao o
     // teclado abriria sem mostrar as teclas ja mapeadas do cliente.
     atualizarEtiquetasDoPad();
+    atualizarBotoesDeCCDoPad();
+
+    padPanel->onTrocarModoDoBotaoDeCC = [this] (int tom, bool comTrava)
+    {
+        if (! juce::isPositiveAndBelow (tom, 12))
+            return;
+
+        definirModoDoBotaoDoTom (
+            tom, comTrava ? ChurchDAWMidiMapping::ModoDeBotaoCC::seguirNivel
+                          : ChurchDAWMidiMapping::ModoDeBotaoCC::alternar);
+
+        juce::Logger::writeToLog (
+            "MIDI MAP: botao de CC do tom " + juce::String (PadPanel::noteName (tom))
+            + (comTrava ? " passou a seguir o nivel (pad com trava)"
+                        : " voltou a alternar no aperto"));
+    };
+
     padPanel->onMidiLearnTarget = [this] (int key)
     {
         if (! midiLearnActive.load())
@@ -913,9 +1390,172 @@ MainComponent::MainComponent()
         midiLearnPanel.showPlayNote (target);
         juce::Logger::writeToLog ("MIDI MAP: aguardando nota para " + target);
     };
+
+    // APRENDER MIDI DIRETO DO MENU DO TOM — um gesto so.
+    //
+    // Sem isto o item "Aprender MIDI para este tom" nascia CINZA: o painel so o
+    // habilita quando ha este callback ou quando o Mapear MIDI global ja esta
+    // ligado. Ou seja, o item principal do modo "Editar" — que existe justamente
+    // para o tablet, onde nao ha clique direito — vinha desligado.
+    //
+    // A ORDEM IMPORTA: ligar o modo limpa o pendingNoteAction (e o que o clique
+    // no mapButton faz), entao o alvo tem de ser armado DEPOIS de ligar.
+    padPanel->onPedirAprenderTom = [this] (int tom)
+    {
+        if (! juce::isPositiveAndBelow (tom, 12))
+            return;
+
+        if (! midiLearnActive.load())
+            startMidiLearn();
+
+        // Se o modo nao ligou por qualquer motivo, nao arma alvo nenhum: um
+        // alvo armado sem o modo ligado seria uma tecla comendo notas sem nada
+        // na tela dizendo isso.
+        if (! midiLearnActive.load())
+            return;
+
+        {
+            const juce::ScopedLock sl (mapLock);
+            pendingNoteAction = NoteAction { NoteActionKind::padKey, tom };
+        }
+
+        const auto target = "Pad " + juce::String (PadPanel::noteName (tom));
+        midiLearnPanel.showPlayNote (target);
+        juce::Logger::writeToLog ("MIDI MAP: aguardando nota para " + target
+                                   + " (pedido pelo menu do tom)");
+    };
+
     addChildComponent (*padPanel);
 
+    if (padSynthProcessor != nullptr)
+    {
+        padEditorPanel = std::make_unique<PadEditorPanel> (*padSynthProcessor);
+        padEditorPanel->onClose = [this] { closePadEditor(); };
+        padEditorPanel->onQuickPadContinuo = [this] { showPadWindow(); };
+        padEditorPanel->onStateChanged = [this]
+        {
+            (void) saveChainState();
+        };
+        addChildComponent (*padEditorPanel);
+
+        performanceSessionPanel =
+            std::make_unique<PerformanceSessionPanel> (*padSynthProcessor);
+        if (padProcessor != nullptr)
+            for (auto* parameter : padProcessor->getParameters())
+                if (ChurchDAWMidiMapping::stableParameterId (parameter)
+                        == "padVolume")
+                {
+                    performanceSessionPanel->setPadVolumeMidiLearnTarget (
+                        padProcessor, parameter);
+                    break;
+                }
+        performanceSessionPanel->onLoadScene = [this] (int scene)
+        {
+            (void) aplicarCena (scene);
+            refreshPerformanceSessionPanel();
+        };
+        performanceSessionPanel->onCaptureScene = [this] (int scene)
+        {
+            (void) capturarCena (scene);
+            liveScenePanel.atualizar (cenas, cenaAtiva);
+            refreshPerformanceSessionPanel();
+        };
+        performanceSessionPanel->onDeleteScene = [this] (int scene)
+        {
+            apagarCena (scene);
+        };
+        performanceSessionPanel->onSceneMetadataChanged =
+            [this] (int scene, const ChurchDAWLive::Cena& metadata)
+            {
+                atualizarMetadadosDaCena (scene, metadata);
+            };
+        performanceSessionPanel->onSetlistChanged =
+            [this] (const ChurchDAWLive::Setlist& newSetlist)
+            {
+                atualizarSetlist (newSetlist);
+            };
+        performanceSessionPanel->onExportSession = [this]
+        {
+            exportCultSession();
+        };
+        performanceSessionPanel->onImportSession = [this]
+        {
+            importCultSession();
+        };
+        performanceSessionPanel->onUndo = [this]
+        {
+            undoSceneHistory();
+        };
+        performanceSessionPanel->onRedo = [this]
+        {
+            redoSceneHistory();
+        };
+        performanceSessionPanel->onPanic = [this]
+        {
+            // The panel requests Pad Synth panic immediately before invoking
+            // this callback; complete the global operation without duplicating
+            // that processor request.
+            performGlobalPanic (true);
+        };
+        performanceSessionPanel->onEmergencyPiano = [this]
+        {
+            activateEmergencyPiano();
+        };
+        performanceSessionPanel->onStageTest = [this]
+        {
+            runStageDiagnostic();
+        };
+        performanceSessionPanel->onAutoPatch = [this]
+        {
+            showAutoPatchBuilder();
+        };
+        performanceSessionPanel->onPlayback = [this]
+        {
+            showPlaybackFileChooser();
+        };
+        performanceSessionPanel->onQuickPad = [this] { showPadWindow(); };
+        performanceSessionPanel->onSustainChanged = [this] (bool enabled)
+        {
+            if (auto* live = getChurchLive()) live->setGlobalSustain (enabled);
+            agendarGravacaoDoSetup();
+        };
+        performanceSessionPanel->onTransposeChanged = [this] (int semitones)
+        {
+            if (auto* live = getChurchLive())
+                if (auto* parameter = live->getTransposeGeralParam())
+                    *parameter = semitones;
+            if (padProcessor != nullptr) padProcessor->setTransposeSemis (semitones);
+            agendarGravacaoDoSetup();
+        };
+        performanceSessionPanel->onPadVolumeChanged = [this] (float gain)
+        {
+            if (padProcessor != nullptr) padProcessor->setGain (gain);
+            agendarGravacaoDoSetup();
+        };
+        performanceSessionPanel->onChannelSelected = [this] (int layer)
+        {
+            if (auto* live = getChurchLive()) live->setSelectedLayer (layer);
+            showDesktopWorkspace (DesktopWorkspace::mixer);
+        };
+        addChildComponent (*performanceSessionPanel);
+        refreshPerformanceSessionPanel();
+    }
+
     addAndMakeVisible (saveButton);
+
+    addAndMakeVisible (sabrinaButton);
+    sabrinaButton.setClickingTogglesState (true);
+    sabrinaButton.setToggleState (sabrinaEnabled,
+                                  juce::dontSendNotification);
+    sabrinaButton.setTooltip (
+        "Saturacao suave no barramento master (Sabrina). Desligado = som igual "
+        "ao original.");
+    sabrinaButton.onClick = [this]
+    {
+        setSabrinaEnabled (! sabrinaEnabled);
+        sabrinaButton.setToggleState (sabrinaEnabled,
+                                      juce::dontSendNotification);
+    };
     // vira um indicador de confianca: verde "Salvo" = autosave ligado, seu setup
     // esta guardado. Clicar forca salvar tudo e pisca "Salvo!"
     // Guardado para poder VOLTAR ao verde depois de um "FALHOU" vermelho.
@@ -937,13 +1577,51 @@ MainComponent::MainComponent()
                           juce::Colours::transparentBlack);
     saveButton.setColour (juce::TextButton::textColourOffId, corDoSalvoNormal);
    #endif
-    saveButton.setTooltip ("Projeto salvo. Clique para salvar novamente agora.");
+    if (midiMapPersistenceError.load (std::memory_order_acquire))
+    {
+       #if JUCE_ANDROID || JUCE_IOS
+        saveButton.setButtonText ("FALHOU");
+       #else
+        saveButton.setButtonText (
+            juce::String::fromUTF8 ("\xe2\x9a\xa0 FALHOU"));
+       #endif
+        saveButton.setColour (juce::TextButton::textColourOffId,
+                              NordLookAndFeel::nordRedBright());
+    }
+    saveButton.setTooltip (
+        "Salvar a cena atual e, junto, todo o projeto");
     saveButton.onClick = [this]
     {
-        // salva TUDO agora: cadeia (timbres/volumes/efeitos), mapeamento MIDI e audio
+        // O cliente le este botao como SALVAR A CENA. Antes ele guardava apenas
+        // o setup global e reescrevia o XML das cenas sem recapturar o som: a
+        // luz ficava verde, mas reabrir a cena devolvia o snapshot antigo.
+        //
+        // Uma pagina nova ganha precedencia; fora dela, recaptura a cena que
+        // esta no ar. Sem contexto de cena continua sendo o save geral normal.
+        const int destinoDaCena = ChurchDAWLive::destinoDoSalvarSuperior (
+            cenaEmPreparacao, cenaAtiva, cenas);
+        ChurchDAWLive::Resultado resultadoDaCena = ChurchDAWLive::Resultado::ok;
+
+        if (destinoDaCena >= 0)
+        {
+            resultadoDaCena = capturarCena (destinoDaCena);
+            liveScenePanel.atualizar (cenas, cenaAtiva);
+            refreshPerformanceSessionPanel();
+
+            if (resultadoDaCena != ChurchDAWLive::Resultado::ok)
+                liveScenePanel.avisar (ChurchDAWLive::avisoDaGravacao (
+                    resultadoDaCena,
+                    ChurchDAWLive::OrigemDaGravacao::botaoSalvar,
+                    destinoDaCena));
+        }
+
+        const bool cenaAtualOk = resultadoDaCena == ChurchDAWLive::Resultado::ok;
+
+        // Salva TUDO agora: cena, cadeia, mapeamento MIDI e audio.
         const bool setupOk = saveChainState();
-        const bool ccsOk = saveMidiMap();
-        const bool notasOk = saveNoteMap();
+        const bool midiMapsOk = saveMidiMapPair();
+        const bool ccsOk = midiMapsOk;
+        const bool notasOk = midiMapsOk;
         const bool cenasOk = salvarCenas();
         saveAudioStateNow();
 
@@ -984,8 +1662,11 @@ MainComponent::MainComponent()
                               && (! esquemaDeCenasDesconhecido
                                    || arquivoDeCenasIlegivel);
 
-        const bool tudoOk = setupOk && audioOk
+        const bool tudoOk = cenaAtualOk && setupOk && audioOk
                               && ! ccsFalhou && ! notasFalhou && ! cenasFalhou;
+        // An error remains visible until a later complete save succeeds. A
+        // timer must never turn a failed/recovery-blocked project green.
+        midiMapPersistenceError.store (! tudoOk, std::memory_order_release);
 
        #if JUCE_ANDROID || JUCE_IOS
         saveButton.setButtonText (tudoOk ? "Salvo!" : "FALHOU");
@@ -1001,6 +1682,7 @@ MainComponent::MainComponent()
 
         if (! tudoOk)
             juce::Logger::writeToLog (juce::String ("SALVAR: falhou em ")
+                                      + (cenaAtualOk ? "" : "cena atual ")
                                       + (setupOk      ? "" : "setup ")
                                       + (ccsFalhou    ? "mapa de CCs " : "")
                                       + (notasFalhou  ? "mapa de notas " : "")
@@ -1046,6 +1728,9 @@ MainComponent::MainComponent()
             {
                 if (c->geracaoDoAvisoDeSalvar != minhaGeracao)
                     return;   // um clique mais novo manda na tela
+                if (c->midiMapPersistenceError.load (
+                        std::memory_order_acquire))
+                    return;
 
                #if JUCE_ANDROID || JUCE_IOS
                 c->saveButton.setButtonText ("Salvo");
@@ -1063,76 +1748,86 @@ MainComponent::MainComponent()
     instrumentsButton.setButtonText (juce::String::fromUTF8 ("\xe2\x97\x89 Instrumentos"));   // ◉
     instrumentsButton.setColour (juce::TextButton::buttonColourId, juce::Colour (0xffc4112e));
     instrumentsButton.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
-    instrumentsButton.onClick = [this] { undockEditor(); };   // fecha a tela cheia do Church Live
+    instrumentsButton.onClick = [this]
+    {
+        // Instrumentos e Mapear MIDI sao destinos exclusivos no shell desktop.
+        // Fechar pelo proprio botao de Instrumentos tambem executa toda a
+        if (mapButton.getToggleState() || midiLearnActive.load())
+            finishMidiLearn (true);
+
+        if (padEditorVisible)
+            closePadEditor();
+
+        liveScenePanel.setVisible (false);
+
+        if (desktopWorkspace != DesktopWorkspace::mixer)
+            showDesktopWorkspace (DesktopWorkspace::mixer);
+
+        if ((! dockedNative || dockedEditor == nullptr) && slots[0].nodeID.uid != 0)
+            openEditorForSlot (0);
+
+        resized();
+        repaint();
+    };
+
+    instrumentsButton.setComponentID ("navInstruments");
+    liveButton.setComponentID ("navLive");
+    mapButton.setComponentID ("navMidi");
+    saveButton.setComponentID ("navSave");
+    padButton.setComponentID ("navPad");
+    scanButton.setComponentID ("navPlugins");
+    librariesButton.setComponentID ("navLibraries");
+    audioSettingsButton.setComponentID ("headerNav");
+   #if JUCE_IOS || JUCE_ANDROID
+    for (auto* button : std::initializer_list<juce::Button*> { &instrumentsButton, &liveButton, &mapButton, &saveButton, &padButton, &scanButton, &librariesButton, &liveCamButton })
+        button->getProperties().set ("churchTouchNav", true);
+   #endif
+
+    // Clique de mouse nao leva o foco do teclado para a navegacao. O anel de
+    // foco vermelho fazia a aba clicada (ex.: Live Cam) parecer uma SEGUNDA aba
+    // ativa ao lado da pagina atual, e um Espaco/Enter depois do clique
+    // reapertava o botao -- reabrindo a janela no meio do culto. Tab continua
+    // focando os botoes: a navegacao por teclado segue acessivel.
+    for (auto* button : std::initializer_list<juce::Button*> { &instrumentsButton, &liveButton, &mapButton, &saveButton, &padButton, &scanButton, &librariesButton, &audioSettingsButton, &liveCamButton })
+        button->setMouseClickGrabsKeyboardFocus (false);
 
     // chips premium do header (controlador MIDI + interface); a entrada de
     // guitarra/mic saiu do header e agora mora no dialogo Audio/MIDI
     addAndMakeVisible (deviceBar);
+    addChildComponent (performanceDock);
+    deviceBar.onOpenSettings = [this]
+    {
+        if (audioSettingsButton.onClick) audioSettingsButton.onClick();
+    };
     inputToggle.setButtonText (juce::String::fromUTF8 ("Entrada de \xc3\xa1udio (guitarra/mic)"));   // áudio
     inputToggle.onClick = [this]
     {
+        const bool requested = inputToggle.getToggleState();
+        audioInputAuthorised.store (requested, std::memory_order_release);
+
+        if (! setAudioInputChannelsEnabled (requested) && requested)
+        {
+            audioInputAuthorised.store (false, std::memory_order_release);
+            inputToggle.setToggleState (false, juce::dontSendNotification);
+        }
+
         rebuildGraphConnections();
         saveChainState();
     };
 
     addAndMakeVisible (mapButton);
-    mapButton.setClickingTogglesState (true);
-    // AMBAR, nao vermelho: ligado ele ficava igualzinho ao "Instrumentos", e os
-    // dois querem dizer coisas diferentes (pagina atual x modo armado). Ambar ja
-    // e a cor de "atencao/temporario" no resto do app.
-    mapButton.setColour (juce::TextButton::buttonOnColourId, juce::Colour (0xffe0a83a));
-    mapButton.setColour (juce::TextButton::textColourOnId, juce::Colour (0xff1a1206));
+    mapButton.setClickingTogglesState (false);
+    // No desktop este botao abre uma pagina completa e segue a mesma linguagem
+    // de navegacao ativa do restante do produto. O estado de aprendizado vive
+    // dentro da pagina e continua distinto pelo pulso/status vermelho.
+    mapButton.setColour (juce::TextButton::buttonOnColourId, juce::Colour (0xff2c171d));
+    mapButton.setColour (juce::TextButton::textColourOnId, juce::Colour (0xfff5f5f6));
     mapButton.onClick = [this]
     {
-        const bool on = mapButton.getToggleState();
-        midiLearnActive.store (on);
-        lastTouchedSlot.store (-2);
-        lastTouchedParam.store (-1);
-        lastTouchedInsert.store (-1);
-        {
-            const juce::ScopedLock sl (mapLock);
-            lastTouchedParamName.clear();
-            lastTouchedParamId.clear();
-            pendingNoteAction = {};
-        }
-        clearMapConfirmationArmed = false;
-        clearMapButton.setButtonText ("Limpar mapas");
-        clearMapButton.setVisible (on);
-        mapButton.setButtonText (on ? "Concluir" : "Mapear MIDI");
-        // Os tres ocupantes da faixa de programa sao mutuamente exclusivos.
-        // Entrar no aprendizado fecha o Live Mode: sao dois modos de ensaio
-        // diferentes e ver os dois ao mesmo tempo so confunde.
-        if (on)
-            liveButton.setToggleState (false, juce::dontSendNotification);
-
-        liveScenePanel.setVisible (! on && liveButton.getToggleState());
-        oled.setVisible (! on && ! liveScenePanel.isVisible());
-        midiLearnPanel.setVisible (on);
-
-        if (padPanel != nullptr)
-            padPanel->setMidiLearnMode (on);
-
-        if (on)
-        {
-            midiLearnPanel.setMappingCount (getMidiMappingCount());
-            midiLearnPanel.showChooseTarget();
-            juce::Logger::writeToLog ("MIDI MAP: modo de aprendizado aberto");
-        }
+        if (midiLearnActive.load() || mapButton.getToggleState())
+            finishMidiLearn (true);
         else
-        {
-            juce::Logger::writeToLog ("MIDI MAP: concluido com "
-                                      + juce::String (getMidiMappingCount()) + " mapeamento(s)");
-        }
-
-        // o layout do header muda no modo de mapeamento (abre espaco pra
-        // instrucao e pro "Limpar map."); adiado pra nao rearranjar componentes
-        // com o handler do clique ainda na pilha
-        juce::Component::SafePointer<MainComponent> safe (this);
-        juce::MessageManager::callAsync ([safe]
-        {
-            if (auto* c = safe.getComponent())
-                c->resized();
-        });
+            startMidiLearn();
     };
 
     addChildComponent (clearMapButton);
@@ -1162,68 +1857,389 @@ MainComponent::MainComponent()
             return;
         }
 
+        const auto ccFile = arquivoDoMapaDeCCs();
+        const auto noteFile = arquivoDoMapaDeNotas();
+        ChurchDAWMidiMapping::MidiMapPairRollback diskRollback (
+            ccFile, noteFile, *midiMapFileLock, &midiMapDiskRevision);
+
+        decltype (ccMappings) previousCC;
+        decltype (ccActionMappings) previousActions;
+        decltype (noteMappings) previousNotes;
+        NoteAction previousPendingAction;
+        juce::String previousTouchedName;
+        juce::String previousTouchedId;
+        juce::String previousTouchedPluginId;
+        int previousTouchedSlot = -2;
+        int previousTouchedParam = -1;
+        int previousTouchedInsert = -1;
+        bool previousTouchedIdentityUnique = false;
+        const bool previousUnknownCC = esquemaDeCCsDesconhecido;
+        const bool previousUnknownNotes = esquemaDeNotasDesconhecido;
+        const bool previousBlockedCC = bloquearSalvamentoCCVazio;
+        const bool previousBlockedNotes = bloquearSalvamentoNotasVazio;
+        const bool previousProfilesSuspended = automaticControllerProfilesSuspended;
+
+        bool checkpointReady = false;
+        bool apagouNoDisco = false;
+        bool rollbackOk = true;
+        bool memoryMutated = false;
+        bool ccWritten = false;
+        bool noteWritten = false;
+        juce::uint64 ccEpoch = 0;
+        juce::uint64 noteEpoch = 0;
+
+        beginMidiMapRoutingTransaction();
+
+        checkpointReady = diskRollback.capture ("before-clear");
+        if (! checkpointReady)
+            rollbackOk = false;
+        if (checkpointReady && diskRollback.targetsUnchangedSinceCapture())
         {
-            const juce::ScopedLock sl (mapLock);
-            ccMappings.clear();
-            noteMappings.clear();
-            pendingNoteAction = {};
+            {
+                const juce::ScopedLock sl (mapLock);
+                previousCC = ccMappings;
+                previousActions = ccActionMappings;
+                previousNotes = noteMappings;
+                previousPendingAction = pendingNoteAction;
+                previousTouchedName = lastTouchedParamName;
+                previousTouchedId = lastTouchedParamId;
+                previousTouchedPluginId = lastTouchedPluginId;
+                previousTouchedSlot =
+                    lastTouchedSlot.load (std::memory_order_relaxed);
+                previousTouchedParam =
+                    lastTouchedParam.load (std::memory_order_relaxed);
+                previousTouchedInsert =
+                    lastTouchedInsert.load (std::memory_order_relaxed);
+                previousTouchedIdentityUnique =
+                    lastTouchedParameterIdentityUnique.load (
+                        std::memory_order_relaxed);
 
-            // LIMPAR O LIVRO DE NOTAS SUPRIMIDAS TAMBEM.
-            //
-            // Sem isto, o unico caminho de recuperacao que o app oferece podia
-            // deixar uma nota tocando PARA SEMPRE: se um note-off tivesse se
-            // perdido (falha de USB, Bluetooth caindo, sequenciador parado no
-            // meio da nota), a entrada ficava obsoleta no livro. O musico entao
-            // limpava os mapas para recuperar a tecla, tocava nela — o note-on
-            // passava, mas o note-off batia na entrada velha e era engolido.
-            // Tecla presa no meio do culto, com o PANIC como unica saida.
-            //
-            // O livro so faz sentido enquanto existem mapas. Zerando junto,
-            // "Limpar mapas" volta a ser o que promete: um recomeco.
-            notasSuprimidas.clear();
-            reconstruirMascaraDeSuprimidas();
+                ccMappings.clear();
+                noteMappings.clear();
+                ccActionMappings.clear();
+                pendingNoteAction = {};
+                lastTouchedParamName.clear();
+                lastTouchedParamId.clear();
+                lastTouchedPluginId.clear();
+                lastTouchedParameterIdentityUnique.store (
+                    false, std::memory_order_relaxed);
+                ccDirtyEpoch.markDirty();
+                noteDirtyEpoch.markDirty();
+                memoryMutated = true;
+            }
 
-            lastTouchedParamName.clear();
-            lastTouchedParamId.clear();
+            ccEpoch = ccDirtyEpoch.snapshot();
+            noteEpoch = noteDirtyEpoch.snapshot();
+            ccWritten = saveMidiMap (true);
+            noteWritten = ccWritten && saveNoteMap (true);
+            apagouNoDisco = ccWritten && noteWritten
+                         && diskRollback.commit();
         }
 
+        if (checkpointReady && ! memoryMutated)
+        {
+            // Another writer changed a target after the checkpoint. We did not
+            // touch memory or disk; close our journal without overwriting it.
+            rollbackOk = diskRollback.closeWithoutMutation();
+        }
+        else if (checkpointReady && ! apagouNoDisco)
+        {
+            rollbackOk =
+                ChurchDAWMidiMapping::rollbackMidiMapPairPreservingFutureSchema (
+                    diskRollback, ccFile, noteFile);
+            const juce::ScopedLock sl (mapLock);
+            ccMappings = std::move (previousCC);
+            ccActionMappings = std::move (previousActions);
+            noteMappings = std::move (previousNotes);
+            pendingNoteAction = previousPendingAction;
+            lastTouchedParamName = previousTouchedName;
+            lastTouchedParamId = previousTouchedId;
+            lastTouchedPluginId = previousTouchedPluginId;
+            lastTouchedSlot.store (
+                previousTouchedSlot, std::memory_order_relaxed);
+            lastTouchedParam.store (
+                previousTouchedParam, std::memory_order_relaxed);
+            lastTouchedInsert.store (
+                previousTouchedInsert, std::memory_order_relaxed);
+            lastTouchedParameterIdentityUnique.store (
+                previousTouchedIdentityUnique, std::memory_order_relaxed);
+            esquemaDeCCsDesconhecido = previousUnknownCC;
+            esquemaDeNotasDesconhecido = previousUnknownNotes;
+            bloquearSalvamentoCCVazio = previousBlockedCC;
+            bloquearSalvamentoNotasVazio = previousBlockedNotes;
+            automaticControllerProfilesSuspended = previousProfilesSuspended;
+            // A tentativa do usuario foi desfeita por inteiro. Nao agende um
+            // segundo save: se diskStillOwned ficou falso, esse retry capturaria
+            // o arquivo da outra instancia como baseline e o sobrescreveria.
+            bumpMidiMappingGeneration();
+        }
+        else if (apagouNoDisco)
+        {
+            automaticControllerProfilesSuspended = false;
+        }
+
+        if (apagouNoDisco)
+        {
+            finishMidiMapDirtyEpochsAfterPairCommit (
+                ccEpoch, ccWritten, noteEpoch, noteWritten);
+            bumpMidiMappingGeneration();
+            cancelPendingUpdate();
+            lastMappedCC.store (-1);
+            lastMappedNote.store (-1);
+            lastMappedCCAcao.store (-1);
+            lastCCAcaoRecusada.store (-1);
+            lastCCAcaoDesmapeada.store (-1);
+            lastNoteActionRejected.store (-1);
+            lastParameterMappingRejectedCC.store (-1);
+            {
+                const juce::ScopedLock sl (mapLock);
+                lastTouchedSlot.store (-2, std::memory_order_relaxed);
+                lastTouchedParam.store (-1, std::memory_order_relaxed);
+                lastTouchedInsert.store (-1, std::memory_order_relaxed);
+                lastTouchedParamName.clear();
+                lastTouchedParamId.clear();
+                lastTouchedPluginId.clear();
+                lastTouchedParameterIdentityUnique.store (
+                    false, std::memory_order_relaxed);
+            }
+        }
+        finishMidiMapRoutingTransaction();
+
+        if (! checkpointReady
+             && diskRollback.hadUninspectableTargetConflict())
+            bloquearQuartetoMidiDesconhecido (
+                "checkpoint de Limpar mapas");
+        if (! rollbackOk || diskRollback.preservedExternalChanges())
+            midiMapPairRecoveryFailed = true;
         reconstruirMascaraDeNotas();
+        reconstruirMascaraDeCCsDeAcao();
+
         atualizarEtiquetasDoPad();
-        lastTouchedSlot.store (-2);
-        lastTouchedParam.store (-1);
-        lastTouchedInsert.store (-1);
-        lastMappedCC.store (-1);
-        lastMappedNote.store (-1);
+        atualizarBotoesDeCCDoPad();
         clearMapConfirmationArmed = false;
         clearMapButton.setButtonText ("Limpar mapas");
         ccPickup.clear();
 
-        // Os DOIS mapas precisam ter ido para o disco; senao o que sobrou
-        // volta inteiro na proxima abertura.
-        const bool ccsApagados = saveMidiMap();
-        const bool apagouNoDisco = saveNoteMap() && ccsApagados;
-        deviceBar.setMappingCount (0);
-        midiLearnPanel.setMappingCount (0);
+        const int currentMappingCount = getMidiMappingCount();
+        deviceBar.setMappingCount (currentMappingCount);
+        midiLearnPanel.setMappingCount (currentMappingCount);
 
         // Se o disco recusou, o mapa antigo VOLTA INTEIRO na proxima abertura —
         // inclusive a tecla mapeada por engano que motivou a limpeza. O musico
         // precisa saber disso agora, e nao no domingo.
-        if (apagouNoDisco)
+        if (checkpointReady && apagouNoDisco)
         {
             midiLearnPanel.showChooseTarget();
+            if (midiMappingPanel.isVisible())
+                midiMappingPanel.setStatus (
+                    "Todos os mapeamentos MIDI foram apagados e salvos",
+                    MidiMappingPanel::Status::success);
             juce::Logger::writeToLog ("MIDI MAP: todos os mapeamentos foram apagados");
         }
         else
         {
             midiLearnPanel.showAviso (
-                juce::String::fromUTF8 ("Limpou nesta sess\xc3\xa3o, mas N\xc3\x83O no disco"),
-                juce::String::fromUTF8 ("Os mapas antigos voltam ao reabrir o app"));
-            juce::Logger::writeToLog ("MIDI MAP: limpeza NAO gravada; o mapa antigo "
-                                      "volta na proxima abertura");
+                juce::String::fromUTF8 (
+                    "N\xc3\xa3o foi poss\xc3\xadvel apagar com seguran\xc3\xa7" "a"),
+                rollbackOk
+                    ? juce::String::fromUTF8 ("Os mapas anteriores foram restaurados")
+                    : juce::String::fromUTF8 ("Falha grave no rollback; preserve os backups"));
+            if (midiMappingPanel.isVisible())
+                midiMappingPanel.setStatus (
+                    rollbackOk
+                        ? "Falha ao apagar; os mapeamentos anteriores foram restaurados"
+                        : "Falha ao apagar e restaurar arquivos; verifique os backups",
+                    rollbackOk ? MidiMappingPanel::Status::warning
+                               : MidiMappingPanel::Status::error);
+            juce::Logger::writeToLog (
+                rollbackOk
+                    ? "MIDI MAP: limpeza falhou; estado anterior restaurado"
+                    : "MIDI MAP: ERRO GRAVE no rollback da limpeza");
         }
     };
 
     addChildComponent (midiLearnPanel);
+
+    // Pagina desktop completa de gerenciamento MIDI. O motor de captura,
+    // seguranca, pickup e persistencia continua neste MainComponent; o painel
+    // apenas apresenta alvos reais e devolve a intencao do usuario.
+    midiMappingPanel.onLearningChanged = [this] (bool enabled)
+    {
+        setMidiLearningFromPage (enabled);
+    };
+    midiMappingPanel.onDetectDevices = [this]
+    {
+        refreshMidiInputs();
+        cachedMidiInputsAtMs = 0;
+        const auto& devices = midiInputsCached (
+            juce::Time::getMillisecondCounter());
+        midiMappingPanel.setStatus (
+            devices.isEmpty() ? juce::String ("Nenhum controlador MIDI encontrado")
+                              : juce::String (devices.size()) + " dispositivo(s) MIDI encontrado(s)",
+            devices.isEmpty() ? MidiMappingPanel::Status::warning
+                              : MidiMappingPanel::Status::success);
+    };
+    midiMappingPanel.onQuickMapping = [this]
+    {
+        beginQuickMidiMapping();
+    };
+    midiMappingPanel.onImport = [this] { importMidiMappings(); };
+    midiMappingPanel.onExport = [this] { exportMidiMappings(); };
+    midiMappingPanel.onClearRequested = [this] (bool confirmed)
+    {
+        if (! confirmed)
+        {
+            if (! clearMapConfirmationArmed)
+                clearMapButton.triggerClick();
+            return;
+        }
+
+        if (! clearMapConfirmationArmed)
+            clearMapButton.triggerClick();
+        if (clearMapConfirmationArmed)
+            clearMapButton.triggerClick();
+
+        refreshMidiMappingPanel();
+    };
+    midiMappingPanel.onCommandSelected = [this] (const MidiMappingPanel::Command& command)
+    {
+        if (midiLearnActive.load())
+            armMidiMappingCommand (command);
+    };
+    midiMappingPanel.onDeleteCommand = [this] (const MidiMappingPanel::Command& command)
+    {
+        deleteMidiMappingCommand (command);
+    };
+    midiMappingPanel.onTestCommand = [this] (const MidiMappingPanel::Command& command)
+    {
+        // armMidiMappingCommand decide o status: sucesso mostra a instrucao de
+        // aprendizado e falha (alvo stale/indisponivel) mostra o motivo real.
+        // Sobrescrever aqui com "Alvo pronto" mentia quando o arm falhava.
+        armMidiMappingCommand (command);
+    };
+    midiMappingPanel.onSaveCommand = [this] (const MidiMappingPanel::Command& command)
+    {
+        saveMidiMappingCommand (command);
+    };
+    addChildComponent (midiMappingPanel);
+
+    addChildComponent (midiLearnConsoleOverlay);
+    midiLearnConsoleOverlay.shouldPassThrough = [this] (juce::Point<int> screenPos)
+    {
+        if (mapButton.isShowing() && mapButton.getScreenBounds().contains (screenPos))
+            return true;
+        if (clearMapButton.isShowing() && clearMapButton.getScreenBounds().contains (screenPos))
+            return true;
+        if (midiLearnPanel.isShowing() && midiLearnPanel.getScreenBounds().contains (screenPos))
+            return true;
+        return false;
+    };
+    midiLearnConsoleOverlay.onControlClicked = [this] (juce::Component* hit,
+                                                       juce::Point<int> localPos,
+                                                       juce::Point<int> screenPos)
+    {
+        juce::ignoreUnused (localPos);
+        if (! midiLearnActive.load())
+            return;
+
+        if (hit == &mapButton || mapButton.isParentOf (hit)
+            || (mapButton.isShowing() && mapButton.getScreenBounds().contains (screenPos)))
+        {
+            finishMidiLearn (true);
+            return;
+        }
+
+        if (hit == &clearMapButton || clearMapButton.isParentOf (hit)
+            || (clearMapButton.isShowing() && clearMapButton.getScreenBounds().contains (screenPos)))
+        {
+            clearMapButton.triggerClick();
+            return;
+        }
+
+        juce::AudioProcessor* processor = nullptr;
+        int parameterIndex = -1;
+        int actionKind = 0;
+        int actionArg = -1;
+        juce::String actionDisplayName;
+        juce::Component* targetControl = nullptr;
+
+        for (auto* c = hit; c != nullptr && c != this && c != &midiLearnConsoleOverlay; c = c->getParentComponent())
+        {
+            if (ChurchDAWMidiLearnTarget::read (*c, processor, parameterIndex))
+            {
+                targetControl = c;
+                break;
+            }
+            if (ChurchDAWMidiLearnTarget::readAction (*c, actionKind, actionArg, actionDisplayName))
+            {
+                targetControl = c;
+                break;
+            }
+        }
+
+        if (targetControl != nullptr && processor != nullptr && parameterIndex >= 0)
+        {
+            juce::String customName = ChurchDAWMidiLearnTarget::readDisplayName (*targetControl);
+            armMidiLearnParameter (processor, parameterIndex, targetControl, customName);
+            return;
+        }
+
+        if (targetControl != nullptr && actionKind > 0)
+        {
+            armMidiLearnAction (actionKind, actionArg, actionDisplayName, targetControl);
+            return;
+        }
+
+        if (padPanel != nullptr && padPanel->isShowing() && padPanel->getScreenBounds().contains (screenPos))
+        {
+            const auto padPt = padPanel->getLocalPoint (nullptr, screenPos).toFloat();
+            const int tom = padPanel->getTomAt (padPt);
+            if (tom >= 0)
+            {
+                const auto name = "Pad " + juce::String (PadPanel::noteName (tom));
+                const auto cellBounds = padPanel->getCellBounds (tom).getSmallestIntegerContainer();
+                const auto boundsInOverlay = midiLearnConsoleOverlay.getLocalArea (padPanel.get(), cellBounds);
+                armMidiLearnAction ((int) NoteActionKind::padKey, tom, name, nullptr, boundsInOverlay);
+                return;
+            }
+        }
+
+       #if ! JUCE_ANDROID && ! JUCE_IOS
+        if (desktopReferenceLayout)
+        {
+            const auto mainPt = getLocalPoint (nullptr, screenPos);
+            for (int i = 0; i < ChurchDAWLive::numeroDeCenas; ++i)
+            {
+                if (desktopSceneBounds[i].contains (mainPt))
+                {
+                    const int sceneIdx = desktopSceneIndexAtRow[i];
+                    if (juce::isPositiveAndBelow (sceneIdx, ChurchDAWLive::numeroDeCenas))
+                    {
+                        const auto name = "Cena " + juce::String (sceneIdx + 1);
+                        const auto boundsInOverlay = midiLearnConsoleOverlay.getLocalArea (this, desktopSceneBounds[i]);
+                        armMidiLearnAction ((int) NoteActionKind::cena, sceneIdx, name, nullptr, boundsInOverlay);
+                        return;
+                    }
+                }
+            }
+
+            if (desktopTapBounds.contains (mainPt))
+            {
+                const auto boundsInOverlay = midiLearnConsoleOverlay.getLocalArea (this, desktopTapBounds);
+                armMidiLearnAction ((int) NoteActionKind::tapTempo, -1, "Tap Tempo", nullptr, boundsInOverlay);
+                return;
+            }
+        }
+       #endif
+
+        // A blank click cancels the actual pending target as well as its UI.
+        // Otherwise the next MIDI message silently maps the previous control.
+        resetMidiLearnTargetUnderCallbackBarrier (true);
+        midiLearnConsoleOverlay.clearTarget();
+        midiLearnPanel.showChooseTarget();
+    };
+
+    setWantsKeyboardFocus (true);
 
    #if JUCE_ANDROID
     // O mixer e acelerado por OpenGL no Android. A arte ARGB do icone instalado
@@ -1236,8 +2252,57 @@ MainComponent::MainComponent()
     brandIcon = juce::ImageCache::getFromMemory (BinaryData::logo_round_png,
                                                  BinaryData::logo_round_pngSize);
    #else
-    brandIcon = juce::ImageCache::getFromMemory (BinaryData::icon_png,
-                                                 BinaryData::icon_pngSize);
+    // A marca do desktop usa a mesma arte oficial enviada pelo usuário,
+    // incluindo o círculo, a igreja, as teclas e o wordmark ChurchDAW.
+    brandIcon = juce::ImageCache::getFromMemory (BinaryData::logo_round_png,
+                                                 BinaryData::logo_round_pngSize);
+   #endif
+
+   #if ! JUCE_ANDROID && ! JUCE_IOS
+    // A arte oficial veio em JPG/PNG com fundo preto incorporado. Para a
+    // sidebar atmosferica esse retangulo denunciava o arquivo. Criamos uma
+    // copia com alpha derivado da luminosidade e preservamos vermelho/branco;
+    // a igreja passa a nascer diretamente da textura do shell.
+    if (brandIcon.isValid())
+    {
+        desktopBrandMark = juce::Image (juce::Image::ARGB,
+                                        brandIcon.getWidth(),
+                                        brandIcon.getHeight(), true);
+        for (int y = 0; y < desktopBrandMark.getHeight(); ++y)
+            for (int x = 0; x < desktopBrandMark.getWidth(); ++x)
+            {
+                const auto c = brandIcon.getPixelAt (x, y);
+                const float red = c.getFloatRed();
+                const float light = juce::jmax (red,
+                    juce::jmax (c.getFloatGreen(), c.getFloatBlue()));
+                const float lifted = juce::jlimit (0.0f, 1.0f,
+                                                   (light - 0.080f) / 0.32f);
+                float alpha = lifted;
+                if (red > c.getFloatGreen() * 1.20f
+                     && red > c.getFloatBlue() * 1.16f)
+                    alpha = juce::jmax (alpha,
+                                        juce::jlimit (0.0f, 1.0f, red * 1.18f));
+
+                // Feather real nas bordas visiveis da arte. A transparencia
+                // por luminosidade remove o preto, mas uma borda abrupta ainda
+                // denunciava o bitmap. O smoothstep preserva o miolo nitido e
+                // faz igreja/waveform nascerem diretamente do fundo.
+                const float edgeX = juce::jmin (
+                    (float) (x + 1) / ((float) desktopBrandMark.getWidth() * 0.18f),
+                    (float) (desktopBrandMark.getWidth() - x)
+                        / ((float) desktopBrandMark.getWidth() * 0.18f));
+                const float visibleBottom = (float) desktopBrandMark.getHeight() * 0.60f;
+                const float edgeTop = (float) (y + 1)
+                    / ((float) desktopBrandMark.getHeight() * 0.090f);
+                const float edgeBottom = (visibleBottom - (float) y)
+                    / ((float) desktopBrandMark.getHeight() * 0.090f);
+                const float edge = juce::jlimit (0.0f, 1.0f,
+                    juce::jmin (edgeX, juce::jmin (edgeTop, edgeBottom)));
+                const float feather = edge * edge * (3.0f - 2.0f * edge);
+                desktopBrandMark.setPixelAt (x, y,
+                    c.withAlpha (alpha * feather * c.getFloatAlpha()));
+            }
+    }
    #endif
 
     statusInfo.setFont (juce::Font (juce::FontOptions (
@@ -1277,7 +2342,42 @@ MainComponent::MainComponent()
 
         return 0.0f;
     };
+   #if CHURCHDAW_UI_PREVIEW
+    deviceBar.setControllerName ("Nenhum", false);
+    deviceBar.setInterfaceName (juce::String::fromUTF8 ("Prévia sem áudio"), false);
+    statusInfo.setText (juce::String::fromUTF8 ("Áudio não iniciado"), juce::dontSendNotification);
+   #else
     startTimer (1000);
+   #endif
+
+   #if CHURCHDAW_REMOTE_CONTROL_ENABLED
+    // Nunca derive a credencial de um identificador previsivel do aparelho e
+    // nunca a publique em log ou endpoint. Enquanto nao existir pareamento na
+    // UI, uma ativacao interna deve fornecer manualmente um segredo forte.
+    remoteToken = juce::SystemStats::getEnvironmentVariable (
+                      "CHURCHDAW_REMOTE_TOKEN", {}).trim();
+    if (remoteToken.length() >= 16)
+    {
+        remoteServer = std::make_unique<ChurchDAWRemoteServer>();
+        remoteServer->setHandler (
+            [safe = juce::Component::SafePointer<MainComponent> (this)]
+            (const juce::String& path)
+            {
+                if (auto* self = safe.getComponent())
+                    return self->handleRemoteRequest (path);
+                return juce::String ("{\"error\":\"offline\"}");
+            });
+        if (remoteServer->start())
+            juce::Logger::writeToLog (
+                "REMOTE: servidor local ativo com pareamento manual");
+    }
+    else
+    {
+        remoteToken.clear();
+        juce::Logger::writeToLog (
+            "REMOTE: desativado; token manual forte nao configurado");
+    }
+   #endif
 
     // ---- slots da cadeia ----
     const char* slotNames[numSlots] = { "INSTRUMENTO", "EFEITO 1", "EFEITO 2", "EFEITO 3" };
@@ -1330,17 +2430,49 @@ MainComponent::MainComponent()
 
         if (midiLearnActive.load() && ! applyingMappedCC)
         {
-            lastTouchedSlot.store (-1);   // -1 = Master
-            lastTouchedParam.store (-1);
+            const juce::ScopedLock sl (mapLock);
+            lastTouchedSlot.store (-1, std::memory_order_relaxed);
+            lastTouchedParam.store (-1, std::memory_order_relaxed);
+            lastTouchedInsert.store (-1, std::memory_order_relaxed);
+            lastTouchedParamName = "Master";
+            lastTouchedParamId = "master";
+            lastTouchedPluginId =
+                ChurchDAWMidiMapping::masterProcessorIdentity();
+            lastTouchedParameterIdentityUnique.store (
+                true, std::memory_order_relaxed);
+            pendingNoteAction = {};
             triggerAsyncUpdate();
         }
     };
-    masterSlider.onDragEnd = [this] { saveChainState(); };
+    masterSlider.onDragEnd = [this] { agendarGravacaoDoSetup(); };
     addAndMakeVisible (masterSlider);
+    if (masterProcessor != nullptr
+         && ! masterProcessor->getParameters().isEmpty())
+        ChurchDAWMidiLearnTarget::tag (
+            masterSlider, *masterProcessor,
+            *masterProcessor->getParameters().getFirst());
 
+    // MESMO CONTRATO DA REGUA DO CHURCH LIVE (ver TimbresProcessor, criacao do
+    // masterMeter): sao dois medidores do MESMO barramento em duas telas, e ate
+    // aqui cada um contava uma historia. Este lia o nivel da caixa do outro e
+    // tratava o clip como luz momentanea; agora os dois leem a MESMA trava nao
+    // destrutiva, mostram o mesmo ambar de limiter e cada um tem sua propria
+    // caixa de nivel (levelReaderChain / levelReaderMaster).
     meter = std::make_unique<LevelMeter> (2,
-        [mp = masterProcessor] (int ch) { return mp->readAndResetLevel (ch); },
-        [mp = masterProcessor]          { return mp->readAndResetClip(); });
+        [mp = masterProcessor] (int ch)
+        {
+            return mp->readAndResetLevel (ch, MasterProcessor::levelReaderChain);
+        },
+        // ALERTA (vermelho, travado): sobrecarga de gain-staging na entrada do
+        // limiter. NAO e "passou de 0 dBFS" -- isso e o trabalho normal do
+        // brick-wall. Le sem zerar, entao nao disputa o evento com a outra regua.
+        [mp = masterProcessor] { return mp->getClipLatched(); });
+    // ...e o clique apaga a trava na FONTE, senao ela reacenderia no proximo tick.
+    meter->setClipClearFn ([mp = masterProcessor] { mp->clearClipLatch(); });
+    // INFORMATIVO (ambar, momentaneo): o limiter esta segurando AGORA.
+    meter->setLimiterActivityFn (
+        [mp = masterProcessor] { return mp->getLimiterGainReductionDb() < -0.5f; });
+    meter->setClipRole (LevelMeter::ClipRole::channelClip);
     addAndMakeVisible (*meter);
 
     // ---- painel de plugin embutido ----
@@ -1348,6 +2480,9 @@ MainComponent::MainComponent()
     addChildComponent (dockTitle);
     addChildComponent (dockViewport);
     dockViewport.setViewedComponent (&dockHolder, false);
+   #if ! JUCE_ANDROID && ! JUCE_IOS
+    dockViewport.setScrollBarThickness (8);
+   #endif
     addChildComponent (dockFloatButton);
     addChildComponent (dockCloseButton);
 
@@ -1361,7 +2496,21 @@ MainComponent::MainComponent()
     dockCloseButton.onClick = [this] { undockEditor(); };
 
     refreshSlotChoices();
-    restoreChainState();
+    if (! safeMode)
+        restoreChainState();
+    else
+        juce::Logger::writeToLog (
+            "SAFE_MODE: cadeia salva ignorada; usando instrumentos internos neutros");
+
+    if (slots[0].nodeID.uid == 0)
+    {
+        loadInternalTimbres (0, nullptr, 0);
+        slots[0].box.setSelectedId (timbresComboId, juce::dontSendNotification);
+        refreshSlotChoices();
+        if (slots[0].nodeID.uid != 0)
+            openEditorForSlot (0);
+    }
+
     rebuildGraphConnections();
 
     // O XML so informa qual pagina estava ativa; ele nao prova que a pagina
@@ -1372,7 +2521,9 @@ MainComponent::MainComponent()
             [safe = juce::Component::SafePointer<MainComponent> (this)]
             {
                 if (auto* self = safe.getComponent())
-                    self->reconciliarCenaAtivaNoStartup();
+                    if (! self->componentShutdownStarted.load (
+                            std::memory_order_acquire))
+                        self->reconciliarCenaAtivaNoStartup();
             });
 
     setSize (1280, 720);
@@ -1391,6 +2542,11 @@ MainComponent::MainComponent()
                 c->openEditorForSlot (0);
         });
 
+    // Recebe mouseDown dos controles descendentes. No modo MIDI rapido isso
+    // permite armar um knob/fader com um clique simples, mesmo quando o valor
+    // nao mudou e SliderParameterAttachment nao emitiu callback de parametro.
+    addMouseListener (this, true);
+
     // O escaneador de plugins nunca abre sozinho. Em uma instalacao limpa ele
     // cobria a mesa inteira logo na primeira abertura e fazia o ChurchDAW parecer
     // quebrado, especialmente no macOS. O usuario continua podendo abri-lo pelo
@@ -1399,7 +2555,31 @@ MainComponent::MainComponent()
 
 MainComponent::~MainComponent()
 {
+   #if JUCE_ANDROID
+    glContext.detach();
+   #endif
+    stopTimer();
+    oled.fetchChord = nullptr;
+    oled.fetchLevel = nullptr;
+    if (liveCamWindow != nullptr) delete liveCamWindow.getComponent();
+    beginOwnerTeardown();
+    jassert (ownerTeardownGate == nullptr
+             || ownerTeardownGate->isClosedAndDrained());
+    jassert (parameterCallbackGate.isDrained());
+    midiLearnTouchTimer.setRunning (false);
+    parameterLearnGeneration.fetch_add (1, std::memory_order_acq_rel);
+    parameterTouchMailbox.clear();
+   #if CHURCHDAW_REMOTE_CONTROL_ENABLED
+    if (remoteServer != nullptr)
+        remoteServer->stop();
+   #endif
+    removeMouseListener (this);
     pluginLoadLifetime->store (false);
+    midiCallbackLifetime->store (false);
+    // Launchkey owns a separate MidiInput + AsyncUpdater. Destroy it while all
+    // processors are still alive so no queued surface callback can be pumped
+    // by plugin teardown later in this destructor.
+    launchkey.reset();
 
    #if CHURCHDAW_HOSTS_PLUGINS
     // PluginListHolder guarda referencias para formatManager, knownPlugins,
@@ -1418,9 +2598,85 @@ MainComponent::~MainComponent()
     // um refresh enfileirado podia rodar contra um objeto meio destruido.
     midiListConnection = {};
 
+    // Nenhum callback pode intercalar com o snapshot síncrono final.
+    deviceManager.removeMidiInputDeviceCallback ({}, this);
+    {
+        const juce::ScopedLock drain (midiCallbackBarrier);
+        // A aquisição só termina quando qualquer handleIncomingMidiMessage
+        // em voo deixou a barreira; mapLock não é tomado enquanto se espera.
+    }
+    cancelPendingUpdate();
+    if (midiMapsLoaded)
+    {
+        const auto ccFile = arquivoDoMapaDeCCs();
+        const auto noteFile = arquivoDoMapaDeNotas();
+        bool flushCompleted = false;
+        bool transactionClosed = false;
+
+        if (midiMapFileLock != nullptr)
+        {
+            ChurchDAWMidiMapping::MidiMapPairRollback diskRollback (
+                ccFile, noteFile, *midiMapFileLock, &midiMapDiskRevision);
+            const bool checkpointReady = diskRollback.capture (
+                "shutdown-flush");
+            const bool targetsUnchanged = checkpointReady
+                && diskRollback.targetsUnchangedSinceCapture();
+
+            if (targetsUnchanged)
+            {
+                const auto ccEpoch = ccDirtyEpoch.snapshot();
+                const auto noteEpoch = noteDirtyEpoch.snapshot();
+                const bool ccsOk = saveMidiMap();
+                const bool notesOk = ccsOk && saveNoteMap();
+                if (ccsOk && notesOk)
+                {
+                    transactionClosed = diskRollback.commit();
+                    flushCompleted = transactionClosed;
+                    if (flushCompleted)
+                        finishMidiMapDirtyEpochsAfterPairCommit (
+                            ccEpoch, true, noteEpoch, true);
+                    if (! transactionClosed)
+                        transactionClosed =
+                            ChurchDAWMidiMapping::rollbackMidiMapPairPreservingFutureSchema (
+                                diskRollback, ccFile, noteFile);
+                }
+                else
+                    transactionClosed =
+                        ChurchDAWMidiMapping::rollbackMidiMapPairPreservingFutureSchema (
+                            diskRollback, ccFile, noteFile);
+            }
+            else if (checkpointReady)
+            {
+                // Nenhum arquivo nosso foi alterado. Fecha o checkpoint sem
+                // reescrever um par que mudou fora deste snapshot.
+                transactionClosed = diskRollback.closeWithoutMutation();
+            }
+
+            if (diskRollback.preservedExternalChanges())
+                midiMapPairRecoveryFailed = true;
+            if (! checkpointReady
+                 && diskRollback.hadUninspectableTargetConflict())
+                bloquearQuartetoMidiDesconhecido (
+                    "checkpoint do flush de encerramento");
+        }
+
+        if (! flushCompleted)
+            juce::Logger::writeToLog (
+                "MIDI MAP: flush final do par CC/notas nao foi concluido");
+        if (! transactionClosed)
+            midiMapPairRecoveryFailed = true;
+    }
+
     librariesPanel.reset();  // encerra rede/download antes de desmontar os processadores
     aboutPanel.reset();
     saveChainState();
+
+    // O editor guarda attachments/referencia para o processador do grafo.
+    // Destrua-o enquanto o PadSynthProcessor ainda esta vivo.
+    performanceSessionPanel.reset();
+    padEditorPanel.reset();
+    padPanel.reset();
+    meter.reset();
 
     masterProcessor->removeChangeListener (this);
     masterProcessor->removeListener (this);
@@ -1428,8 +2684,10 @@ MainComponent::~MainComponent()
     if (padProcessor != nullptr)
         padProcessor->juce::AudioProcessor::removeListener (this);   // par do addListener do construtor
 
-    deviceManager.removeMidiInputDeviceCallback ({}, this);
-    deviceManager.removeAudioCallback (&player);
+    if (padSynthProcessor != nullptr)
+        padSynthProcessor->removeListener (this);
+
+    deviceManager.removeAudioCallback (this);
     deviceManager.removeChangeListener (this);
     knownPlugins.removeChangeListener (this);
     player.setProcessor (nullptr);
@@ -1443,7 +2701,36 @@ MainComponent::~MainComponent()
 
     audioPanel.reset();      // o attachment do card Audio/MIDI aponta pra parametro do grafo
     pluginWindows.clear();   // destroi os editores antes dos processadores
-    graph.clear();
+    for (auto& slot : slots)
+        if (auto* live = dynamic_cast<TimbresProcessor*> (slot.proc.load()))
+            live->setMidiMappingTopologyGenerationCounter (nullptr);
+
+    // Os quatro knobs macro da sidebar sao SliderParameterAttachment dos
+    // parametros do PadSynthProcessor. O graph.clear() abaixo destroi o
+    // processador e, com ele, os parametros; se os attachments ainda estiverem
+    // vivos, ~ParameterAttachment chama removeListener num AudioProcessorParameter
+    // ja liberado -- 0xc0000005 em RtlEnterCriticalSection em TODO fechamento.
+    for (auto& attachment : desktopMacroAttachments)
+        attachment.reset();
+
+    // Handshake de vida (ver liveHandshakeLock no topo do arquivo):
+    // removeMidiInputDeviceCallback acima nao promete drenar um callback de MIDI
+    // em voo ate o fim — um handleIncomingMidiMessage prestes a desreferenciar o
+    // TimbresProcessor ainda poderia estar rodando. So destroi os nos do grafo
+    // depois de adquirir o lock, espelhando unloadSlot.
+    {
+        const juce::ScopedLock sl (liveHandshakeLock);
+        for (auto& slot : slots)
+        {
+            slot.proc.store (nullptr);
+            slot.nodeID = {};
+        }
+        masterProcessor = nullptr;
+        padProcessor = nullptr;
+        padSynthProcessor = nullptr;
+        sabrinaProcessor = nullptr;
+        graph.clear();
+    }
 
     appProperties.getUserSettings()->saveIfNeeded();
     appProperties.closeFiles();
@@ -1454,6 +2741,20 @@ void MainComponent::beginLicenseFadeOut()
     if (masterProcessor != nullptr)
         masterProcessor->setMasterDb (MasterProcessor::minusInfinityDb);
 }
+
+void MainComponent::beginOwnerTeardown() noexcept
+{
+    componentShutdownStarted.store (true, std::memory_order_release);
+    midiLearnActive.store (false, std::memory_order_release);
+    midiCallbackLifetime->store (false, std::memory_order_release);
+    parameterCallbackGate.closePermanently();
+}
+
+bool MainComponent::ownerTeardownIsReady() const noexcept
+{
+    return parameterCallbackGate.isDrained();
+}
+
 
 //==============================================================================
 void MainComponent::paint (juce::Graphics& g)
@@ -1467,23 +2768,64 @@ void MainComponent::paint (juce::Graphics& g)
     // e o vermelho volta a ser acento (filete, wordmark, botao ativo).
     // O material do header cobre o recorte superior (full bleed), mas toda a
     // geometria clicavel comeca em layoutContentBounds.getY().
-    auto headerArea = getLocalBounds().removeFromTop (
+    auto headerArea = juce::Rectangle<int> (
+        layoutContentBounds.getX(), 0, layoutContentBounds.getWidth(),
         juce::jmin (getHeight(), layoutSafeTop + layoutHeaderHeight));
     const int headerContentY = layoutContentBounds.getY();
     const bool compactHeader = compactHeaderLayout;
     const bool narrowHeader = narrowHeaderLayout;
-    g.setGradientFill (juce::ColourGradient (juce::Colour (0xff24272e), 0.0f, 0.0f,
-                                             juce::Colour (0xff15161a), 0.0f, (float) headerArea.getBottom(), false));
-    g.fillRect (headerArea);
+    if (desktopReferenceLayout)
+    {
+        g.setColour (juce::Colour (0xff16191e));
+        g.fillRect (headerArea);
+        g.setColour (juce::Colours::white.withAlpha (0.035f));
+        g.drawHorizontalLine (headerContentY + 56,
+                              (float) headerArea.getX() + 18.0f,
+                              (float) headerArea.getRight() - 18.0f);
+    }
+    else
+    {
+        g.setColour (NordLookAndFeel::bgApp());
+        g.fillRect (headerArea);
+        ChurchDAWArtwork::texture (g, headerArea.toFloat(), 0.35f);
+    }
+    g.setColour (NordLookAndFeel::borderSoft());
+    g.fillRect (headerArea.withTop (headerArea.getBottom() - 1));
 
-    g.setColour (juce::Colours::white.withAlpha (0.06f));   // brilho de 1px no topo
-    g.fillRect (headerArea.withHeight (1));
+    if (desktopReferenceLayout)
+    {
+        if (brandHover)
+        {
+            g.setColour (juce::Colours::white.withAlpha (0.06f));
+            g.fillRoundedRectangle (brandArea().toFloat(), 6.0f);
+            g.setColour (juce::Colours::white.withAlpha (0.10f));
+            g.drawRoundedRectangle (brandArea().toFloat().reduced (0.5f), 6.0f, 1.0f);
+        }
 
-    g.setColour (juce::Colours::black.withAlpha (0.5f));
-    g.fillRect (juce::Rectangle<int> (0, headerArea.getBottom() - 4, getWidth(), 4));
-    g.setColour (NordLookAndFeel::nordRed().withAlpha (0.86f));
-    g.fillRect (juce::Rectangle<int> (0, headerArea.getBottom() - 1, getWidth(), 1));
+        // Marca horizontal CHURCHDAW no canto superior esquerdo do header
+        auto brandFont = juce::Font (juce::FontOptions (brandArea().getWidth() < 180 ? 23.0f : 25.0f, juce::Font::bold));
+        g.setFont (brandFont);
+        juce::GlyphArrangement brandMeasure;
+        brandMeasure.addLineOfText (brandFont, "CHURCH", 0.0f, 0.0f);
+        const int churchW = juce::roundToInt (
+            brandMeasure.getBoundingBox (0, -1, true).getWidth());
+        juce::GlyphArrangement dawMeasure;
+        dawMeasure.addLineOfText (brandFont, "DAW", 0.0f, 0.0f);
+        const int dawW = juce::roundToInt (
+            dawMeasure.getBoundingBox (0, -1, true).getWidth());
 
+        const int brandX = brandArea().getX();
+        const int brandY = brandArea().getCentreY() - 16;
+        g.setColour (juce::Colours::white);
+        g.drawText ("CHURCH", brandX, brandY, churchW + 2, 32, juce::Justification::centredLeft);
+        g.setColour (NordLookAndFeel::nordRedBright());
+        g.drawText ("DAW", brandX + churchW, brandY, dawW + 4, 32, juce::Justification::centredLeft);
+
+        // Os tres modulos tecnicos desenham suas proprias chapas elevadas.
+        // Aqui fica apenas a luz ambiente que os une, sem uma quarta caixa.
+    }
+    else
+    {
     // Marca: o icone ja e um "app icon" vermelho vivo com forma propria — nao
     // precisa de chapa atras, so de uma sombra pra pousar no header.
     //
@@ -1502,14 +2844,14 @@ void MainComponent::paint (juce::Graphics& g)
 
    #if JUCE_ANDROID
     {
-        const float iconSize = mobileShortLandscapeLayout ? 24.0f
-                                                          : compactHeader ? 32.0f : 46.0f;
+        const float iconSize = mobileShortLandscapeLayout ? 34.0f
+                                                          : compactHeader ? 46.0f : 82.0f;
         const float iconX = (float) layoutSafeLeft
                           + (mobileShortLandscapeLayout ? 5.0f
                                                        : compactHeader ? 8.0f
                                                                        : (narrowHeader ? 12.0f : 17.0f));
-        const float iconRowH = mobilePortraitLayout ? 48.0f
-                                                    : (float) layoutHeaderHeight;
+        const float iconRowH = mobileTwoRowHeader ? 48.0f
+                                                  : (float) layoutHeaderHeight;
         const float iconY = (float) headerContentY
                           + (iconRowH - iconSize) * 0.5f;
         NordLookAndFeel::drawChurchDAWMark (
@@ -1524,8 +2866,8 @@ void MainComponent::paint (juce::Graphics& g)
                           + (mobileShortLandscapeLayout ? 5.0f
                                                        : compactHeader ? 8.0f
                                                                        : (narrowHeader ? 12.0f : 17.0f));
-        const float iconRowH = mobilePortraitLayout ? 48.0f
-                                                    : (float) layoutHeaderHeight;
+        const float iconRowH = mobileTwoRowHeader ? 48.0f
+                                                  : (float) layoutHeaderHeight;
         const float iconY = (float) headerContentY
                           + (iconRowH - iconSize) * 0.5f;
         const auto box = juce::Rectangle<float> (iconX, iconY, iconSize, iconSize);
@@ -1574,7 +2916,11 @@ void MainComponent::paint (juce::Graphics& g)
         g.setOpacity (1.0f);
 
         const auto draw = box.expanded (compactHeader ? 1.5f : 3.0f).toNearestInt();
-        g.drawImageWithin (brandIcon, draw.getX(), draw.getY(), draw.getWidth(), draw.getHeight(),
+        const auto markSource = juce::Rectangle<int> (
+            0, 0, brandIcon.getWidth(),
+            juce::jmax (1, juce::roundToInt (brandIcon.getHeight() * 0.73f)));
+        const auto mark = brandIcon.getClippedImage (markSource);
+        g.drawImageWithin (mark, draw.getX(), draw.getY(), draw.getWidth(), draw.getHeight(),
                            juce::RectanglePlacement::centred);
     }
    #endif
@@ -1583,23 +2929,34 @@ void MainComponent::paint (juce::Graphics& g)
     {
         auto titleFont = juce::Font (juce::FontOptions (
                                 mobileShortLandscapeLayout ? 15.0f
-                                                           : compactHeader ? 18.0f : 22.0f))
+                                : compactHeader ? 20.0f : 28.0f))
                              .boldened().italicised();
         g.setFont (titleFont);
 
         juce::GlyphArrangement measure;
-        measure.addLineOfText (titleFont, "Church", 0.0f, 0.0f);
+        measure.addLineOfText (titleFont, "CHURCH", 0.0f, 0.0f);
         const int churchW = (int) std::ceil (measure.getBoundingBox (0, -1, true).getWidth());
-        const int textX = layoutSafeLeft + (mobileShortLandscapeLayout ? 34
-                                                                       : compactHeader ? 48
-                                                                                       : 18 + 44 + 8);
+        const int textX = layoutSafeLeft + (mobileShortLandscapeLayout ? 48
+                                                                       : compactHeader ? 62
+                                                                                       : 17 + 82 + 8);
 
+        const int titleRowHeight = mobileTwoRowHeader ? 48 : layoutHeaderHeight;
         g.setColour (juce::Colours::white);
-        g.drawText ("Church", textX, headerContentY, churchW + 4, layoutHeaderHeight,
+        g.drawText ("CHURCH", textX, headerContentY, churchW + 4, titleRowHeight,
                     juce::Justification::centredLeft);
         g.setColour (NordLookAndFeel::nordRedBright());   // "DAW" carrega a cor da marca
-        g.drawText ("DAW", textX + churchW, headerContentY, 200, layoutHeaderHeight,
+        g.drawText ("DAW", textX + churchW, headerContentY, 200, titleRowHeight,
                     juce::Justification::centredLeft);
+
+        if (! compactHeader)
+        {
+            g.setColour (juce::Colours::white.withAlpha (0.68f));
+            g.setFont (NordLookAndFeel::stageLabel (8.0f));
+            g.drawFittedText (juce::String::fromUTF8 ("DAW PARA IGREJAS"),
+                              juce::Rectangle<int> (textX, headerContentY + 57,
+                                                    juce::jmax (1, layoutBrandWidth - textX + layoutSafeLeft - 8), 14),
+                              juce::Justification::centredLeft, 1, 0.8f);
+        }
     }
 
     // separador vertical apos a marca
@@ -1608,40 +2965,81 @@ void MainComponent::paint (juce::Graphics& g)
                                                           : compactHeader ? 6 : 11;
     const int separatorY = headerContentY + separatorInset;
     const int separatorH = juce::jmax (
-        0, (mobilePortraitLayout ? 48 : layoutHeaderHeight) - separatorInset * 2);
+        0, (mobileTwoRowHeader ? 48 : layoutHeaderHeight) - separatorInset * 2);
     g.setColour (juce::Colours::black.withAlpha (0.45f));
     g.fillRect (separatorX, separatorY, 1, separatorH);
     g.setColour (juce::Colours::white.withAlpha (0.08f));
     g.fillRect (separatorX + 1, separatorY, 1, separatorH);
+    }
 
     // chip de vidro atras do status (kHz / buffer / CPU) — combina com os chips
     // de dispositivo do header
-    // CHAPA DE CHASSI do painel de programa. Na foto do Electro 7 o display esta
-    // encaixado no corpo do instrumento, nao flutuando: sem esta chapa o visor
-    // ficava solto num vazio preto e parecia um cartao jogado na tela.
-    // liveScenePanel e o TERCEIRO ocupante desta faixa. Faltava aqui, e o Live
-    // Mode desenhava direto sobre o fundo: um buraco retangular no meio do
-    // painel, sem chapa, sem vinco e sem o fio vermelho.
-    if (! programBand.isEmpty()
+    // No mixer a faixa serve somente como separador de contexto. Canal, estado
+    // e timbre ja aparecem nas proprias reguas e nao devem ocupar este espaco.
+    if (compactProgramBand && ! programBand.isEmpty())
+    {
+        auto strip = programBand.toFloat();
+        g.setColour (NordLookAndFeel::bgApp());
+        g.fillRect (strip);
+        g.setColour (juce::Colours::white.withAlpha (0.05f));
+        g.fillRect (strip.getX(), strip.getY(), strip.getWidth(), 1.0f);
+        g.setColour (desktopReferenceLayout ? juce::Colours::transparentBlack
+                                            : NordLookAndFeel::nordRed().withAlpha (0.78f));
+        g.fillRect (strip.getX(), strip.getBottom() - 1.0f, strip.getWidth(), 1.0f);
+
+        if (desktopReferenceLayout)
+        {
+            g.setColour (juce::Colours::white.withAlpha (0.04f));
+            g.fillRect (strip.getX(), strip.getBottom() - 1.0f, strip.getWidth(), 1.0f);
+
+            auto mixerHdr = desktopMixerTabBounds;
+            g.setColour (NordLookAndFeel::txtSecondary().withAlpha (0.65f));
+            g.fillRoundedRectangle ((float) mixerHdr.getX(),
+                                    (float) mixerHdr.getCentreY() - 3.5f,
+                                    2.0f, 7.0f, 1.0f);
+            mixerHdr.removeFromLeft (8);
+            g.setColour (NordLookAndFeel::txtPrimary().withAlpha (0.90f));
+            g.setFont (NordLookAndFeel::stageLabel (9.6f));
+            g.drawText ("MESA AO VIVO", mixerHdr, juce::Justification::centredLeft);
+            const int referenceMasterW = juce::jlimit (
+                232, 292, juce::roundToInt (programBand.getWidth() * 0.239f));
+            const int referenceMasterX = programBand.getRight() - referenceMasterW;
+            if (desktopWorkspace == DesktopWorkspace::mixer)
+            {
+                // Na referencia a coluna MASTER nasce na propria subnavegacao:
+                // somente o cabecalho sobe; os modulos comecam alinhados aos
+                // channel strips. Essa continuidade evita que o master pareca um
+                // oitavo canal comum e devolve a hierarquia visual do mockup.
+                auto masterHeader = juce::Rectangle<int> (
+                    referenceMasterX + 18, programBand.getY(),
+                    referenceMasterW - 36, programBand.getHeight());
+                g.setColour (NordLookAndFeel::nordRed());
+                g.fillRoundedRectangle ((float) masterHeader.getX(),
+                                        (float) masterHeader.getCentreY() - 3.5f,
+                                        2.0f, 7.0f, 1.0f);
+                masterHeader.removeFromLeft (8);
+                g.setColour (NordLookAndFeel::txtPrimary().withAlpha (0.90f));
+                g.setFont (NordLookAndFeel::stageLabel (9.6f));
+                g.drawText ("MASTER", masterHeader, juce::Justification::centredLeft);
+            }
+        }
+        else
+        {
+            g.setColour (juce::Colours::white.withAlpha (0.72f));
+            g.setFont (NordLookAndFeel::stageLabel (10.0f));
+            g.drawFittedText ("MIXER", programBand.reduced (18, 0),
+                              juce::Justification::centredLeft, 1, 0.82f);
+        }
+    }
+
+    if (! compactProgramBand && ! programBand.isEmpty()
          && (oled.isVisible() || midiLearnPanel.isVisible() || liveScenePanel.isVisible()))
     {
         auto plate = programBand.toFloat();
 
-        g.setGradientFill (juce::ColourGradient (juce::Colour (0xff1c1e24), plate.getX(), plate.getY(),
-                                                 juce::Colour (0xff101216), plate.getX(), plate.getBottom(),
-                                                 false));
+        g.setColour (NordLookAndFeel::bgCard());
         g.fillRect (plate);
-
-        // escovado vertical sutil: da materia a chapa sem virar textura chamativa
-        g.setColour (juce::Colours::white.withAlpha (0.012f));
-
-        for (float xx = plate.getX(); xx < plate.getRight(); xx += 3.0f)
-            g.drawLine (xx, plate.getY(), xx, plate.getBottom(), 1.0f);
-
-        // vincos de chassi em cima e embaixo
-        g.setColour (juce::Colours::black.withAlpha (0.55f));
-        g.fillRect (plate.getX(), plate.getBottom() - 2.0f, plate.getWidth(), 2.0f);
-        g.setColour (juce::Colours::white.withAlpha (0.05f));
+        g.setColour (NordLookAndFeel::borderSoft());
         g.fillRect (plate.getX(), plate.getY(), plate.getWidth(), 1.0f);
 
         // No Learn o fio ambar avisa que o modo esta armado; fora dele volta a
@@ -1690,18 +3088,42 @@ void MainComponent::paint (juce::Graphics& g)
 
     if (auto sb = engineStatusBounds; ! sb.isEmpty())
     {
-        auto chip = sb.toFloat().reduced (0.0f, 1.0f);
-        g.setColour (juce::Colours::black.withAlpha (0.32f));
-        g.fillRoundedRectangle (chip, NordLookAndFeel::radiusControl);
-        g.setColour (juce::Colours::white.withAlpha (0.09f));
-        g.drawRoundedRectangle (chip.reduced (0.5f), NordLookAndFeel::radiusControl, 1.0f);
-
-        auto label = sb.reduced (8, 2).removeFromTop (10);
-        g.setColour (juce::Colours::white.withAlpha (0.64f));
-        g.setFont (juce::Font (juce::FontOptions (8.0f, juce::Font::bold))
-                       .withExtraKerningFactor (0.12f));
-        g.drawText (juce::String::fromUTF8 ("\xc3\x81UDIO ENGINE"), label,
-                    juce::Justification::centred, false);
+        if (desktopReferenceLayout)
+        {
+            g.setColour (juce::Colours::white.withAlpha (0.08f));
+            g.drawVerticalLine (sb.getX(), (float) sb.getY() + 8.0f,
+                                (float) sb.getBottom() - 8.0f);
+            auto chip = juce::Rectangle<float> ((float) sb.getX() + 11.0f,
+                (float) sb.getCentreY() - 7.0f, 14.0f, 14.0f);
+            g.setColour (NordLookAndFeel::txtSecondary());
+            g.drawRoundedRectangle (chip, 2.0f, 1.25f);
+            g.drawRect (chip.reduced (4.0f), 1.0f);
+            for (int pin = 0; pin < 3; ++pin)
+            {
+                const float step = 3.0f + 4.0f * (float) pin;
+                g.drawLine (chip.getX() + step, chip.getY() - 3.0f,
+                            chip.getX() + step, chip.getY(), 1.0f);
+                g.drawLine (chip.getX() + step, chip.getBottom(),
+                            chip.getX() + step, chip.getBottom() + 3.0f, 1.0f);
+            }
+            g.setFont (NordLookAndFeel::stageLabel (8.0f));
+            g.setColour (NordLookAndFeel::txtDisabled());
+            g.drawText ("ENGINE", sb.withTrimmedLeft (38).withTrimmedTop (6)
+                                       .withHeight (14), juce::Justification::centredLeft);
+        }
+        else
+        {
+            auto chip = sb.toFloat().reduced (0.0f, 1.0f);
+            g.setColour (NordLookAndFeel::bgCard());
+            g.fillRoundedRectangle (chip, 7.0f);
+            g.setColour (NordLookAndFeel::borderSoft());
+            g.drawRoundedRectangle (chip.reduced (0.5f), 7.0f, 1.0f);
+            g.setColour (juce::Colours::white.withAlpha (0.64f));
+            g.setFont (NordLookAndFeel::stageLabel (8.0f));
+            g.drawText (juce::String::fromUTF8 ("ÁUDIO ENGINE"),
+                        sb.reduced (8, 2).removeFromTop (10),
+                        juce::Justification::centred, false);
+        }
     }
 
     // ---- cartoes (vidro premium compartilhado) ----
@@ -1789,7 +3211,38 @@ void MainComponent::paint (juce::Graphics& g)
 // Chamada na largada e a cada mudanca na lista de dispositivos.
 void MainComponent::refreshMidiInputs()
 {
+   #if CHURCHDAW_UI_PREVIEW
+    return; // Isolated visual harness must not open the musician's MIDI ports.
+   #endif
     const auto midiIns = juce::MidiInput::getAvailableDevices();
+
+    std::vector<ChurchDAWMidiMapping::MidiSourceDescriptor> refreshedSources;
+    refreshedSources.reserve ((size_t) midiIns.size());
+    for (const auto& device : midiIns)
+        refreshedSources.push_back ({ device.identifier, device.name });
+
+    {
+        // A MIDI callback can be comparing a learned control while a hot-plug
+        // notification arrives on the message thread. Swap the complete cache
+        // under the same lock used by every callback-side traversal so no
+        // iterator can outlive the old vector storage.
+        const juce::ScopedLock sl (mapLock);
+        midiSourcesCached = std::move (refreshedSources);
+    }
+
+    if (midiMapsLoaded)
+        reindexMidiMappingsAfterRefresh (midiIns);
+
+    int launchkeyDawPortCount = 0;
+    for (const auto& device : midiIns)
+        if (LaunchkeyControl::isDawPort (device.name))
+            ++launchkeyDawPortCount;
+
+    const auto launchkeyPolicy =
+        ChurchDAWMidiMapping::launchkeyCommonInputPolicy (
+            launchkeyMappingEnabled,
+            midiIns.size(),
+            launchkeyDawPortCount);
 
     // A CONTAGEM e registrada mesmo sendo zero, de proposito: sem ela, "nenhuma
     // linha no log" e ambiguo -- pode ser lista vazia ou log que nao chega. Foi
@@ -1804,17 +3257,14 @@ void MainComponent::refreshMidiInputs()
     // cliente ficou sem teclado nenhum. Se o filtro fosse desligar tudo, ele
     // esta errado: e melhor um pad tocar nota errada do que o instrumento
     // ficar mudo no meio do culto.
-    int candidatasALigar = 0;
-    for (auto& d : midiIns)
-        if (! LaunchkeyControl::isDawPort (d.name))
-            ++candidatasALigar;
-
-    const bool filtroDerrubariaTudo = midiIns.size() > 0 && candidatasALigar == 0;
+    const bool filtroDerrubariaTudo =
+        launchkeyPolicy.failSafeKeepingDawPort;
 
     if (filtroDerrubariaTudo)
         juce::Logger::writeToLog (
-            "MIDI: o filtro de porta DAW desligaria TODAS as entradas — ignorado "
-            "nesta varredura para o teclado nao ficar mudo");
+            juce::String::fromUTF8 (
+                u8"MIDI: o filtro de porta DAW desligaria TODAS as entradas — ignorado "
+                u8"nesta varredura para o teclado nao ficar mudo"));
 
     // A LISTA REGISTRADA TEM DE SER A QUE FOI LIGADA DE VERDADE.
     //
@@ -1831,8 +3281,23 @@ void MainComponent::refreshMidiInputs()
     //     exatamente para isso.
     juce::StringArray agora;
     for (auto& d : midiIns)
-        if (filtroDerrubariaTudo || ! LaunchkeyControl::isDawPort (d.name))
+        if (launchkeyPolicy.shouldEnableAsCommonInput (
+                LaunchkeyControl::isDawPort (d.name)))
             agora.add (d.identifier);
+
+    // O sustain global guarda a origem fisica para aplicar OR entre portas.
+    // Remova somente as origens que realmente desapareceram; uma porta ainda
+    // conectada com o pedal embaixo precisa sobreviver ao panic de hot-plug e
+    // ser reaplicada logo depois dele.
+    {
+        juce::StringArray fontesAtivas;
+        for (const auto& id : agora)
+            fontesAtivas.add (
+                ChurchDAWMidiMapping::normalizeMidiSourceId (id));
+
+        const juce::ScopedLock sl (mapLock);
+        sourceAwareSustain.retainOnlySources (fontesAtivas);
+    }
 
     // Feche primeiro os identificadores que desapareceram. Em especial no
     // Android, apenas observar a lista nova nao solta necessariamente a porta
@@ -1851,7 +3316,8 @@ void MainComponent::refreshMidiInputs()
 
     for (auto& d : midiIns)
     {
-        const bool daw = ! filtroDerrubariaTudo && LaunchkeyControl::isDawPort (d.name);
+        const bool daw = ! launchkeyPolicy.shouldEnableAsCommonInput (
+            LaunchkeyControl::isDawPort (d.name));
         deviceManager.setMidiInputDeviceEnabled (d.identifier, ! daw);
 
         // O filtro de porta DAW procura "MIDIIN2"/"MIDIOUT2"/"DAW", que sao
@@ -1860,7 +3326,17 @@ void MainComponent::refreshMidiInputs()
         // descobrir se ele caiu no lado certo do filtro.
         juce::Logger::writeToLog ("MIDI IN: \"" + d.name + "\"  id=" + d.identifier
                                    + (daw ? "  -> DAW (desligada)" : "  -> LIGADA"));
+
+        // No Android o identificador e efemero (muda a cada replug/reinicio).
+        // Guarda nome -> id para reescrever os mapas quando o mesmo aparelho
+        // voltar com um id novo.
+        if (d.name.isNotEmpty())
+            nomeParaIdMidi[d.name] = d.identifier;
     }
+
+    if (midiMapsLoaded)
+        for (const auto& device : midiIns)
+            applyAutomaticControllerProfile (device);
 
     // PANICO SO QUANDO ALGO SAIU.
     //
@@ -1875,8 +3351,20 @@ void MainComponent::refreshMidiInputs()
     const bool listaMudou = entradasMidiConhecidas != agora;
     entradasMidiConhecidas = agora;
 
+    // Mantem a lista CRUA (com portas DAW) para o poll de reconexao comparar
+    // cru-com-cru. Sem isto o poll comparava a lista crua com a filtrada e
+    // nunca batiam, gerando refresh em loop.
+    {
+        juce::StringArray crua;
+
+        for (const auto& d : midiIns)
+            crua.add (d.identifier);
+
+        ultimaListaMidiCrua = crua;
+    }
+
     if (alguemSaiu && ! primeiraVez)
-        resetMidiTransportState();
+        resetMidiTransportState (true);
 
     // As etiquetas do Pad dizem QUAL tecla comanda cada tom, e apagam quando o
     // teclado daquele mapa nao esta ligado. Trocar de controlador e exatamente
@@ -1886,31 +3374,297 @@ void MainComponent::refreshMidiInputs()
         atualizarEtiquetasDoPad();
 }
 
-void MainComponent::resetMidiTransportState()
+void MainComponent::reindexMidiMappingsAfterRefresh (
+    const juce::Array<juce::MidiDeviceInfo>& midiIns)
 {
+    std::vector<ChurchDAWMidiMapping::MidiSourceDescriptor> available;
+    available.reserve ((size_t) midiIns.size());
+    for (const auto& device : midiIns)
+        available.push_back ({ device.identifier, device.name });
+
+    const auto ccFile = arquivoDoMapaDeCCs();
+    const auto noteFile = arquivoDoMapaDeNotas();
+    const auto ccLastGood = ccFile.getSiblingFile (
+        ccFile.getFileName() + ".last-good");
+    const auto noteLastGood = noteFile.getSiblingFile (
+        noteFile.getFileName() + ".last-good");
+    ChurchDAWMidiMapping::MidiMapPairRollback diskRollback (
+        ccFile, noteFile, *midiMapFileLock, &midiMapDiskRevision);
+
+    decltype (ccMappings) previousCC;
+    decltype (ccActionMappings) previousActions;
+    decltype (noteMappings) previousNotes;
+    const bool previousProfilesSuspended = automaticControllerProfilesSuspended;
+
+    ChurchDAWMidiMapping::MidiRekeyResult ccResult;
+    ChurchDAWMidiMapping::MidiRekeyResult actionResult;
+    ChurchDAWMidiMapping::MidiRekeyResult noteResult;
+    bool hasUnresolvedUnnamedSource = false;
+    bool pairConflictAfterRekey = false;
+    bool changed = false;
+    bool memoryMutated = false;
+    bool committed = false;
+    bool rollbackOk = true;
+
+    beginMidiMapRoutingTransaction();
+
+    const bool checkpointReady = ! midiMapPairRecoveryFailed
+        && diskRollback.capture ("before-android-reindex");
+    const bool futureSchemaProtected =
+        ChurchDAWMidiMapping::midiMapFilesHaveFutureSchema (
+            ccFile, ccLastGood, "MIDIMAP")
+        || ChurchDAWMidiMapping::midiMapFilesHaveFutureSchema (
+            noteFile, noteLastGood, "NOTEMAP");
+    const bool diskStillOwned = checkpointReady
+        && diskRollback.targetsUnchangedSinceCapture()
+        && ! futureSchemaProtected;
+
+    if (diskStillOwned)
+    {
+        // A copia/rebuild/swap dos tres mapas e uma unica transacao de memoria.
+        // A lista available foi capturada antes; nao ha enumeracao, I/O ou log
+        // enquanto mapLock esta tomado.
+        const juce::ScopedLock sl (mapLock);
+        previousCC = ccMappings;
+        previousActions = ccActionMappings;
+        previousNotes = noteMappings;
+
+        ccResult = ChurchDAWMidiMapping::rekeyMidiMapByUniqueSourceName (
+            ccMappings, available);
+        actionResult = ChurchDAWMidiMapping::rekeyMidiMapByUniqueSourceName (
+            ccActionMappings, available);
+        noteResult = ChurchDAWMidiMapping::rekeyMidiMapByUniqueSourceName (
+            noteMappings, available);
+
+        const bool noteConflict =
+            ChurchDAWMidiMapping::midiMapCollectionsHaveConflictingNoteControls (
+                ccMappings, noteMappings);
+        const bool ccConflict =
+            ChurchDAWMidiMapping::midiMapCollectionsHaveConflictingCCControls (
+                ccMappings, ccActionMappings,
+                [] (const AcaoDeCC& action)
+                {
+                    return action.acao.kind != NoteActionKind::none;
+                });
+        pairConflictAfterRekey = noteConflict || ccConflict;
+        if (pairConflictAfterRekey)
+        {
+            ccMappings = previousCC;
+            ccActionMappings = previousActions;
+            noteMappings = previousNotes;
+            ccResult = {};
+            actionResult = {};
+            noteResult = {};
+        }
+
+        hasUnresolvedUnnamedSource =
+            ChurchDAWMidiMapping::hasUnresolvedUnnamedMidiSource (
+                ccMappings, available)
+            || ChurchDAWMidiMapping::hasUnresolvedUnnamedMidiSource (
+                ccActionMappings, available)
+            || ChurchDAWMidiMapping::hasUnresolvedUnnamedMidiSource (
+                noteMappings, available);
+        changed = ccResult.moved > 0 || actionResult.moved > 0
+               || noteResult.moved > 0;
+        memoryMutated = changed;
+    }
+
+    if (! diskStillOwned)
+    {
+        rollbackOk = checkpointReady
+            && diskRollback.closeWithoutMutation();
+        if (! checkpointReady
+             && diskRollback.hadUninspectableTargetConflict())
+            bloquearQuartetoMidiDesconhecido (
+                "checkpoint do reindex MIDI");
+        if (! rollbackOk
+             || diskRollback.preservedExternalChanges())
+            midiMapPairRecoveryFailed = true;
+        finishMidiMapRoutingTransaction();
+        juce::Logger::writeToLog (
+            futureSchemaProtected
+                ? "MIDI MAP: rekey Android ignorado para preservar schema futuro"
+                : "MIDI MAP: rekey Android cancelado porque os arquivos mudaram");
+        return;
+    }
+
+    if (pairConflictAfterRekey)
+    {
+        automaticControllerProfilesSuspended = true;
+        rollbackOk = diskRollback.closeWithoutMutation();
+        if (! rollbackOk)
+            midiMapPairRecoveryFailed = true;
+        finishMidiMapRoutingTransaction();
+        juce::Logger::writeToLog (
+            "MIDI MAP: rekey Android cancelado porque criaria conflito entre controles");
+        return;
+    }
+
+    automaticControllerProfilesSuspended = hasUnresolvedUnnamedSource;
+
+    if (! changed)
+    {
+        const bool transactionClosed =
+            diskRollback.closeWithoutMutation();
+        if (! transactionClosed)
+            midiMapPairRecoveryFailed = true;
+        finishMidiMapRoutingTransaction();
+        return;
+    }
+
+    if (ccResult.moved > 0 || actionResult.moved > 0)
+        ccDirtyEpoch.markDirty();
+    if (noteResult.moved > 0)
+        noteDirtyEpoch.markDirty();
+
+    if (ccResult.ambiguous + actionResult.ambiguous + noteResult.ambiguous > 0)
+        juce::Logger::writeToLog ("MIDI MAP: nomes duplicados mantiveram entradas stale");
+    if (ccResult.collisions + actionResult.collisions + noteResult.collisions > 0)
+        juce::Logger::writeToLog ("MIDI MAP: colisões preservadas durante rekey");
+
+    const auto ccEpoch = ccDirtyEpoch.snapshot();
+    const auto noteEpoch = noteDirtyEpoch.snapshot();
+    const bool ccSaved = saveMidiMap();
+    const bool noteSaved = ccSaved && saveNoteMap();
+    committed = ccSaved && noteSaved && diskRollback.commit();
+
+    if (committed)
+        finishMidiMapDirtyEpochsAfterPairCommit (
+            ccEpoch, ccSaved, noteEpoch, noteSaved);
+
+    if (! committed)
+    {
+        rollbackOk =
+            ChurchDAWMidiMapping::rollbackMidiMapPairPreservingFutureSchema (
+                diskRollback, ccFile, noteFile);
+        const juce::ScopedLock sl (mapLock);
+        ccMappings = std::move (previousCC);
+        ccActionMappings = std::move (previousActions);
+        noteMappings = std::move (previousNotes);
+        automaticControllerProfilesSuspended = previousProfilesSuspended;
+    }
+
+    // Success publishes the new source IDs; rollback invalidates any callback
+    // that copied the temporary in-memory generation.
+    if (memoryMutated)
+        bumpMidiMappingGeneration();
+    finishMidiMapRoutingTransaction();
+
+    if (! checkpointReady
+         && diskRollback.hadUninspectableTargetConflict())
+        bloquearQuartetoMidiDesconhecido (
+            "checkpoint de comando MIDI");
+    if (! rollbackOk || diskRollback.preservedExternalChanges())
+        midiMapPairRecoveryFailed = true;
+
+    reconstruirMascaraDeNotas();
+    reconstruirMascaraDeCCsDeAcao();
+    atualizarEtiquetasDoPad();
+    atualizarBotoesDeCCDoPad();
+
+    juce::Logger::writeToLog (
+        committed
+            ? "MIDI MAP: reindex Android salvo como transacao completa"
+            : rollbackOk
+                ? "MIDI MAP: reindex Android falhou; par anterior restaurado"
+                : "MIDI MAP: reindex Android falhou e o rollback ficou bloqueado");
+}
+
+void MainComponent::resetMidiTransportState (
+    bool preservePhysicalSustain)
+{
+    bool reapplyPhysicalSustain = false;
+
     {
         const juce::ScopedLock sl (mapLock);
         notasSuprimidas.clear();
         reconstruirMascaraDeSuprimidas();
+        rawCCGesturesDuringMapTransaction.clear();
+        rawCCTransactionGesturePending.store (
+            false, std::memory_order_release);
+
+        if (preservePhysicalSustain)
+            reapplyPhysicalSustain = sourceAwareSustain.isDown();
+        else
+        {
+            sourceAwareSustain.clear();
+            rawCCPhysicalGestures.clear();
+        }
     }
 
     // O panic direto abaixo atende o instrumento nativo. Injete tambem a
     // sequencia MIDI completa no grafo: se o slot 1 estiver com um VST3/AU,
     // ele nao conhece TimbresProcessor::panic() e ficaria com nota/bend preso
     // depois de hot-plug ou resume.
+    pianoVisualState->reset();
     juce::MidiBuffer panic;
     panic.ensureSize (4096);
     ChurchDAWPerformanceMidiSafety::appendFullPanic (panic, 0);
 
+    // metadata.getMessage() devolve timestamp = posicao no buffer = 0 aqui, o
+    // mesmo defeito do roteamento: o coletor carimbaria samplePosition negativa
+    // gigante. Selo com o relogio de alta resolucao, espelhando o que o proprio
+    // MidiMessageCollector usa quando injeta mensagens internas.
+    const double panicTs = juce::Time::getMillisecondCounterHiRes() * 0.001;
+
     for (const auto metadata : panic)
-        player.getMidiMessageCollector().addMessageToQueue (
-            metadata.getMessage());
+    {
+        auto msg = metadata.getMessage();
+        msg.setTimeStamp (panicTs);
+        player.getMidiMessageCollector().addMessageToQueue (msg);
+    }
+
+    // O panic zera CC64 em todos os motores. Se ele foi provocado por hot-plug
+    // de OUTRA porta, o pedal que continua fisicamente embaixo nao enviara um
+    // novo 127 sozinho. Reaplique depois da fronteira terminal, com folga de
+    // 5 ms para nunca cair no mesmo sample dos CC120/123 coalescidos.
+    if (reapplyPhysicalSustain)
+        for (int channel = 1; channel <= 16; ++channel)
+        {
+            auto sustain = juce::MidiMessage::controllerEvent (
+                channel, 64, 127);
+            sustain.setTimeStamp (panicTs + 0.005);
+            if (auto* live = getChurchLive())
+                pianoVisualState->observeHost (sustain, live->getPedalInverted());
+            else
+                pianoVisualState->observe (sustain);
+            player.getMidiMessageCollector().addMessageToQueue (
+                sustain);
+        }
 
     if (auto* live = getChurchLive())
         live->panic();
 
     juce::Logger::writeToLog (
         "MIDI SAFETY: transporte recentralizado apos hot-plug/resume");
+}
+
+void MainComponent::performGlobalPanic (bool padSynthAlreadyRequested)
+{
+    // PANIC is one global operation. Clearing only Church Live leaves hosted
+    // VST/AU notes and the continuous Pad sounding; clearing only the graph
+    // leaves callback ledgers/sustain able to swallow the next release.
+    ChurchDAWPerformanceMidiSafety::performGlobalPanic (
+        [this]
+        {
+            if (padProcessor != nullptr)
+                padProcessor->setKey (-1);
+        },
+        [this]
+        {
+            if (padPanel != nullptr)
+                padPanel->refreshState();
+        },
+        [this]
+        {
+            if (padSynthProcessor != nullptr)
+                padSynthProcessor->requestPanic();
+        },
+        [this]
+        {
+            resetMidiTransportState (false);
+        },
+        padSynthAlreadyRequested);
 }
 
 void MainComponent::resized()
@@ -1952,10 +3706,17 @@ void MainComponent::resized()
             juce::Desktop::getInstance().getDisplays().getDisplayForRect (
                 getScreenBounds()))
     {
-        layoutSafeLeft = juce::jlimit (0, 16, display->safeAreaInsets.getLeft());
-        layoutSafeRight = juce::jlimit (0, 16, display->safeAreaInsets.getRight());
-        layoutSafeTop = juce::jlimit (0, 24, display->safeAreaInsets.getTop());
-        layoutSafeBottom = juce::jlimit (0, 16, display->safeAreaInsets.getBottom());
+       #if JUCE_IOS
+        layoutSafeLeft = juce::jmax (0, display->safeAreaInsets.getLeft());
+        layoutSafeRight = juce::jmax (0, display->safeAreaInsets.getRight());
+        layoutSafeTop = juce::jmax (0, display->safeAreaInsets.getTop());
+        layoutSafeBottom = juce::jmax (0, display->safeAreaInsets.getBottom());
+       #else
+        layoutSafeLeft = juce::jlimit (0, 80, display->safeAreaInsets.getLeft());
+        layoutSafeRight = juce::jlimit (0, 80, display->safeAreaInsets.getRight());
+        layoutSafeTop = juce::jlimit (0, 64, display->safeAreaInsets.getTop());
+        layoutSafeBottom = juce::jlimit (0, 64, display->safeAreaInsets.getBottom());
+       #endif
     }
    #else
     const bool compact = getHeight() < 600;
@@ -1996,6 +3757,99 @@ void MainComponent::resized()
     if (layoutContentBounds.getWidth() < 1 || layoutContentBounds.getHeight() < 1)
         layoutContentBounds = getLocalBounds();
 
+   #if ! JUCE_ANDROID && ! JUCE_IOS
+    // A referencia desktop usa uma moldura de console completa: a marca e as
+    // cenas vivem numa coluna fixa, enquanto header, mixer e rodape ocupam a
+    // area principal. Em janelas menores voltamos ao layout responsivo atual.
+    // A nova identidade e o shell principal do aplicativo inteiro, nao apenas
+    // um estado temporario do Church Live. Assim a navegacao nao muda de forma
+    // ao abrir/fechar paineis e o desktop sempre conserva sidebar, header e
+    // rodape da referencia.
+    // O ScaledHolder normaliza uma janela Full HD para cerca de 1280x672
+    // unidades logicas. Estes limites portanto representam o desktop grande
+    // real, e nao os pixels fisicos do monitor.
+    // Keep the same shell at the normal resizable desktop minimum. The header
+    // contracts its technical regions instead of switching to a cramped legacy
+    // layout when a native window border subtracts one or two pixels.
+    desktopReferenceLayout = DesktopHeaderLayout::supports (layoutContentBounds);
+    // FULL SCREEN LIVE MIXER: Sem menu lateral, tudo na cara e com máxima largura para os canais
+    desktopSidebarWidth = 0;
+    desktopBottomBarHeight = desktopReferenceLayout ? 62 : 0;
+
+    if (desktopReferenceLayout)
+    {
+        // No shell desktop estes sao dois destinos reais e ambos permanecem
+        // visiveis. O destaque segue a pagina que realmente esta na frente:
+        // Mapear MIDI e PAD nao podem deixar Instrumentos parecendo ativo so
+        // porque a cadeia continua montada por baixo.
+        const bool instrumentsActive = ! churchFull
+                                    && (! mapButton.getToggleState()
+                                         || quickMidiMappingMode)
+                                    && ! padEditorVisible;
+        instrumentsButton.setVisible (true);
+        instrumentsButton.setToggleState (instrumentsActive, juce::dontSendNotification);
+        liveButton.setToggleState (churchFull && ! padEditorVisible
+                                    && (! mapButton.getToggleState() || quickMidiMappingMode),
+                                   juce::dontSendNotification);
+        instrumentsButton.setColour (juce::TextButton::buttonColourId,
+                                     instrumentsActive ? NordLookAndFeel::nordRedDark()
+                                                       : NordLookAndFeel::bgControl());
+        liveButton.setColour (juce::TextButton::buttonColourId,
+                              NordLookAndFeel::bgControl());
+        liveButton.setColour (juce::TextButton::buttonOnColourId,
+                              NordLookAndFeel::nordRed());
+        instrumentsButton.setButtonText ("Instrumentos");
+        liveButton.setButtonText ("Live");
+        const bool learnModeActive = mapButton.getToggleState() || midiLearnActive.load() || quickMidiMappingMode;
+        mapButton.setButtonText (learnModeActive ? "Concluir MIDI" : "Mapear MIDI");
+        padButton.setButtonText ("Pad");
+        scanButton.setButtonText ("Plugins");
+        librariesButton.setButtonText ("Bibliotecas");
+        audioSettingsButton.setButtonText (juce::String::fromUTF8 ("\xc3\x81udio"));
+    }
+    else
+    {
+        instrumentsButton.setToggleState (false, juce::dontSendNotification);
+        statusInfo.setFont (juce::Font (juce::FontOptions (
+            juce::Font::getDefaultMonospacedFontName(), 9.5f, juce::Font::bold)));
+        statusInfo.setJustificationType (juce::Justification::centred);
+        instrumentsButton.setColour (juce::TextButton::buttonColourId,
+                                     juce::Colour (0xffc4112e));
+        liveButton.setColour (juce::TextButton::buttonColourId,
+                              juce::Colours::transparentBlack);
+    }
+
+    if (desktopReferenceLayout)
+    {
+        desktopSidebarBounds = juce::Rectangle<int> (
+            layoutContentBounds.getX(), layoutContentBounds.getY(),
+            desktopSidebarWidth, layoutContentBounds.getHeight());
+        desktopBottomBarBounds = juce::Rectangle<int> (
+            layoutContentBounds.getX() + desktopSidebarWidth,
+            layoutContentBounds.getBottom() - desktopBottomBarHeight,
+            layoutContentBounds.getWidth() - desktopSidebarWidth,
+            desktopBottomBarHeight);
+        layoutContentBounds = layoutContentBounds
+                                  .withTrimmedLeft (desktopSidebarWidth)
+                                  .withTrimmedBottom (desktopBottomBarHeight);
+    }
+    else
+    {
+        desktopSidebarBounds = {};
+        desktopBottomBarBounds = {};
+    }
+   #else
+    desktopReferenceLayout = false;
+    desktopSidebarWidth = 0;
+    desktopBottomBarHeight = 0;
+    desktopSidebarBounds = {};
+    desktopBottomBarBounds = {};
+   #endif
+
+    getProperties().set ("churchDesktopShell", desktopReferenceLayout);
+    performanceDock.setVisible (desktopReferenceLayout);
+    performanceDock.setBounds (desktopBottomBarBounds);
+
     auto area = layoutContentBounds;
 
     // 720 dp e uma largura comum em aparelhos 20:9. Tratar exatamente 720 como
@@ -2008,14 +3862,25 @@ void MainComponent::resized()
     mobilePortraitLayout = false;
    #endif
     const bool narrowPhone = compact && safeContentWidth <= 760;
+   #if JUCE_ANDROID || JUCE_IOS
+    // Tablets em paisagem tem largura suficiente para marca e destinos por
+    // extenso. Telefones em paisagem (>=680 dp livres) e tablets em paisagem
+    // usam uma unica fileira de 52 dp para devolver +56 dp de altura a mesa;
+    // retrato e split-view estreito (<680 dp) usam duas fileiras de 48 dp.
+    const bool wideMobileTablet = ! mobilePortraitLayout
+                               && ! mobileShortLandscapeLayout
+                               && safeContentWidth >= 1080;
+    mobileTwoRowHeader = churchstudioMobileHeader
+                      && (mobilePortraitLayout || safeContentWidth < 680);
+    narrowHeaderLayout = narrowPhone
+                      || (! mobileTwoRowHeader && safeContentWidth < 900);
+   #else
+    mobileTwoRowHeader = false;
     narrowHeaderLayout = narrowPhone;
+   #endif
 
    #if JUCE_ANDROID || JUCE_IOS
-    // 56 dp entrega 48 dp reais de alvo apos as margens. Em retrato a barra
-    // vira duas fileiras: identidade/status em cima, acoes embaixo. Assim
-    // Android 16/freeform nao comprime seis botoes numa unica linha.
-    layoutHeaderHeight = mobilePortraitLayout ? 108
-                                              : mobileShortLandscapeLayout ? 32 : 56;
+    layoutHeaderHeight = mobileTwoRowHeader ? 108 : 52;
     // A FAIXA CRESCE PARA AS CENAS.
     //
     // O visor mostra texto e cabe em 52 px; as dez cenas sao ALVOS DE DEDO e
@@ -2032,37 +3897,139 @@ void MainComponent::resized()
     layoutProgramBandHeight = mobilePortraitLayout ? (cenasNaFaixa ? 104 : 52)
                                                    : mobileShortLandscapeLayout ? (cenasNaFaixa ? 56 : 32)
                                                                                 : mobileProgramBandHeight;
-    layoutBrandWidth = narrowPhone ? 58
-                                   : mobileShortLandscapeLayout ? 132 : 166;
+    layoutBrandWidth = mobileTwoRowHeader ? (narrowPhone ? 58 : 166)
+                     : safeContentWidth < 900 ? 48
+                     : wideMobileTablet ? 214 : 158;
     desktopHeaderTwoRows = false;
    #else
-    desktopHeaderTwoRows = safeContentWidth < 1160;
-    layoutHeaderHeight = compact ? (desktopHeaderTwoRows ? 82 : 46)
+    desktopHeaderTwoRows = desktopReferenceLayout || safeContentWidth < 1160;
+    layoutHeaderHeight = desktopReferenceLayout ? DesktopHeaderLayout::height
+                       : compact ? (desktopHeaderTwoRows ? 82 : 46)
                                  : desktopHeaderTwoRows ? 96 : headerHeight;
-    layoutProgramBandHeight = compact ? 60
+    layoutProgramBandHeight = desktopReferenceLayout
+                                      ? (midiLearnActive.load() ? 66
+                                         : liveScenePanel.isVisible() ? 90 : 30)
+                                      : compact ? 60
                                       : desktopHeaderTwoRows ? 96
                                                              : programBandHeight;
-    layoutBrandWidth = narrowPhone ? 70 : compact ? 190 : 190;
+    // A marca agora ocupa uma zona horizontal: simbolo da igreja + wordmark.
+    layoutBrandWidth = desktopReferenceLayout ? 0
+                     : narrowPhone ? 70 : compact ? 300 : 360;
    #endif
     compactHeaderLayout = compact;
 
     const int headerH = layoutHeaderHeight;
+   #if JUCE_ANDROID || JUCE_IOS
+    compactProgramBand = false;
+   #else
+    // Com a mesa Church Live aberta, o visor grande repete o canal/timbre que
+    // as reguas ja mostram. Conservamos uma faixa curta para contexto, mas
+    // devolvemos a maior parte dessa altura ao mixer.
+    compactProgramBand = churchFull
+                      && ! liveScenePanel.isVisible()
+                      && ! midiLearnPanel.isVisible();
+   #endif
+
+    if (compactProgramBand)
+        layoutProgramBandHeight = desktopReferenceLayout ? 34
+                                                         : compactProgramBandHeight;
+
     const int bandH = layoutProgramBandHeight;
+
+    for (int i = 0; i < ChurchDAWLive::numeroDeCenas; ++i)
+    {
+        desktopSceneBounds[i] = {};
+        desktopSceneIndexAtRow[i] = i;
+    }
+
+    desktopSaveBounds = {};
+    desktopResetBounds = {};
+    desktopAudioBounds = {};
+    desktopHeaderExtrasBounds = {};
+    desktopBpmBounds = {};
+    desktopTapBounds = {};
+    desktopSettingsBounds = {};
+    desktopLiveStatusBounds = {};
+    desktopMixerTabBounds = {};
+    desktopPerformanceTabBounds = {};
+    desktopSessionTabBounds = {};
+    desktopSceneAddBounds = {};
+    for (auto& bounds : desktopFavouriteBounds)
+        bounds = {};
+
+    if (desktopReferenceLayout && desktopSidebarWidth > 0 && ! desktopSidebarBounds.isEmpty())
+    {
+        const int sideX = desktopSidebarBounds.getX() + 12;
+        const int sideW = desktopSidebarBounds.getWidth() - 24;
+        const int firstSceneY = desktopSidebarBounds.getY() + 76;
+
+        for (int i = 0; i < ChurchDAWLive::numeroDeCenas; ++i)
+        {
+            desktopSceneBounds[i] = { sideX, firstSceneY + i * 19,
+                                      sideW, 18 };
+            if (desktopWorkspace != DesktopWorkspace::mixer
+                 && ! setlist.vazio())
+                desktopSceneIndexAtRow[i] = i < setlist.tamanho
+                                              ? setlist.ordem[(size_t) i]
+                                              : -1;
+        }
+
+        auto actions = desktopBottomBarBounds.reduced (12, 8);
+        desktopAudioBounds = actions.removeFromRight (228);
+        actions.removeFromRight (10);
+        desktopResetBounds = actions.removeFromRight (88);
+        actions.removeFromRight (8);
+        desktopSaveBounds = actions.removeFromRight (104);
+
+        const int macrosTop = desktopSidebarBounds.getY() + 42 + 230 + 10 + 140 + 10;
+        auto macroCard = juce::Rectangle<int> (
+            desktopSidebarBounds.getX() + 12,
+            macrosTop,
+            desktopSidebarBounds.getWidth() - 24, 116);
+        const int macroW = macroCard.getWidth() / 4;
+        for (int i = 0; i < 4; ++i)
+        {
+            auto cell = juce::Rectangle<int> (
+                macroCard.getX() + i * macroW, macroCard.getY() + 40,
+                macroW, juce::jmin (68, macroCard.getHeight() - 36));
+            desktopMacroSliders[(size_t) i].setBounds (
+                cell.removeFromTop (38).withSizeKeepingCentre (34, 34));
+            desktopMacroSliders[(size_t) i].setVisible (true);
+        }
+    }
+    else
+    {
+        for (auto& slider : desktopMacroSliders)
+        {
+            slider.setVisible (false);
+            slider.setBounds ({});
+        }
+    }
 
     // larguras enxutas: cada pixel economizado aqui vira nome de aparelho legivel
     // nos chips (antes saia "Launchkey..." / "Focus...")
     // 44 dp de altura no touch. Antes o recuo vertical de 7 deixava apenas
     // 32 dp: bonito no print, pequeno demais para acertar rapido no palco.
     auto headerRow = area.removeFromTop (juce::jmin (headerH, area.getHeight()));
-    auto headerControls = headerRow.reduced (compact ? 8 : 12,
-                                             mobileShortLandscapeLayout ? 2
-                                                                        : compact ? 4 : 11);
+    auto headerControls = desktopReferenceLayout
+        ? headerRow.reduced (18, 0)
+        : headerRow.reduced (compact ? 8 : 12,
+                             mobileShortLandscapeLayout ? 2
+                                                        : compact ? 4 : 11);
 
     // PAINEL DE PROGRAMA: faixa propria logo abaixo do cabecalho, centralizado na
     // largura. Estava enfiado no cabecalho e ficava apertado e feio -- ele e um
     // bloco de painel, nao um chip de barra de ferramentas.
     {
         programBand = area.removeFromTop (bandH);
+
+        if (desktopReferenceLayout)
+        {
+            auto tabs = programBand.reduced (18, 4);
+            desktopMixerTabBounds = tabs.removeFromLeft (110);
+            desktopPerformanceTabBounds = {};
+            desktopSessionTabBounds = {};
+        }
 
         // No compacto o visor usa a LARGURA TODA e quase toda a altura da faixa:
         // com 60 px nao ha o que sobrar para margem decorativa. Ele continua
@@ -2073,11 +4040,20 @@ void MainComponent::resized()
                                       mobileShortLandscapeLayout ? 2 : 3)
                                 : programBand.withSizeKeepingCentre (juce::jmin (860, programBand.getWidth() - 48),
                                                                      programBand.getHeight() - 16));
-        midiLearnPanel.setBounds (compact ? programBand.reduced (
-                                                mobileShortLandscapeLayout ? 6 : 8,
-                                                mobileShortLandscapeLayout ? 2 : 3)
-                                          : programBand.withSizeKeepingCentre (juce::jmin (960, programBand.getWidth() - 48),
-                                                                               programBand.getHeight() - 22));
+        if (desktopReferenceLayout)
+        {
+            auto quickBanner = programBand.reduced (10, 5);
+            midiLearnPanel.setBounds (quickBanner);
+        }
+        else
+        {
+            midiLearnPanel.setBounds (compact ? programBand.reduced (
+                                                    mobileShortLandscapeLayout ? 6 : 8,
+                                                    mobileShortLandscapeLayout ? 2 : 3)
+                                              : programBand.withSizeKeepingCentre (
+                                                    juce::jmin (960, programBand.getWidth() - 48),
+                                                    programBand.getHeight() - 22));
+        }
 
         // As cenas ocupam o MESMO retangulo do visor e do MIDI Learn: e uma
         // superficie que ja alterna ocupantes, entao o Live Mode entra sem
@@ -2088,7 +4064,16 @@ void MainComponent::resized()
                                           : programBand.withSizeKeepingCentre (juce::jmin (960, programBand.getWidth() - 48),
                                                                                programBand.getHeight() - 22));
     }
-    const bool learning = mapButton.getToggleState();
+    const bool learning = mapButton.getToggleState() || midiLearnActive.load();
+
+    midiLearnPanel.setVisible (learning);
+    if (learning)
+        oled.setVisible (false);
+
+    if (compactProgramBand)
+        oled.setVisible (false);
+    else if (churchFull && ! learning && ! liveScenePanel.isVisible())
+        oled.setVisible (true);
     const int gap = compact ? 4 : 7;
 
    #if JUCE_ANDROID || JUCE_IOS
@@ -2096,15 +4081,18 @@ void MainComponent::resized()
     // 166 marca + 112 dispositivo + 474 acoes/gaps + 22 margens = 774.
     // Em 720 dp entra o ramo narrow (58 + 112 + 420 + 22 = 612).
     // Assim o chip MIDI nunca e espremido a poucos pixels nem invade botoes.
-    const int audioW = narrowPhone ? 68 : 88;
-    const int librariesW = narrowPhone ? 64 : 88;
-    const int scanW = narrowPhone ? 68 : 72;
-    const int padW = narrowPhone ? 52 : 54;
-    const int saveW = narrowPhone ? 58 : 54;
-    const int mapW = narrowPhone ? 76 : 82;
-    const int clearW = narrowPhone ? 78 : 82;
-    const int instrumentsW = narrowPhone ? 82 : 88;
-    const int deviceW = 112;
+    const int audioW = wideMobileTablet ? 96 : narrowPhone ? 68 : 88;
+    const int librariesW = wideMobileTablet ? 116 : narrowPhone ? 64 : 88;
+    const int scanW = wideMobileTablet ? 90 : narrowPhone ? 68 : 72;
+    const int padW = wideMobileTablet ? 66 : narrowPhone ? 52 : 54;
+    const int saveW = wideMobileTablet ? 72
+                    : mobileShortLandscapeLayout ? 64
+                    : narrowPhone ? 58 : 54;
+    const int mapW = wideMobileTablet ? 110 : narrowPhone ? 76 : 82;
+    const int clearW = wideMobileTablet ? 102 : narrowPhone ? 78 : 82;
+    const int instrumentsW = wideMobileTablet ? 132 : narrowPhone ? 82 : 88;
+    const int liveW = wideMobileTablet ? 70 : 62;
+    const int deviceW = wideMobileTablet ? 132 : 112;
    #else
     const int audioW = narrowPhone ? 70 : compact ? 96 : 104;
     const int librariesW = narrowPhone ? 64 : compact ? 104 : 112;
@@ -2117,13 +4105,27 @@ void MainComponent::resized()
     const int deviceW = narrowPhone ? 116 : compact ? 128 : 392;
    #endif
 
-    audioSettingsButton.setButtonText (narrowPhone ? juce::String::fromUTF8 ("\xc3\x81udio")
-                                                   : juce::String::fromUTF8 ("\xc3\x81udio / MIDI"));
-    librariesButton.setButtonText ("Bibliotecas");
-    instrumentsButton.setButtonText (narrowPhone ? "Timbres"
-                                                 : juce::String::fromUTF8 ("\xe2\x97\x89 Instrumentos"));
-    mapButton.setButtonText (learning ? "Concluir"
-                                     : narrowPhone ? "Mapear" : "Mapear MIDI");
+    // O texto completo virava "Áudio ..." em larguras intermediárias. O
+    // tooltip mantém o significado e o botão permanece legível.
+    audioSettingsButton.setButtonText (juce::String::fromUTF8 (
+        desktopReferenceLayout ? "\xc3\x81udio" : "\xc3\x81udio"));
+    audioSettingsButton.setTooltip (juce::String::fromUTF8 (
+        "Abrir configura\xc3\xa7\xc3\xb5" "es de \xc3\xa1udio e MIDI"));
+    librariesButton.setButtonText (desktopReferenceLayout ? "Bibliotecas"
+                                     : mobileShortLandscapeLayout ? "Biblioteca"
+                                     : "Bibliotecas");
+    instrumentsButton.setButtonText (desktopReferenceLayout ? "Instrumentos"
+                                         : (narrowPhone || mobileShortLandscapeLayout) ? "Timbres"
+                                         : "Instrumentos");
+    liveButton.setButtonText (desktopReferenceLayout ? "Live" : "Live");
+    mapButton.setButtonText (desktopReferenceLayout
+                                     ? learning ? "Concluir MIDI"
+                                                : "Mapear MIDI"
+                                     : learning ? "Concluir"
+                                     : (narrowPhone || mobileShortLandscapeLayout)
+                                           ? "Mapear" : "Mapear MIDI");
+    padButton.setButtonText (desktopReferenceLayout ? "Pad" : "Pad");
+    scanButton.setButtonText (desktopReferenceLayout ? "Plugins" : "Plugins");
 
     if (! clearMapConfirmationArmed)
         clearMapButton.setButtonText (narrowPhone ? "Limpar" : "Limpar mapas");
@@ -2133,8 +4135,13 @@ void MainComponent::resized()
     // usuario fica com Instrumentos + Limpar + Concluir. Ao sair, tudo volta.
     audioSettingsButton.setVisible (! learning);
     librariesButton.setVisible (! learning);
-    padButton.setVisible (! learning);
     saveButton.setVisible (! learning);
+   #if JUCE_IOS || JUCE_ANDROID
+    liveCamButton.setVisible (! learning);
+   #endif
+   #if JUCE_IOS
+    scanButton.setVisible (! learning);
+   #endif
     liveButton.setVisible (! learning);
     statusInfo.setVisible ((! compact || desktopHeaderTwoRows) && ! learning);
 
@@ -2143,7 +4150,7 @@ void MainComponent::resized()
    #endif
 
    #if JUCE_ANDROID || JUCE_IOS
-    if (mobilePortraitLayout)
+    if (mobileTwoRowHeader)
     {
         // Retrato/freeform: primeira linha conserva marca, dispositivos e o
         // estado de salvamento; segunda linha e uma barra de acoes de 48 dp.
@@ -2159,6 +4166,7 @@ void MainComponent::resized()
                                             juce::jmin (64, identityRow.getWidth())));
         identityRow.removeFromRight (learning ? 0 : gap);
         deviceBar.setCompact (true);
+        deviceBar.setIntegratedRack (false);
         deviceBar.setVisible (true);
         deviceBar.setBounds (identityRow);
         statusInfo.setBounds ({});
@@ -2187,6 +4195,12 @@ void MainComponent::resized()
             actions.add (&liveButton);
             actions.add (&mapButton);
             actions.add (&padButton);
+           #if JUCE_IOS
+            actions.add (&scanButton);
+           #endif
+           #if JUCE_IOS || JUCE_ANDROID
+            actions.add (&liveCamButton);
+           #endif
             actions.add (&librariesButton);
             actions.add (&audioSettingsButton);
         }
@@ -2205,7 +4219,6 @@ void MainComponent::resized()
                 actionRow.removeFromLeft (actionGap);
         }
 
-        scanButton.setBounds ({});
         clearMapButton.setBounds (learning ? clearMapButton.getBounds()
                                           : juce::Rectangle<int>());
     }
@@ -2222,7 +4235,7 @@ void MainComponent::resized()
 
         for (juce::Button* button : std::initializer_list<juce::Button*> { &instrumentsButton, &liveButton, &mapButton,
                                                                             &clearMapButton, &saveButton, &padButton,
-                                                                            &scanButton, &librariesButton,
+                                                                            &scanButton, &liveCamButton, &librariesButton,
                                                                             &audioSettingsButton })
             button->setBounds ({});
 
@@ -2236,7 +4249,7 @@ void MainComponent::resized()
                 weights.add (weight);
             };
 
-            if (churchFull)
+            if (churchFull || desktopReferenceLayout)
                 // O destino primario precisa caber por extenso mesmo na work
                 // area de 1280; com o peso antigo virava "Instrument...".
                 add (instrumentsButton, 140);
@@ -2248,20 +4261,23 @@ void MainComponent::resized()
             }
             else
             {
-                add (liveButton, 54);
-                add (mapButton, 96);
-                add (saveButton, 70);
-                add (padButton, 54);
+                add (liveButton, desktopReferenceLayout ? 80 : 54);
+                add (mapButton, desktopReferenceLayout ? 136 : 96);
+                if (! desktopReferenceLayout) add (saveButton, 70);
+                add (padButton, desktopReferenceLayout ? 70 : 54);
 
                #if CHURCHDAW_HOSTS_PLUGINS
-                add (scanButton, 72);
+                add (scanButton, desktopReferenceLayout ? 92 : 72);
                #endif
 
-                add (librariesButton, 92);
+                add (liveCamButton, desktopReferenceLayout ? 108 : 106);
+                add (librariesButton, desktopReferenceLayout ? 116 : 92);
                 add (audioSettingsButton, 100);
             }
 
-            constexpr int navGap = 5;
+            // Uma barra de navegacao continua: a separacao vem da luz/estado
+            // interno de cada destino, nao de sete frestas pretas.
+            const int navGap = desktopReferenceLayout ? 5 : 0;
             const int gapTotal = navGap * juce::jmax (0, buttons.size() - 1);
             const int usable = juce::jmax (1, row.getWidth() - gapTotal);
             int totalWeight = 0;
@@ -2284,9 +4300,24 @@ void MainComponent::resized()
         };
 
         deviceBar.setCompact (compact && ! desktopHeaderTwoRows);
+        deviceBar.setIntegratedRack (desktopReferenceLayout);
         deviceBar.setVisible (true);
 
-        if (desktopHeaderTwoRows && ! learning)
+        if (desktopReferenceLayout)
+        {
+            const auto header = DesktopHeaderLayout::calculate (headerRow);
+            deviceBar.setCompact (false);
+            deviceBar.setBounds (header.devices);
+            engineStatusBounds = header.engine;
+            statusInfo.setFont (juce::Font (juce::FontOptions (11.0f)));
+            statusInfo.setJustificationType (juce::Justification::centredLeft);
+            statusInfo.setBounds (header.engine.withTrimmedLeft (38)
+                                                   .withTrimmedTop (23)
+                                                   .withTrimmedBottom (7));
+            saveButton.setBounds (learning ? juce::Rectangle<int>() : header.save);
+            layoutNavigation (header.navigation);
+        }
+        else if (desktopHeaderTwoRows && ! learning)
         {
             constexpr int rowGap = 6;
             auto statusRow = headerControls.removeFromTop (
@@ -2335,74 +4366,83 @@ void MainComponent::resized()
             layoutNavigation (navigationRow);
         }
        #else
-        headerControls.removeFromLeft (layoutBrandWidth);   // marca + separador
-        headerControls.removeFromRight (compact ? 6 : 14);
+        for (juce::Button* button : std::initializer_list<juce::Button*> {
+                 &instrumentsButton, &liveButton, &mapButton, &clearMapButton,
+                 &saveButton, &sabrinaButton, &padButton, &scanButton,
+                 &liveCamButton, &librariesButton, &audioSettingsButton })
+            button->setBounds ({});
+
+        headerControls.removeFromLeft (
+            juce::jmin (layoutBrandWidth + (narrowHeaderLayout ? 8 : 12),
+                        headerControls.getWidth()));
+        headerControls.removeFromRight (juce::jmin (4, headerControls.getWidth()));
+
+        juce::Array<juce::Button*> navButtons;
+        juce::Array<int> navWeights;
+        auto addMobileNav = [&] (juce::Button& button, int weight)
+        {
+            navButtons.add (&button);
+            navWeights.add (weight);
+        };
+
+        if (churchFull)
+            addMobileNav (instrumentsButton, wideMobileTablet ? 118 : 74);
 
         if (learning)
         {
-            // Durante o aprendizado o Live Mode sai do cabecalho: os dois
-            // ocupam a mesma faixa, e um botao visivel que nao pode ser usado
-            // e pior que botao nenhum.
-            liveButton.setBounds ({});
-
-            mapButton.setBounds (headerControls.removeFromRight (mapW));
-            headerControls.removeFromRight (gap);
-            clearMapButton.setBounds (headerControls.removeFromRight (clearW));
-
-            if (churchFull)
-            {
-                headerControls.removeFromRight (gap);
-                instrumentsButton.setBounds (headerControls.removeFromRight (instrumentsW));
-            }
+            addMobileNav (clearMapButton, 92);
+            addMobileNav (mapButton, 88);
         }
         else
         {
-            clearMapButton.setBounds ({});
-
-            audioSettingsButton.setBounds (headerControls.removeFromRight (audioW));
-            headerControls.removeFromRight (gap);
-
-            librariesButton.setBounds (headerControls.removeFromRight (librariesW));
-            headerControls.removeFromRight (gap);
-
-           #if CHURCHDAW_HOSTS_PLUGINS
-            scanButton.setBounds (headerControls.removeFromRight (scanW));
-            headerControls.removeFromRight (gap);
-           #else
-            // Nao reservar espaco para um botao que nem existe. Este buraco de
-            // 84 px era exatamente onde o status "Launchkey conectado" sumia.
-            scanButton.setBounds ({});
+            addMobileNav (liveButton, 52);
+            addMobileNav (mapButton, wideMobileTablet ? 96 : 68);
+            addMobileNav (saveButton, 60);
+            addMobileNav (padButton, 50);
+           #if JUCE_IOS || CHURCHDAW_HOSTS_PLUGINS
+            addMobileNav (scanButton, 68);
            #endif
-
-            padButton.setBounds (headerControls.removeFromRight (padW));
-            headerControls.removeFromRight (gap);
-            saveButton.setBounds (headerControls.removeFromRight (saveW));
-            headerControls.removeFromRight (gap);
-            mapButton.setBounds (headerControls.removeFromRight (mapW));
-            headerControls.removeFromRight (gap);
-            liveButton.setBounds (headerControls.removeFromRight (62));
-
-            if (churchFull)
-            {
-                headerControls.removeFromRight (gap);
-                instrumentsButton.setBounds (headerControls.removeFromRight (instrumentsW));
-            }
+            addMobileNav (liveCamButton, 66);
+            addMobileNav (librariesButton, wideMobileTablet ? 104 : 78);
+            addMobileNav (audioSettingsButton, 62);
         }
 
-        if (! compact && ! learning)
-        {
-            statusInfo.setBounds (headerControls.removeFromRight (juce::jmin (152, headerControls.getWidth())));
-            headerControls.removeFromRight (10);
-        }
-        else
-        {
-            statusInfo.setBounds ({});
-        }
+        const int navGap = 4;
+        int totalWeight = 0;
+        for (const auto w : navWeights)
+            totalWeight += w;
+        const int idealNavW = totalWeight
+                            + navGap * juce::jmax (0, navButtons.size() - 1);
+        const int minDeviceW = learning ? 140
+                             : wideMobileTablet ? 148
+                             : safeContentWidth >= 900 ? 116 : 94;
+        const int maxNavAvailable = juce::jmax (
+            1, headerControls.getWidth() - minDeviceW - 6);
+        const int actualNavW = juce::jmin (idealNavW, maxNavAvailable);
+        auto navRow = headerControls.removeFromRight (
+            juce::jmin (actualNavW, headerControls.getWidth()));
+        headerControls.removeFromRight (juce::jmin (6, headerControls.getWidth()));
 
-        deviceBar.setCompact (compact);
+        statusInfo.setBounds ({});
+        deviceBar.setCompact (true);
+        deviceBar.setIntegratedRack (false);
         deviceBar.setVisible (true);
-        deviceBar.setBounds (headerControls.removeFromLeft (juce::jmin (deviceW,
-                                                                        headerControls.getWidth())));
+        deviceBar.setBounds (headerControls.removeFromLeft (
+            juce::jmin (wideMobileTablet ? 240 : 188, headerControls.getWidth())));
+
+        const int usableNav = juce::jmax (
+            1, navRow.getWidth() - navGap * juce::jmax (0, navButtons.size() - 1));
+        for (int i = 0; i < navButtons.size(); ++i)
+        {
+            const int w = i == navButtons.size() - 1
+                ? navRow.getWidth()
+                : juce::jmax (1, juce::roundToInt (
+                      (double) usableNav * (double) navWeights.getUnchecked (i)
+                      / (double) juce::jmax (1, totalWeight)));
+            navButtons.getUnchecked (i)->setBounds (navRow.removeFromLeft (w));
+            if (i < navButtons.size() - 1)
+                navRow.removeFromLeft (juce::jmin (navGap, navRow.getWidth()));
+        }
        #endif
     }
 
@@ -2555,7 +4595,13 @@ void MainComponent::resized()
         // A mesa touch usa paginas de foco. Em janelas com menos de 520 dp de
         // altura, rolagem vertical e intencional para preservar alvos de 48 dp;
         // nunca existe rolagem horizontal no editor nativo.
-        if (dockedNative && compact)
+        if (dockedNative && desktopReferenceLayout)
+        {
+            // Preserve usable channel and master fader travel when the header,
+            // MIDI mapping row and performance dock leave less than 480 px.
+            dockViewport.setScrollBarsShown (area.getHeight() < 480, false);
+        }
+        else if (dockedNative && compact)
         {
            #if JUCE_ANDROID || JUCE_IOS
             if (mobileShortLandscapeLayout)
@@ -2579,9 +4625,8 @@ void MainComponent::resized()
         else
             dockViewport.setScrollBarsShown (! compact, true);
 
-        // O minimo de 600 forcava barra de rolagem assim que o painel de programa
-        // cresceu: as reguas nao encolhiam, eram CORTADAS (sumiam M/S e PANIC).
-        // Com 400 elas se compactam de verdade e tudo continua na tela.
+        // Desktop shell keeps 480 px for the master controls and scrolls when
+        // necessary; legacy desktop and mobile retain their existing sizing.
         if (dockedNative)
         {
             // O minimo de 1120x400 e do PC e no celular era exatamente o que
@@ -2602,23 +4647,49 @@ void MainComponent::resized()
                                : juce::jmax (520, area.getHeight()))
                         : juce::jmax (400, area.getHeight()));
            #else
-            dockedEditor->setSize (
-                compact ? area.getWidth() : juce::jmax (1120, area.getWidth()),
-                compact ? area.getHeight() : juce::jmax (400, area.getHeight()));
+            {
+                const int editorHeight = desktopReferenceLayout
+                    ? juce::jmax (480, area.getHeight())
+                    : compact ? area.getHeight() : juce::jmax (400, area.getHeight());
+
+                // JUCE resolves scrollbar visibility from the viewed holder.
+                // Give it the target height before reading the visible width,
+                // so a newly shown vertical bar cannot cover the master strip.
+                if (desktopReferenceLayout)
+                    dockHolder.setSize (area.getWidth(), editorHeight);
+
+                const int visibleW = juce::jmax (1, dockViewport.getMaximumVisibleWidth());
+                dockedEditor->setSize (
+                    compact && ! desktopReferenceLayout ? area.getWidth() : visibleW,
+                    editorHeight);
+            }
            #endif
         }
 
         layoutDockHolder();
     }
 
-   #if JUCE_ANDROID
-    // Central Áudio/MIDI full-screen: acompanha rotação, freeform e safe area.
+    // Audio/MIDI overlay follows the window and keeps the controls centered.
     if (audioPanel != nullptr)
     {
+       #if JUCE_IOS || JUCE_ANDROID
+        audioPanel->setBounds (layoutContentBounds.isEmpty() ? getLocalBounds()
+                                                             : layoutContentBounds);
+       #else
         audioPanel->setBounds (getLocalBounds());
+       #endif
         audioPanel->toFront (false);
     }
-   #endif
+
+    if (librariesPanel != nullptr)
+    {
+       #if JUCE_IOS || JUCE_ANDROID
+        librariesPanel->setBounds (layoutContentBounds.isEmpty() ? getLocalBounds()
+                                                                 : layoutContentBounds);
+       #else
+        librariesPanel->setBounds (getLocalBounds());
+       #endif
+    }
 
     // card do Pad Continuo: centrado, um pouco abaixo do meio (flutua no mixer)
     if (padPanel != nullptr)
@@ -2632,8 +4703,16 @@ void MainComponent::resized()
             topoDisponivel,
             juce::jmax (1, layoutContentBounds.getWidth() - margem * 2),
             juce::jmax (1, layoutContentBounds.getBottom() - topoDisponivel - margem));
-        const int larguraPad = juce::jmin (560, disponivel.getWidth());
-        const int alturaPad = juce::jmin (318, disponivel.getHeight());
+        // O TAMANHO VEM DO PROPRIO PAINEL, nao de dois numeros cravados aqui.
+        //
+        // 560x318 era o teto herdado do teclado de piano desenhado a mao. Com a
+        // grade de 12 tons ele deixava cada celula com ~35 px de altura — abaixo
+        // do alvo de toque de 44 px e menos que as teclas antigas entregavam, o
+        // que num tablet no palco vira tom errado no meio do louvor. O PadPanel
+        // publica o tamanho que a grade pede exatamente para este ponto; se a
+        // janela for menor, os jmin continuam cortando e o painel se adapta.
+        const int larguraPad = juce::jmin (PadPanel::larguraPreferida, disponivel.getWidth());
+        const int alturaPad = juce::jmin (PadPanel::alturaPreferida, disponivel.getHeight());
 
         // so re-centraliza enquanto o usuario nao arrastou o card (a posicao
         // atual ainda e a ultima que o codigo setou)
@@ -2659,6 +4738,66 @@ void MainComponent::resized()
             padPanel->setBounds (pb);
         }
     }
+
+    midiMappingPanel.setVisible (false);
+    midiMappingPanel.setBounds ({});
+
+    const int contentTop = juce::jmax (headerRow.getBottom(), programBand.isEmpty() ? layoutContentBounds.getY() : programBand.getBottom());
+    const auto overlayBounds = juce::Rectangle<int> (
+        0, contentTop, getWidth(), juce::jmax (1, getHeight() - contentTop));
+    midiLearnConsoleOverlay.setBounds (overlayBounds);
+    if (midiLearnConsoleOverlay.isVisible())
+        midiLearnConsoleOverlay.toFront (false);
+
+    if (padEditorPanel != nullptr)
+    {
+        const auto padWorkspace = juce::Rectangle<int> (
+            layoutContentBounds.getX(), programBand.getY(),
+            layoutContentBounds.getWidth(),
+            juce::jmax (1, layoutContentBounds.getBottom() - programBand.getY()));
+        padEditorPanel->setBounds (padWorkspace);
+        padEditorPanel->setVisible (padEditorVisible);
+
+        if (padEditorVisible)
+            padEditorPanel->toFront (false);
+    }
+
+    if (performanceSessionPanel != nullptr)
+    {
+        performanceSessionPanel->setBounds ({});
+        performanceSessionPanel->setVisible (false);
+    }
+    auto editActions = programBand.reduced (18, 7).withTrimmedLeft (118);
+    undoMixButton.setBounds (editActions.removeFromLeft (78)); editActions.removeFromLeft (5);
+    redoMixButton.setBounds (editActions.removeFromLeft (74));
+    undoMixButton.setVisible (desktopReferenceLayout && ! learning && ! padEditorVisible);
+    redoMixButton.setVisible (undoMixButton.isVisible());
+
+    // A workspace must stay below the settings/catalogue cards on resize.
+    for (auto* overlay : { audioPanel.get(), aboutPanel.get(), librariesPanel.get() })
+        if (overlay != nullptr && overlay->isVisible()) overlay->toFront (false);
+
+
+    // O aviso do modo rapido precisa ficar acima tanto do mixer quanto da aba
+    // de samples, mas ocupa somente a parte direita da subbarra e nao bloqueia
+    // a navegacao de workspace. Os botoes de comando permanecem na frente de tudo.
+    if (learning)
+    {
+        if (midiLearnConsoleOverlay.isVisible())
+            midiLearnConsoleOverlay.toFront (false);
+        midiLearnPanel.toFront (false);
+        clearMapButton.toFront (false);
+        mapButton.toFront (false);
+    }
+
+   #if JUCE_ANDROID
+    // O contexto OpenGL desenha somente quando solicitado. Uma mudanca de
+    // geometria precisa invalidar a hierarquia inteira antes de pedir o novo
+    // quadro; caso contrario, controles estaticos do header podem conservar o
+    // frame anterior ate o primeiro toque do usuario.
+    repaint();
+    glContext.triggerRepaint();
+   #endif
 }
 
 //==============================================================================
@@ -2678,6 +4817,287 @@ int MainComponent::getCurrentBlockSize() const
     return 512;
 }
 
+void MainComponent::audioDeviceAboutToStart (juce::AudioIODevice* device)
+{
+   #if JUCE_ANDROID
+    // AAudio recria a thread ao trocar buffer/taxa. A afinidade pertence ao
+    // tid antigo e precisa ser aplicada novamente. O ADPF fica sob ownership
+    // do proprio Oboe, evitando duas sessoes concorrentes para a mesma thread.
+    audioAffinitySet = false;
+    churchdaw::androidPerformance::prepareFastCoreMask();
+   #endif
+   #if JUCE_ANDROID || JUCE_IOS
+    androidBufferTunerWarmupPending.store (true,
+                                            std::memory_order_release);
+   #endif
+
+    idleOutputPeak.store (0.0f, std::memory_order_relaxed);
+    idleOutputSquareSum.store (0.0, std::memory_order_relaxed);
+    idleOutputSampleCount.store (0, std::memory_order_relaxed);
+    idleOutputNonFiniteCount.store (0, std::memory_order_relaxed);
+    blockedInputCallbackCount.store (0, std::memory_order_relaxed);
+    blockedInputChannelMaximum.store (0, std::memory_order_relaxed);
+    studioAudioTap->prepare (device != nullptr ? device->getCurrentSampleRate() : 48000.0);
+   #if JUCE_IOS || JUCE_ANDROID
+    studioMicrophoneTap->prepare (device != nullptr ? device->getCurrentSampleRate() : 48000.0);
+   #endif
+    player.audioDeviceAboutToStart (device);
+    playbackEngine.prepareToPlay (device != nullptr
+                                      ? device->getCurrentBufferSizeSamples() : 512,
+                                  device != nullptr
+                                      ? device->getCurrentSampleRate() : 44100.0);
+    diagnosticTestTone.prepare (device != nullptr ? device->getCurrentSampleRate() : 44100.0);
+    finalOutputGuard.prepare (device != nullptr ? device->getCurrentSampleRate() : 44100.0,
+                              device != nullptr ? device->getCurrentBufferSizeSamples() : 512,
+                              device != nullptr ? device->getActiveOutputChannels().countNumberOfSetBits() : 2);
+}
+
+#if JUCE_IOS || JUCE_ANDROID
+juce::Result MainComponent::setStudioMicrophoneEnabled (bool enabled, int channel)
+{
+    // Only the explicit ChurchCam mic action calls this. Camera capture owns
+    // no audio session and this input remains absent from the main graph.
+    studioMicRequested.store (false, std::memory_order_release);
+    const auto previous = deviceManager.getAudioDeviceSetup();
+    auto setup = previous;
+    setup.useDefaultInputChannels = false;
+    setup.inputChannels.clear();
+    if (enabled)
+    {
+        if (deviceManager.getCurrentAudioDevice() == nullptr)
+            return juce::Result::fail ("Ative o audio da DAW primeiro.");
+        if (auto* type = deviceManager.getCurrentDeviceTypeObject())
+        {
+            type->scanForDevices();
+            const auto names = type->getDeviceNames (true);
+            const auto defaultIndex = type->getDefaultDeviceIndex (true);
+            if (names.contains (setup.outputDeviceName)) setup.inputDeviceName = setup.outputDeviceName;
+            else if (juce::isPositiveAndBelow (defaultIndex, names.size())) setup.inputDeviceName = names[defaultIndex];
+            else if (! names.isEmpty()) setup.inputDeviceName = names[0];
+            else return juce::Result::fail ("Nenhuma entrada de microfone disponivel.");
+        }
+        setup.inputChannels.setBit (juce::jlimit (0, 1, channel));
+    }
+    auto error = deviceManager.setAudioDeviceSetup (setup, false);
+    auto* device = deviceManager.getCurrentAudioDevice();
+    if (enabled && error.isEmpty() && (device == nullptr || ! device->getActiveInputChannels()[juce::jlimit (0, 1, channel)]))
+        error = "Essa entrada de microfone nao esta disponivel. Selecione Entrada 1 ou conecte sua interface.";
+    if (error.isNotEmpty())
+    {
+        if (enabled)deviceManager.setAudioDeviceSetup (previous, false);
+        return juce::Result::fail (error);
+    }
+    studioMicRequested.store (enabled, std::memory_order_release);
+    return juce::Result::ok();
+}
+void MainComponent::suspendChurchCam()
+{
+    if (auto* window = dynamic_cast<churchstudio::Window*> (liveCamWindow.getComponent()))window->suspendCapture();
+}
+void MainComponent::resumeChurchCam()
+{
+    if (auto* window = dynamic_cast<churchstudio::Window*> (liveCamWindow.getComponent()))window->resumeCapture();
+}
+void MainComponent::ensureMobileAudioRunningAfterResume()
+{
+    auto* device = deviceManager.getCurrentAudioDevice();
+    if (device == nullptr || ! device->isPlaying())
+    {
+        juce::Logger::writeToLog ("AUDIO_MOBILE: reabrindo dispositivo apos interrupcao do sistema");
+        deviceManager.restartLastAudioDevice();
+    }
+}
+#endif
+
+void MainComponent::handleMemoryWarning()
+{
+    if (auto* live = getChurchLive())
+        live->audition.stop (true);
+}
+
+void MainComponent::audioDeviceStopped()
+{
+    playbackEngine.releaseResources();
+    player.audioDeviceStopped();
+    diagnosticTestTone.reset();
+    finalOutputGuard.release();
+}
+
+void MainComponent::audioDeviceError (const juce::String& message)
+{
+    juce::Logger::writeToLog ("AUDIO_DRIVER error=" + message);
+    juce::MessageManager::callAsync (
+        [safe = juce::Component::SafePointer<MainComponent> (this),
+         lifetime = pluginLoadLifetime, message]
+        {
+            if (! lifetime->load()) return;
+            if (auto* self = safe.getComponent())
+            {
+                self->lastAudioDriverError = message;
+                if (auto* live = self->getChurchLive()) live->audition.stop (true);
+                self->statusInfo.setTooltip (message + " / Abra Audio para reabrir a interface.");
+            }
+        });
+}
+
+#if JUCE_ANDROID
+void MainComponent::prepareAndroidAudioThread() noexcept
+{
+    if (! audioAffinitySet)
+    {
+        audioAffinitySet = true;
+        if (churchdaw::androidPerformance::pinCurrentThreadToFastCores())
+            juce::Logger::outputDebugString (
+                "AUDIO: callback fixado nos nucleos rapidos");
+    }
+}
+#endif
+
+void MainComponent::audioDeviceIOCallbackWithContext (
+    const float* const* inputChannelData, int numInputChannels,
+    float* const* outputChannelData, int numOutputChannels,
+    int numSamples,
+    const juce::AudioIODeviceCallbackContext& context)
+{
+   #if JUCE_ANDROID
+    prepareAndroidAudioThread();
+   #endif
+
+   #if CHURCHDAW_AUDIO_INSTRUMENTATION
+    const auto callbackStartTicks = juce::Time::getHighResolutionTicks();
+   #endif
+
+   #if JUCE_IOS || JUCE_ANDROID
+    // The opted-in microphone feeds the movie only. It never enters the
+    // instrument graph or loudspeakers, even when the route changes.
+    const bool movieInputAuthorised = studioMicRequested.load (std::memory_order_acquire);
+    if (movieInputAuthorised)
+        studioMicrophoneTap->push (inputChannelData, numInputChannels, numSamples);
+    const bool inputAllowed = false;
+   #else
+    const bool inputAllowed =
+        audioInputAuthorised.load (std::memory_order_acquire);
+   #endif
+
+    if (! inputAllowed && numInputChannels > 0
+       #if JUCE_IOS || JUCE_ANDROID
+        && ! movieInputAuthorised
+       #endif
+    )
+    {
+        blockedInputCallbackCount.fetch_add (1, std::memory_order_relaxed);
+
+        int observed = blockedInputChannelMaximum.load (
+            std::memory_order_relaxed);
+        while (numInputChannels > observed
+                && ! blockedInputChannelMaximum.compare_exchange_weak (
+                    observed, numInputChannels,
+                    std::memory_order_relaxed,
+                    std::memory_order_relaxed))
+        {
+        }
+    }
+
+    // Mesmo que um driver/hotplug entregue canais antes da correcao do setup,
+    // o grafo recebe zero ponteiros e zero canais enquanto nao houver permissao.
+    player.audioDeviceIOCallbackWithContext (
+        inputAllowed ? inputChannelData : nullptr,
+        inputAllowed ? numInputChannels : 0,
+        outputChannelData, numOutputChannels, numSamples, context);
+
+   #if CHURCHDAW_AUDIO_INSTRUMENTATION
+    const auto diagAfterPlayer = juce::Time::getHighResolutionTicks();
+   #endif
+
+    playbackEngine.getNextAudioBlock (outputChannelData, numOutputChannels,
+                                      numSamples);
+
+    diagnosticTestTone.processAdd (outputChannelData, numOutputChannels, numSamples);
+
+    // Preserve independent playback transport; protect the complete mix before
+    // recording and physical output. The established lookahead adds about 3 ms.
+    finalOutputGuard.process (outputChannelData, numOutputChannels, numSamples);
+
+    studioAudioTap->push (outputChannelData, numOutputChannels, numSamples);
+
+   #if JUCE_WINDOWS || JUCE_MAC
+    // "Tem som saindo": alimenta o sinal que impede o encerramento por licenca
+    // no meio de um culto. Um peak por bloco, sem alocacao.
+    ChurchDAWAudioActivity::noteBlock (outputChannelData, numOutputChannels,
+                                       numSamples);
+   #endif
+
+   #if CHURCHDAW_AUDIO_INSTRUMENTATION
+    const auto callbackEndTicks = juce::Time::getHighResolutionTicks();
+   #endif
+
+   #if CHURCHDAW_AUDIO_INSTRUMENTATION
+    diagPlayerTicks.fetch_add (
+        diagAfterPlayer - callbackStartTicks, std::memory_order_relaxed);
+    diagPlaybackTicks.fetch_add (
+        callbackEndTicks - diagAfterPlayer, std::memory_order_relaxed);
+    diagCallbackSamples.fetch_add (
+        (juce::uint64) juce::jmax (0, numSamples),
+        std::memory_order_relaxed);
+   #endif
+
+   #if CHURCHDAW_AUDIO_INSTRUMENTATION
+    // Sonda de laboratorio. Ela percorre a saida inteira e acumula RMS para
+    // provar silencio/NaN durante QA, mas nao participa de nenhuma decisao do
+    // motor. Mantê-la no binario comercial gastava CPU em todo callback — em
+    // especial enquanto um Pad Continuo tocava sem MIDI — sem beneficio para
+    // o cliente.
+    const auto now = juce::Time::getMillisecondCounter();
+    if (inputAllowed || now - lastMidiActivityMs.load (
+                            std::memory_order_relaxed) < 5000)
+        return;
+
+    float blockPeak = 0.0f;
+    double blockSquareSum = 0.0;
+    juce::uint64 finiteSamples = 0;
+    juce::uint64 nonFiniteSamples = 0;
+
+    for (int channel = 0; channel < numOutputChannels; ++channel)
+        if (const auto* samples = outputChannelData[channel])
+            for (int sample = 0; sample < numSamples; ++sample)
+            {
+                const float value = samples[sample];
+                if (! std::isfinite (value))
+                {
+                    ++nonFiniteSamples;
+                    continue;
+                }
+
+                blockPeak = juce::jmax (blockPeak, std::abs (value));
+                blockSquareSum += (double) value * (double) value;
+                ++finiteSamples;
+            }
+
+    float observedPeak = idleOutputPeak.load (std::memory_order_relaxed);
+    while (blockPeak > observedPeak
+            && ! idleOutputPeak.compare_exchange_weak (
+                observedPeak, blockPeak,
+                std::memory_order_relaxed,
+                std::memory_order_relaxed))
+    {
+    }
+
+    double observedSquares = idleOutputSquareSum.load (
+        std::memory_order_relaxed);
+    while (! idleOutputSquareSum.compare_exchange_weak (
+        observedSquares, observedSquares + blockSquareSum,
+        std::memory_order_relaxed,
+        std::memory_order_relaxed))
+    {
+    }
+
+    idleOutputSampleCount.fetch_add (finiteSamples,
+                                     std::memory_order_relaxed);
+    idleOutputNonFiniteCount.fetch_add (nonFiniteSamples,
+                                        std::memory_order_relaxed);
+   #endif
+}
+
 //==============================================================================
 void MainComponent::changeListenerCallback (juce::ChangeBroadcaster* source)
 {
@@ -2690,6 +5110,8 @@ void MainComponent::changeListenerCallback (juce::ChangeBroadcaster* source)
     }
     else if (source == &deviceManager)
     {
+        const bool inputPolicyOk = reconcileAudioInputPolicy();
+
        #if JUCE_ANDROID
         // Mudanca feita dentro do painel e escolha explicita do usuario. Um
         // fallback automatico acontece com o painel fechado e nao apaga o USB
@@ -2715,11 +5137,22 @@ void MainComponent::changeListenerCallback (juce::ChangeBroadcaster* source)
                 + "\" output=\"" + setup.outputDeviceName
                 + "\" input=\"" + setup.inputDeviceName
                 + "\" inChannels=" + juce::String (setup.inputChannels.countNumberOfSetBits())
+                + " inputAuthorised="
+                + juce::String (audioInputAuthorised.load (
+                                    std::memory_order_acquire) ? 1 : 0)
+                + " inputPolicyOk=" + juce::String (inputPolicyOk ? 1 : 0)
                 + " buffer=" + juce::String (setup.bufferSize)
                 + " rate=" + juce::String (setup.sampleRate, 0)
                 + (dev != nullptr ? juce::String (" open=yes \"") + dev->getName() + "\""
                                    : juce::String (" open=NO")));
         }
+       #endif
+
+       #if JUCE_WINDOWS || JUCE_MAC
+        // Com o painel de Audio aberto a escolha e do musico; fechado, uma saida
+        // que aparece (fone plugado, interface USB ligada) e usada na hora.
+        if (deviceManager.getCurrentAudioDevice() == nullptr && ! audioDialogOpen)
+            reconnectAudioOutputIfAvailable();
        #endif
 
         // so grava enquanto o dialogo de audio esta aberto: um fallback de driver
@@ -2736,6 +5169,13 @@ void MainComponent::changeListenerCallback (juce::ChangeBroadcaster* source)
     }
     else if (source == getChurchLive())
     {
+        // A single insert swap advances the global topology generation. Refresh
+        // every fixed cache in the same message-thread turn so unrelated active
+        // insert mappings do not remain conservatively pending until the 1 s
+        // maintenance timer.
+        for (int slot = 0; slot < numSlots; ++slot)
+            refreshInsertMappingIdentityCacheForSlot (slot);
+
         // O setup do Church Live so ia para o disco no botao Salvar ou no
         // destrutor. Se o app morre antes disso — e ele morria varrendo
         // plugins — o cliente reabre SEM o setup dele, e a primeira
@@ -2770,9 +5210,22 @@ void MainComponent::agendarGravacaoDoSetup()
         [safe = juce::Component::SafePointer<MainComponent> (this), token]
         {
             if (auto* self = safe.getComponent())
-                if (self->controleDeGravacaoDoSetup.timerAindaValido (
+            {
+                if (! self->controleDeGravacaoDoSetup.timerAindaValido (
                         token, self->geracaoDaCena))
-                    self->saveChainState();
+                    return;
+
+                const auto nowMs = juce::Time::getMillisecondCounter();
+                const bool midiActive =
+                    nowMs - self->lastMidiActivityMs.load (std::memory_order_relaxed) < 2500;
+                if (midiActive || ChurchDAWAudioActivity::audibleWithin (1200))
+                {
+                    self->agendarGravacaoDoSetup();
+                    return;
+                }
+
+                self->saveChainState();
+            }
         });
 }
 
@@ -2787,6 +5240,140 @@ void MainComponent::agendarFimDaSupressaoDeGravacaoDaCena (int geracao)
             if (auto* self = safe.getComponent())
                 (void) self->controleDeGravacaoDoSetup.encerrarSupressao (
                     geracao, self->geracaoDaCena);
+        });
+}
+
+void MainComponent::capturarInicioDaTransicao (TimbresProcessor& live,
+                                                int geracao)
+{
+    EstadoContinuoAntesDaCena inicio;
+    inicio.valido = true;
+    inicio.geracao = geracao;
+
+    for (int layer = 0; layer < ChurchDAWLive::numeroDeCanais; ++layer)
+    {
+        if (auto* p = live.getLayerVolParam (layer))
+            inicio.volumes[(size_t) layer] = p->getValue();
+        if (auto* p = live.getLayerReverbSendParam (layer))
+            inicio.reverbs[(size_t) layer] = p->get();
+    }
+
+    if (auto* p = live.getVolumeGeralParam())
+        inicio.volumeGeral = p->get();
+    if (auto* p = live.getRetornoDeReverbParam())
+        inicio.retornoReverb = p->get();
+    if (masterProcessor != nullptr)
+        inicio.masterDb = masterProcessor->getMasterDb();
+    if (padProcessor != nullptr)
+    {
+        inicio.padVolume = padProcessor->getGain();
+        inicio.padCorte = padProcessor->getCutoff();
+    }
+
+    estadoAntesDaTransicao = inicio;
+}
+
+void MainComponent::aplicarFrameDaTransicao (
+    const EstadoContinuoAntesDaCena& inicio,
+    const ChurchDAWLive::Cena& destino,
+    float progresso)
+{
+    auto* live = getChurchLive();
+    if (live == nullptr)
+        return;
+
+    const float t = juce::jlimit (0.0f, 1.0f, progresso);
+    const float eased = t * t * (3.0f - 2.0f * t);
+    const auto mix = [eased] (float from, float to)
+    {
+        return from + (to - from) * eased;
+    };
+
+    for (int layer = 0; layer < ChurchDAWLive::numeroDeCanais; ++layer)
+    {
+        if (auto* p = live->getLayerVolParam (layer))
+            p->setValueNotifyingHost (juce::jlimit (
+                0.0f, 1.0f, mix (inicio.volumes[(size_t) layer],
+                                 destino.canais[layer].volume)));
+        if (auto* p = live->getLayerReverbSendParam (layer))
+            *p = mix (inicio.reverbs[(size_t) layer],
+                      destino.canais[layer].envioDeReverb);
+    }
+
+    if (destino.temGlobais)
+    {
+        if (auto* p = live->getVolumeGeralParam())
+            *p = mix (inicio.volumeGeral, destino.volumeGeral);
+        if (auto* p = live->getRetornoDeReverbParam())
+            *p = mix (inicio.retornoReverb, destino.retornoDeReverb);
+    }
+
+    if (padProcessor != nullptr)
+    {
+        padProcessor->setGain (mix (inicio.padVolume, destino.padVolume));
+        padProcessor->setCutoff (mix (inicio.padCorte, destino.padCorte));
+    }
+
+    if (destino.temMaster && masterProcessor != nullptr)
+    {
+        const float db = mix (inicio.masterDb, destino.masterDb);
+        masterProcessor->setMasterDb (db);
+        masterSlider.setValue (db, juce::dontSendNotification);
+    }
+}
+
+bool MainComponent::iniciarTransicaoDaCena (
+    const ChurchDAWLive::Cena& cena, int geracao)
+{
+    const auto inicio = estadoAntesDaTransicao;
+    const double duration = juce::jlimit (0.0, 15.0,
+                                         cena.transicaoSegundos);
+    if (! inicio.valido || inicio.geracao != geracao || duration < 0.04)
+        return false;
+
+    // O restore da pagina pode ter escrito os valores de destino. Recoloca o
+    // ponto de partida no mesmo giro da message thread, antes de o proximo
+    // bloco de audio observar a mudanca, e entao percorre a curva escolhida.
+    aplicarFrameDaTransicao (inicio, cena, 0.0f);
+
+    auto transition = std::make_shared<TransicaoEmCurso>();
+    transition->inicio = inicio;
+    transition->destino = cena;
+    transition->geracao = geracao;
+    transition->inicioMs = juce::Time::getMillisecondCounterHiRes();
+    transition->duracaoMs = duration * 1000.0;
+    continuarTransicaoDaCena (transition);
+    return true;
+}
+
+void MainComponent::continuarTransicaoDaCena (
+    const std::shared_ptr<TransicaoEmCurso>& transicao)
+{
+    if (transicao == nullptr || geracaoDaCena != transicao->geracao)
+        return;
+
+    const auto elapsed = juce::Time::getMillisecondCounterHiRes()
+                       - transicao->inicioMs;
+    const float progress = (float) juce::jlimit (
+        0.0, 1.0, elapsed / transicao->duracaoMs);
+    aplicarFrameDaTransicao (transicao->inicio, transicao->destino, progress);
+
+    if (progress >= 1.0f)
+    {
+        ccPickup.clear();
+        if (padPanel != nullptr)
+            padPanel->refreshState();
+        refreshPerformanceSessionPanel();
+        agendarFimDaSupressaoDeGravacaoDaCena (transicao->geracao);
+        return;
+    }
+
+    juce::Timer::callAfterDelay (
+        16,
+        [safe = juce::Component::SafePointer<MainComponent> (this), transicao]
+        {
+            if (auto* self = safe.getComponent())
+                self->continuarTransicaoDaCena (transicao);
         });
 }
 
@@ -2809,8 +5396,10 @@ void MainComponent::refreshSlotChoices()
         const bool wantInstrument = (i == 0);
 
         for (const auto& d : types)
-            if (d.isInstrument == wantInstrument
-                && ! knownPlugins.isBlacklisted (d.fileOrIdentifier, true)
+            if (ChurchDAWPluginScan::descricaoDeclaraInstrumento (d)
+                    == wantInstrument
+                && ! ChurchDAWPluginScan::estaNaBlacklist (
+                        knownPlugins, d.fileOrIdentifier, true)
                 && ! pluginScanQuarantine.contains (d.fileOrIdentifier, true))
                 s.choices.add (d);
 
@@ -2907,9 +5496,18 @@ void MainComponent::loadPlugin (int slotIndex,
                                 bool saveAfterLoad)
 {
     auto& s = slots[slotIndex];
+    if (s.pendingNodeRetirement.hasPending())
+    {
+        juce::Logger::writeToLog (
+            "PLUGIN LOAD: slot aguardando retirada segura do no anterior");
+        return;
+    }
     const auto requestedIdentifier = desc.createIdentifierString();
+    const auto requestedMappingIdentity =
+        ChurchDAWMidiMapping::hostedPluginIdentityForDescription (desc);
 
-    if (knownPlugins.isBlacklisted (desc.fileOrIdentifier, true)
+    if (ChurchDAWPluginScan::estaNaBlacklist (
+            knownPlugins, desc.fileOrIdentifier, true)
          || pluginScanQuarantine.contains (desc.fileOrIdentifier, true))
     {
         juce::Logger::writeToLog (
@@ -2948,7 +5546,8 @@ void MainComponent::loadPlugin (int slotIndex,
 
     formatManager.createPluginInstanceAsync (
         desc, getCurrentSampleRate(), getCurrentBlockSize(),
-        [safe, lifetime, slotIndex, desc, requestedIdentifier, generation,
+        [safe, lifetime, slotIndex, desc, requestedIdentifier,
+         requestedMappingIdentity, generation,
          stateCopy = std::move (stateCopy), hasState,
          openEditorAfterLoad, saveAfterLoad]
         (std::unique_ptr<juce::AudioPluginInstance> instance, const juce::String& error) mutable
@@ -2986,7 +5585,8 @@ void MainComponent::loadPlugin (int slotIndex,
 
             const auto pluginWasBlocked = [self, &desc]
             {
-                return self->knownPlugins.isBlacklisted (
+                return ChurchDAWPluginScan::estaNaBlacklist (
+                           self->knownPlugins,
                            desc.fileOrIdentifier, true)
                     || self->pluginScanQuarantine.contains (
                            desc.fileOrIdentifier, true);
@@ -3080,11 +5680,25 @@ void MainComponent::loadPlugin (int slotIndex,
                 || slot.loadGeneration != generation)
                 return;
 
+            if (slot.pendingNodeRetirement.hasPending())
+            {
+                slot.loadingIdentifier.clear();
+                restoreCurrentSelection();
+                return;
+            }
+
             const auto inputChannels = instance->getTotalNumInputChannels();
             const auto outputChannels = instance->getTotalNumOutputChannels();
+            const ChurchDAWPluginScan::RuntimePluginRoleEvidence
+                roleEvidence {
+                    instance->acceptsMidi(), inputChannels, outputChannels
+                };
+            const bool runtimeIsInstrument =
+                ChurchDAWPluginScan::deveSerTratadoComoInstrumento (
+                    desc, roleEvidence);
             juce::String incompatibleReason;
 
-            if (desc.isInstrument != (slotIndex == 0))
+            if (runtimeIsInstrument != (slotIndex == 0))
             {
                 incompatibleReason = slotIndex == 0
                     ? "o plugin foi identificado como efeito, nao instrumento"
@@ -3094,7 +5708,7 @@ void MainComponent::loadPlugin (int slotIndex,
             {
                 if (outputChannels <= 0)
                     incompatibleReason = "o instrumento nao oferece saida de audio";
-                else if (! instance->acceptsMidi())
+                else if (! roleEvidence.acceptsMidi)
                     incompatibleReason = "o instrumento nao aceita MIDI";
             }
             else if (inputChannels <= 0 || outputChannels <= 0)
@@ -3239,22 +5853,57 @@ void MainComponent::loadPlugin (int slotIndex,
                 return;
             }
 
+            // Reserve the sole physical retirement slot before publishing the
+            // replacement. If the old Church Live is suspended in a nested
+            // plug-in frame, a second replacement fails here without changing
+            // the current node or growing a chain of deferred graph nodes.
+            if (oldNodeID.uid != 0)
+                if (auto oldNode = self->graph.getNodeForId (oldNodeID))
+                    if (auto* oldLive = dynamic_cast<TimbresProcessor*> (
+                            oldNode->getProcessor());
+                        oldLive != nullptr
+                         && ! oldLive->canDestroyWithoutBlockingOnMidiMapping()
+                         && ! slot.pendingNodeRetirement.tryReserve (
+                                oldNodeID.uid))
+                    {
+                        self->rebuildGraphConnections();
+                        self->graph.removeNode (newNode->nodeID);
+                        slot.loadingIdentifier.clear();
+                        restoreCurrentSelection();
+                        return;
+                    }
+
             slot.nodeID = newNode->nodeID;
-            slot.proc.store (newNode->getProcessor());
             slot.pluginIdentifier = requestedIdentifier;
+            {
+                const juce::ScopedLock mappingLock (self->mapLock);
+                slot.mappingIdentity = requestedMappingIdentity;
+                slot.proc.store (newNode->getProcessor());
+                self->parameterTargetGeneration.fetch_add (
+                    1, std::memory_order_acq_rel);
+            }
             slot.pendingIdentifier.clear();
             slot.pendingState.clear();
             slot.loadingIdentifier.clear();
             slot.openButton.setEnabled (true);
             newNode->getProcessor()->addListener (self);
+            for (int cacheSlot = 0; cacheSlot < numSlots; ++cacheSlot)
+                self->refreshInsertMappingIdentityCacheForSlot (cacheSlot);
 
             for (int c = 0; c < slot.choices.size(); ++c)
                 if (slot.choices.getReference (c).createIdentifierString()
                     == slot.pluginIdentifier)
                     slot.box.setSelectedId (c + 2, juce::dontSendNotification);
 
+            // Handshake de vida (ver liveHandshakeLock no topo do arquivo): o
+            // no antigo era o TimbresProcessor que a thread de MIDI pode estar
+            // desreferenciando em handleIncomingMidiMessage. So destroi depois
+            // de adquirir o lock.
             if (oldNodeID.uid != 0)
+            {
+                const juce::ScopedLock sl (liveHandshakeLock);
                 self->removeNodeForSlot (slotIndex, oldNodeID);
+            }
 
             // Destrutores de plugins de terceiros podem bombear a message
             // thread. Se houve outra escolha durante o fechamento do antigo,
@@ -3273,13 +5922,45 @@ void MainComponent::loadPlugin (int slotIndex,
 
 void MainComponent::loadInternalTimbres (int slotIndex, const juce::MemoryBlock* state, int libraryIndex)
 {
+    if (slots[slotIndex].pendingNodeRetirement.hasPending())
+        return;
+
     unloadSlot (slotIndex);
     const auto loadGeneration = slots[slotIndex].loadGeneration;
 
     auto instance = std::make_unique<TimbresProcessor>();
+    instance->setMidiMappingTopologyGenerationCounter (
+        &parameterTargetGeneration);
+    instance->setMidiMappingParameterCallbackGate (
+        &parameterCallbackGate);
+    auto* const internalTimbres = instance.get();
+    instance->setInsertParameterListenerWillRetireCallback (
+        [safe = juce::Component::SafePointer<MainComponent> (this),
+         internalTimbres] (int insert,
+                           juce::AudioPluginInstance* processor)
+        {
+            if (auto* self = safe.getComponent())
+                self->retireInsertParameterListener (
+                    internalTimbres, insert, processor);
+        });
     instance->setExternalMaster (masterProcessor);                    // master grandao dentro do Church Live
     instance->setPluginResources (&knownPlugins, &formatManager,
                                   &pluginScanQuarantine);     // plugins hospedados no canal master
+    instance->setGlobalPanicRequestCallback (
+        [safe = juce::Component::SafePointer<MainComponent> (this)]
+        {
+            if (auto* self = safe.getComponent())
+                if (! self->componentShutdownStarted.load (
+                        std::memory_order_acquire))
+                    self->performGlobalPanic();
+        });
+    instance->setOpenPadEditorCallback (
+        [safe = juce::Component::SafePointer<MainComponent> (this)]
+        (int layer, const juce::String& name)
+        {
+            if (auto* self = safe.getComponent())
+                self->showPadEditor (layer, name);
+        });
 
     if (libraryIndex == 1)
         instance->setLibraryRoot (TimbresProcessor::redkeysSamplesFolder());
@@ -3306,10 +5987,23 @@ void MainComponent::loadInternalTimbres (int slotIndex, const juce::MemoryBlock*
     auto& s = slots[slotIndex];
     s.nodeID = node->nodeID;
     s.pluginIdentifier = timbresIdentifiers[libraryIndex];
+    {
+        const juce::ScopedLock mappingLock (mapLock);
+        s.mappingIdentity =
+            ChurchDAWMidiMapping::internalSlotProcessorIdentity (
+                s.pluginIdentifier);
+        s.globalTransposeParameterIndex.store (
+            internalTimbres->getTransposeGeralParam() != nullptr
+                ? internalTimbres->getTransposeGeralParam()
+                      ->getParameterIndex()
+                : -1,
+            std::memory_order_release);
+        s.proc.store (node->getProcessor(), std::memory_order_release);
+        parameterTargetGeneration.fetch_add (1, std::memory_order_acq_rel);
+    }
     s.pendingIdentifier.clear();
     s.pendingState.clear();
     s.openButton.setEnabled (true);
-    s.proc.store (node->getProcessor());
     node->getProcessor()->addListener (this);
 
     // Escutar o Church Live e o que permite gravar o setup logo depois de
@@ -3325,26 +6019,58 @@ void MainComponent::loadInternalTimbres (int slotIndex, const juce::MemoryBlock*
     s.box.setSelectedId (timbresComboId, juce::dontSendNotification);
 
     rebuildGraphConnections();
+    for (int cacheSlot = 0; cacheSlot < numSlots; ++cacheSlot)
+        refreshInsertMappingIdentityCacheForSlot (cacheSlot);
 }
 
 void MainComponent::unloadSlot (int slotIndex)
 {
     auto& s = slots[slotIndex];
+    if (s.pendingNodeRetirement.hasPending())
+        return;
+
+    if (auto* live = dynamic_cast<TimbresProcessor*> (s.proc.load()))
+        live->setMidiMappingTopologyGenerationCounter (nullptr);
     ++s.loadGeneration;   // cancela qualquer AUv3 que ainda esteja abrindo
     s.loadingIdentifier.clear();
     s.openButton.setEnabled (false);
     const auto nodeToRemove = s.nodeID;
+    {
+        const juce::ScopedLock mappingLock (mapLock);
+        s.globalTransposeParameterIndex.store (
+            -1, std::memory_order_release);
+        s.mappingIdentity.clear();
+        for (auto& snapshot : insertMappingIdentityCache[slotIndex])
+        {
+            snapshot.processor = nullptr;
+            snapshot.identity.clear();
+            snapshot.topologyGeneration = 0;
+        }
+        parameterTargetGeneration.fetch_add (1, std::memory_order_acq_rel);
+    }
 
     // Desanexa o slot ANTES de destruir editores. Plugins reais podem bombear
     // a fila de mensagens ao fechar; uma escolha reentrante passa a pertencer
     // a uma nova geracao e nunca pode ser removida por este unload antigo.
     s.nodeID = {};
-    s.proc.store (nullptr);
 
-    if (nodeToRemove.uid != 0)
-        removeNodeForSlot (slotIndex, nodeToRemove);
+    // Handshake de vida com a thread de MIDI (ver liveHandshakeLock no topo do
+    // arquivo): so chama graph.removeNode (que destroi o processador) depois de
+    // adquirir o lock, garantindo que nenhum callback de MIDI esteja dentro do
+    // roteamento de canal em handleIncomingMidiMessage. A troca de slot e um
+    // gesto manual — o bloqueio breve da thread de MIDI aqui e aceitavel frente
+    // ao crash de desreferenciar o objeto destruido.
+    {
+        const juce::ScopedLock sl (liveHandshakeLock);
+        s.proc.store (nullptr);
+
+        if (nodeToRemove.uid != 0)
+            removeNodeForSlot (slotIndex, nodeToRemove);
+    }
 
     rebuildGraphConnections();
+    for (int cacheSlot = 0; cacheSlot < numSlots; ++cacheSlot)
+        refreshInsertMappingIdentityCacheForSlot (cacheSlot);
 }
 
 void MainComponent::removeNodeForSlot (int slotIndex,
@@ -3355,6 +6081,18 @@ void MainComponent::removeNodeForSlot (int slotIndex,
 
     if (auto node = graph.getNodeForId (nodeID))
     {
+        if (auto* live = dynamic_cast<TimbresProcessor*> (
+                node->getProcessor());
+            live != nullptr
+             && ! live->canDestroyWithoutBlockingOnMidiMapping())
+        {
+            const bool reserved = slots[slotIndex]
+                .pendingNodeRetirement.tryReserve (nodeID.uid);
+            jassert (reserved);
+            juce::ignoreUnused (reserved);
+            return;
+        }
+
         node->getProcessor()->removeListener (this);
 
         if (auto* live = dynamic_cast<TimbresProcessor*> (node->getProcessor()))
@@ -3371,6 +6109,7 @@ void MainComponent::removeNodeForSlot (int slotIndex,
 
     closeWindowForNode (nodeID);
     graph.removeNode (nodeID);
+    (void) slots[slotIndex].pendingNodeRetirement.clearIf (nodeID.uid);
 }
 
 void MainComponent::openEditorForSlot (int slotIndex)
@@ -3454,6 +6193,17 @@ void MainComponent::dockNodeNow (juce::AudioProcessorGraph::NodeID nodeID)
         dockedNative = (dynamic_cast<TimbresProcessor*> (proc) != nullptr);
         dockTitle.setText (proc->getName(), juce::dontSendNotification);
 
+       #if ! JUCE_ANDROID && ! JUCE_IOS
+        if (dockedNative && desktopReferenceLayout)
+        {
+            // O destaque do header acompanha a pagina realmente aberta. A
+            // mudanca e silenciosa para nao reentrar no callback que acabou de
+            // criar o editor.
+            liveButton.setToggleState (true, juce::dontSendNotification);
+            liveScenePanel.setVisible (false);
+        }
+       #endif
+
         dockTitle.setVisible (! dockedNative);
         dockFloatButton.setVisible (! dockedNative);
         dockCloseButton.setVisible (! dockedNative);
@@ -3482,6 +6232,8 @@ void MainComponent::dockNodeNow (juce::AudioProcessorGraph::NodeID nodeID)
 
 void MainComponent::undockEditor()
 {
+    const bool wasNative = dockedNative;
+
     if (dockedEditor != nullptr)
     {
         dockedEditor->removeComponentListener (this);
@@ -3495,6 +6247,11 @@ void MainComponent::undockEditor()
     dockViewport.setVisible (false);
     dockFloatButton.setVisible (false);
     dockCloseButton.setVisible (false);
+
+   #if ! JUCE_ANDROID && ! JUCE_IOS
+    if (wasNative && desktopReferenceLayout)
+        liveButton.setToggleState (false, juce::dontSendNotification);
+   #endif
 
     updateDockLayout();
     repaint();
@@ -3544,7 +6301,21 @@ void MainComponent::openFloatingWindowForNode (juce::AudioProcessorGraph::NodeID
         });
 
         const int offset = 40 * ((int) pluginWindows.size() % 5);
-        window->setTopLeftPosition (140 + offset, 140 + offset);
+
+        // Antes a janela nascia em coordenada de tela absoluta (140,140): num
+        // setup de dois monitores abria no monitor PRIMARIO, atras da tela que o
+        // musico olha. Agora posiciona relativo a janela principal da mesa e
+        // recorta pela area util do monitor em que ela esta — sempre visivel e
+        // no mesmo display do musico.
+        auto host = getScreenBounds();
+        auto place = juce::Rectangle<int> (window->getWidth(), window->getHeight())
+                        .withPosition (host.getX() + 40 + offset,
+                                       host.getY() + 40 + offset);
+
+        if (auto* d = juce::Desktop::getInstance().getDisplays().getDisplayForRect (host))
+            place = place.constrainedWithin (d->userArea);
+
+        window->setBoundsConstrained (place);
         pluginWindows[nodeID.uid] = std::move (window);
     }
 }
@@ -3577,8 +6348,157 @@ TimbresProcessor* MainComponent::getChurchLive() const
     return nullptr;
 }
 
+void MainComponent::setLaunchkeyMappingEnabled (bool enabled)
+{
+    if (launchkeyMappingEnabled == enabled)
+        return;
+
+    launchkeyMappingEnabled = enabled;
+    appProperties.getUserSettings()->setValue (
+        "launchkeyMappingEnabled", enabled);
+    appProperties.getUserSettings()->saveIfNeeded();
+
+    // Solta primeiro a porta exclusiva; depois a varredura reabre a entrada
+    // comum quando o mapeamento foi desligado.
+    launchkey.reset();
+    refreshMidiInputs();
+
+    if (launchkeyMappingEnabled)
+    {
+        lastLaunchkeyRetryMs = juce::Time::getMillisecondCounter();
+        setupLaunchkey();
+    }
+}
+
+void MainComponent::applyAutomaticControllerProfile (
+    const juce::MidiDeviceInfo& device)
+{
+    if (LaunchkeyControl::isDawPort (device.name))
+        return;
+
+    const auto name = device.name.toLowerCase();
+    juce::String profile;
+    if (name.contains ("arturia")) profile = "Arturia";
+    else if (name.contains ("m-audio") || name.contains ("m audio")) profile = "M-Audio";
+    else if (name.contains ("studiologic") || name.contains ("n-key")) profile = "Studiologic";
+    else if (name.contains ("native instruments") || name.contains ("komplete")) profile = "Native Instruments";
+    else return;
+
+    const auto sourceId =
+        ChurchDAWMidiMapping::normalizeMidiSourceId (device.identifier);
+    if (! midiMapsLoaded
+         || automaticControllerProfilesApplied.count (sourceId) != 0)
+        return;
+
+    // Se o mapa principal e o last-good falharam, defaults automaticos nao
+    // podem transformar um estado vazio em snapshot "valido" e sobrescrever
+    // a unica evidencia recuperavel do cliente. Um novo Learn manual ou o
+    // comando Limpar mapas resolve a situacao de forma explicita.
+    if (esquemaDeCCsDesconhecido
+         || bloquearSalvamentoCCVazio
+         || automaticControllerProfilesSuspended)
+    {
+        juce::Logger::writeToLog (
+            "MIDI_PROFILE: perfil automatico suspenso para preservar mapa existente");
+        return;
+    }
+
+    beginMidiMapRoutingTransaction();
+    bool changed = false;
+    std::vector<MidiControlKey> insertedKeys;
+    {
+        const juce::ScopedLock sl (mapLock);
+        // Convenção comum e segura: CC7 é volume principal. O mapeamento só
+        // entra se o músico ainda não criou algo para aquele controle.
+        const MidiControlKey volumeKey { sourceId, 1, 7, false, device.name };
+        if (ChurchDAWMidiMapping::shouldAddAutomaticMapping (
+                ccMappings, ccActionMappings, sourceId, device.name, 1, 7, false)
+             && masterProcessor != nullptr
+             && ! masterProcessor->getParameters().isEmpty())
+        {
+            const auto result = ccMappings.emplace (
+                volumeKey, CCTarget {
+                    -1, -1, -1, "Master", "master",
+                    ChurchDAWMidiMapping::masterProcessorIdentity() });
+            if (result.second)
+            {
+                insertedKeys.push_back (volumeKey);
+                changed = true;
+            }
+        }
+
+        // CC1 vira envio de reverb do primeiro layer quando o Church Live
+        // está presente; não substitui um mapa existente e pode ser alterado
+        // pelo MIDI Learn depois.
+        if (auto* live = getChurchLive())
+            if (auto* parameter = live->getLayerReverbSendParam (0))
+            {
+                const MidiControlKey ambienceKey { sourceId, 1, 1, false, device.name };
+                if (ChurchDAWMidiMapping::shouldAddAutomaticMapping (
+                        ccMappings, ccActionMappings, sourceId, device.name, 1, 1, false))
+                {
+                    const auto result = ccMappings.emplace (
+                        ambienceKey,
+                        CCTarget { 0,
+                                   live->getParameters().indexOf (parameter),
+                                   -1, parameter->getName (32),
+                                   ChurchDAWMidiMapping::stableParameterId (parameter),
+                                   slots[0].mappingIdentity });
+                    if (result.second)
+                    {
+                        insertedKeys.push_back (ambienceKey);
+                        changed = true;
+                    }
+                }
+            }
+    }
+
+    if (changed)
+    {
+        ccDirtyEpoch.markDirty();
+        const auto saved = saveMidiMap();
+        if (saved)
+        {
+            automaticControllerProfilesApplied.insert (sourceId);
+            bumpMidiMappingGeneration();
+        }
+        else
+        {
+            // A profile is a convenience, not user data. If persistence is
+            // unavailable, roll it back from this session as well; otherwise
+            // it can control the stage despite never having been accepted.
+            const juce::ScopedLock sl (mapLock);
+            for (const auto& key : insertedKeys)
+                ccMappings.erase (key);
+            // Um callback pode ter copiado um alvo temporario durante o I/O.
+            // Invalide esse trabalho depois que o perfil sai da memoria.
+            bumpMidiMappingGeneration();
+        }
+        refreshMidiMappingPanel();
+        juce::Logger::writeToLog (
+            "MIDI_PROFILE: " + profile + " aplicado a " + device.name
+            + (saved ? " e salvo" : " (nao foi possivel salvar)"));
+    }
+    else
+    {
+        automaticControllerProfilesApplied.insert (sourceId);
+        juce::Logger::writeToLog (
+            "MIDI_PROFILE: " + profile + " detectado; mapas existentes preservados");
+    }
+    finishMidiMapRoutingTransaction();
+}
+
 void MainComponent::setupLaunchkey()
 {
+   #if CHURCHDAW_UI_PREVIEW
+    return;
+   #endif
+    if (! launchkeyMappingEnabled)
+    {
+        launchkey.reset();
+        return;
+    }
+
     // Reconexao tambem acontece com o app aberto. Soltar o objeto antigo antes
     // de abrir o novo e obrigatorio no Windows, onde a porta MIDI e exclusiva.
     launchkey.reset();
@@ -3594,8 +6514,12 @@ void MainComponent::setupLaunchkey()
                               + juce::String (launchkey->isListening() ? " (entrada e saida)"
                                                                       : " (somente saida)"));
 
-    launchkey->onFader = [this] (int index, float v)
+    const auto launchkeyLifetime = midiCallbackLifetime;
+    launchkey->onFader = [this, launchkeyLifetime] (int index, float v)
     {
+        if (! launchkeyLifetime->load())
+            return;
+
         static const juce::String sourceId ("churchdaw:launchkey-daw");
 
         // A porta DAW agora passa pelo MESMO MIDI Learn dos outros teclados.
@@ -3603,7 +6527,7 @@ void MainComponent::setupLaunchkey()
         // superficie pronta de fabrica logo abaixo.
         if (processControllerCC (LaunchkeyControl::faderCC0 + index,
                                  juce::roundToInt (v * 127.0f),
-                                 sourceId, 1))
+                                 sourceId, 1, false, "Launchkey DAW"))
             return;
 
         if (index == 8)   // fader 9 = master
@@ -3618,13 +6542,16 @@ void MainComponent::setupLaunchkey()
                 p->setValueNotifyingHost (v);
     };
 
-    launchkey->onEncoder = [this] (int index, float v)
+    launchkey->onEncoder = [this, launchkeyLifetime] (int index, float v)
     {
+        if (! launchkeyLifetime->load())
+            return;
+
         static const juce::String sourceId ("churchdaw:launchkey-daw");
 
         if (processControllerCC (LaunchkeyControl::encoderCC0 + index,
                                  juce::roundToInt (v * 127.0f),
-                                 sourceId, 1))
+                                 sourceId, 1, false, "Launchkey DAW"))
             return;
 
         auto* live = getChurchLive();
@@ -3675,8 +6602,11 @@ void MainComponent::setupLaunchkey()
     // ---- pads ----
     // cima  (96..102): tons naturais do Pad Continuo   103: parar o pad
     // baixo (112..116): liga/desliga canais 1-5        119: PANIC
-    launchkey->onPad = [this] (int note)
+    launchkey->onPad = [this, launchkeyLifetime] (int note)
     {
+        if (! launchkeyLifetime->load())
+            return;
+
         if (note >= LaunchkeyControl::padTop0 && note < LaunchkeyControl::padTop0 + 7)
         {
             if (padProcessor != nullptr)
@@ -3733,7 +6663,7 @@ void MainComponent::setupLaunchkey()
 
         if (note == LaunchkeyControl::padBottom0 + 7)
         {
-            resetMidiTransportState();
+            performGlobalPanic();
             return;
         }
     };
@@ -3837,17 +6767,41 @@ void MainComponent::refreshLaunchkeyNames()
 void MainComponent::handleIncomingMidiMessage (juce::MidiInput* source,
                                                const juce::MidiMessage& message)
 {
+    const juce::ScopedLock callbackBarrier (midiCallbackBarrier);
+    bool normalizeSustain = false;
+    bool aggregateSustainDown = false;
+    bool reassertSustainAfterBoundary = false;
+
     // roda na thread de MIDI - nao mexer em componentes daqui
     // O LED do header representa execucao musical, nao so knobs aprendidos.
     // Atomico e barato: note-on/off agora acende o mesmo pulso visual dos CCs.
     if (message.isNoteOnOrOff())
         lastMidiActivityMs.store (juce::Time::getMillisecondCounter());
 
+    // Logging de cada toque faz formatacao, lock e I/O de arquivo na thread
+    // MIDI. Em acordes densos isso disputa o callback de audio e produz um
+    // atraso exatamente por evento. Fica disponivel apenas para builds de
+    // diagnostico explicitamente preparados para inspecao de MIDI.
+#if defined (CHURCHDAW_MIDI_EVENT_LOGGING) && CHURCHDAW_MIDI_EVENT_LOGGING
+    if (message.isNoteOn())
+        juce::Logger::writeToLog (
+            "TOQUE: nota " + juce::String (message.getNoteNumber())
+            + " vel " + juce::String (message.getVelocity())
+            + " ch " + juce::String (message.getChannel()));
+    else if (message.isController())
+        juce::Logger::writeToLog (
+            "TOQUE: CC " + juce::String (message.getControllerNumber())
+            + " val " + juce::String (message.getControllerValue())
+            + " ch " + juce::String (message.getChannel()));
+#endif
+
     if (message.isController())
     {
-        const juce::String sourceId =
-            "midi:" + (source != nullptr ? source->getIdentifier()
-                                         : juce::String ("unknown"));
+        const juce::String sourceId = ChurchDAWMidiMapping::normalizeMidiSourceId (
+            source != nullptr ? source->getIdentifier()
+                              : juce::String ("unknown"));
+        const juce::String sourceName =
+            source != nullptr ? source->getName() : juce::String();
         const int controller = message.getControllerNumber();
 
         // Alguns controladores encerram a frase somente com All Sound Off /
@@ -3859,24 +6813,138 @@ void MainComponent::handleIncomingMidiMessage (juce::MidiInput* source,
         {
             const int channel = juce::jlimit (1, 16, message.getChannel());
             const juce::ScopedLock sl (mapLock);
-
-            for (auto it = notasSuprimidas.begin(); it != notasSuprimidas.end();)
-                if (it->sourceId == sourceId && it->channel == channel)
-                    it = notasSuprimidas.erase (it);
-                else
-                    ++it;
-
+            notasSuprimidas.clearSourceChannel (sourceId, channel);
             reconstruirMascaraDeSuprimidas();
+        }
+
+        // A ORDEM AQUI E O RECURSO INTEIRO.
+        //
+        // O pad de borracha que manda CC caia direto no processControllerCC, e
+        // aquele caminho so sabe transformar CC em VALOR DE PARAMETRO continuo —
+        // ele nem olha o alvo que o painel do Pad armou. Por isso o mapeamento
+        // do Pad por CC nunca acontecia, em circunstancia nenhuma: nao havia
+        // bloqueio deliberado, simplesmente nao existia fio ligando os dois.
+        //
+        // E quando o CC VIRA comando, ele NAO segue para o motor. Sem esse
+        // return, um pedal mapeado como "Pad Sol" tambem pisaria o sustain do
+        // piano no mesmo gesto.
+        if (ccDeAcaoFoiConsumido (controller, message.getControllerValue(),
+                                  sourceId, message.getChannel(), sourceName))
+            return;
+
+        {
+            const juce::ScopedLock stateLock (mapLock);
+            rawCCPhysicalGestures.observeRawDuringTransaction (
+                { sourceId,
+                  juce::jlimit (1, 16, message.getChannel()),
+                  controller, false, sourceName },
+                message.getControllerValue());
+            if (controller == 121)
+                rawCCPhysicalGestures.clearSourceChannel (
+                    sourceId,
+                    juce::jlimit (1, 16, message.getChannel()));
         }
 
         processControllerCC (
             controller, message.getControllerValue(),
-            sourceId, message.getChannel());
+            sourceId, message.getChannel(), false, sourceName);
+
+        // O CC11 passa primeiro pelo Learn acima, portanto um pedal de
+        // expressao ainda pode comandar qualquer fader/knob escolhido pelo
+        // usuario. Sem mapa, porem, ele termina aqui: encaminha-lo tambem ao
+        // piano fazia o proprio instrumento mudar de expressao por fora da
+        // mesa, que e exatamente a interferencia relatada pelo cliente.
+        if (! ChurchDAWMidiMapping::shouldForwardRawControllerToInstruments (
+                controller))
+            return;
+
+        if (controller == 64)
+        {
+            ChurchDAWMidiMapping::SourceAwareSustainState::Decision decision;
+            {
+                const juce::ScopedLock stateLock (mapLock);
+                decision = sourceAwareSustain.update (
+                    sourceId,
+                    message.getChannel(),
+                    message.getControllerValue() >= 64);
+            }
+
+            // O agregado nao mudou: outra porta ainda segura o pedal (ou este
+            // aparelho repetiu o mesmo valor). Encaminhar o OFF individual
+            // recriaria exatamente o corte "last OFF wins".
+            if (! decision.forwardTransition)
+                return;
+
+            normalizeSustain = true;
+            aggregateSustainDown = decision.aggregateDown;
+        }
+        else if (controller == 121)
+        {
+            // Reset All Controllers pertence a esta origem/canal. O motor
+            // recebe o reset normalmente, mas o sustain agregado das outras
+            // portas precisa ser reafirmado depois da fronteira.
+            const juce::ScopedLock stateLock (mapLock);
+            sourceAwareSustain.update (
+                sourceId, message.getChannel(), false);
+            reassertSustainAfterBoundary =
+                sourceAwareSustain.isDown();
+        }
+        else if (controller == 120 || controller == 123)
+        {
+            // O host trata estes CCs como PANIC global e zera seu latch de
+            // sustain. O pedal fisico, porem, continua abaixado e nao manda um
+            // segundo 127; restaure-o logo apos o boundary.
+            const juce::ScopedLock stateLock (mapLock);
+            reassertSustainAfterBoundary =
+                sourceAwareSustain.isDown();
+        }
     }
     else if (message.isNoteOnOrOff() || message.isAftertouch())
     {
         if (notaFoiConsumida (source, message))
             return;   // tecla de comando: NAO vira nota no instrumento
+
+        if (message.isNoteOnOrOff())
+        {
+            bool consumed = false;
+            // P1-002: Ignorar Note-Off para evitar que alvos contínuos vão a zero ao soltar a nota.
+            // sourceId so e montado em note-on: note-off nao consome mapeamento, e
+            // montar a String aqui seria alocacao de heap morta em toda tecla solta
+            // (o proprio arquivo documenta esse defeito em montarChaveDeNota).
+            if (message.isNoteOn())
+            {
+                const auto suppressed = montarChaveDeNota (
+                    source, message, message.getNoteNumber());
+                bool debtReserved = false;
+                {
+                    const juce::ScopedLock stateLock (mapLock);
+                    debtReserved = reservarNotaSuprimidaUnderMapLock (
+                        suppressed);
+                }
+
+                // Reserve the paired OFF before processControllerCC can learn,
+                // move a parameter or consume this ON. At capacity/depth limit
+                // the complete gesture fails open and reaches the instrument.
+                if (debtReserved)
+                {
+                    consumed = processControllerCC (
+                        message.getNoteNumber(), message.getVelocity(),
+                        suppressed.sourceId, message.getChannel(), true,
+                        source != nullptr ? source->getName() : juce::String());
+                    if (! consumed)
+                    {
+                        const juce::ScopedLock stateLock (mapLock);
+                        if (notasSuprimidas.cancelAcquire (suppressed)
+                              == ChurchDAWMidiMapping::SuppressedNoteRelease::releasedLast)
+                            reconstruirMascaraDeSuprimidas();
+                    }
+                }
+            }
+
+            // P1-003: Se foi mapeada como CC, não tocar a nota original!
+            if (consumed)
+                return;
+        }
     }
 
     // Tudo que nao foi consumido segue para o motor. Este repasse substitui o
@@ -3885,7 +6953,20 @@ void MainComponent::handleIncomingMidiMessage (juce::MidiInput* source,
     // Roteamento 2 teclados: se o dispositivo esta amarrado a um canal do
     // Church Live (piano vs pad), reescreve o canal MIDI da mensagem antes de
     // enfileirar — teclados USB quase sempre mandam tudo no canal 1.
+    //
+    // Handshake de vida (ver liveHandshakeLock no topo do arquivo): a thread de
+    // MIDI desreferencia o TimbresProcessor por ponteiro cru logo abaixo. O lock
+    // garante que unloadSlot/ troca de slot nao destroem o objeto no meio deste
+    // trecho — so e disputado numa troca de slot, nunca no meio do tocar.
+    const juce::ScopedLock sl (liveHandshakeLock);
+
     juce::MidiMessage routed = message;
+
+    if (normalizeSustain)
+        routed = juce::MidiMessage::controllerEvent (
+            message.getChannel(), 64,
+            aggregateSustainDown ? 127 : 0);
+
     if (source != nullptr)
         if (auto* live = getChurchLive())
         {
@@ -3894,6 +6975,12 @@ void MainComponent::handleIncomingMidiMessage (juce::MidiInput* source,
             if (forced >= 1 && forced <= 16
                  && routed.getChannel() != forced
                  && (routed.isNoteOnOrOff() || routed.isAftertouch()
+                      // Channel pressure faltava nesta lista: o ramo de
+                      // reescrita dela logo abaixo era codigo morto. Sem isso a
+                      // pressao do teclado do piano continuava no canal 1 e
+                      // modulava o pad do outro teclado — o musico ouve "o pad
+                      // respira sozinho" e nao associa ao peso da propria mao.
+                      || routed.isChannelPressure()
                       || routed.isPitchWheel()
                       || (routed.isController()
                            && routed.getControllerNumber() != 64
@@ -3926,7 +7013,38 @@ void MainComponent::handleIncomingMidiMessage (juce::MidiInput* source,
             }
         }
 
+    // As fabricas estaticas do JUCE (noteOn/noteOff/aftertouch/pitchWheel/
+    // controllerEvent) criam a mensagem com timestamp ZERO. O coletor jassert-
+    // ifica timestamp != 0 e deriva a samplePosition como (ts - lastCallbackTime)
+    // * rate — negativo gigante depois de minutos de culto, que o jlimit grampa
+    // na amostra 0 (ou estoura int32 quando o callback atrasa). Repassa o
+    // carimbo real do driver tambem quando o canal foi reescrito.
+    routed.setTimeStamp (message.getTimeStamp());
+
+    if (auto* live = getChurchLive())
+    {
+        pianoVisualState->setHostGlobalSustain (live->getGlobalSustain());
+        pianoVisualState->observeHost (routed, live->getPedalInverted());
+    }
+    else
+        pianoVisualState->observe (routed);
     player.getMidiMessageCollector().addMessageToQueue (routed);
+
+    if (reassertSustainAfterBoundary)
+    {
+        auto sustain = juce::MidiMessage::controllerEvent (
+            routed.getChannel(), 64, 127);
+        const double baseTimestamp = message.getTimeStamp() > 0.0
+            ? message.getTimeStamp()
+            : juce::Time::getMillisecondCounterHiRes() * 0.001;
+        sustain.setTimeStamp (baseTimestamp + 0.005);
+        if (auto* live = getChurchLive())
+            pianoVisualState->observeHost (sustain, live->getPedalInverted());
+        else
+            pianoVisualState->observe (sustain);
+        player.getMidiMessageCollector().addMessageToQueue (
+            sustain);
+    }
 }
 
 // Chave completa da nota (aparelho + canal + numero). So e montada depois que
@@ -3934,10 +7052,13 @@ void MainComponent::handleIncomingMidiMessage (juce::MidiInput* source,
 ChurchDAWMidiMapping::ControllerKey MainComponent::montarChaveDeNota (
     juce::MidiInput* source, const juce::MidiMessage& message, int nota) const
 {
-    return { "midi:" + (source != nullptr ? source->getIdentifier()
-                                          : juce::String ("unknown")),
+    return { ChurchDAWMidiMapping::normalizeMidiSourceId (
+                 source != nullptr ? source->getIdentifier()
+                                   : juce::String ("unknown")),
              juce::jlimit (1, 16, message.getChannel()),
-             nota };
+             nota,
+             false,
+             source != nullptr ? source->getName() : juce::String() };
 }
 
 // Espelha notasSuprimidas numa mascara atomica por NUMERO de nota, para o
@@ -3948,12 +7069,183 @@ void MainComponent::reconstruirMascaraDeSuprimidas()
 {
     juce::uint32 nova[4] = { 0, 0, 0, 0 };
 
-    for (const auto& k : notasSuprimidas)
-        if (juce::isPositiveAndBelow (k.cc, 128))
-            nova[k.cc >> 5] |= 1u << (k.cc & 31);
+    notasSuprimidas.forEach (
+        [&nova] (const auto& key, std::uint16_t depth)
+        {
+            if (depth > 0 && juce::isPositiveAndBelow (key.cc, 128))
+                nova[key.cc >> 5] |= 1u << (key.cc & 31);
+        });
 
     for (int i = 0; i < 4; ++i)
         mascaraDeNotasSuprimidas[i].store (nova[i], std::memory_order_relaxed);
+}
+
+bool MainComponent::reservarNotaSuprimidaUnderMapLock (
+    const ChurchDAWMidiMapping::ControllerKey& key)
+{
+    if (! notasSuprimidas.tryAcquire (key))
+    {
+        // Capacity/depth exhaustion latches this key fail-open. Rebuild the
+        // per-note fast mask now so its ON/OFF/aftertouch can bypass this
+        // ledger unless another source/channel still has a real debt.
+        reconstruirMascaraDeSuprimidas();
+        return false;
+    }
+    if (juce::isPositiveAndBelow (key.cc, 128))
+        mascaraDeNotasSuprimidas[key.cc >> 5].fetch_or (
+            1u << (key.cc & 31), std::memory_order_relaxed);
+    return true;
+}
+
+void MainComponent::beginMidiMapRoutingTransaction()
+{
+    // Acquire the same barrier held for the complete MIDI callback before
+    // publishing the mode. A callback therefore sees one routing generation
+    // from start to finish; none can observe the flag changing halfway through
+    // a note/CC gesture.
+    const juce::ScopedLock callbackDrain (midiCallbackBarrier);
+    midiMapTransactionInProgress.store (true, std::memory_order_release);
+    // Invalidate every Learn event captured before this structural boundary.
+    // MIDI producers are drained by callbackBarrier, so this queue clear is
+    // complete; parameter callbacks use generations and remain non-blocking.
+    parameterLearnGeneration.fetch_add (1, std::memory_order_acq_rel);
+    parameterLearnSelectionGeneration.fetch_add (
+        1, std::memory_order_acq_rel);
+    midiLearnControlQueue.clear();
+    const juce::ScopedLock mapGuard (mapLock);
+
+    ccActionsAtMapTransactionStart = ccActionMappings;
+    notesSuppressedByMapTransaction.clear();
+    deferredCCDecisions.clear();
+
+    for (const auto& mapping : noteMappings)
+    {
+        auto key = mapping.first;
+        key.isNote = false;
+        notesSuppressedByMapTransaction.insert (std::move (key));
+    }
+
+    for (const auto& mapping : ccMappings)
+        if (mapping.first.isNote)
+        {
+            auto key = mapping.first;
+            key.isNote = false;
+            notesSuppressedByMapTransaction.insert (std::move (key));
+        }
+
+    // Any stateful raw pedal (64..69) may predate the transaction. Start with
+    // the complete physical ledger, then let the dedicated sustain aggregate
+    // seed cover devices restored before the generic ledger was populated.
+    rawCCGesturesDuringMapTransaction = rawCCPhysicalGestures;
+    sourceAwareSustain.seedRawTransactionGestures (
+        rawCCGesturesDuringMapTransaction);
+    rawCCTransactionGesturePending.store (
+        rawCCGesturesDuringMapTransaction.hasPendingGesture(),
+        std::memory_order_release);
+}
+
+void MainComponent::finishMidiMapRoutingTransaction()
+{
+    using DeferredOutput =
+        ChurchDAWMidiMapping::DeferredMidiActionQueue<64>::Output;
+    std::array<DeferredOutput, 64> decisions {};
+    size_t decisionCount = 0;
+    bool decisionOverflow = false;
+    {
+        const juce::ScopedLock callbackDrain (midiCallbackBarrier);
+        const juce::ScopedLock mapGuard (mapLock);
+
+        // Preserve edge-detector progress observed while disk I/O was in
+        // flight, independent of whether the structural map committed or
+        // rolled back.
+        for (auto& destination : ccActionMappings)
+            for (const auto& runtime : ccActionsAtMapTransactionStart)
+                if (ChurchDAWMidiMapping::samePhysicalMidiControl (
+                        destination.first, runtime.first,
+                        midiSourcesCached))
+                {
+                    destination.second.estado = runtime.second.estado;
+                    break;
+                }
+
+        decisionCount = deferredCCDecisions.copyTo (decisions);
+        decisionOverflow = deferredCCDecisions.overflowed();
+        deferredCCDecisions.clear();
+
+        // Publish the new structural masks before callbacks can observe that
+        // the transaction ended. Otherwise a raw ON can escape in the gap and
+        // its OFF can be consumed by the freshly-installed map.
+        reconstruirMascaraDeNotasUnderMapLock();
+        reconstruirMascaraDeCCsDeAcaoUnderMapLock();
+        ccActionsAtMapTransactionStart.clear();
+        notesSuppressedByMapTransaction.clear();
+        // Producers are still stopped by midiCallbackBarrier, so publish the
+        // complete descriptor table before callbacks can observe the new map
+        // generation. This prevents the first post-transaction CC from being
+        // lost as a stale-table event.
+        if (publishedControllerRouteMappingGeneration
+              != midiMappingGeneration.load (std::memory_order_acquire))
+            rebuildControllerRoutesIfNeeded (true);
+        midiMapTransactionInProgress.store (
+            false, std::memory_order_release);
+    }
+
+    // A pending AsyncUpdater callback may have returned while the transaction
+    // flag was set. Re-arm the single coalesced wake after publishing routes.
+    triggerAsyncUpdate();
+
+    // Execute physical edges only after both callback/map locks are released.
+    // In particular, a seguirNivel OFF received during disk I/O must still
+    // stop the Pad; copying only the edge-detector state left it sounding
+    // forever because no second release event exists.
+    if (decisionOverflow
+         && ! componentShutdownStarted.load (std::memory_order_acquire))
+    {
+        // A fila de decisoes pode exceder 64 ate repetindo uma unica identidade.
+        // Falhe em silencio: pare o som sustentado e nao execute nenhum prefixo
+        // da sequencia que ficou parcialmente representada.
+        juce::Logger::writeToLog (
+            "MIDI MAP: overflow ao reconciliar botoes; PANIC seguro aplicado");
+        executarAcaoDeNota ({ NoteActionKind::panic, -1 });
+    }
+    else if (! componentShutdownStarted.load (std::memory_order_acquire))
+        for (size_t i = 0; i < decisionCount; ++i)
+            aplicarDecisaoDeBotaoNoTom (
+                { static_cast<NoteActionKind> (decisions[i].actionKind),
+                  decisions[i].argument },
+                decisions[i].decision);
+}
+
+void MainComponent::resetMidiLearnTargetUnderCallbackBarrier (bool enabled)
+{
+    const juce::ScopedLock callbackDrain (midiCallbackBarrier);
+    midiLearnTouchTimer.setRunning (false);
+    midiLearnActive.store (false, std::memory_order_release);
+    // Parameter callbacks publish only POD events tagged with Learn/topology
+    // generations. An in-flight old callback may finish after this point, but
+    // the consumer rejects its generation, so no synchronous spin or unsafe
+    // clear is needed. MIDI producers, on the other hand, are drained by the
+    // barrier held above, so their bounded queue can be cleared completely.
+    parameterLearnGeneration.fetch_add (1, std::memory_order_acq_rel);
+    midiLearnControlQueue.clear();
+
+    {
+        const juce::ScopedLock mapGuard (mapLock);
+        lastTouchedSlot.store (-2, std::memory_order_relaxed);
+        lastTouchedParam.store (-1, std::memory_order_relaxed);
+        lastTouchedInsert.store (-1, std::memory_order_relaxed);
+        lastTouchedTopologyGeneration.store (
+            0, std::memory_order_relaxed);
+        lastTouchedParamName.clear();
+        lastTouchedParamId.clear();
+        lastTouchedPluginId.clear();
+        lastTouchedParameterIdentityUnique.store (
+            false, std::memory_order_relaxed);
+        pendingNoteAction = {};
+    }
+
+    midiLearnActive.store (enabled, std::memory_order_release);
+    midiLearnTouchTimer.setRunning (enabled);
 }
 
 // Decide se esta mensagem de nota e uma TECLA DE COMANDO mapeada pelo musico.
@@ -3964,6 +7256,9 @@ void MainComponent::reconstruirMascaraDeSuprimidas()
 bool MainComponent::notaFoiConsumida (juce::MidiInput* source,
                                       const juce::MidiMessage& message)
 {
+    const bool transactionInProgress =
+        midiMapTransactionInProgress.load (std::memory_order_acquire);
+
     const int nota = message.getNoteNumber();
 
     if (! juce::isPositiveAndBelow (nota, 128))
@@ -3995,25 +7290,41 @@ bool MainComponent::notaFoiConsumida (juce::MidiInput* source,
 
         const auto chaveOff = montarChaveDeNota (source, message, nota);
         const juce::ScopedLock trava (mapLock);
-        const auto it = notasSuprimidas.find (chaveOff);
-        const bool eraSuprimida = it != notasSuprimidas.end();
 
-        if (message.isNoteOff() && eraSuprimida)
+        if (message.isNoteOff())
         {
-            notasSuprimidas.erase (it);
-            reconstruirMascaraDeSuprimidas();
+            const auto release =
+                notasSuprimidas.consumeRelease (chaveOff);
+            if (release == ChurchDAWMidiMapping::SuppressedNoteRelease::releasedLast)
+                reconstruirMascaraDeSuprimidas();
+            return release == ChurchDAWMidiMapping::SuppressedNoteRelease::stillSuppressed
+                || release == ChurchDAWMidiMapping::SuppressedNoteRelease::releasedLast;
         }
 
-        return eraSuprimida;
+        return notasSuprimidas.shouldSuppressCurrentGesture (chaveOff);
     }
 
     // Note-on: fora do Learn, sem bit ligado nao existe mapeamento para esta
     // nota — devolve na hora, sem construir chave nenhuma.
-    if (! midiLearnActive.load()
+    if (! transactionInProgress
+         && ! midiLearnActive.load()
          && (mascaraDeNotasMapeadas[palavra].load (std::memory_order_relaxed) & bit) == 0)
         return false;
 
     const auto chave = montarChaveDeNota (source, message, nota);
+
+    if (transactionInProgress)
+    {
+        const juce::ScopedLock trava (mapLock);
+        if (notesSuppressedByMapTransaction.find (chave)
+                == notesSuppressedByMapTransaction.end())
+            return false;
+
+        // Congela comandos E notas usadas como parâmetros durante a transação,
+        // conservando o pareamento do gesto. O note-off correspondente seguirá
+        // este ledger mesmo se a estrutura do mapa mudar antes da soltura.
+        return reservarNotaSuprimidaUnderMapLock (chave);
+    }
 
     // No modo Learn, tocar um tom no painel do Pad escolhe o alvo e a proxima
     // nota fisica cria o mapa. O primeiro note-on serve apenas para aprender;
@@ -4022,6 +7333,7 @@ bool MainComponent::notaFoiConsumida (juce::MidiInput* source,
     {
         NoteAction aprendida;
         bool desmapeou = false;
+        bool recusou = false;
 
         {
             const juce::ScopedLock trava (mapLock);
@@ -4029,20 +7341,48 @@ bool MainComponent::notaFoiConsumida (juce::MidiInput* source,
 
             if (aprendida.kind != NoteActionKind::none)
             {
-                noteMappings[chave] = aprendida;
-                notasSuprimidas.insert (chave);
-                mascaraDeNotasSuprimidas[palavra].fetch_or (bit, std::memory_order_relaxed);
+                if (! reservarNotaSuprimidaUnderMapLock (chave))
+                    return false;
 
-                // O bit de MAPEADAS sobe aqui DENTRO do lock, junto com a
-                // escrita no mapa. Ligado la fora, uma reconstrucao que
-                // estivesse em curso na outra thread escrevia o snapshot velho
-                // por cima e apagava este bit — a tecla ficava gravada no
-                // disco, etiquetada na tela, e muda no culto.
-                mascaraDeNotasMapeadas[palavra].fetch_or (bit, std::memory_order_relaxed);
+                auto parameterKey = chave;
+                parameterKey.isNote = true;
+                const CCTarget* existingParameter = nullptr;
+                for (const auto& mapping : ccMappings)
+                    if (mapping.first.isNote
+                         && ChurchDAWMidiMapping::samePhysicalMidiControl (
+                                mapping.first, parameterKey,
+                                midiSourcesCached))
+                    {
+                        existingParameter = &mapping.second;
+                        break;
+                    }
+                if (existingParameter != nullptr)
+                {
+                    motivoDaRecusaDeNota =
+                        existingParameter->paramName.isNotEmpty()
+                            ? existingParameter->paramName
+                            : juce::String::fromUTF8 ("outro parâmetro");
+                    lastNoteActionRejected.store (nota, std::memory_order_relaxed);
+                    recusou = true;
+                }
+                else
+                {
+                    noteMappings[chave] = aprendida;
+                    noteDirtyEpoch.markDirty();
 
-                lastMappedNoteKey = chave;
-                lastMappedNoteAction = aprendida;
-                pendingNoteAction = {};
+                    // O bit de MAPEADAS sobe aqui DENTRO do lock, junto com a
+                    // escrita no mapa. Ligado la fora, uma reconstrucao que
+                    // estivesse em curso na outra thread escreveria o snapshot
+                    // velho e apagaria este bit.
+                    mascaraDeNotasMapeadas[palavra].fetch_or (
+                        bit, std::memory_order_relaxed);
+
+                    lastMappedNoteKey = chave;
+                    lastMappedNoteAction = aprendida;
+                    lastMappedNote.store (nota, std::memory_order_relaxed);
+                    bumpMidiMappingGeneration();
+                    pendingNoteAction = {};
+                }
             }
             else
             {
@@ -4061,14 +7401,23 @@ bool MainComponent::notaFoiConsumida (juce::MidiInput* source,
 
                 if (it != noteMappings.end())
                 {
+                    if (! reservarNotaSuprimidaUnderMapLock (chave))
+                        return false;
                     noteMappings.erase (it);
-                    notasSuprimidas.insert (chave);   // engole o par desta tecla
-                    mascaraDeNotasSuprimidas[palavra].fetch_or (bit, std::memory_order_relaxed);
+                    noteDirtyEpoch.markDirty();
                     lastMappedNoteKey = chave;
                     lastMappedNoteAction = {};
+                    lastMappedNote.store (nota, std::memory_order_relaxed);
+                    bumpMidiMappingGeneration();
                     desmapeou = true;
                 }
             }
+        }
+
+        if (recusou)
+        {
+            triggerAsyncUpdate();
+            return true;
         }
 
         if (desmapeou)
@@ -4077,7 +7426,6 @@ bool MainComponent::notaFoiConsumida (juce::MidiInput* source,
             // seguir mapeada noutro canal ou noutro teclado. Reconstruir e a
             // unica forma correta de apagar o bit — e nao pode acontecer aqui,
             // na thread de MIDI, porque percorre o mapa inteiro.
-            lastMappedNote.store (nota);
             lastLearnedAtMs.store (juce::Time::getMillisecondCounter());
             triggerAsyncUpdate();
             return true;
@@ -4086,7 +7434,6 @@ bool MainComponent::notaFoiConsumida (juce::MidiInput* source,
         if (aprendida.kind != NoteActionKind::none)
         {
             // (o bit ja subiu sob o lock, junto com a escrita no mapa)
-            lastMappedNote.store (nota);
             lastLearnedAtMs.store (juce::Time::getMillisecondCounter());
             triggerAsyncUpdate();
             return true;
@@ -4099,6 +7446,7 @@ bool MainComponent::notaFoiConsumida (juce::MidiInput* source,
         return false;
 
     NoteAction acao;
+    juce::uint64 mappingGeneration = 0;
 
     {
         const juce::ScopedLock trava (mapLock);
@@ -4108,11 +7456,12 @@ bool MainComponent::notaFoiConsumida (juce::MidiInput* source,
             return false;
 
         acao = it->second;
+        mappingGeneration = midiMappingGeneration.load (std::memory_order_relaxed);
 
         if (acao.kind != NoteActionKind::none)
         {
-            notasSuprimidas.insert (chave);
-            mascaraDeNotasSuprimidas[palavra].fetch_or (bit, std::memory_order_relaxed);
+            if (! reservarNotaSuprimidaUnderMapLock (chave))
+                return false;
         }
     }
 
@@ -4120,11 +7469,17 @@ bool MainComponent::notaFoiConsumida (juce::MidiInput* source,
         return false;
 
     // A acao em si mexe em UI e no motor: sai da thread de MIDI.
+    const auto midiLifetime = midiCallbackLifetime;
     juce::MessageManager::callAsync (
-        [safe = juce::Component::SafePointer<MainComponent> (this), acao]
+        [safe = juce::Component::SafePointer<MainComponent> (this),
+         midiLifetime, mappingGeneration, acao]
         {
+            if (! midiLifetime->load())
+                return;
             if (auto* self = safe.getComponent())
-                self->executarAcaoDeNota (acao);
+                if (self->midiMappingGeneration.load (std::memory_order_acquire)
+                        == mappingGeneration)
+                    self->executarAcaoDeNota (acao);
         });
 
     return true;
@@ -4132,9 +7487,11 @@ bool MainComponent::notaFoiConsumida (juce::MidiInput* source,
 
 void MainComponent::executarAcaoDeNota (NoteAction acao)
 {
-    if (padProcessor == nullptr)
-        return;
-
+    // O guard do Pad vive DENTRO dos cases dele.
+    //
+    // No topo da funcao ele calava tambem cena e panic: num setup sem Pad
+    // carregado o musico apertava a tecla do panico no meio do culto e nada
+    // acontecia. Cena e panic nao dependem do Pad Continuo.
     switch (acao.kind)
     {
         case NoteActionKind::padKey:
@@ -4148,12 +7505,85 @@ void MainComponent::executarAcaoDeNota (NoteAction acao)
             // certificar. Com toggle, esse "certificar-se" DESLIGAVA o Pad no
             // primeiro acorde. Selecionar e idempotente: apertar de novo
             // confirma. Para calar o Pad existe a acao Parar, que e explicita.
+            if (padProcessor == nullptr)
+                return;
+
             padProcessor->setKey (acao.arg);
             break;
 
         case NoteActionKind::padOff:
+            if (padProcessor == nullptr)
+                return;
+
             padProcessor->setKey (-1);
             break;
+
+        case NoteActionKind::cena:
+            // aplicarCena valida o indice sozinho e devolve "indisponivel"
+            // quando arg nao aponta cena nenhuma; nada a fazer com o resultado
+            // aqui, o proprio aplicarCena ja loga e cuida da UI.
+            (void) aplicarCena (acao.arg);
+            return;
+
+        case NoteActionKind::panic:
+        {
+            performGlobalPanic();
+            return;
+        }
+
+        case NoteActionKind::nextScene:
+        {
+            const int next = cenaAtiva < 0 ? 0
+                                           : juce::jmin (ChurchDAWLive::numeroDeCenas - 1,
+                                                         cenaAtiva + 1);
+            (void) aplicarCena (next);
+            return;
+        }
+
+        case NoteActionKind::previousScene:
+        {
+            const int previous = cenaAtiva < 0 ? 0 : juce::jmax (0, cenaAtiva - 1);
+            (void) aplicarCena (previous);
+            return;
+        }
+
+        case NoteActionKind::padSynthProgram:
+            if (padSynthProcessor != nullptr
+                 && juce::isPositiveAndBelow (acao.arg,
+                                               PadSynthProcessor::numPrograms))
+            {
+                padSynthProcessor->selectProgram (acao.arg);
+                if (padEditorPanel != nullptr)
+                    padEditorPanel->refreshFromProcessor();
+                (void) saveChainState();
+            }
+            return;
+
+        case NoteActionKind::tapTempo:
+            if (performanceSessionPanel != nullptr)
+                performanceSessionPanel->triggerTapTempo();
+            return;
+
+        case NoteActionKind::sustainToggle:
+            if (auto* live = getChurchLive())
+            {
+                live->setGlobalSustain (! live->getGlobalSustain());
+                refreshPerformanceSessionPanel();
+                agendarGravacaoDoSetup();
+            }
+            return;
+
+        case NoteActionKind::padSynthEngineToggle:
+            // Compatibilidade com mapas antigos: a acao ainda pode existir no
+            // XML de um cliente, mas o Pad Synth foi retirado do produto. Nunca
+            // reative o motor silencioso por um footswitch esquecido.
+            if (padSynthProcessor != nullptr)
+            {
+                padSynthProcessor->setEngineEnabled (false);
+                if (padEditorPanel != nullptr)
+                    padEditorPanel->refreshFromProcessor();
+            }
+            return;
 
         case NoteActionKind::none:
         default:
@@ -4164,276 +7594,1025 @@ void MainComponent::executarAcaoDeNota (NoteAction acao)
         padPanel->refreshState();
 }
 
-// Um unico caminho para CCs vindos da porta MIDI musical e da porta DAW do
-// Launchkey. Retorna true quando o CC foi aprendido ou ja possui mapeamento;
-// assim a superficie fixa do Launchkey sabe quando deve ceder ao mapa do usuario.
-bool MainComponent::processControllerCC (int cc, int value,
-                                         const juce::String& sourceId,
-                                         int channel)
-{
-    cc = juce::jlimit (0, 127, cc);
-    value = juce::jlimit (0, 127, value);
-    const MidiControlKey control {
-        sourceId, juce::jlimit (1, 16, channel), cc
-    };
+//==============================================================================
+// PAD CONTINUO ACIONADO POR CC — o "pad de borracha" (07/08/2026)
+//==============================================================================
+//
+// A REGRA, EM UMA FRASE: no caminho de CC o Pad ALTERNA no APERTO e a mensagem
+// de "soltou" nunca liga nem desliga nada. Quem tem pad com trava marca isso no
+// menu do tom e ai o Pad passa a seguir o nivel do proprio controle.
+//
+// POR QUE NAO HA DETECCAO AUTOMATICA DE "COM TRAVA vs SEM TRAVA":
+//
+// A sequencia de bytes dos dois e IDENTICA, bit a bit. Um pedal momentaneo manda
+// alto ao pisar e baixo ao soltar; um pedal com trava manda alto num toque e
+// baixo no seguinte. A UNICA diferenca esta no TEMPO entre as duas mensagens — e
+// o tempo e uma variavel do MUSICO, nao do aparelho: um pe parado em cima do
+// pedal enquanto ele le a tela produz exatamente o intervalo do pedal com trava.
+// A tentativa anterior tentou classificar por tempo, com a constante indo de
+// 350 ms para 1000 ms e depois para 4000 ms em tres iteracoes, sem hardware para
+// medir nenhuma delas, e foi revertida inteira.
+//
+// E O ERRO NAO E SIMETRICO:
+//   - tratar um pad COM TRAVA como sem trava  -> ele responde a cada dois toques.
+//     Chato, visivel na hora, o musico contorna apertando de novo. FALHA MACIA.
+//   - tratar um pad SEM TRAVA como com trava  -> o tom soa SO ENQUANTO O DEDO
+//     ESTA EM CIMA. O musico nao sustenta nada e nao tem como adivinhar o motivo.
+//     FALHA FATAL no meio do culto.
+//
+// Por isso o padrao e "alterna no aperto, ignora o soltar": nesse modo e
+// IMPOSSIVEL o Pad se desligar sozinho por causa de uma mensagem de release.
+//
+// O ESTADO DO PAD NAO E GUARDADO AQUI. A decisao "alternar" e resolvida lendo
+// padProcessor->getKey() na hora, por tres motivos que valem no palco:
+//   1. uma cena, a tela ou uma tecla MIDI que troquem o tom por fora nao
+//      dessincronizam nada — o proximo toque no pad continua fazendo o esperado;
+//   2. com o Pad em Re, apertar o pad de "Sol" LIGA em Sol, em vez de desligar;
+//   3. uma mensagem perdida no cabo nao inverte o estado para o resto do culto.
 
-    if (! control.isValid()
-         || ! ChurchDAWMidiMapping::isMappableController (cc))
+bool MainComponent::ccDeAcaoFoiConsumido (int cc, int value,
+                                          const juce::String& sourceId,
+                                          int channel,
+                                          const juce::String& sourceName)
+{
+    if (! juce::isPositiveAndBelow (cc, 128))
         return false;
 
-    const float value01 = (float) value / 127.0f;
-    const auto now = juce::Time::getMillisecondCounter();
-    lastMidiActivityMs.store (now);
+    const int palavra = cc >> 5;
+    const juce::uint32 bit = 1u << (cc & 31);
+    const bool aprendendo = midiLearnActive.load();
+    const bool transactionInProgress =
+        midiMapTransactionInProgress.load (std::memory_order_acquire);
+    const bool rawTransactionGesturePending =
+        rawCCTransactionGesturePending.load (std::memory_order_acquire);
 
-    // CCs que NAO podem virar mapeamento: 64/66/67 sao os pedais (sustain,
-    // sostenuto, soft) e 120-127 sao mensagens de modo do canal (all notes off,
-    // reset...). Pisar no pedal com o Learn armado sequestrava o controle
-    // selecionado — e ai o pedal passava a mexer num knob no meio do culto.
-    const bool learnable = true;
+    // CAMINHO COMUM, SEM LOCK: fora do Learn, sem bit ligado nao existe comando
+    // para este numero de CC. Um knob mandando dezenas de mensagens por segundo
+    // sai por esta linha sem encostar no std::map.
+    if (! transactionInProgress && ! rawTransactionGesturePending
+         && ! aprendendo
+         && (mascaraDeCCsDeAcao[palavra].load (std::memory_order_relaxed) & bit) == 0)
+        return false;
 
-    if (midiLearnActive.load() && learnable)
+    const MidiControlKey control {
+        sourceId, juce::jlimit (1, 16, channel), cc, false, sourceName
+    };
+
+    if (! control.isValid())
+        return false;
+
+    const auto agora = juce::Time::getMillisecondCounter();
     {
-        const int slot = lastTouchedSlot.load();
-        const int param = lastTouchedParam.load();
-        const bool touchOnMaster = slot == -1;
+        const juce::ScopedLock sl (mapLock);
 
-        // ESTAS DUAS COPIAS PRECISAM DO mapLock.
-        //
-        // Estamos na thread MIDI. Copiar juce::String incrementa o refcount de
-        // um StringHolder compartilhado; se audioProcessorParameterChanged
-        // reatribuir a String no mesmo instante (e o comentario dela diz que
-        // "pode chegar em qualquer thread"), esta copia pode reter um holder
-        // cujo refcount ja foi a zero — use-after-free. O header sempre
-        // declarou estes dois campos como "protegido por mapLock"; a leitura
-        // e que estava fora dele.
-        juce::String capturedParamName;
-        juce::String capturedParamId;
+        // Se o inicio do gesto atravessou cru durante uma transacao, o release
+        // tambem precisa atravessar cru. Isto e especialmente importante para
+        // CC64: consumir apenas o OFF depois de uma importacao deixaria o
+        // sustain bruto permanentemente abaixado no instrumento.
+        if (rawCCGesturesDuringMapTransaction
+                .shouldContinueRawGesture (control, value))
         {
-            const juce::ScopedLock trava (mapLock);
-            capturedParamName = lastTouchedParamName;
-            capturedParamId = lastTouchedParamId;
+            rawCCTransactionGesturePending.store (
+                rawCCGesturesDuringMapTransaction.hasPendingGesture(),
+                std::memory_order_release);
+            return false;
         }
 
-        if (slot != -2)
+        if (transactionInProgress)
         {
-            if (ChurchDAWMidiMapping::isProtectedPitchTarget (
-                    capturedParamId,
-                    capturedParamName))
+            const auto mapped = ccActionsAtMapTransactionStart.find (control);
+            if (mapped != ccActionsAtMapTransactionStart.end()
+                 && mapped->second.acao.kind != NoteActionKind::none)
             {
-                juce::Logger::writeToLog ("MIDI MAP: aprendizado bloqueado para alvo protegido ("
-                                          + capturedParamName
-                                          + ") de "
-                                          + (capturedParamName.isNotEmpty()
-                                                 ? capturedParamName
-                                                 : juce::String ("slot/param desconhecido"))
-                                          + " no canal "
-                                          + juce::String (lastTouchedInsert.load())
-                                          + " / slot " + juce::String (slot)
-                                          + " — use outro controle ou escolha um parâmetro não de tuning.");
-
-                lastTouchedSlot.store (-2);
-                lastTouchedParam.store (-1);
-                lastTouchedInsert.store (-1);
+                // Mantenha o detector de borda coerente e adie a acao ate o
+                // par de mapas fechar. Descartar a decisao perdia sobretudo o
+                // unico OFF de um controle em modo seguirNivel.
+                const auto decision =
+                    ChurchDAWMidiMapping::decidirBotaoCC (
+                    mapped->second.estado, mapped->second.modo, value, agora);
+                if (decision
+                     != ChurchDAWMidiMapping::DecisaoDeBotaoCC::nada)
                 {
-                    const juce::ScopedLock sl (mapLock);
-                    lastTouchedParamName.clear();
-                    lastTouchedParamId.clear();
+                    (void) deferredCCDecisions.push (
+                        (int) mapped->second.acao.kind,
+                        mapped->second.acao.arg,
+                        decision);
                 }
-
                 return true;
             }
 
-            CCTarget learned;
+            rawCCGesturesDuringMapTransaction.observeRawDuringTransaction (
+                control, value);
+            rawCCTransactionGesturePending.store (
+                rawCCGesturesDuringMapTransaction.hasPendingGesture(),
+                std::memory_order_release);
+            return false;
+        }
+    }
 
-            {
-                const juce::ScopedLock sl (mapLock);
-                learned = { slot, param, lastTouchedInsert.load(),
-                            capturedParamName, capturedParamId };
+    // The pending-gesture slow path above may have found a different source.
+    // Preserve the normal lock-free rejection for this unrelated CC.
+    if (! aprendendo
+         && (mascaraDeCCsDeAcao[palavra].load (std::memory_order_relaxed) & bit) == 0)
+        return false;
 
-                if (learned.slot == -1)
+    if (aprendendo)
+    {
+        NoteAction alvo;
+        bool jaEParametro = false;
+        juce::String nomeDoParametro;
+
+        {
+            const juce::ScopedLock sl (mapLock);
+            alvo = pendingNoteAction;
+
+            for (const auto& mapping : ccMappings)
+                if (ChurchDAWMidiMapping::samePhysicalMidiControl (
+                        mapping.first, control, midiSourcesCached))
                 {
-                    learned.paramName = "Master";
-                    learned.paramId = "master";
+                    jaEParametro = true;
+                    nomeDoParametro = mapping.second.paramName;
+                    break;
+                }
+        }
+
+        if (alvo.kind != NoteActionKind::none)
+        {
+            // Estrutural do protocolo (Bank Select, Data Entry, RPN/NRPN, Channel
+            // Mode) nunca e gesto de musico. Note que 64/66/67 — os pedais — SAO
+            // aceitos aqui, ao contrario da lista que protege parametro: e
+            // exatamente em CC 64 que sai de fabrica boa parte dos footswitches.
+            if (! ChurchDAWMidiMapping::isMappableAction (cc))
+                return false;
+
+            // NAO ROUBAR UM CONTROLE QUE JA TEM DONO.
+            //
+            // A tela pede "aperte o pad / pedal", entao a mao do musico ja esta no
+            // controlador. Encostar num fader que ele mapeou mes passado criaria o
+            // botao do Pad EM SILENCIO e, a partir dali, aquele CC nunca mais
+            // chegaria ao processControllerCC (por causa do return la em cima): o
+            // fader simplesmente parava de funcionar, com o mapa antigo vivo no
+            // arquivo e ate o contador da tela subindo. O que chegava no telefone
+            // era "o fader de volume parou", sem uma unica pista ligando as duas
+            // coisas. Recusa, avisa com o nome do parametro, e deixa o tom armado.
+            if (jaEParametro)
+            {
+                {
+                    const juce::ScopedLock sl (mapLock);
+                    motivoDaRecusaDeCCAcao =
+                        nomeDoParametro.isNotEmpty()
+                            ? nomeDoParametro
+                            : juce::String::fromUTF8 ("outro par\xc3\xa2metro");
+                    lastCCAcaoRecusada.store (cc, std::memory_order_relaxed);
                 }
 
-                ccMappings[control] = learned;
-                lastMappedKey = control;
+                triggerAsyncUpdate();
+                return true;
             }
 
-            // mapeamento novo = pickup zerado: o fader tem que reencontrar o valor
-            // do parametro novo antes de comecar a mexer nele. O clear fica pro
-            // handleAsyncUpdate: ccPickup so pode ser tocado na message thread
-            ccPickupToClear.store (cc);
-
-            lastTouchedSlot.store (-2);
-            lastTouchedParam.store (-1);
-            lastTouchedInsert.store (-1);
             {
                 const juce::ScopedLock sl (mapLock);
-                lastTouchedParamName.clear();
-                lastTouchedParamId.clear();
+
+                AcaoDeCC nova;
+                nova.acao = alvo;
+                nova.aprendidoNesteLearn = true;
+
+                // Alimenta o alcance do controle com a mensagem que criou o mapa.
+                // A decisao e descartada: o GESTO DE APRENDIZADO E MUDO — o Pad
+                // nao pode tocar no momento em que o musico esta so mapeando.
+                (void) ChurchDAWMidiMapping::decidirBotaoCC (
+                    nova.estado, nova.modo, value, agora);
+
+                ccActionMappings[control] = nova;
+                ccDirtyEpoch.markDirty();
+
+                // O bit sobe DENTRO do lock, junto com a escrita no mapa. Ligado
+                // la fora, uma reconstrucao em curso na outra thread escreveria o
+                // snapshot velho por cima e apagaria o bit — o controle ficava
+                // gravado no disco e MUDO no culto.
+                mascaraDeCCsDeAcao[palavra].fetch_or (bit, std::memory_order_relaxed);
+
+                lastMappedCCAcaoKey = control;
+                lastMappedCCAcaoAction = alvo;
+                lastMappedCCAcao.store (cc, std::memory_order_relaxed);
+                bumpMidiMappingGeneration();
+                pendingNoteAction = {};
             }
-            lastMappedCC.store (cc);
-            lastLearnedAtMs.store (now);
-            suppressTouchUntilMs.store (now + 800);
-            juce::Logger::writeToLog ("MIDI MAP: aprendido CC " + juce::String (cc)
-                                      + " canal " + juce::String (control.channel)
-                                      + " de " + control.sourceId
-                                      + " -> " + (learned.paramName.isNotEmpty()
-                                                    ? learned.paramName : juce::String ("parametro")));
+
+            lastLearnedAtMs.store (agora);
             triggerAsyncUpdate();
             return true;
         }
+
+        // Sem alvo do Pad armado. Se o musico armou um PARAMETRO na tela, a
+        // intencao dele e esta: libera o CC e deixa o caminho antigo aprender.
+        const bool alvoDeParametroArmado = lastTouchedSlot.load() != -2;
+
+        bool existe = false;
+        bool ehDesteLearn = false;
+        bool virouKnob = false;
+        bool desmapeou = false;
+
+        {
+            const juce::ScopedLock sl (mapLock);
+            const auto it = ccActionMappings.find (control);
+
+            if (it != ccActionMappings.end())
+            {
+                existe = true;
+                ehDesteLearn = it->second.aprendidoNesteLearn;
+
+                if (ehDesteLearn && ! alvoDeParametroArmado)
+                {
+                    // VIGIA DE "CARA DE BOTAO".
+                    //
+                    // Mesmo sem dono anterior, o primeiro nao-zero que chegar pode
+                    // ser de um knob, de um fader ou de um pedal de expressao. No
+                    // culto, cada movimento espacado daquele controle alternaria o
+                    // tom. Valores DISTINTOS demais provam controle continuo.
+                    (void) ChurchDAWMidiMapping::decidirBotaoCC (
+                        it->second.estado, it->second.modo, value, agora);
+
+                    if (it->second.estado.pareceKnob()
+                         && it->second.acao.kind != NoteActionKind::none)
+                    {
+                        // ESVAZIAR, NAO APAGAR. Apagando a entrada, a mensagem
+                        // seguinte (o "soltei") nao acharia mais nada, cairia no
+                        // processControllerCC com o Learn AINDA LIGADO e podia ser
+                        // aprendida como CC -> PARAMETRO sem ninguem ver.
+                        it->second.acao = {};
+                        bumpMidiMappingGeneration();
+                        virouKnob = true;
+                    }
+                }
+                else if (it->second.acao.kind != NoteActionKind::none
+                          && ! alvoDeParametroArmado)
+                {
+                    // DESMAPEAR: dentro do Learn, sem alvo escolhido, apertar um
+                    // pad JA mapeado devolve ele. Mesmo gesto do mapa de notas.
+                    it->second.acao = {};
+                    bumpMidiMappingGeneration();
+                    desmapeou = true;
+                }
+                else if (alvoDeParametroArmado)
+                {
+                    it->second.acao = {};
+                    bumpMidiMappingGeneration();
+                }
+            }
+        }
+
+        if (virouKnob)
+        {
+            {
+                const juce::ScopedLock sl (mapLock);
+                motivoDaRecusaDeCCAcao = juce::String::fromUTF8 (
+                    "isso parece um knob / pedal de express\xc3\xa3o");
+                lastCCAcaoRecusada.store (cc, std::memory_order_relaxed);
+            }
+
+            triggerAsyncUpdate();
+            return true;
+        }
+
+        if (desmapeou)
+        {
+            lastCCAcaoDesmapeada.store (cc);
+            lastLearnedAtMs.store (agora);
+            triggerAsyncUpdate();
+            return true;
+        }
+
+        if (existe && ! alvoDeParametroArmado)
+            return true;   // entrada viva porem vazia: engole o resto do gesto
+
+        return false;
     }
 
-    CCTarget target;
-    bool hasMapping = false;
+    // ---- PALCO ----
+    NoteAction acao;
+    juce::uint64 mappingGeneration = 0;
+    auto decisao = ChurchDAWMidiMapping::DecisaoDeBotaoCC::nada;
 
     {
         const juce::ScopedLock sl (mapLock);
-        const auto it = ccMappings.find (control);
+        const auto it = ccActionMappings.find (control);
 
-        if (it != ccMappings.end())
-        {
-            target = it->second;
-            hasMapping = true;
-        }
+        if (it == ccActionMappings.end()
+             || it->second.acao.kind == NoteActionKind::none)
+            return false;
+
+        acao = it->second.acao;
+        mappingGeneration = midiMappingGeneration.load (std::memory_order_relaxed);
+        decisao = ChurchDAWMidiMapping::decidirBotaoCC (
+            it->second.estado, it->second.modo, value, agora);
     }
 
-    if (hasMapping)
+    if (decisao != ChurchDAWMidiMapping::DecisaoDeBotaoCC::nada)
     {
-        auto safe = juce::Component::SafePointer<MainComponent> (this);
-
-        juce::MessageManager::callAsync ([safe, target, value01, control]
-        {
-            if (auto* c = safe.getComponent())
-                c->applyCCTarget (target, value01, control);
-        });
+        const auto midiLifetime = midiCallbackLifetime;
+        juce::MessageManager::callAsync (
+            [safe = juce::Component::SafePointer<MainComponent> (this),
+             midiLifetime, mappingGeneration, acao, decisao]
+            {
+                if (! midiLifetime->load())
+                    return;
+                if (auto* self = safe.getComponent())
+                    if (self->midiMappingGeneration.load (std::memory_order_acquire)
+                            == mappingGeneration)
+                        self->aplicarDecisaoDeBotaoNoTom (acao, decisao);
+            });
     }
 
-    return hasMapping;
+    // Consumido mesmo quando a decisao foi "nada": este CC virou comando, e
+    // deixa-lo seguir para o motor faria o mesmo pedal pisar o sustain do piano.
+    return true;
 }
 
-void MainComponent::audioProcessorParameterChanged (juce::AudioProcessor* processor, int parameterIndex, float)
+void MainComponent::aplicarDecisaoDeBotaoNoTom (
+    NoteAction acao, ChurchDAWMidiMapping::DecisaoDeBotaoCC decisao)
 {
-    // pode chegar em qualquer thread; usar apenas atomics
-    if (! midiLearnActive.load() || applyingMappedCC)
+    using Decisao = ChurchDAWMidiMapping::DecisaoDeBotaoCC;
+
+    if (decisao == Decisao::nada)
         return;
 
-    // Trocar/restaurar um timbre altera varios parametros de forma
-    // programatica. Isso nao e um gesto do musico e nunca pode virar o
-    // "ultimo controle tocado" do MIDI Learn.
-    if (auto* timbres =
-            dynamic_cast<TimbresProcessor*> (processor);
-        timbres != nullptr
-         && timbres->isProgrammaticToneChange())
-        return;
-
-    // plugins ecoam a mudanca logo depois que aplicamos/mapeamos um CC;
-    // sem esta janela o modo Learn pediria o knob de novo em loop
-    if (juce::Time::getMillisecondCounter() < suppressTouchUntilMs.load())
-        return;
-
-    if (processor == masterProcessor)
+    // As acoes modernas (programa do PAD, TAP, sustain, engine, cenas) usam o
+    // mesmo detector seguro de gesto do footswitch, mas nao dependem do Pad
+    // Continuo. Executam uma vez no flanco de ligar; o release nunca dispara
+    // uma segunda acao.
+    if (acao.kind != NoteActionKind::padKey
+         && acao.kind != NoteActionKind::padOff)
     {
-        {
-            const juce::ScopedLock sl (mapLock);
-            lastTouchedParamName = "Master";
-            lastTouchedParamId = "master";
-        }
-
-        lastTouchedSlot.store (-1);   // -1 = Master
-        lastTouchedParam.store (-1);
-        lastTouchedInsert.store (-1);
-        triggerAsyncUpdate();
+        if (decisao != Decisao::desligar)
+            executarAcaoDeNota (acao);
         return;
     }
 
-    // Pad Continuo: nao e slot nem insert, e um no proprio do grafo. Sem este
-    // ramo, mexer no corte ou no volume do Pad nao selecionava nada no modo
-    // de mapeamento, e os knobs dele eram inalcancaveis por controlador.
-    if (padProcessor != nullptr && processor == padProcessor)
-    {
-        const auto& params = processor->getParameters();
-
-        {
-            const juce::ScopedLock sl (mapLock);
-            lastTouchedParamName = juce::isPositiveAndBelow (parameterIndex, params.size())
-                                     ? params[parameterIndex]->getName (32)
-                                     : juce::String();
-            lastTouchedParamId = juce::isPositiveAndBelow (parameterIndex, params.size())
-                                   ? ChurchDAWMidiMapping::stableParameterId (params[parameterIndex])
-                                   : juce::String();
-        }
-
-        lastTouchedSlot.store (padSlotId);
-        lastTouchedParam.store (parameterIndex);
-        lastTouchedInsert.store (-1);
-        triggerAsyncUpdate();
+    if (padProcessor == nullptr)
         return;
-    }
 
-    for (int i = 0; i < numSlots; ++i)
+    if (acao.kind == NoteActionKind::padOff)
     {
-        if (slots[i].proc.load() == processor)
-        {
-            const auto& params = processor->getParameters();
-
-            {
-                const juce::ScopedLock sl (mapLock);
-                lastTouchedParamName = juce::isPositiveAndBelow (parameterIndex, params.size())
-                                         ? params[parameterIndex]->getName (32)
-                                         : juce::String();
-                lastTouchedParamId = juce::isPositiveAndBelow (parameterIndex, params.size())
-                                       ? ChurchDAWMidiMapping::stableParameterId (params[parameterIndex])
-                                       : juce::String();
-            }
-
-            lastTouchedSlot.store (i);
-            lastTouchedParam.store (parameterIndex);
-            lastTouchedInsert.store (-1);
-            triggerAsyncUpdate();
+        // Parar e parar: nunca alterna, e o "soltou" do modo por nivel nao
+        // religa nada.
+        if (decisao == Decisao::desligar)
             return;
+
+        padProcessor->setKey (-1);
+    }
+    else if (acao.kind == NoteActionKind::padKey
+              && juce::isPositiveAndBelow (acao.arg, 12))
+    {
+        const int atual = padProcessor->getKey();   // fonte unica de verdade
+        const int novo = ChurchDAWMidiMapping::tomDepoisDoBotao (
+            atual, acao.arg, decisao);
+
+        if (novo == atual)
+            return;
+
+        padProcessor->setKey (novo);
+    }
+    else
+    {
+        return;
+    }
+
+    if (padPanel != nullptr)
+        padPanel->refreshState();
+}
+
+// Snapshot e store sob o MESMO lock, pelo mesmo motivo da mascara de notas: com
+// o store fora, a thread de MIDI podia aprender um CC entre as duas metades e o
+// snapshot velho apagava o bit recem-ligado.
+void MainComponent::reconstruirMascaraDeCCsDeAcao()
+{
+    const juce::ScopedLock sl (mapLock);
+    reconstruirMascaraDeCCsDeAcaoUnderMapLock();
+}
+
+void MainComponent::reconstruirMascaraDeCCsDeAcaoUnderMapLock()
+{
+    juce::uint32 nova[4] = { 0, 0, 0, 0 };
+
+    for (const auto& par : ccActionMappings)
+        if (juce::isPositiveAndBelow (par.first.cc, 128)
+             && par.second.acao.kind != NoteActionKind::none)
+            nova[par.first.cc >> 5] |= (1u << (par.first.cc & 31));
+
+    for (int i = 0; i < 4; ++i)
+        mascaraDeCCsDeAcao[i].store (nova[i], std::memory_order_relaxed);
+}
+
+// Sai do Learn: as entradas esvaziadas (desmapeadas ou recusadas por parecerem
+// knob) sao removidas de vez. Devolve true se alguma coisa mudou.
+bool MainComponent::limparBotoesDeCCVazios()
+{
+    bool mudou = false;
+
+    {
+        const juce::ScopedLock sl (mapLock);
+
+        for (auto it = ccActionMappings.begin(); it != ccActionMappings.end();)
+        {
+            if (it->second.acao.kind == NoteActionKind::none)
+            {
+                it = ccActionMappings.erase (it);
+                mudou = true;
+            }
+            else
+            {
+                it->second.aprendidoNesteLearn = false;
+                ++it;
+            }
         }
     }
 
-    // plugins hospedados DENTRO do Church Live (MASTER FX: BigSky etc.). Eles nao
-    // sao nos do grafo, entao nao apareciam na varredura acima — era por isso que
-    // tocar o MIX do BigSky nao selecionava nada no modo de mapeamento.
-    for (int i = 0; i < numSlots; ++i)
+    if (mudou)
     {
-        auto* timbres = dynamic_cast<TimbresProcessor*> (slots[i].proc.load());
+        ccDirtyEpoch.markDirty();
+        bumpMidiMappingGeneration();
+        reconstruirMascaraDeCCsDeAcao();
+    }
 
-        if (timbres == nullptr)
+    return mudou;
+}
+
+ChurchDAWMidiMapping::ModoDeBotaoCC MainComponent::modoDoBotaoDoTom (int tom) const
+{
+    const juce::ScopedLock sl (mapLock);
+
+    for (const auto& par : ccActionMappings)
+        if (par.second.acao.kind == NoteActionKind::padKey
+             && par.second.acao.arg == tom)
+            return par.second.modo;
+
+    return ChurchDAWMidiMapping::ModoDeBotaoCC::alternar;
+}
+
+bool MainComponent::tomTemBotaoDeCC (int tom) const
+{
+    const juce::ScopedLock sl (mapLock);
+
+    for (const auto& par : ccActionMappings)
+        if (par.second.acao.kind == NoteActionKind::padKey
+             && par.second.acao.arg == tom)
+            return true;
+
+    return false;
+}
+
+void MainComponent::definirModoDoBotaoDoTom (
+    int tom, ChurchDAWMidiMapping::ModoDeBotaoCC modo)
+{
+    bool mudou = false;
+    {
+        const juce::ScopedLock sl (mapLock);
+
+        for (auto& par : ccActionMappings)
+            if (par.second.acao.kind == NoteActionKind::padKey
+                 && par.second.acao.arg == tom
+                 && par.second.modo != modo)
+            {
+                par.second.modo = modo;
+                mudou = true;
+
+                // Trocar o modo zera alcance/nivel medidos sob a regra anterior,
+                // mas o primeiro gesto no novo modo continua valendo.
+                par.second.estado.esquecer();
+            }
+    }
+
+    if (mudou)
+    {
+        ccDirtyEpoch.markDirty();
+        bumpMidiMappingGeneration();
+        (void) saveMidiMap();
+    }
+    atualizarBotoesDeCCDoPad();
+}
+
+void MainComponent::clearMidiLearnParameterTargetUnderMapLock()
+{
+    lastTouchedSlot.store (-2, std::memory_order_relaxed);
+    lastTouchedParam.store (-1, std::memory_order_relaxed);
+    lastTouchedInsert.store (-1, std::memory_order_relaxed);
+    lastTouchedTopologyGeneration.store (0, std::memory_order_relaxed);
+    lastTouchedParamName.clear();
+    lastTouchedParamId.clear();
+    lastTouchedPluginId.clear();
+    lastTouchedParameterIdentityUnique.store (
+        false, std::memory_order_relaxed);
+    parameterLearnSelectionGeneration.fetch_add (
+        1, std::memory_order_release);
+}
+
+void MainComponent::bumpMidiMappingGeneration()
+{
+    midiMappingGeneration.fetch_add (1, std::memory_order_release);
+    // AsyncUpdater coalesces concurrent MIDI/message-thread mutations into a
+    // single preallocated wake. The message thread then republishes the fixed
+    // route table before applying any queued value.
+    triggerAsyncUpdate();
+}
+
+void MainComponent::rebuildControllerRoutesIfNeeded (bool force)
+{
+    jassert (juce::MessageManager::getInstance()->isThisTheMessageThread());
+    if (! force
+         && midiMapTransactionInProgress.load (std::memory_order_acquire))
+        return;
+
+    const auto observedGeneration = midiMappingGeneration.load (
+        std::memory_order_acquire);
+    if (! force
+         && publishedControllerRouteMappingGeneration == observedGeneration)
+        return;
+
+    // publishRoute retires and rewrites one slot at a time. Stop callback
+    // readers across the complete table swap so no mapped control can observe
+    // that internal inactive/mixed-metadata window. The established lock order
+    // is callback barrier, then mapLock (both are recursive for transaction
+    // callers already holding them).
+    const juce::ScopedLock callbackDrain (midiCallbackBarrier);
+    controllerRoutes.beginRouteUpdate();
+    size_t requested = 0;
+    size_t published = 0;
+    juce::uint64 capturedGeneration = observedGeneration;
+    {
+        const juce::ScopedLock sl (mapLock);
+        capturedGeneration = midiMappingGeneration.load (
+            std::memory_order_relaxed);
+        requested = ccMappings.size();
+
+        for (auto& descriptor : controllerRouteDescriptors)
+            descriptor = {};
+
+        for (const auto& mapping : ccMappings)
+        {
+            if (published >= controllerRouteCapacity)
+                break;
+
+            const auto* bytes = mapping.first.sourceId.toRawUTF8();
+            const auto length = static_cast<size_t> (
+                mapping.first.sourceId.getNumBytesAsUTF8());
+            const auto routeGeneration = controllerRoutes.publishRoute (
+                published, bytes, length, mapping.first.channel,
+                mapping.first.cc, mapping.first.isNote);
+            if (routeGeneration == 0)
+                continue;
+
+            controllerRouteDescriptors[published] = {
+                mapping.first, mapping.second, routeGeneration, true
+            };
+            ++published;
+        }
+    }
+
+    controllerRoutes.finishRouteUpdate (
+        capturedGeneration, requested, published);
+    publishedControllerRouteMappingGeneration = capturedGeneration;
+
+    if (controllerRoutes.overflowed())
+    {
+        if (! controllerRouteOverflowReported)
+        {
+            controllerRouteOverflowReported = true;
+            juce::Logger::writeToLog (
+                "MIDI MAP: capacidade fixa de 128 rotas excedida; "
+                "rotas excedentes seguem fail-open");
+        }
+    }
+    else
+    {
+        controllerRouteOverflowReported = false;
+    }
+}
+
+void MainComponent::consumeControllerRouteEvents()
+{
+    jassert (juce::MessageManager::getInstance()->isThisTheMessageThread());
+    constexpr int drainBudget = 32;
+    for (int drained = 0; drained < drainBudget; ++drained)
+    {
+        ChurchDAWMidiMapping::ControllerRouteEvent event;
+        if (! controllerRoutes.tryConsumeNext (event))
+            break;
+
+        CCTarget target;
+        MidiControlKey control;
+        bool current = false;
+        {
+            const juce::ScopedLock sl (mapLock);
+            if (event.routeSlot < controllerRouteDescriptors.size())
+            {
+                const auto& descriptor =
+                    controllerRouteDescriptors[event.routeSlot];
+                const auto existing = ccMappings.find (descriptor.control);
+                current = descriptor.occupied
+                    && descriptor.generation == event.routeGeneration
+                    && event.mappingGeneration
+                        == midiMappingGeneration.load (
+                            std::memory_order_relaxed)
+                    && existing != ccMappings.end()
+                    && ChurchDAWMidiMapping::controllerKeysExactlyEqual (
+                        existing->first, descriptor.control)
+                    && ChurchDAWMidiMapping::persistedTargetsExactlyEqual (
+                        existing->second, descriptor.target);
+                if (current)
+                {
+                    target = descriptor.target;
+                    control = descriptor.control;
+                }
+            }
+        }
+
+        if (current
+             && event.mappingGeneration
+                    == midiMappingGeneration.load (std::memory_order_acquire)
+             && ! midiMapTransactionInProgress.load (
+                    std::memory_order_acquire))
+            applyCCTarget (std::move (target),
+                           static_cast<float> (event.value) / 127.0f,
+                           std::move (control));
+    }
+
+    if (controllerRoutes.hasPending())
+        triggerAsyncUpdate();
+}
+
+void MainComponent::consumeMidiLearnControlEvents()
+{
+    jassert (juce::MessageManager::getInstance()->isThisTheMessageThread());
+    if (componentShutdownStarted.load (std::memory_order_acquire))
+        return;
+
+    const auto generationBefore = midiMappingGeneration.load (
+        std::memory_order_acquire);
+    ChurchDAWMidiMapping::FixedMidiLearnControlQueue<16>::Event event;
+    while (midiLearnControlQueue.tryConsume (event))
+    {
+        if (! midiLearnActive.load (std::memory_order_acquire)
+             || event.targetGeneration
+                    != parameterLearnSelectionGeneration.load (
+                        std::memory_order_acquire))
             continue;
 
-        for (int ins = 0; ins < TimbresProcessor::numInserts; ++ins)
+        const auto sourceId = juce::String::fromUTF8 (
+            event.sourceId.data(), static_cast<int> (event.sourceIdLength));
+        const auto sourceName = juce::String::fromUTF8 (
+            event.sourceName.data(),
+            static_cast<int> (event.sourceNameLength));
+        const MidiControlKey control {
+            sourceId, static_cast<int> (event.channel),
+            static_cast<int> (event.number), event.isNote, sourceName
+        };
+        if (! control.isValid())
+            continue;
+        lastLearnInputKey = control;
+        lastLearnInputValue = (int) event.value;
+
+
+        if (event.unmapOnly)
         {
-            if (timbres->getInsert (ins) == processor)
+            bool removed = false;
             {
-                if (timbres->isProgrammaticToneChange())
-                    return;
-
-                const auto& params = processor->getParameters();
-
+                const juce::ScopedLock sl (mapLock);
+                if (event.targetGeneration
+                      != parameterLearnSelectionGeneration.load (
+                            std::memory_order_relaxed))
+                    continue;
+                const auto existing = ccMappings.find (control);
+                if (existing != ccMappings.end())
                 {
-                    const juce::ScopedLock sl (mapLock);
-                    lastTouchedParamName = juce::isPositiveAndBelow (parameterIndex, params.size())
-                                             ? params[parameterIndex]->getName (32)
-                                             : juce::String();
-                    lastTouchedParamId = juce::isPositiveAndBelow (parameterIndex, params.size())
-                                           ? ChurchDAWMidiMapping::stableParameterId (params[parameterIndex])
-                                           : juce::String();
+                    const auto persistedControl = existing->first;
+                    ccMappings.erase (existing);
+                    ccDirtyEpoch.markDirty();
+                    lastMappedKey = persistedControl;
+                    lastMappedCC.store (event.number,
+                                        std::memory_order_relaxed);
+                    bumpMidiMappingGeneration();
+                    removed = true;
                 }
-
-                lastTouchedSlot.store (i);
-                lastTouchedParam.store (parameterIndex);
-                lastTouchedInsert.store (ins);
-                triggerAsyncUpdate();
-                return;
             }
+            if (removed)
+            {
+                ccPickupToClear.store (event.number,
+                                       std::memory_order_release);
+                lastLearnedAtMs.store (
+                    juce::Time::getMillisecondCounter(),
+                    std::memory_order_release);
+            }
+            continue;
+        }
+
+        int slot = -2;
+        int parameter = -1;
+        int insert = -1;
+        juce::uint64 armedTopologyGeneration = 0;
+        bool identityUnique = false;
+        juce::String parameterName;
+        juce::String parameterId;
+        juce::String pluginId;
+        {
+            const juce::ScopedLock sl (mapLock);
+            if (event.targetGeneration
+                  != parameterLearnSelectionGeneration.load (
+                        std::memory_order_relaxed))
+                continue;
+            slot = lastTouchedSlot.load (std::memory_order_relaxed);
+            parameter = lastTouchedParam.load (std::memory_order_relaxed);
+            insert = lastTouchedInsert.load (std::memory_order_relaxed);
+            armedTopologyGeneration =
+                lastTouchedTopologyGeneration.load (
+                    std::memory_order_relaxed);
+            identityUnique = lastTouchedParameterIdentityUnique.load (
+                std::memory_order_relaxed);
+            parameterName = lastTouchedParamName;
+            parameterId = lastTouchedParamId;
+            pluginId = lastTouchedPluginId;
+        }
+        if (slot == -2)
+            continue;
+
+        const auto currentTopologyGeneration =
+            parameterTargetGeneration.load (std::memory_order_acquire);
+        juce::String currentPluginId;
+        auto* const currentProcessor =
+            resolveCurrentMidiMappingProcessor (
+                slot, insert, currentPluginId);
+        if (! ChurchDAWMidiMapping::parameterLearnTargetStillCurrent (
+                armedTopologyGeneration, currentTopologyGeneration,
+                pluginId, currentPluginId, currentProcessor != nullptr)
+             || currentTopologyGeneration
+                    != parameterTargetGeneration.load (
+                        std::memory_order_acquire))
+        {
+            const juce::ScopedLock sl (mapLock);
+            motivoDaRecusaDeParametro =
+                "O plugin mudou depois que o alvo foi selecionado";
+            lastParameterMappingRejectedCC.store (
+                event.number, std::memory_order_relaxed);
+            if (event.targetGeneration
+                  == parameterLearnSelectionGeneration.load (
+                        std::memory_order_relaxed))
+                clearMidiLearnParameterTargetUnderMapLock();
+            continue;
+        }
+
+        if (ChurchDAWMidiMapping::isProtectedPitchTarget (
+                parameterId, parameterName))
+        {
+            juce::Logger::writeToLog (
+                "MIDI MAP: aprendizado bloqueado para alvo protegido ("
+                + parameterName + ")");
+            const juce::ScopedLock sl (mapLock);
+            if (event.targetGeneration
+                  == parameterLearnSelectionGeneration.load (
+                        std::memory_order_relaxed))
+                clearMidiLearnParameterTargetUnderMapLock();
+            continue;
+        }
+
+        if (! identityUnique)
+        {
+            const juce::ScopedLock sl (mapLock);
+            motivoDaRecusaDeParametro = pluginId.isEmpty()
+                ? juce::String (
+                    "A identidade do motor ainda nao esta pronta; mova o alvo novamente")
+                : juce::String::fromUTF8 (
+                    "O plugin publicou um identificador duplicado ou inválido");
+            lastParameterMappingRejectedCC.store (
+                event.number, std::memory_order_relaxed);
+            if (event.targetGeneration
+                  == parameterLearnSelectionGeneration.load (
+                        std::memory_order_relaxed))
+                clearMidiLearnParameterTargetUnderMapLock();
+            continue;
+        }
+
+        CCTarget learned {
+            slot, parameter, insert, parameterName, parameterId, pluginId
+        };
+        if (learned.slot == -1)
+        {
+            learned.paramName = "Master";
+            learned.paramId = "master";
+        }
+
+        bool noteActionConflict = false;
+        {
+            const juce::ScopedLock sl (mapLock);
+            if (event.targetGeneration
+                  != parameterLearnSelectionGeneration.load (
+                        std::memory_order_relaxed))
+                continue;
+            if (armedTopologyGeneration
+                  != parameterTargetGeneration.load (
+                        std::memory_order_relaxed))
+                continue;
+
+            auto noteActionKey = control;
+            noteActionKey.isNote = false;
+            if (control.isNote)
+                for (const auto& mapping : noteMappings)
+                    if (ChurchDAWMidiMapping::samePhysicalMidiControl (
+                            mapping.first, noteActionKey,
+                            midiSourcesCached))
+                    {
+                        noteActionConflict = true;
+                        break;
+                    }
+
+            if (noteActionConflict)
+            {
+                motivoDaRecusaDeParametro =
+                    "essa nota ja controla outro comando";
+                lastParameterMappingRejectedCC.store (
+                    event.number, std::memory_order_relaxed);
+            }
+            else
+            {
+                ccMappings[control] = learned;
+                ccDirtyEpoch.markDirty();
+                lastMappedKey = control;
+                lastMappedCC.store (event.number,
+                                    std::memory_order_relaxed);
+                bumpMidiMappingGeneration();
+            }
+            clearMidiLearnParameterTargetUnderMapLock();
+        }
+
+        if (! noteActionConflict)
+        {
+            const auto now = juce::Time::getMillisecondCounter();
+            ccPickupToClear.store (event.number,
+                                   std::memory_order_release);
+            lastLearnedAtMs.store (now, std::memory_order_release);
+            suppressTouchUntilMs.store (now + 800,
+                                        std::memory_order_release);
+            juce::Logger::writeToLog (
+                "MIDI MAP: aprendido controle "
+                + juce::String (event.number) + " canal "
+                + juce::String (event.channel) + " de " + sourceId
+                + " -> " + (learned.paramName.isNotEmpty()
+                    ? learned.paramName : juce::String ("parametro")));
         }
     }
+
+    if (midiLearnControlQueue.overflowed())
+    {
+        if (! midiLearnQueueOverflowReported)
+        {
+            midiLearnQueueOverflowReported = true;
+            juce::Logger::writeToLog (
+                "MIDI MAP: FIFO fixa de Learn cheia; gesto excedente seguiu fail-open");
+        }
+    }
+    else
+    {
+        midiLearnQueueOverflowReported = false;
+    }
+
+    if (generationBefore != midiMappingGeneration.load (
+            std::memory_order_acquire))
+        rebuildControllerRoutesIfNeeded (true);
+}
+
+// Um unico caminho para CCs vindos da porta MIDI musical e da porta DAW do
+// Launchkey. Retorna true quando o evento PERTENCE ao mapa do usuario — pelo
+// membership da tabela de rotas (mesmo que o valor deste evento tenha sido
+// dropado por republicacao/contencao) ou porque foi aceito pela fila de Learn.
+// A superficie fixa do Launchkey e a nota crua so agem quando isto e false;
+// com a tabela alem da capacidade fisica, rotas excedentes seguem fail-open.
+bool MainComponent::processControllerCC (int cc, int value,
+                                         const juce::String& sourceId,
+                                         int channel,
+                                         bool isNote,
+                                         const juce::String& sourceName)
+{
+    if (midiMapTransactionInProgress.load (std::memory_order_acquire))
+        return false;
+
+    cc = juce::jlimit (0, 127, cc);
+    value = juce::jlimit (0, 127, value);
+    channel = juce::jlimit (1, 16, channel);
+    if (sourceId.isEmpty()
+         || (! isNote
+              && ! ChurchDAWMidiMapping::isMappableController (cc)))
+        return false;
+
+    lastMidiActivityMs.store (
+        juce::Time::getMillisecondCounter(),
+        std::memory_order_relaxed);
+
+    // No String value, CCTarget or map lock crosses this producer boundary.
+    // The caller-owned UTF-8 remains valid for this synchronous scan; accepted
+    // work copies only bounded bytes/POD into preallocated cells.
+    const auto* const sourceBytes = sourceId.toRawUTF8();
+    const auto sourceLength = static_cast<size_t> (
+        sourceId.getNumBytesAsUTF8());
+    const auto* const sourceNameBytes = sourceName.toRawUTF8();
+    const auto sourceNameLength = static_cast<size_t> (
+        sourceName.getNumBytesAsUTF8());
+    const auto mappingGeneration = midiMappingGeneration.load (
+        std::memory_order_acquire);
+
+    // Membership independe da geracao da tabela: uma rota armada na ultima
+    // publicacao continua respondendo durante a propria republicacao, entao um
+    // fader/tecla mapeado nunca cai na superficie de fabrica nem toca a nota
+    // crua so porque o mapa acabou de mudar. O valor de um evento que caiu na
+    // janela e dropado com seguranca — o proximo evento continuo se aplica.
+    const bool mapped = controllerRoutes.matchesActiveRoute (
+        sourceBytes, sourceLength, channel, cc, isNote);
+
+    if (midiLearnActive.load (std::memory_order_acquire))
+    {
+        const auto targetGeneration =
+            parameterLearnSelectionGeneration.load (
+                std::memory_order_acquire);
+        const bool targetArmed = lastTouchedSlot.load (
+            std::memory_order_acquire) != -2;
+        // Alem da capacidade fisica, a rota pode nao estar na tabela mesmo com
+        // a tecla mapeada; o consumidor decide sob mapLock com o mapa exato,
+        // entao no overflow o gesto de desmapear continua funcionando.
+        const bool unmapOnly = ! targetArmed && isNote
+            && (mapped || controllerRoutes.overflowed());
+
+        if (targetArmed || unmapOnly)
+        {
+            const bool accepted = midiLearnControlQueue.tryPublish (
+                sourceBytes, sourceLength,
+                sourceNameBytes, sourceNameLength,
+                channel, cc, value, isNote, unmapOnly,
+                targetGeneration);
+            if (accepted)
+                triggerAsyncUpdate();
+            // An overflow only says that some route did not fit; it is not
+            // membership proof for this note. Still queue the exact lookup so
+            // an overflowed mapping can be removed, but let unknown notes pass
+            // through raw. A known indexed route or an armed target is consumed
+            // only when its bounded publication succeeded.
+            return ChurchDAWMidiMapping::
+                midiLearnPublicationConsumesRawInput (
+                    accepted, targetArmed, mapped);
+        }
+    }
+
+    const auto result = controllerRoutes.tryPublish (
+        sourceBytes, sourceLength, channel, cc, isNote, value,
+        mappingGeneration);
+    if (result
+          == ChurchDAWMidiMapping::ControllerRoutePublishResult::published)
+        triggerAsyncUpdate();
+
+    return mapped
+        || result
+               == ChurchDAWMidiMapping::ControllerRoutePublishResult::published;
+}
+
+void MainComponent::audioProcessorParameterChanged (juce::AudioProcessor* processor,
+                                                    int parameterIndex,
+                                                    float newValue)
+{
+    auto callbackLease = parameterCallbackGate.tryEnter();
+    if (! callbackLease)
+        return;
+
+    juce::uint64 callbackTopologyGeneration = 0;
+    if (! validatedCallbackTopologyGeneration (
+            processor, callbackTopologyGeneration))
+        return;
+
+    // Mandatory sound synchronisation is independent from the optional Learn
+    // mailbox. The callback source has already been validated by raw address;
+    // use JUCE's normalised newValue and cached parameter index, so no raw
+    // AudioProcessor pointer is cast or dereferenced here.
+    if (padProcessor != nullptr)
+        for (int slot = 0; slot < numSlots; ++slot)
+            if (slots[slot].proc.load (std::memory_order_acquire) == processor
+                 && slots[slot].globalTransposeParameterIndex.load (
+                        std::memory_order_acquire) == parameterIndex)
+            {
+                padProcessor->setTransposeSemis (
+                    ChurchDAWMidiMapping::
+                        globalTransposeSemitonesFromNormalised (newValue));
+                break;
+            }
+
+    // pode chegar em qualquer thread; usar apenas atomics
+    if (midiMapTransactionInProgress.load (std::memory_order_acquire)
+         || ! midiLearnActive.load() || applyingMappedCC)
+        return;
+
+    // RT boundary: no names, IDs, parameter scans, map locks, String writes,
+    // clocks, plug-in location scans or AsyncUpdater calls here. A full
+    // mailbox drops only this Learn touch; audio and the parameter change
+    // continue normally.
+    (void) parameterTouchMailbox.tryPublish (
+        processor, parameterIndex,
+        parameterLearnGeneration.load (std::memory_order_acquire),
+        callbackTopologyGeneration);
 }
 
 // deixa o nome do aparelho apresentavel: tira "MIDIIN2 (...)", sufixos de driver
@@ -4484,12 +8663,55 @@ static juce::String prettifyDeviceName (juce::String n)
 
 void MainComponent::timerCallback()
 {
+    // GUI toggles / scene restores can change global sustain without a MIDI
+    // event. Update telemetry under the same lock order as the MIDI callback.
+    // Try-lock keeps the UI from waiting on a device callback or plugin swap.
+    {
+        const juce::ScopedTryLock callbackLock (midiCallbackBarrier);
+        if (callbackLock.isLocked())
+        {
+            const juce::ScopedTryLock instrumentLock (liveHandshakeLock);
+            if (instrumentLock.isLocked())
+                if (auto* live = getChurchLive())
+                    pianoVisualState->setHostGlobalSustain (live->getGlobalSustain());
+        }
+    }
     CHURCHDAW_UI_SCOPE ("MainComponent::timerCallback");
+
+    // 25s de app aberto com o device funcionando provam que o setup atual e
+    // bom: a partir daqui um driver novo que derrube o app pode ser descartado
+    // com seguranca no boot seguinte.
+    if (audioGoodPromoTicks >= 0 && ++audioGoodPromoTicks == 25)
+        promoteGoodAudioNow();
     CHURCHDAW_UI_LAP_BEGIN();
 
     // Subiu para antes do bloco de MIDI: a lista de entradas agora e cacheada
     // por tempo (ver midiInputsCached) e precisa do relogio aqui em cima.
     const auto nowMs = juce::Time::getMillisecondCounter();
+
+    // Fixed-capacity graph retirement: at most one old node per physical slot
+    // can wait here. No callAsync retry chain is created; this existing timer
+    // destroys it only after every insert lease/callback has left.
+    for (int slot = 0; slot < numSlots; ++slot)
+    {
+        const auto pending = slots[slot].pendingNodeRetirement.node();
+        if (pending == 0)
+            continue;
+
+        const juce::AudioProcessorGraph::NodeID nodeID { pending };
+        if (auto node = graph.getNodeForId (nodeID))
+        {
+            auto* live = dynamic_cast<TimbresProcessor*> (
+                node->getProcessor());
+            if (live == nullptr
+                 || live->canDestroyWithoutBlockingOnMidiMapping())
+                removeNodeForSlot (slot, nodeID);
+        }
+        else
+        {
+            (void) slots[slot].pendingNodeRetirement.clearIf (pending);
+        }
+    }
 
     // MASTER FX listeners: addListener e idempotente. No Android a cada 1 s
     // competia com o audio; 3 s basta pro MIDI Learn sem jank.
@@ -4503,13 +8725,23 @@ void MainComponent::timerCallback()
     {
         lastInsertListenerScanMs = nowMs;
         for (int i = 0; i < numSlots; ++i)
-            if (auto* timbres = dynamic_cast<TimbresProcessor*> (slots[i].proc.load()))
-                for (int ins = 0; ins < TimbresProcessor::numInserts; ++ins)
-                    if (auto* fx = timbres->getInsert (ins))
-                        fx->addListener (this);
+            refreshInsertMappingIdentityCacheForSlot (i);
     }
 
     CHURCHDAW_UI_LAP ("timer:listeners");
+
+    // Cura de NaN dos plugins hospedados. A guarda do callback so limpa o buffer
+    // e levanta a bandeira -- reset() de VST3/VST2 aloca, pega mutex e re-prepara
+    // streams de disco, entao nao pode sair da thread de audio. Sem pedido em
+    // aberto isto custa apenas alguns loads atomicos.
+    for (int i = 0; i < numSlots; ++i)
+        if (auto* timbres = dynamic_cast<TimbresProcessor*> (slots[i].proc.load()))
+        {
+            timbres->serviceRetiredInsertProcessors();
+            timbres->serviceHostedPluginNanResets();
+        }
+
+    CHURCHDAW_UI_LAP ("timer:nan-reset");
 
     // A porta DAW tem de ficar FORA da entrada MIDI comum. O estado de audio
     // salvo e o proprio dialogo Audio/MIDI podem reabilita-la sem querer — e ai
@@ -4519,15 +8751,22 @@ void MainComponent::timerCallback()
     // pratico: sem ela, o cliente que abrisse Audio/MIDI e marcasse a entrada
     // na mao via este timer desmarcar em menos de 1 s. Nao havia contorno
     // possivel pelo usuario — foi o que tornou a regressao da 1.5.4 tao grave.
+    if (launchkeyMappingEnabled)
     {
         const auto entradas = midiInputsCached (nowMs);
 
-        int sobrariam = 0;
+        int portasDaw = 0;
         for (const auto& d : entradas)
-            if (! LaunchkeyControl::isDawPort (d.name))
-                ++sobrariam;
+            if (LaunchkeyControl::isDawPort (d.name))
+                ++portasDaw;
 
-        if (entradas.size() == 0 || sobrariam > 0)
+        const auto launchkeyPolicy =
+            ChurchDAWMidiMapping::launchkeyCommonInputPolicy (
+                launchkeyMappingEnabled,
+                entradas.size(),
+                portasDaw);
+
+        if (launchkeyPolicy.reserveDawPort)
             for (const auto& d : entradas)
                 if (LaunchkeyControl::isDawPort (d.name)
                      && deviceManager.isMidiInputDeviceEnabled (d.identifier))
@@ -4544,67 +8783,154 @@ void MainComponent::timerCallback()
     pollAndroidAudioTopology();
 
     CHURCHDAW_UI_LAP ("timer:android-audio-topology");
+   #endif
 
-    // Tuner de fluidez: roda na message thread, so AUMENTA buffer quando ha
-    // xrun real. 1 xrun/8 s ja sobe um degrau (antes 2/10 s e teto 1024) —
-    // culto multi-camada + streaming de samples precisa de folga. Teto 2048
-    // se o driver oferecer. getXRunCount e caro (lock Oboe): UMA leitura/ciclo.
+   #if JUCE_ANDROID || JUCE_IOS
+    // Tuner de fluidez na message thread. Usa APENAS o contador nativo da HAL.
+    // AudioDeviceManager::getXRunCount() tambem soma deadlines perdidos pelo
+    // medidor de callback; aumentar a capacidade do stream nao muda o tamanho
+    // do callback Oboe e, portanto, reagir a esse segundo contador so elevaria
+    // a latencia em ciclo sem corrigir a carga de CPU.
+    // Um xrun isolado nao reabre o device;
+    // dois confirmam pressao real e sobem um degrau. O aumento e TEMPORARIO:
+    // depois de 120 s limpos e sem MIDI, recupera latencia ate a preferencia
+    // manual. Nunca altera sample rate, DSP ou qualidade dos samples.
     if (nowMs - androidLastBufferTuneMs >= 8000)
     {
-        const int currentXRuns = deviceManager.getXRunCount();
-        const int newXRuns = currentXRuns >= androidLastXRunCount
-                                ? currentXRuns - androidLastXRunCount
-                                : currentXRuns;
+        auto* currentDevice = deviceManager.getCurrentAudioDevice();
+        const int currentXRuns = currentDevice != nullptr
+            ? juce::jmax (0, currentDevice->getXRunCount()) : 0;
+        const int observedNewXRuns = currentXRuns >= androidLastXRunCount
+                                        ? currentXRuns - androidLastXRunCount
+                                        : currentXRuns;
+        const bool warmupWindow =
+            androidBufferTunerWarmupPending.exchange (
+                false, std::memory_order_acq_rel);
+        const int newXRuns = warmupWindow ? 0 : observedNewXRuns;
         bool bufferChanged = false;
+        bool deferredMidPerformance = false;
 
-        if (newXRuns >= 1)
-            if (auto* device = deviceManager.getCurrentAudioDevice())
+        if (warmupWindow)
+        {
+            // A primeira janela apos abrir a rota mede o zero real do driver.
+            // Sem isto dois underruns do proprio start do AAudio faziam 256
+            // subir para 512 mesmo com uma unica nota e DSP abaixo de 30%.
+            androidXRunPressure = 0;
+            androidStableBufferWindows = 0;
+
+            if (observedNewXRuns > 0)
+                juce::Logger::writeToLog (
+                    "AUDIO: tuner mobile descartou "
+                    + juce::String (observedNewXRuns)
+                    + " xrun(s) de aquecimento");
+        }
+
+        if (auto* device = deviceManager.getCurrentAudioDevice())
+        {
+           #if JUCE_ANDROID
+            const int savedPreference = appProperties.getUserSettings()
+                ->getIntValue ("androidUserBufferSize",
+                               androidPreferredBufferSize);
+           #else
+            const int savedPreference = appProperties.getUserSettings()
+                ->getIntValue ("bufferSize",
+                               androidPreferredBufferSize);
+           #endif
+            if (savedPreference > 0)
+                androidPreferredBufferSize = savedPreference;
+
+            if (androidAvailableBufferSizes.isEmpty())
+                androidAvailableBufferSizes = device->getAvailableBufferSizes();
+
+            const int currentSize = device->getCurrentBufferSizeSamples();
+            const ChurchDAWMobileAudio::BufferTunerState previousState {
+                androidXRunPressure, androidStableBufferWindows };
+            const auto decision = ChurchDAWMobileAudio::decideBuffer (
+                currentSize,
+                androidPreferredBufferSize > 0
+                    ? androidPreferredBufferSize : currentSize,
+                androidAvailableBufferSizes.begin(),
+                androidAvailableBufferSizes.size(), newXRuns,
+                nowMs - lastMidiActivityMs.load (
+                            std::memory_order_relaxed) < 10000,
+                previousState,
+                1024);
+
+            androidXRunPressure = warmupWindow
+                ? 0 : decision.state.xrunPressure;
+            androidStableBufferWindows = warmupWindow
+                ? 0 : decision.state.stableWindows;
+
+            if (decision.requestedBuffer > 0
+                 && decision.requestedBuffer != currentSize)
             {
-                const int currentSize = device->getCurrentBufferSizeSamples();
-                int nextSize = 0;
+                const bool activelyPlaying =
+                    (nowMs - lastMidiActivityMs.load (std::memory_order_relaxed) < 3500)
+                    || ChurchDAWAudioActivity::audibleWithin (1500);
 
-                for (const int candidate : device->getAvailableBufferSizes())
-                    if (candidate > currentSize && candidate <= 2048)
-                    {
-                        nextSize = candidate;
-                        break;
-                    }
-
-                if (nextSize > 0)
+                if (activelyPlaying && newXRuns < 24)
+                {
+                    // NUNCA derrube/reabra o stream no meio de uma frase musical!
+                    // Mantemos a pressao armada e reavaliamos em 2 s para aplicar
+                    // na primeira pausa entre frases/acordes.
+                    androidXRunPressure = juce::jmax (2, previousState.xrunPressure + 1);
+                    deferredMidPerformance = true;
+                }
+                else
                 {
                     auto setup = deviceManager.getAudioDeviceSetup();
-                    setup.bufferSize = nextSize;
+                    setup.bufferSize = decision.requestedBuffer;
                     const auto error =
                         deviceManager.setAudioDeviceSetup (setup, false);
-                    bufferChanged = true;
+                    bufferChanged = error.isEmpty();
 
-                    if (error.isEmpty())
+                    if (! bufferChanged)
                     {
-                        appProperties.getUserSettings()->setValue (
-                            "bufferSize", nextSize);
-                        appProperties.getUserSettings()->saveIfNeeded();
+                        // A decisao pode ser tentada novamente na proxima janela;
+                        // falha de HAL nao deve apagar a evidencia acumulada.
+                        androidXRunPressure = previousState.xrunPressure;
+                        androidStableBufferWindows = previousState.stableWindows;
                     }
 
+                    const bool recovering = decision.reason
+                        == ChurchDAWMobileAudio::BufferDecisionReason::stableIdleRecovery;
                     juce::Logger::writeToLog (
-                        "AUDIO: tuner Android " + juce::String (currentSize)
-                        + " -> " + juce::String (nextSize)
-                        + " apos " + juce::String (newXRuns)
-                        + " xruns/8s"
+                        "AUDIO: tuner mobile " + juce::String (currentSize)
+                        + " -> " + juce::String (decision.requestedBuffer)
+                        + (recovering ? " apos 120s estaveis/sem MIDI"
+                                      : " apos xruns repetidos")
                         + (error.isEmpty()
-                               ? juce::String (" (ok)")
+                               ? juce::String (" (temporario, preferencia=")
+                                    + juce::String (androidPreferredBufferSize) + ")"
                                : " ERRO: " + error));
                 }
             }
+        }
 
-        androidLastXRunCount = bufferChanged ? deviceManager.getXRunCount()
-                                             : currentXRuns;
-        androidLastBufferTuneMs = nowMs;
+        if (bufferChanged)
+        {
+            if (auto* reopened = deviceManager.getCurrentAudioDevice())
+                androidLastXRunCount = juce::jmax (0, reopened->getXRunCount());
+            else
+                androidLastXRunCount = 0;
+        }
+        else
+            androidLastXRunCount = currentXRuns;
+        androidLastBufferTuneMs = deferredMidPerformance ? (nowMs - 6000) : nowMs;
     }
    #endif
 
     CHURCHDAW_UI_LAP ("timer:android-buffer");
 
-    if ((launchkey == nullptr || ! launchkey->isConnected() || ! launchkey->isListening())
+    // Reconexao do Launchkey: recria quando a porta DAW NAO esta disponivel
+    // (desplugado) ou quando o objeto atual nao esta conectado/ouvindo. O
+    // output/input antigos continuam nao-nulos apos o replug, entao o teste
+    // de disponibilidade da porta e o que detecta a remocao.
+    if (launchkeyMappingEnabled
+         && (launchkey == nullptr
+          || ! launchkey->isConnected()
+          || ! launchkey->isListening()
+          || ! LaunchkeyControl::isDawPortAvailable())
          && nowMs - lastLaunchkeyRetryMs >= 5000)
     {
         lastLaunchkeyRetryMs = nowMs;
@@ -4612,6 +8938,192 @@ void MainComponent::timerCallback()
     }
 
     CHURCHDAW_UI_LAP ("timer:launchkey-setup");
+
+    // DIAGNOSTICO PERIODICO (10 s): saude do motor para o monitor de log.
+    // Mostra steals de voz, NaN, xruns e clips — os sinais de bug que nao
+    // aparecem em lugar nenhum enquanto o musico toca.
+    {
+        static juce::uint32 lastDiagLogMs = 0;
+
+        if (nowMs - lastDiagLogMs >= 10000)
+        {
+            lastDiagLogMs = nowMs;
+
+            juce::String diag = "DIAG:";
+
+            int timbreProcessorCount = 0;
+            juce::uint32 totalSteals = 0;
+            juce::uint32 totalNan = 0;
+            juce::uint32 totalStreamMisses = 0;
+
+            for (int i = 0; i < numSlots; ++i)
+                if (auto* timbres = dynamic_cast<TimbresProcessor*> (slots[i].proc.load()))
+                {
+                    ++timbreProcessorCount;
+                    totalSteals += timbres->getVoiceStealsInLayer();
+                    totalNan += timbres->getNanGuardHitCount();
+                    totalStreamMisses += timbres->getStreamMissCount();
+                   #if CHURCHDAW_AUDIO_INSTRUMENTATION
+                    diag += " s" + juce::String (i)
+                          + "_avg=" + juce::String (timbres->getDiagAverageLoadPercent(), 1)
+                          + "_peak=" + juce::String (timbres->getDiagPeakLoadPercent(), 1)
+                          + "_voices=" + juce::String (timbres->getDiagVoiceLoadPercent(), 1)
+                          + "_fx=" + juce::String (timbres->getDiagFxLoadPercent(), 1)
+                          + "_active=" + juce::String (timbres->getDiagActiveVoices());
+                   #endif
+                }
+
+            diag += " timbre_processors=" + juce::String (timbreProcessorCount);
+            diag += " steals=" + juce::String (totalSteals);
+            diag += " nan=" + juce::String (totalNan);
+            diag += " stream_misses=" + juce::String (totalStreamMisses);
+
+            const int totalXRuns = deviceManager.getXRunCount();
+            const int driverXRuns = deviceManager.getCurrentAudioDevice() != nullptr
+                ? juce::jmax (0, deviceManager.getCurrentAudioDevice()->getXRunCount())
+                : 0;
+            diag += " xruns=" + juce::String (totalXRuns);
+            diag += " driver_xruns=" + juce::String (driverXRuns);
+            diag += " callback_overruns="
+                + juce::String (juce::jmax (0, totalXRuns - driverXRuns));
+
+           #if CHURCHDAW_AUDIO_INSTRUMENTATION
+            const auto measuredSamples = diagCallbackSamples.exchange (
+                0, std::memory_order_relaxed);
+            const auto playerTicks = diagPlayerTicks.exchange (
+                0, std::memory_order_relaxed);
+            const auto playbackTicks = diagPlaybackTicks.exchange (
+                0, std::memory_order_relaxed);
+            const double diagnosticSampleRate =
+                deviceManager.getCurrentAudioDevice() != nullptr
+                    ? deviceManager.getCurrentAudioDevice()->getCurrentSampleRate()
+                    : 48000.0;
+            const double measuredBudget = (double) measuredSamples
+                / juce::jmax (1.0, diagnosticSampleRate);
+
+            if (measuredBudget > 0.0)
+            {
+                diag += " graph_load=" + juce::String (
+                    100.0 * juce::Time::highResolutionTicksToSeconds (playerTicks)
+                        / measuredBudget, 1);
+                diag += " playback_load=" + juce::String (
+                    100.0 * juce::Time::highResolutionTicksToSeconds (playbackTicks)
+                        / measuredBudget, 1);
+            }
+           #endif
+
+            int clips = 0;
+
+            for (int i = 0; i < numSlots; ++i)
+                if (auto* timbres = dynamic_cast<TimbresProcessor*> (slots[i].proc.load()))
+                    for (int l = 0; l < TimbresProcessor::numLayers; ++l)
+                        if (timbres->readAndResetLayerClip (l))
+                            ++clips;
+
+            diag += " clips=" + juce::String (clips);
+
+            juce::Logger::writeToLog (diag);
+
+           #if CHURCHDAW_AUDIO_INSTRUMENTATION
+            const float idlePeak = idleOutputPeak.exchange (
+                0.0f, std::memory_order_relaxed);
+            const double idleSquares = idleOutputSquareSum.exchange (
+                0.0, std::memory_order_relaxed);
+            const auto idleSamples = idleOutputSampleCount.exchange (
+                0, std::memory_order_relaxed);
+            const auto idleNonFinite = idleOutputNonFiniteCount.exchange (
+                0, std::memory_order_relaxed);
+           #else
+            constexpr float idlePeak = 0.0f;
+            constexpr double idleSquares = 0.0;
+            constexpr juce::uint64 idleSamples = 0;
+            constexpr juce::uint64 idleNonFinite = 0;
+           #endif
+            const auto blockedCallbacks = blockedInputCallbackCount.exchange (
+                0, std::memory_order_relaxed);
+            const int blockedChannels = blockedInputChannelMaximum.exchange (
+                0, std::memory_order_relaxed);
+
+            if (idleSamples > 0 || idleNonFinite > 0
+                 || blockedCallbacks > 0)
+            {
+                double idleRms = 0.0;
+               #if CHURCHDAW_AUDIO_INSTRUMENTATION
+                if (idleSamples > 0)
+                    idleRms = std::sqrt (idleSquares
+                                         / static_cast<double> (idleSamples));
+               #endif
+                const auto setup = deviceManager.getAudioDeviceSetup();
+                const auto* device = deviceManager.getCurrentAudioDevice();
+                const int activeInputs = device != nullptr
+                    ? device->getActiveInputChannels().countNumberOfSetBits()
+                    : 0;
+
+                juce::Logger::writeToLog (
+                    "AUDIO_IDLE peak=" + juce::String (idlePeak, 9)
+                    + " peak_dbfs=" + juce::String (
+                        juce::Decibels::gainToDecibels (
+                            idlePeak, -200.0f), 2)
+                    + " rms=" + juce::String (idleRms, 9)
+                    + " rms_dbfs=" + juce::String (
+                        juce::Decibels::gainToDecibels (
+                            (float) idleRms, -200.0f), 2)
+                    + " samples=" + juce::String (idleSamples)
+                    + " non_finite=" + juce::String (idleNonFinite)
+                    + " input_authorised=" + juce::String (
+                        audioInputAuthorised.load (
+                            std::memory_order_acquire) ? 1 : 0)
+                    + " setup_inputs=" + juce::String (
+                        setup.inputChannels.countNumberOfSetBits())
+                    + " active_inputs=" + juce::String (activeInputs)
+                    + " blocked_input_callbacks="
+                    + juce::String (blockedCallbacks)
+                    + " max_blocked_input_channels="
+                    + juce::String (blockedChannels));
+            }
+        }
+    }
+
+    CHURCHDAW_UI_LAP ("timer:diag");
+
+    // POLL DE RECONEXAO MIDI. O watcher WinRT (MidiDeviceListConnection) as
+    // vezes perde o re-add do teclado no replug — o log mostrava a remocao
+    // mas nunca o retorno, e o musico tinha que fechar e abrir o app. Este
+    // poll compara a lista CRUA atual com a ultima conhecida e, se mudou,
+    // chama o refreshMidiInputs (que reabre a porta e reescreve os mapas por
+    // nome). Compara cru-com-cru para nunca gerar refresh em loop.
+    //
+    // Alem da lista, verifica se os dispositivos presentes estao REALMENTE
+    // habilitados: o MidiInput::openDevice pode falhar silenciosamente na
+    // primeira tentativa (driver WinRT ainda inicializando apos o replug) e
+    // o log mostra "LIGADA" mesmo sem a porta aberta. Se algum dispositivo
+    // nao-DAW esta presente mas nao habilitado, tenta de novo.
+    {
+        static juce::uint32 lastMidiPollMs = 0;
+
+        if (nowMs - lastMidiPollMs >= 2000)
+        {
+            lastMidiPollMs = nowMs;
+
+            const auto& entradas = midiInputsCached (nowMs);
+            juce::StringArray ids;
+            bool algumPresenteNaoHabilitado = false;
+
+            for (const auto& d : entradas)
+            {
+                ids.add (d.identifier);
+
+                if (! LaunchkeyControl::isDawPort (d.name)
+                     && ! deviceManager.isMidiInputDeviceEnabled (d.identifier))
+                    algumPresenteNaoHabilitado = true;
+            }
+
+            if (ids != ultimaListaMidiCrua || algumPresenteNaoHabilitado)
+                refreshMidiInputs();
+        }
+    }
+
+    CHURCHDAW_UI_LAP ("timer:midi-poll");
 
     refreshLaunchkeyNames();   // so envia o que mudou
 
@@ -4623,7 +9135,8 @@ void MainComponent::timerCallback()
     juce::String ifaceName;
     bool ifaceOn = false;
 
-    if (auto* device = deviceManager.getCurrentAudioDevice())
+    if (auto* device = deviceManager.getCurrentAudioDevice();
+        device != nullptr && device->isOpen() && device->isPlaying())
     {
         txt << juce::String (device->getCurrentSampleRate() / 1000.0, 1) << " kHz" << sep
             << device->getCurrentBufferSizeSamples() << " smp" << sep << "CPU "
@@ -4631,12 +9144,20 @@ void MainComponent::timerCallback()
 
         ifaceName = prettifyDeviceName (device->getName());
         ifaceOn = true;
+        lastAudioDriverError.clear();
+        statusInfo.setTooltip ({});
     }
     else
     {
-        txt << "sem dispositivo de audio";
+        txt << (lastAudioDriverError.isEmpty() ? "Sem audio / abra Audio para reabrir" : "Falha de audio / abra Audio");
     }
 
+    if (auto* editor = dynamic_cast<TimbresEditor*> (dockedEditor.get()))
+    {
+        undoMixButton.setEnabled (editor->canUndoParameterEdit());
+        redoMixButton.setEnabled (editor->canRedoParameterEdit());
+    }
+    else { undoMixButton.setEnabled (false); redoMixButton.setEnabled (false); }
     statusInfo.setText (txt, juce::dontSendNotification);
 
     CHURCHDAW_UI_LAP ("timer:android-audio");
@@ -4644,6 +9165,7 @@ void MainComponent::timerCallback()
     // Visor de programa no formato do Electro 7: chapa vermelha com o canal em
     // foco, nome grande do timbre dele, e embaixo a lista dos outros canais --
     // que e como a Nord mostra as camadas empilhadas sob o programa.
+    if (oled.isVisible() || qaOledChannel > 0)
     {
         juce::String slot, title (juce::CharPointer_UTF8 ("\xe2\x80\x94"));
         std::vector<OledDisplay::Row> rows;
@@ -4699,13 +9221,26 @@ void MainComponent::timerCallback()
                 }
             }
 
-            const auto liveSummary = loaded == 0
-                ? juce::String ("Nenhum timbre")
-                : on == loaded
-                    ? juce::String (on) + " canais ativos"
-                    : juce::String (on) + " / " + juce::String (loaded)
-                        + " canais ativos";
             const auto summarySeparator = juce::String::fromUTF8 (" \xc2\xb7 ");
+
+            // A cena no ar e a informacao mais urgente do culto e a unica que o
+            // visor nunca mostrava. Prefixa no liveSummary (que alimenta os tres
+            // ramos do slot) so quando ha cena carregada — cenaAtiva=-1 (sem
+            // cena no ar) ou cena vazia (preenchida=false) nao produzem rotulo,
+            // assim o visor parado continua limpo.
+            const auto cenaPrefix =
+                (juce::isPositiveAndBelow (cenaAtiva, ChurchDAWLive::numeroDeCenas)
+                   && cenas[cenaAtiva].preenchida)
+                    ? ChurchDAWLive::rotuloDaCena (cenas[cenaAtiva], cenaAtiva) + summarySeparator
+                    : juce::String();
+
+            const auto liveSummary = cenaPrefix
+                + (loaded == 0
+                     ? juce::String ("Nenhum timbre")
+                     : on == loaded
+                         ? juce::String (on) + " canais ativos"
+                         : juce::String (on) + " / " + juce::String (loaded)
+                             + " canais ativos");
 
             // Nenhum canal em foco: em vez de deixar a coluna oca, o visor conta
             // o estado do setup. Produto premium tem que ser bonito PARADO.
@@ -4870,10 +9405,29 @@ void MainComponent::timerCallback()
     deviceBar.setMidiActivity (recentMidi);
     midiLearnPanel.setDevice (controllerName, midiCount > 0);
     midiLearnPanel.setMappingCount (mappingCount);
+
+    if (midiMappingPanel.isVisible())
+        refreshMidiMappingPanel();
+
+    if (performanceSessionPanel != nullptr
+         && performanceSessionPanel->isVisible())
+        refreshPerformanceSessionPanel();
 }
 
 void MainComponent::handleAsyncUpdate()
 {
+    if (! midiCallbackLifetime->load())
+        return;
+    if (midiMapTransactionInProgress.load (std::memory_order_acquire))
+        return;
+
+    // Both callback-facing paths publish only bounded POD records. Drain Learn
+    // first because it may mutate the map/generation, then publish that exact
+    // generation before applying regular controller values.
+    consumeMidiLearnControlEvents();
+    rebuildControllerRoutesIfNeeded();
+    consumeControllerRouteEvents();
+
     // reset de pickup pedido pela thread de MIDI (o map e so desta thread).
     // O slot atomico e unico: dois pedidos coalescidos perderiam o primeiro
     // e o CC re-mapeado pularia o soft-takeover. Limpar o mapa inteiro cobre
@@ -4881,8 +9435,44 @@ void MainComponent::handleAsyncUpdate()
     if (ccPickupToClear.exchange (-1) >= 0)
         ccPickup.clear();
 
-    bool noteMappingWasCompleted = false;
-    const int mappedNote = lastMappedNote.exchange (-1);
+    bool mappingEventWasCompleted = false;
+
+    int rejectedNote = -1;
+    juce::String rejectedNoteReason;
+    {
+        const juce::ScopedLock sl (mapLock);
+        rejectedNote = lastNoteActionRejected.exchange (
+            -1, std::memory_order_relaxed);
+        if (rejectedNote >= 0)
+            rejectedNoteReason = motivoDaRecusaDeNota;
+    }
+    if (rejectedNote >= 0)
+    {
+        midiLearnPanel.showAviso (
+            "Nota " + juce::String (rejectedNote) + " nao foi usada",
+            rejectedNoteReason + " ja usa essa nota");
+        if (midiMappingPanel.isVisible())
+            midiMappingPanel.setStatus (
+                "Essa nota ja controla " + rejectedNoteReason,
+                MidiMappingPanel::Status::warning);
+        juce::Logger::writeToLog (
+            "MIDI MAP: nota " + juce::String (rejectedNote)
+              + " recusada porque ja controla " + rejectedNoteReason);
+        mappingEventWasCompleted = true;
+    }
+
+    int mappedNote = -1;
+    NoteAction mappedAction;
+    MidiControlKey mappedNoteKey;
+    {
+        const juce::ScopedLock sl (mapLock);
+        mappedNote = lastMappedNote.exchange (-1, std::memory_order_relaxed);
+        if (mappedNote >= 0)
+        {
+            mappedNoteKey = lastMappedNoteKey;
+            mappedAction = lastMappedNoteAction;
+        }
+    }
 
     if (mappedNote >= 0)
     {
@@ -4891,14 +9481,6 @@ void MainComponent::handleAsyncUpdate()
         // caminho que grava varias vezes seguidas, entao o musico mapeia o
         // culto inteiro achando que esta guardado.
         const bool gravouNoDisco = saveNoteMap();
-
-        NoteAction mappedAction;
-        MidiControlKey mappedKey;
-        {
-            const juce::ScopedLock sl (mapLock);
-            mappedKey = lastMappedNoteKey;
-            mappedAction = lastMappedNoteAction;
-        }
 
         // kind == none significa DESMAPEADA (a tecla voltou a tocar nota).
         const bool desmapeada = mappedAction.kind == NoteActionKind::none;
@@ -4930,23 +9512,191 @@ void MainComponent::handleAsyncUpdate()
         deviceBar.setMappingCount (count);
 
         if (desmapeada)
+        {
             midiLearnPanel.showUnmappedNote (
                 mappedNote,
                 gravouNoDisco ? juce::String ("Mapeamento salvo automaticamente")
                               : juce::String::fromUTF8 (
                                     "Vale s\xc3\xb3 nesta sess\xc3\xa3o \xe2\x80\x94 volta ao fechar"));
+            if (midiMappingPanel.isVisible())
+            {
+                refreshMidiMappingPanel();
+                midiMappingPanel.setStatus (
+                    "Nota " + juce::String (mappedNote)
+                      + (gravouNoDisco
+                            ? " liberada e salva automaticamente"
+                            : " liberada apenas nesta sessao"),
+                    gravouNoDisco ? MidiMappingPanel::Status::success
+                                  : MidiMappingPanel::Status::warning);
+            }
+        }
         else
-            midiLearnPanel.showMappedNote (acao, mappedNote, gravouNoDisco);
+        {
+            midiLearnPanel.showReceipt (acao, mappedNoteKey.sourceName, mappedNoteKey.channel, mappedNote, true, gravouNoDisco,
+                (!(lastLearnInputKey < mappedNoteKey) && !(mappedNoteKey < lastLearnInputKey)) ? lastLearnInputValue : -1);
+            midiLearnConsoleOverlay.flashSuccess (acao + " / Nota " + juce::String (mappedNote)
+                + (gravouNoDisco ? " / salvo" : " / nao salvo"), gravouNoDisco);
+            if (midiMappingPanel.isVisible())
+            {
+                refreshMidiMappingPanel();
+                midiMappingPanel.showMapped (acao, mappedNoteKey.channel, mappedNote,
+                                             gravouNoDisco, true);
+            }
+        }
         juce::Logger::writeToLog (juce::String (desmapeada ? "MIDI MAP: DESMAPEADA nota "
                                                            : "MIDI MAP: aprendida nota ")
                                   + juce::String (mappedNote)
-                                  + " canal " + juce::String (mappedKey.channel)
-                                  + " de " + mappedKey.sourceId + " -> " + acao
+                                  + " canal " + juce::String (mappedNoteKey.channel)
+                                  + " de " + mappedNoteKey.sourceId + " -> " + acao
                                   + (gravouNoDisco ? "" : "  [NAO SALVOU]"));
-        noteMappingWasCompleted = true;
+        mappingEventWasCompleted = true;
     }
 
-    const int mappedCC = lastMappedCC.exchange (-1);
+    // ---- BOTAO DO PAD POR CC (pad de borracha) ----
+    int ccRecusado = -1;
+    juce::String motivo;
+    {
+        const juce::ScopedLock sl (mapLock);
+        ccRecusado = lastCCAcaoRecusada.exchange (
+            -1, std::memory_order_relaxed);
+        if (ccRecusado >= 0)
+            motivo = motivoDaRecusaDeCCAcao;
+    }
+
+    if (ccRecusado >= 0)
+    {
+        // A ENTRADA RECUSADA CONTINUA VIVA (so que vazia) ATE O LEARN FECHAR.
+        //
+        // Apagando ela aqui, a mensagem seguinte do mesmo gesto — o "soltei" do
+        // pad, ou o proximo passo do knob — nao acharia mais nada e cairia no
+        // processControllerCC com o Learn AINDA LIGADO, onde pode virar um
+        // mapeamento de PARAMETRO que o musico nunca fez e nao viu.
+        atualizarBotoesDeCCDoPad();
+
+        const int count = getMidiMappingCount();
+        midiLearnPanel.setMappingCount (count);
+        deviceBar.setMappingCount (count);
+        midiLearnPanel.showAviso (
+            juce::String::fromUTF8 ("CC ") + juce::String (ccRecusado)
+                + juce::String::fromUTF8 (" n\xc3\xa3o foi usado"),
+            motivo + juce::String::fromUTF8 (
+                        " \xe2\x80\x94 aperte outro pad para este tom"));
+        juce::Logger::writeToLog ("MIDI MAP: CC " + juce::String (ccRecusado)
+                                  + " recusado como botao do Pad (" + motivo + ")");
+        mappingEventWasCompleted = true;
+    }
+
+    const int ccDesmapeado = lastCCAcaoDesmapeada.exchange (-1);
+
+    if (ccDesmapeado >= 0)
+    {
+        const bool gravou = saveMidiMap();
+        atualizarBotoesDeCCDoPad();
+
+        const int count = getMidiMappingCount();
+        midiLearnPanel.setMappingCount (count);
+        deviceBar.setMappingCount (count);
+        midiLearnPanel.showAviso (
+            "CC " + juce::String (ccDesmapeado)
+                + juce::String::fromUTF8 (" liberado"),
+            gravou ? juce::String::fromUTF8 ("Esse pad n\xc3\xa3o comanda mais o Pad")
+                   : juce::String::fromUTF8 (
+                         "Vale s\xc3\xb3 nesta sess\xc3\xa3o \xe2\x80\x94 volta ao fechar"));
+        juce::Logger::writeToLog ("MIDI MAP: DESMAPEADO CC " + juce::String (ccDesmapeado)
+                                  + " do Pad" + (gravou ? "" : "  [NAO SALVOU]"));
+        mappingEventWasCompleted = true;
+    }
+
+    int ccDeAcao = -1;
+    NoteAction acaoAprendida;
+    MidiControlKey chave;
+    {
+        const juce::ScopedLock sl (mapLock);
+        ccDeAcao = lastMappedCCAcao.exchange (
+            -1, std::memory_order_relaxed);
+        if (ccDeAcao >= 0)
+        {
+            chave = lastMappedCCAcaoKey;
+            acaoAprendida = lastMappedCCAcaoAction;
+        }
+    }
+
+    if (ccDeAcao >= 0)
+    {
+        // Mesma regra da nota e do CC de parametro: a tela nao confirma um mapa
+        // que nao foi para o disco.
+        const bool gravou = saveMidiMap();
+
+        reconstruirMascaraDeCCsDeAcao();
+        atualizarBotoesDeCCDoPad();
+
+        const auto alvo = acaoAprendida.kind == NoteActionKind::padOff
+                            ? juce::String ("Pad Parar")
+                            : "Pad " + juce::String (
+                                  PadPanel::noteName (acaoAprendida.arg));
+
+        const int count = getMidiMappingCount();
+        midiLearnPanel.setMappingCount (count);
+        deviceBar.setMappingCount (count);
+        midiLearnPanel.showReceipt (alvo, chave.sourceName, chave.channel, ccDeAcao, false, gravou,
+                (!(lastLearnInputKey < chave) && !(chave < lastLearnInputKey)) ? lastLearnInputValue : -1);
+        midiLearnConsoleOverlay.flashSuccess (alvo + " / CC " + juce::String (ccDeAcao)
+                + (gravou ? " / salvo" : " / nao salvo"), gravou);
+        if (midiMappingPanel.isVisible())
+        {
+            refreshMidiMappingPanel();
+            midiMappingPanel.showMapped (alvo, chave.channel, ccDeAcao, gravou);
+        }
+        juce::Logger::writeToLog ("MIDI MAP: aprendido CC " + juce::String (ccDeAcao)
+                                  + " canal " + juce::String (chave.channel)
+                                  + " de " + chave.sourceId + " -> " + alvo
+                                  + (gravou ? "" : "  [NAO SALVOU]"));
+        mappingEventWasCompleted = true;
+    }
+
+    int rejectedParameterCC = -1;
+    juce::String rejectedParameterReason;
+    {
+        const juce::ScopedLock sl (mapLock);
+        rejectedParameterCC = lastParameterMappingRejectedCC.exchange (
+            -1, std::memory_order_relaxed);
+        if (rejectedParameterCC >= 0)
+            rejectedParameterReason = motivoDaRecusaDeParametro;
+    }
+    if (rejectedParameterCC >= 0)
+    {
+        midiLearnPanel.showAviso (
+            "Controle " + juce::String (rejectedParameterCC)
+                + " nao foi mapeado",
+            rejectedParameterReason);
+        if (midiMappingPanel.isVisible())
+            midiMappingPanel.setStatus (
+                rejectedParameterReason,
+                MidiMappingPanel::Status::warning);
+        juce::Logger::writeToLog (
+            "MIDI MAP: controle " + juce::String (rejectedParameterCC)
+              + " recusado: " + rejectedParameterReason);
+        mappingEventWasCompleted = true;
+    }
+
+    int mappedCC = -1;
+    CCTarget mappedTarget;
+    MidiControlKey mappedKey;
+    bool mappingStillExists = false;
+    {
+        const juce::ScopedLock sl (mapLock);
+        mappedCC = lastMappedCC.exchange (-1, std::memory_order_relaxed);
+        if (mappedCC >= 0)
+        {
+            mappedKey = lastMappedKey;
+            const auto it = ccMappings.find (mappedKey);
+            if (it != ccMappings.end())
+            {
+                mappedTarget = it->second;
+                mappingStillExists = true;
+            }
+        }
+    }
 
     if (mappedCC >= 0)
     {
@@ -4958,105 +9708,78 @@ void MainComponent::handleAsyncUpdate()
         // reaprendia tudo e perdia tudo de novo na proxima abertura.
         const bool gravouCC = saveMidiMap();
 
-        CCTarget mappedTarget;
-        MidiControlKey mappedKey;
-        {
-            const juce::ScopedLock sl (mapLock);
-            mappedKey = lastMappedKey;
-            const auto it = ccMappings.find (mappedKey);
-
-            if (it != ccMappings.end())
-                mappedTarget = it->second;
-        }
-
         const auto alvo = describeCCTarget (mappedTarget);
         const auto targetName = alvo.isNotEmpty() ? alvo : juce::String ("controle");
 
         const int count = getMidiMappingCount();
         midiLearnPanel.setMappingCount (count);
         deviceBar.setMappingCount (count);
-        midiLearnPanel.showMapped (targetName, mappedCC, gravouCC);
-        return;
+        if (mappingStillExists)
+        {
+            midiLearnPanel.showReceipt (targetName, mappedKey.sourceName, mappedKey.channel, mappedCC, mappedKey.isNote, gravouCC,
+                (!(lastLearnInputKey < mappedKey) && !(mappedKey < lastLearnInputKey)) ? lastLearnInputValue : -1);
+            midiLearnConsoleOverlay.flashSuccess (targetName + " / CC " + juce::String (mappedCC)
+                + (gravouCC ? " / salvo" : " / nao salvo"), gravouCC);
+            if (midiMappingPanel.isVisible())
+            {
+                refreshMidiMappingPanel();
+                midiMappingPanel.showMapped (targetName, mappedKey.channel,
+                                             mappedCC, gravouCC, mappedKey.isNote);
+            }
+        }
+        else if (midiMappingPanel.isVisible())
+        {
+            refreshMidiMappingPanel();
+            midiMappingPanel.setStatus (
+                gravouCC
+                    ? "Mapeamento removido e salvo automaticamente"
+                    : "Mapeamento removido apenas nesta sessao",
+                gravouCC ? MidiMappingPanel::Status::success
+                         : MidiMappingPanel::Status::warning);
+        }
+        mappingEventWasCompleted = true;
     }
-
-    if (noteMappingWasCompleted)
-        return;
 
     if (! midiLearnActive.load())
         return;
 
-    const int slot = lastTouchedSlot.load();
-    const int param = lastTouchedParam.load();
+    int slot = -2;
+    int param = -1;
+    int insert = -1;
+    juce::String touchedName;
+    {
+        // Slot, indice, insert e identidade formam uma unica publicacao. Ler
+        // tudo sob mapLock impede que um callback de parametro mais novo seja
+        // combinado com metade do alvo anterior.
+        const juce::ScopedLock sl (mapLock);
+        slot = lastTouchedSlot.load (std::memory_order_relaxed);
+        param = lastTouchedParam.load (std::memory_order_relaxed);
+        insert = lastTouchedInsert.load (std::memory_order_relaxed);
+        touchedName = lastTouchedParamName;
+    }
 
-    juce::String name;
+    // A confirmacao de um mapa nao deve apagar um toque de parametro mais novo
+    // que foi coalescido no mesmo AsyncUpdater. Se nao existe novo alvo, a
+    // mensagem de sucesso/aviso acima permanece visivel.
+    if (mappingEventWasCompleted && slot == -2)
+        return;
+
+    juce::String name = touchedName;
 
     if (slot == -1)
-    {
         name = "Master";
-    }
-    else if (slot == padSlotId)
+    else if (slot == padSlotId && name.isNotEmpty()
+              && ! name.startsWithIgnoreCase ("Pad"))
+        name = "Pad  " + name;
+    else if (slot >= 0 && slot < numSlots && insert >= 0)
     {
-        // O PAD PRECISA DE RAMO PROPRIO AQUI TAMBEM.
-        //
-        // Sem ele o slot -3 caia no "else" la embaixo, que APAGA o nome do
-        // parametro — a ancora que a thread de MIDI le para fechar o
-        // mapeamento. O resultado, medido na tela: mexer no knob de corte
-        // dentro do MIDI Learn nao saia do PASSO 1, e o knob que o cliente
-        // pediu simplesmente nao era mapeavel. O caminho de aplicacao ja
-        // existia; faltava o de APRENDIZADO.
-        if (padProcessor != nullptr)
-        {
-            const auto& params = padProcessor->getParameters();
-
-            if (juce::isPositiveAndBelow (param, params.size()))
-            {
-                const auto paramName = params[param]->getName (32);
-                const auto paramId = ChurchDAWMidiMapping::stableParameterId (params[param]);
-
-                // Os parametros do Pad ja se chamam "Pad Cutoff"/"Pad Volume".
-                // Prefixar sempre produzia "Pad  Pad Cutoff" na tela.
-                name = paramName.startsWithIgnoreCase ("Pad") ? paramName
-                                                              : "Pad  " + paramName;
-
-                const juce::ScopedLock sl (mapLock);
-                lastTouchedParamName = paramName;
-                lastTouchedParamId = paramId;
-            }
-        }
+        juce::String identity;
+        if (auto* processor = resolveCurrentMidiMappingProcessor (
+                slot, insert, identity))
+            name = processor->getName() + " " + name;
     }
-    else if (slot >= 0 && slot < numSlots)
-    {
-        juce::AudioProcessor* proc = slots[slot].proc.load();
-        const int insert = lastTouchedInsert.load();
 
-        if (insert >= 0)
-            if (auto* timbres = dynamic_cast<TimbresProcessor*> (proc))
-                proc = timbres->getInsert (insert);
-
-        if (proc != nullptr)
-        {
-            const auto& params = proc->getParameters();
-
-            if (param >= 0 && param < params.size())
-            {
-                const auto paramName = params[param]->getName (32);
-                const auto paramId = ChurchDAWMidiMapping::stableParameterId (params[param]);
-                name = (insert >= 0 ? proc->getName() + " " : juce::String()) + paramName;
-
-                // guarda o NOME pra ancorar o mapeamento (a thread de MIDI le isto
-                // sob o mesmo lock quando o knob chegar)
-                const juce::ScopedLock sl (mapLock);
-                lastTouchedParamName = paramName;
-                lastTouchedParamId = paramId;
-            }
-        }
-    }
-    else
-    {
-        const juce::ScopedLock sl (mapLock);
-        lastTouchedParamName.clear();
-        lastTouchedParamId.clear();
-    }
+    juce::ignoreUnused (param);
 
     if (name.isNotEmpty())
         midiLearnPanel.showMoveHardware (name);
@@ -5097,9 +9820,415 @@ bool MainComponent::ccHasPickedUp (const MidiControlKey& control,
     return false;
 }
 
+void MainComponent::refreshInsertMappingIdentityCacheForSlot (int slot)
+{
+    if (! juce::isPositiveAndBelow (slot, numSlots))
+        return;
+
+    auto* timbres = dynamic_cast<TimbresProcessor*> (
+        slots[slot].proc.load());
+    for (int insertIndex = 0;
+         insertIndex < TimbresProcessor::numInserts; ++insertIndex)
+    {
+        juce::AudioProcessor* insert = nullptr;
+        juce::String identity;
+        const auto generationBefore = parameterTargetGeneration.load (
+            std::memory_order_acquire);
+        if (timbres != nullptr)
+            (void) timbres->getInsertMappingIdentitySnapshot (
+                insertIndex, insert, identity);
+        const auto generationAfter = parameterTargetGeneration.load (
+            std::memory_order_acquire);
+        if (generationBefore != generationAfter)
+        {
+            insert = nullptr;
+            identity.clear();
+        }
+
+        {
+            const juce::ScopedLock mappingLock (mapLock);
+            auto& snapshot =
+                insertMappingIdentityCache[slot][insertIndex];
+            snapshot.processor = insert;
+            snapshot.identity = identity;
+            snapshot.topologyGeneration = generationAfter;
+        }
+
+        if (insert != nullptr)
+        {
+            insertParameterCallbackRoutes[slot][insertIndex].publish (
+                insert, generationAfter);
+            insert->addListener (this);
+        }
+        else
+        {
+            insertParameterCallbackRoutes[slot][insertIndex].invalidate();
+        }
+    }
+}
+
+void MainComponent::retireInsertParameterListener (
+    TimbresProcessor* owner, int insert,
+    juce::AudioPluginInstance* processor)
+{
+    jassert (juce::MessageManager::getInstance()->isThisTheMessageThread());
+    if (processor == nullptr
+         || ! juce::isPositiveAndBelow (
+                insert, numHostedInsertMappingCaches))
+        return;
+
+    bool invalidated = false;
+    for (int slot = 0; slot < numSlots; ++slot)
+    {
+        if (owner != nullptr
+             && slots[slot].proc.load (std::memory_order_acquire) != owner)
+            continue;
+
+        if (! insertParameterCallbackRoutes[slot][insert].invalidate (
+                processor))
+            continue;
+
+        invalidated = true;
+        const juce::ScopedLock mappingLock (mapLock);
+        auto& snapshot = insertMappingIdentityCache[slot][insert];
+        if (snapshot.processor == processor)
+        {
+            snapshot.processor = nullptr;
+            snapshot.identity.clear();
+            snapshot.topologyGeneration = 0;
+        }
+    }
+
+    // During outer TimbresProcessor destruction the slot pointer may already
+    // be unpublished. Fall back to the exact raw route across all fixed slots;
+    // this remains bounded and still validates before dereferencing processor.
+    if (! invalidated)
+        for (int slot = 0; slot < numSlots; ++slot)
+            if (insertParameterCallbackRoutes[slot][insert].invalidate (
+                    processor))
+            {
+                invalidated = true;
+                const juce::ScopedLock mappingLock (mapLock);
+                auto& snapshot = insertMappingIdentityCache[slot][insert];
+                if (snapshot.processor == processor)
+                {
+                    snapshot.processor = nullptr;
+                    snapshot.identity.clear();
+                    snapshot.topologyGeneration = 0;
+                }
+            }
+
+    if (invalidated)
+        processor->removeListener (this);
+}
+
+bool MainComponent::validatedCallbackTopologyGeneration (
+    const juce::AudioProcessor* processor,
+    juce::uint64& topologyGeneration) const noexcept
+{
+    if (processor == nullptr)
+        return false;
+
+    if (processor == masterProcessor
+         || processor == padProcessor
+         || processor == padSynthProcessor)
+    {
+        topologyGeneration = parameterTargetGeneration.load (
+            std::memory_order_acquire);
+        return true;
+    }
+
+    for (int slot = 0; slot < numSlots; ++slot)
+        if (slots[slot].proc.load (std::memory_order_acquire) == processor)
+        {
+            topologyGeneration = parameterTargetGeneration.load (
+                std::memory_order_acquire);
+            return slots[slot].proc.load (std::memory_order_acquire)
+                    == processor;
+        }
+
+    for (int slot = 0; slot < numSlots; ++slot)
+        for (int insert = 0;
+             insert < numHostedInsertMappingCaches; ++insert)
+        {
+            ChurchDAWMidiMapping::ParameterCallbackRoute::Snapshot snapshot;
+            if (insertParameterCallbackRoutes[slot][insert]
+                    .snapshotIfCurrent (processor, snapshot))
+            {
+                topologyGeneration = snapshot.topologyGeneration;
+                return true;
+            }
+        }
+
+    return false;
+}
+
+juce::String MainComponent::cachedProcessorMappingIdentity (
+    int slot, int insert, const juce::AudioProcessor* expected) const
+{
+    if (slot == -1)
+        return ChurchDAWMidiMapping::masterProcessorIdentity();
+    if (slot == padSlotId)
+        return ChurchDAWMidiMapping::padProcessorIdentity();
+    if (slot == padSynthSlotId)
+        return ChurchDAWMidiMapping::padSynthProcessorIdentity();
+    if (! juce::isPositiveAndBelow (slot, numSlots))
+        return {};
+
+    const juce::ScopedLock mappingLock (mapLock);
+    if (insert >= 0)
+    {
+        if (! juce::isPositiveAndBelow (
+                insert, TimbresProcessor::numInserts))
+            return {};
+        const auto& snapshot = insertMappingIdentityCache[slot][insert];
+        return snapshot.topologyGeneration
+                    == parameterTargetGeneration.load (
+                        std::memory_order_acquire)
+                && (expected == nullptr || snapshot.processor == expected)
+            ? snapshot.identity : juce::String();
+    }
+
+    return expected == nullptr || slots[slot].proc.load() == expected
+        ? slots[slot].mappingIdentity : juce::String();
+}
+
+juce::AudioProcessor* MainComponent::resolveCurrentMidiMappingProcessor (
+    int slot, int insert, juce::String& identity) const
+{
+    jassert (juce::MessageManager::getInstance()->isThisTheMessageThread());
+    identity.clear();
+
+    switch (ChurchDAWMidiMapping::classifyMidiTargetLocation (
+        slot, insert, numSlots, padSlotId, padSynthSlotId))
+    {
+        case ChurchDAWMidiMapping::MidiTargetLocationKind::master:
+            identity = ChurchDAWMidiMapping::masterProcessorIdentity();
+            return masterProcessor;
+        case ChurchDAWMidiMapping::MidiTargetLocationKind::pad:
+            identity = ChurchDAWMidiMapping::padProcessorIdentity();
+            return padProcessor;
+        case ChurchDAWMidiMapping::MidiTargetLocationKind::padSynth:
+            identity = ChurchDAWMidiMapping::padSynthProcessorIdentity();
+            return padSynthProcessor;
+        case ChurchDAWMidiMapping::MidiTargetLocationKind::slot:
+        {
+            auto* processor = slots[slot].proc.load (std::memory_order_acquire);
+            identity = cachedProcessorMappingIdentity (slot, -1, processor);
+            return processor;
+        }
+        case ChurchDAWMidiMapping::MidiTargetLocationKind::insert:
+        {
+            auto* live = dynamic_cast<TimbresProcessor*> (
+                slots[slot].proc.load (std::memory_order_acquire));
+            juce::AudioProcessor* processor = nullptr;
+            if (live != nullptr)
+                (void) live->getInsertMappingIdentitySnapshot (
+                    insert, processor, identity);
+            return processor;
+        }
+        case ChurchDAWMidiMapping::MidiTargetLocationKind::invalid:
+            break;
+    }
+
+    return nullptr;
+}
+
+void MainComponent::consumeMidiLearnParameterMailbox()
+{
+    jassert (juce::MessageManager::getInstance()->isThisTheMessageThread());
+
+    auto ownerFrame = ownerTeardownGate != nullptr
+        ? ownerTeardownGate->tryEnter()
+        : ChurchDAWMidiMapping::DeferredOwnerTeardownGate::Lease {};
+    if (! ownerFrame)
+        return;
+
+    if (! midiLearnActive.load (std::memory_order_acquire)
+         || componentShutdownStarted.load (std::memory_order_acquire))
+        return;
+
+    // Toque dropado por mailbox cheio e fail-open para o Learn, mas nao pode
+    // ser invisivel: o musico ve "mova o alvo de novo" no log em vez de um
+    // gesto que simplesmente nao aprendeu.
+    if (const auto drops = parameterTouchMailbox.droppedCount();
+        drops != parameterTouchDropsReported)
+    {
+        parameterTouchDropsReported = drops;
+        juce::Logger::writeToLog (
+            "MIDI MAP: mailbox de toques de parametro cheio; gesto seguiu "
+            "fail-open (total " + juce::String (drops) + ")");
+    }
+
+    bool published = false;
+    ChurchDAWMidiMapping::ParameterTouchEvent event;
+    while (parameterTouchMailbox.tryConsume (event))
+    {
+        // Plug-ins echo a mapped/programmatic change shortly after it was
+        // applied. The clock query belongs on the message thread, never in the
+        // AudioProcessorListener callback.
+        if (juce::Time::getMillisecondCounter()
+              < suppressTouchUntilMs.load (std::memory_order_acquire))
+            continue;
+
+        const auto learnGeneration = parameterLearnGeneration.load (
+            std::memory_order_acquire);
+        const auto topologyGeneration = parameterTargetGeneration.load (
+            std::memory_order_acquire);
+        if (! ChurchDAWMidiMapping::parameterTouchBelongsToGeneration (
+                event, learnGeneration, topologyGeneration))
+            continue;
+
+        auto* const touchedProcessor = reinterpret_cast<juce::AudioProcessor*> (
+            event.processor);
+        int slot = -2;
+        int insert = -1;
+        juce::String processorIdentity;
+        TimbresProcessor* owningLive = nullptr;
+        juce::AudioPluginInstance* leasedInsert = nullptr;
+
+        if (touchedProcessor == masterProcessor)
+        {
+            slot = -1;
+            processorIdentity = ChurchDAWMidiMapping::masterProcessorIdentity();
+        }
+        else if (touchedProcessor == padProcessor)
+        {
+            slot = padSlotId;
+            processorIdentity = ChurchDAWMidiMapping::padProcessorIdentity();
+        }
+        else if (touchedProcessor == padSynthProcessor)
+        {
+            slot = padSynthSlotId;
+            processorIdentity = ChurchDAWMidiMapping::padSynthProcessorIdentity();
+        }
+        else
+        {
+            for (int candidateSlot = 0;
+                 candidateSlot < numSlots && slot == -2; ++candidateSlot)
+            {
+                auto* const candidate = slots[candidateSlot].proc.load (
+                    std::memory_order_acquire);
+                if (candidate == touchedProcessor)
+                {
+                    slot = candidateSlot;
+                    processorIdentity = cachedProcessorMappingIdentity (
+                        candidateSlot, -1, touchedProcessor);
+                    owningLive = dynamic_cast<TimbresProcessor*> (candidate);
+                    break;
+                }
+
+                auto* const live = dynamic_cast<TimbresProcessor*> (candidate);
+                if (live == nullptr)
+                    continue;
+
+                for (int candidateInsert = 0;
+                     candidateInsert < TimbresProcessor::numInserts;
+                     ++candidateInsert)
+                {
+                    auto* currentInsert =
+                        live->acquireInsertForMidiMapping (candidateInsert);
+                    if (currentInsert != touchedProcessor)
+                    {
+                        if (currentInsert != nullptr)
+                            live->releaseInsertForMidiMapping (
+                                candidateInsert, currentInsert);
+                        continue;
+                    }
+
+                    slot = candidateSlot;
+                    insert = candidateInsert;
+                    processorIdentity = cachedProcessorMappingIdentity (
+                        candidateSlot, candidateInsert, currentInsert);
+                    owningLive = live;
+                    leasedInsert = currentInsert;
+                    break;
+                }
+            }
+        }
+
+        const juce::ScopeGuard releaseInsertLease {
+            [owningLive, leasedInsert, insert]
+            {
+                if (owningLive != nullptr && leasedInsert != nullptr)
+                    owningLive->releaseInsertForMidiMapping (
+                        insert, leasedInsert);
+            }
+        };
+
+        // The stale pointer is never dereferenced before it is proven to be a
+        // current route. A swap/unload also bumps the generation synchronously,
+        // closing the allocator-address-reuse (ABA) case.
+        if (slot == -2 || processorIdentity.isEmpty()
+             || topologyGeneration != parameterTargetGeneration.load (
+                    std::memory_order_acquire)
+             || learnGeneration != parameterLearnGeneration.load (
+                    std::memory_order_acquire)
+             || (owningLive != nullptr
+                  && owningLive->isProgrammaticToneChange()))
+            continue;
+
+        const auto& parameters = touchedProcessor->getParameters();
+        if (! juce::isPositiveAndBelow (event.parameterIndex,
+                                        parameters.size())
+             || parameters[event.parameterIndex] == nullptr)
+            continue;
+
+        auto name = parameters[event.parameterIndex]->getName (32);
+        auto id = ChurchDAWMidiMapping::stableParameterId (
+            parameters[event.parameterIndex]);
+        const bool isMaster = slot == -1;
+        if (isMaster)
+        {
+            name = "Master";
+            id = "master";
+        }
+        const bool uniqueIdentity = isMaster
+            || ChurchDAWMidiMapping::parameterIdentityIsUnique (
+                parameters, event.parameterIndex);
+
+        {
+            const juce::ScopedLock sl (mapLock);
+            if (midiMapTransactionInProgress.load (
+                    std::memory_order_acquire)
+                 || ! midiLearnActive.load (std::memory_order_acquire)
+                 || applyingMappedCC.load (std::memory_order_acquire)
+                 || topologyGeneration != parameterTargetGeneration.load (
+                        std::memory_order_acquire)
+                 || learnGeneration != parameterLearnGeneration.load (
+                        std::memory_order_acquire))
+                continue;
+
+            lastTouchedParamName = std::move (name);
+            lastTouchedParamId = std::move (id);
+            lastTouchedPluginId = std::move (processorIdentity);
+            lastTouchedSlot.store (slot, std::memory_order_relaxed);
+            lastTouchedParam.store (
+                isMaster ? -1 : event.parameterIndex,
+                std::memory_order_relaxed);
+            lastTouchedInsert.store (insert, std::memory_order_relaxed);
+            lastTouchedTopologyGeneration.store (
+                topologyGeneration, std::memory_order_relaxed);
+            lastTouchedParameterIdentityUnique.store (
+                uniqueIdentity, std::memory_order_relaxed);
+            published = true;
+        }
+    }
+
+    if (published)
+        triggerAsyncUpdate();
+}
+
 void MainComponent::applyCCTarget (CCTarget target, float value01,
                                    MidiControlKey control)
 {
+    jassert (juce::MessageManager::getInstance()->isThisTheMessageThread());
+    auto ownerFrame = ownerTeardownGate != nullptr
+        ? ownerTeardownGate->tryEnter()
+        : ChurchDAWMidiMapping::DeferredOwnerTeardownGate::Lease {};
+    if (! ownerFrame)
+        return;
+
     suppressTouchUntilMs.store (juce::Time::getMillisecondCounter() + 600);
     applyingMappedCC = true;
     bool valid = false;
@@ -5107,7 +10236,12 @@ void MainComponent::applyCCTarget (CCTarget target, float value01,
     bool pickupPending = false;
     auto targetName = describeCCTarget (target);
 
-    if (target.slot == -1)
+    if (target.slot == -1
+         && ChurchDAWMidiMapping::MidiTargetIdentityPolicy::classifyProcessor (
+                target.pluginId,
+                ChurchDAWMidiMapping::masterProcessorIdentity(),
+                masterProcessor != nullptr)
+              == ChurchDAWMidiMapping::ProcessorTargetMatch::ready)
     {
         valid = true;
         const float cur = (float) masterSlider.valueToProportionOfLength (masterSlider.getValue());
@@ -5124,7 +10258,12 @@ void MainComponent::applyCCTarget (CCTarget target, float value01,
             pickupPending = true;
         }
     }
-    else if (target.slot == padSlotId)
+    else if (target.slot == padSlotId
+              && ChurchDAWMidiMapping::MidiTargetIdentityPolicy::classifyProcessor (
+                    target.pluginId,
+                    ChurchDAWMidiMapping::padProcessorIdentity(),
+                    padProcessor != nullptr)
+                   == ChurchDAWMidiMapping::ProcessorTargetMatch::ready)
     {
         // O PAD NAO E UM SLOT.
         //
@@ -5143,8 +10282,15 @@ void MainComponent::applyCCTarget (CCTarget target, float value01,
                 valid = true;
                 auto* p = params[index];
                 const float cur = p->getValue();
+                // Chaves (mute/solo/on/rotary/etc.) nao tem posicao absoluta: o
+                // soft-takeover as matava no primeiro toque apos cada troca de
+                // cena (ccPickup.clear()), quando o valor fisico (0 ou 1) ainda
+                // nao "alcançou" o alvo. Bypassa o pickup para parametros
+                // discretos ou de 2 passos.
+                const bool ehChave = p->isDiscrete() || p->getNumSteps() <= 2;
 
-                if (! control.isValid() || ccHasPickedUp (control, value01, cur))
+                if (! control.isValid() || ehChave
+                     || ccHasPickedUp (control, value01, cur))
                 {
                     p->setValueNotifyingHost (value01);
                     applied = true;
@@ -5159,15 +10305,85 @@ void MainComponent::applyCCTarget (CCTarget target, float value01,
             }
         }
     }
+    else if (target.slot == padSynthSlotId
+              && ChurchDAWMidiMapping::MidiTargetIdentityPolicy::classifyProcessor (
+                    target.pluginId,
+                    ChurchDAWMidiMapping::padSynthProcessorIdentity(),
+                    padSynthProcessor != nullptr)
+                   == ChurchDAWMidiMapping::ProcessorTargetMatch::ready)
+    {
+        if (padSynthProcessor != nullptr)
+        {
+            const auto& params = padSynthProcessor->getParameters();
+            const int index = ChurchDAWMidiMapping::resolveParameterIndex (
+                params, target.paramId, target.paramName);
+            if (juce::isPositiveAndBelow (index, params.size()))
+            {
+                // Um mapa antigo pode apontar diretamente para o bool do
+                // engine. A aba e o som do Pad Synth foram desativados; os
+                // quatro macros visiveis continuam mapeaveis normalmente.
+                if (ChurchDAWMidiMapping::stableParameterId (params[index])
+                        == "padEngineEnabled")
+                {
+                    padSynthProcessor->setEngineEnabled (false);
+                    applyingMappedCC = false;
+                    return;
+                }
+
+                valid = true;
+                auto* p = params[index];
+                const float cur = p->getValue();
+                const bool isSwitch = p->isDiscrete() || p->getNumSteps() <= 2;
+                if (! control.isValid() || isSwitch
+                     || ccHasPickedUp (control, value01, cur))
+                {
+                    p->setValueNotifyingHost (value01);
+                    applied = true;
+                    if (padEditorPanel != nullptr)
+                        padEditorPanel->refreshFromProcessor();
+                }
+                else
+                    pickupPending = true;
+            }
+        }
+    }
     else if (target.slot >= 0 && target.slot < numSlots)
     {
-        juce::AudioProcessor* proc = slots[target.slot].proc.load();
-
+        juce::String currentIdentity;
+        TimbresProcessor* insertOwner = nullptr;
+        juce::AudioPluginInstance* leasedInsert = nullptr;
+        juce::AudioProcessor* proc = nullptr;
         if (target.insert >= 0)
-            if (auto* timbres = dynamic_cast<TimbresProcessor*> (proc))
-                proc = timbres->getInsert (target.insert);   // MASTER FX do Church Live
+        {
+            insertOwner = dynamic_cast<TimbresProcessor*> (
+                slots[target.slot].proc.load (std::memory_order_acquire));
+            if (insertOwner != nullptr)
+                leasedInsert = insertOwner->acquireInsertForMidiMapping (
+                    target.insert);
+            proc = leasedInsert;
+            currentIdentity = cachedProcessorMappingIdentity (
+                target.slot, target.insert, proc);
+        }
+        else
+        {
+            proc = resolveCurrentMidiMappingProcessor (
+                target.slot, -1, currentIdentity);
+        }
+        const juce::ScopeGuard releaseInsertLease {
+            [insertOwner, leasedInsert, insert = target.insert]
+            {
+                if (insertOwner != nullptr && leasedInsert != nullptr)
+                    insertOwner->releaseInsertForMidiMapping (
+                        insert, leasedInsert);
+            }
+        };
 
-        if (proc != nullptr)
+        const auto pluginMatch =
+            ChurchDAWMidiMapping::MidiTargetIdentityPolicy::classifyProcessor (
+                target.pluginId, currentIdentity, proc != nullptr);
+
+        if (pluginMatch
+                == ChurchDAWMidiMapping::ProcessorTargetMatch::ready)
         {
             const auto& params = proc->getParameters();
             const int index = ChurchDAWMidiMapping::resolveParameterIndex (
@@ -5176,12 +10392,19 @@ void MainComponent::applyCCTarget (CCTarget target, float value01,
             if (index >= 0)
             {
                 valid = true;
-                const float cur = params[index]->getValue();
+                auto* p = params[index];
+                const float cur = p->getValue();
+                // Mesmo bypass de pickup do ramo do Pad: chaves (mute/solo/on/
+                // rotaryMode) nao podem exigir que o footswitch "alcance" o
+                // valor atual — o primeiro toque apos trocar de cena tem que
+                // comandar.
+                const bool ehChave = p->isDiscrete() || p->getNumSteps() <= 2;
 
                 if (! control.isValid()
+                     || ehChave
                      || ccHasPickedUp (control, value01, cur))
                 {
-                    params[index]->setValueNotifyingHost (value01);
+                    p->setValueNotifyingHost (value01);
                     applied = true;
                 }
                 else
@@ -5233,17 +10456,36 @@ void MainComponent::applyCCTarget (CCTarget target, float value01,
     if (midiLearnActive.load() && now - lastLearnedAtMs.load() >= 800)
     {
         if (applied)
+        {
             midiLearnPanel.showActivity (targetName, ccNumber,
                                          juce::roundToInt (value01 * 127.0f));
+            if (midiMappingPanel.isVisible())
+                midiMappingPanel.showActivity (
+                    targetName, control.channel, ccNumber,
+                    juce::roundToInt (value01 * 127.0f));
+        }
         else if (pickupPending)
+        {
             midiLearnPanel.showPickup (targetName, ccNumber);
+            if (midiMappingPanel.isVisible())
+                midiMappingPanel.showPickup (targetName, control.channel, ccNumber);
+        }
     }
 }
 
 juce::String MainComponent::describeCCTarget (const CCTarget& target) const
 {
     if (target.slot == -1)
-        return "Master";
+    {
+        const auto match =
+            ChurchDAWMidiMapping::MidiTargetIdentityPolicy::classifyProcessor (
+                target.pluginId,
+                ChurchDAWMidiMapping::masterProcessorIdentity(),
+                masterProcessor != nullptr);
+        return match == ChurchDAWMidiMapping::ProcessorTargetMatch::ready
+            ? juce::String ("Master")
+            : juce::String ("Master  - revalidar mapa antigo");
+    }
 
     // O Pad tem slot proprio (padSlotId) porque nao mora na cadeia de slots.
     // Ele ganhou caminho no applyCCTarget e no audioProcessorParameterChanged,
@@ -5254,6 +10496,11 @@ juce::String MainComponent::describeCCTarget (const CCTarget& target) const
     if (target.slot == padSlotId)
     {
         juce::String nome = target.paramName;
+        const auto identityMatch =
+            ChurchDAWMidiMapping::MidiTargetIdentityPolicy::classifyProcessor (
+                target.pluginId,
+                ChurchDAWMidiMapping::padProcessorIdentity(),
+                padProcessor != nullptr);
 
         // Resolve pelo mesmo caminho dos slots, em vez de comparar com nomes
         // fixos: paramName aqui e o rotulo de exibicao, que muda se o
@@ -5272,43 +10519,3013 @@ juce::String MainComponent::describeCCTarget (const CCTarget& target) const
         if (nome.isEmpty())
             return "Pad";
 
-        return nome.startsWithIgnoreCase ("Pad") ? nome : "Pad  " + nome;
+        auto result = nome.startsWithIgnoreCase ("Pad") ? nome : "Pad  " + nome;
+        if (identityMatch != ChurchDAWMidiMapping::ProcessorTargetMatch::ready)
+            result += "  - revalidar";
+        return result;
+    }
+
+    if (target.slot == padSynthSlotId)
+    {
+        juce::String name = target.paramName;
+        const auto identityMatch =
+            ChurchDAWMidiMapping::MidiTargetIdentityPolicy::classifyProcessor (
+                target.pluginId,
+                ChurchDAWMidiMapping::padSynthProcessorIdentity(),
+                padSynthProcessor != nullptr);
+        if (padSynthProcessor != nullptr)
+        {
+            const auto& params = padSynthProcessor->getParameters();
+            const int resolved = ChurchDAWMidiMapping::resolveParameterIndex (
+                params, target.paramId, target.paramName);
+            if (juce::isPositiveAndBelow (resolved, params.size()))
+                name = params[resolved]->getName (64);
+        }
+        auto result = name.isNotEmpty() ? name : juce::String ("PAD Engine");
+        if (identityMatch != ChurchDAWMidiMapping::ProcessorTargetMatch::ready)
+            result += "  - revalidar";
+        return result;
     }
 
     if (! juce::isPositiveAndBelow (target.slot, numSlots))
         return {};
 
-    juce::AudioProcessor* proc = slots[target.slot].proc.load();
-
-    if (target.insert >= 0)
-        if (auto* timbres = dynamic_cast<TimbresProcessor*> (proc))
-            proc = timbres->getInsert (target.insert);
+    juce::String currentIdentity;
+    auto* proc = resolveCurrentMidiMappingProcessor (
+        target.slot, target.insert, currentIdentity);
 
     juce::String parameterName = target.paramName;
+    bool parameterAvailable = false;
+    const auto pluginMatch =
+            ChurchDAWMidiMapping::MidiTargetIdentityPolicy::classifyProcessor (
+            target.pluginId, currentIdentity, proc != nullptr);
 
     if (proc != nullptr)
     {
-        const auto& params = proc->getParameters();
-        const int resolved = ChurchDAWMidiMapping::resolveParameterIndex (
-            params, target.paramId, target.paramName);
+        if (pluginMatch
+              == ChurchDAWMidiMapping::ProcessorTargetMatch::ready)
+        {
+            const auto& params = proc->getParameters();
+            const int resolved = ChurchDAWMidiMapping::resolveParameterIndex (
+                params, target.paramId, target.paramName);
 
-        if (juce::isPositiveAndBelow (resolved, params.size()))
-            parameterName = params[resolved]->getName (32);
+            if (juce::isPositiveAndBelow (resolved, params.size()))
+            {
+                parameterName = params[resolved]->getName (32);
+                parameterAvailable = true;
+            }
+        }
     }
 
     if (parameterName.isEmpty())
         parameterName = "Parametro";
 
-    if (target.insert >= 0 && proc != nullptr)
-        return proc->getName() + "  " + parameterName;
+    if (parameterAvailable)
+        return target.insert >= 0 ? proc->getName() + "  " + parameterName
+                                  : parameterName;
 
-    return parameterName;
+    return parameterName + "  - revalidar / alvo pendente";
 }
 
 int MainComponent::getMidiMappingCount() const
 {
     const juce::ScopedLock sl (mapLock);
-    return (int) (ccMappings.size() + noteMappings.size());
+
+    // Entradas ESVAZIADAS (desmapeadas dentro do Learn, ainda vivas so para
+    // engolir o resto do gesto) nao contam. O numero na tela e justamente o que
+    // o musico olha para conferir que o gesto pegou; se ele nao baixasse depois
+    // de desmapear, a tela estaria dizendo o oposto do que aconteceu.
+    int botoes = 0;
+
+    for (const auto& par : ccActionMappings)
+        if (par.second.acao.kind != NoteActionKind::none)
+            ++botoes;
+
+    return (int) (ccMappings.size() + noteMappings.size()) + botoes;
+}
+
+void MainComponent::refreshMidiMappingPanel()
+{
+    if (! midiMappingPanel.isVisible())
+        return;
+
+    juce::Array<MidiMappingPanel::Command> commands;
+    std::vector<std::pair<MidiControlKey, CCTarget>>
+        consumedParameterMappings;
+    auto* live = getChurchLive();
+    int liveSlot = -1;
+
+    if (live != nullptr)
+        for (int slot = 0; slot < numSlots; ++slot)
+            if (slots[slot].proc.load() == live)
+            {
+                liveSlot = slot;
+                break;
+            }
+
+    auto describeDevice = [this] (const MidiControlKey& key)
+    {
+        auto name = prettifyDeviceName (
+            ChurchDAWMidiMapping::sourceNameForPersistence (
+                key.sourceName, nomeDoAparelho (key.sourceId)));
+        if (name.isEmpty())
+            name = key.sourceId.fromFirstOccurrenceOf ("midi:", false, false);
+        return name;
+    };
+
+    auto fillParameterMapping = [this, &describeDevice,
+                                 &consumedParameterMappings]
+        (MidiMappingPanel::Command& command, int slot,
+         juce::AudioProcessorParameter* parameter)
+    {
+        if (parameter == nullptr)
+            return;
+
+        const auto stableId = ChurchDAWMidiMapping::stableParameterId (parameter);
+        const auto name = parameter->getName (32);
+        juce::AudioProcessor* processor = nullptr;
+        if (slot == -1)
+            processor = masterProcessor;
+        else if (slot == padSlotId)
+            processor = padProcessor;
+        else if (slot == padSynthSlotId)
+            processor = padSynthProcessor;
+        else if (juce::isPositiveAndBelow (slot, numSlots))
+            processor = slots[slot].proc.load();
+
+        CCTarget currentTarget {
+            slot, processor != nullptr
+                    ? processor->getParameters().indexOf (parameter) : -1,
+            -1, name, stableId,
+            cachedProcessorMappingIdentity (slot, -1, processor)
+        };
+        if (slot == -1)
+        {
+            currentTarget.param = -1;
+            currentTarget.paramName = "Master";
+            currentTarget.paramId = "master";
+        }
+        if (currentTarget.pluginId.isEmpty())
+            return;
+
+        command.parameterIndex = currentTarget.param;
+        command.parameterInsert = currentTarget.insert;
+        command.parameterId = currentTarget.paramId;
+        command.parameterName = currentTarget.paramName;
+        command.expectedCurrentPluginId = currentTarget.pluginId;
+        command.expectedParameterEntryPresent = false;
+
+        MidiControlKey mappedKey;
+        CCTarget mappedTarget;
+        bool found = false;
+
+        {
+            const juce::ScopedLock sl (mapLock);
+            for (const auto& pair : ccMappings)
+            {
+                if (ChurchDAWMidiMapping::MidiTargetIdentityPolicy::sameTarget (
+                        pair.second, currentTarget))
+                {
+                    mappedKey = pair.first;
+                    mappedTarget = pair.second;
+                    found = true;
+                    break;
+                }
+            }
+        }
+
+        if (! found)
+            return;
+
+        command.mapped = true;
+        command.type = mappedKey.isNote ? "Nota" : "CC";
+        command.midiChannel = mappedKey.channel;
+        command.number = mappedKey.cc;
+        command.device = describeDevice (mappedKey);
+        command.control = (mappedKey.isNote ? "Nota " : "CC ")
+                            + juce::String (mappedKey.cc);
+        command.expectedParameterEntryPresent = true;
+        command.persistedParameterSlot = mappedTarget.slot;
+        command.persistedParameterIndex = mappedTarget.param;
+        command.persistedParameterInsert = mappedTarget.insert;
+        command.persistedParameterId = mappedTarget.paramId;
+        command.persistedParameterName = mappedTarget.paramName;
+        command.persistedPluginId = mappedTarget.pluginId;
+        command.mappedSourceId = mappedKey.sourceId;
+        command.mappedSourceName = mappedKey.sourceName;
+        command.mappedChannel = mappedKey.channel;
+        command.mappedNumber = mappedKey.cc;
+        command.mappedWasNote = mappedKey.isNote;
+        consumedParameterMappings.emplace_back (
+            mappedKey, mappedTarget);
+    };
+
+    auto fillActionMapping = [this, &describeDevice]
+        (MidiMappingPanel::Command& command, NoteAction wanted)
+    {
+        MidiControlKey mappedKey;
+        bool found = false;
+        bool isNote = false;
+        bool conflict = false;
+        int mappedMode = 1;
+
+        const auto matches = [&wanted] (const NoteAction& value)
+        {
+            const bool argumentMatters = wanted.kind == NoteActionKind::cena
+                                      || wanted.kind == NoteActionKind::padKey
+                                      || wanted.kind == NoteActionKind::padSynthProgram;
+            return value.kind == wanted.kind
+                    && (! argumentMatters || value.arg == wanted.arg);
+        };
+
+        {
+            const juce::ScopedLock sl (mapLock);
+            for (const auto& pair : noteMappings)
+                if (matches (pair.second))
+                {
+                    if (! found)
+                    {
+                        mappedKey = pair.first;
+                        found = true;
+                        isNote = true;
+                    }
+                    else
+                        conflict = true;
+                }
+
+            for (const auto& pair : ccActionMappings)
+                if (matches (pair.second.acao))
+                {
+                    if (! found)
+                    {
+                        mappedKey = pair.first;
+                        found = true;
+                        isNote = false;
+                        mappedMode = pair.second.modo
+                                       == ChurchDAWMidiMapping::ModoDeBotaoCC::seguirNivel
+                                     ? 4 : 3;
+                    }
+                    else
+                        conflict = true;
+                }
+        }
+
+        if (! found)
+            return;
+
+        command.mapped = true;
+        command.conflict = conflict;
+        command.type = isNote ? "Nota" : "CC";
+        command.midiChannel = mappedKey.channel;
+        command.number = mappedKey.cc;
+        command.mode = mappedMode;
+        command.device = describeDevice (mappedKey);
+        command.control = (isNote ? "Nota " : "CC ") + juce::String (mappedKey.cc);
+    };
+
+    auto addParameter = [&commands, &fillParameterMapping]
+        (juce::String name, juce::String category,
+         MidiMappingPanel::TargetKind kind, int argument,
+         int slot, juce::AudioProcessorParameter* parameter,
+         int rowDisambiguator = -1)
+    {
+        MidiMappingPanel::Command command;
+        command.name = std::move (name);
+        command.category = std::move (category);
+        command.target = kind;
+        command.argument = argument;
+        command.parameterSlot = slot;
+        command.parameterId = ChurchDAWMidiMapping::stableParameterId (parameter);
+        command.parameterName = parameter != nullptr
+            ? parameter->getName (32) : juce::String();
+        command.rowDisambiguator = rowDisambiguator;
+        fillParameterMapping (command, slot, parameter);
+        commands.add (std::move (command));
+    };
+
+    for (int layer = 0; layer < TimbresProcessor::numLayers; ++layer)
+        addParameter ("Volume  Canal " + juce::String (layer + 1), "Mixer",
+                      MidiMappingPanel::TargetKind::layerVolume, layer,
+                      liveSlot, live != nullptr ? live->getLayerVolParam (layer) : nullptr);
+
+    // Acesso rapido: estes sao os dois knobs que existem no modal Pad
+    // Continuo. Eles ficavam depois de dezenas de sends/efeitos e pareciam
+    // inexistentes sem uma busca exata. Logo apos os faders de canal, os tres
+    // alvos reclamados pelo cliente ficam juntos na primeira tela da lista.
+    juce::AudioProcessorParameter* padCutoff = nullptr;
+    juce::AudioProcessorParameter* padVolume = nullptr;
+    if (padProcessor != nullptr)
+        for (auto* parameter : padProcessor->getParameters())
+        {
+            const auto id = ChurchDAWMidiMapping::stableParameterId (parameter);
+            if (id == "padCutoff") padCutoff = parameter;
+            if (id == "padVolume") padVolume = parameter;
+        }
+
+    addParameter (juce::String::fromUTF8 ("Volume do Pad Cont\xc3\xadnuo"), "Pad / Trigger",
+                  MidiMappingPanel::TargetKind::padVolume, -1, padSlotId, padVolume);
+    addParameter (juce::String::fromUTF8 ("Corte do Pad Cont\xc3\xadnuo"), "Pad / Trigger",
+                  MidiMappingPanel::TargetKind::padCutoff, -1, padSlotId, padCutoff);
+
+    for (int layer = 0; layer < TimbresProcessor::numLayers; ++layer)
+        addParameter ("Reverb  Canal " + juce::String (layer + 1), "Efeitos",
+                      MidiMappingPanel::TargetKind::layerReverb, layer,
+                      liveSlot, live != nullptr ? live->getLayerReverbSendParam (layer) : nullptr);
+
+    for (int layer = 0; layer < TimbresProcessor::numLayers; ++layer)
+        addParameter (juce::String::fromUTF8 ("Compress\xc3\xa3o  Canal ")
+                        + juce::String (layer + 1),
+                      "Efeitos", MidiMappingPanel::TargetKind::layerComp, layer,
+                      liveSlot, live != nullptr ? live->getLayerCompParam (layer) : nullptr);
+
+    // A mesa da referencia expoe muito mais que os tres controles historicos.
+    // Todos abaixo sao os parametros reais do Church Live; entram no mesmo
+    // mecanismo de pickup, conflito, importacao e persistencia dos faders.
+    for (int layer = 0; layer < TimbresProcessor::numLayers; ++layer)
+    {
+        const auto suffix = "  Canal " + juce::String (layer + 1);
+        // Com o motor ausente todos os 12 controles viram placeholder com
+        // parameterId vazio; o ordinal impede a selecao restaurada de saltar
+        // para o primeiro controle do canal.
+        int liveControlOrdinal = 0;
+        auto addLive = [&] (const juce::String& name, const juce::String& category,
+                            juce::AudioProcessorParameter* parameter)
+        {
+            addParameter (name + suffix, category,
+                          MidiMappingPanel::TargetKind::processorParameter,
+                          layer, liveSlot, parameter, liveControlOrdinal++);
+        };
+
+        addLive ("Liga / desliga", "Mixer", live != nullptr ? live->getLayerOnParam (layer) : nullptr);
+        addLive ("Mute", "Mixer", live != nullptr ? live->getLayerMuteParam (layer) : nullptr);
+        addLive ("Solo", "Mixer", live != nullptr ? live->getLayerSoloParam (layer) : nullptr);
+        addLive ("Oitava", "Instrumentos", live != nullptr ? live->getLayerOctaveParam (layer) : nullptr);
+        addLive ("Transpose", "Instrumentos", live != nullptr ? live->getLayerTransposeParam (layer) : nullptr);
+        addLive ("Attack", "Instrumentos", live != nullptr ? live->getLayerAttackParam (layer) : nullptr);
+        addLive ("Release", "Instrumentos", live != nullptr ? live->getLayerReleaseParam (layer) : nullptr);
+        addLive ("EQ grave", "Efeitos", live != nullptr ? live->getLayerLowEqParam (layer) : nullptr);
+        addLive ("EQ medio", "Efeitos", live != nullptr ? live->getLayerMidEqParam (layer) : nullptr);
+        addLive ("EQ agudo", "Efeitos", live != nullptr ? live->getLayerHighEqParam (layer) : nullptr);
+        addLive ("Rotary modo", "Efeitos", live != nullptr ? live->getLayerRotaryModeParam (layer) : nullptr);
+        addLive ("Rotary intensidade", "Efeitos", live != nullptr ? live->getLayerRotaryAmountParam (layer) : nullptr);
+    }
+
+    if (live != nullptr)
+    {
+        addParameter ("Transpose global", "Instrumentos",
+                      MidiMappingPanel::TargetKind::processorParameter, -1,
+                      liveSlot, live->getTransposeGeralParam());
+        addParameter ("Retorno de reverb", "Efeitos",
+                      MidiMappingPanel::TargetKind::processorParameter, -1,
+                      liveSlot, live->getRetornoDeReverbParam());
+    }
+
+    auto* masterParameter = masterProcessor != nullptr
+                              && ! masterProcessor->getParameters().isEmpty()
+                            ? masterProcessor->getParameters()[0] : nullptr;
+    addParameter ("Volume Master", "Mixer",
+                  MidiMappingPanel::TargetKind::masterVolume, -1, -1, masterParameter);
+
+    if (padSynthProcessor != nullptr)
+        for (auto* parameter : padSynthProcessor->getParameters())
+        {
+            if (parameter == nullptr)
+                continue;
+
+            const auto id = ChurchDAWMidiMapping::stableParameterId (parameter);
+            // O Pad Synth nao faz mais parte da aba PAD. Somente os quatro
+            // macros que continuam visiveis na sidebar e em Performance entram
+            // na central de mapeamento.
+            if (! id.startsWithIgnoreCase ("padMacro"))
+                continue;
+
+            juce::String category = "Pad / Trigger";
+            if (id.startsWithIgnoreCase ("padMacro")
+                 || id.startsWithIgnoreCase ("padXY"))
+                category = "Macros";
+            else if (id.containsIgnoreCase ("Chorus")
+                      || id.containsIgnoreCase ("Reverb")
+                      || id.containsIgnoreCase ("Delay")
+                      || id.containsIgnoreCase ("Tone"))
+                category = "Efeitos";
+            else if (id.startsWithIgnoreCase ("padL"))
+                category = "Instrumentos";
+
+            addParameter (parameter->getName (80), category,
+                          MidiMappingPanel::TargetKind::processorParameter,
+                          parameter->getParameterIndex(), padSynthSlotId,
+                          parameter);
+        }
+
+    auto addAction = [&commands, &fillActionMapping]
+        (juce::String name, juce::String category,
+         MidiMappingPanel::TargetKind kind, int argument, NoteAction action)
+    {
+        MidiMappingPanel::Command command;
+        command.name = std::move (name);
+        command.category = std::move (category);
+        command.target = kind;
+        command.argument = argument;
+        fillActionMapping (command, action);
+        commands.add (std::move (command));
+    };
+
+    addAction ("PANIC", "Transporte", MidiMappingPanel::TargetKind::panic, -1,
+               { NoteActionKind::panic, -1 });
+    addAction (juce::String::fromUTF8 ("Pr\xc3\xb3xima cena"),
+               juce::String::fromUTF8 ("Live / Sess\xc3\xa3o"),
+               MidiMappingPanel::TargetKind::nextScene, -1,
+               { NoteActionKind::nextScene, -1 });
+    addAction ("Cena anterior", juce::String::fromUTF8 ("Live / Sess\xc3\xa3o"),
+               MidiMappingPanel::TargetKind::previousScene, -1,
+               { NoteActionKind::previousScene, -1 });
+
+    for (int scene = 0; scene < ChurchDAWLive::numeroDeCenas; ++scene)
+    {
+        auto sceneName = cenas[scene].nome.trim();
+        if (sceneName.isEmpty())
+            sceneName = "Cena " + juce::String (scene + 1);
+
+        addAction ("Carregar  " + sceneName,
+                   juce::String::fromUTF8 ("Live / Sess\xc3\xa3o"),
+                   MidiMappingPanel::TargetKind::scene, scene,
+                   { NoteActionKind::cena, scene });
+    }
+
+    addAction ("Tap tempo", "Transporte",
+               MidiMappingPanel::TargetKind::tapTempo, -1,
+               { NoteActionKind::tapTempo, -1 });
+    addAction ("Alternar sustain", "Transporte",
+               MidiMappingPanel::TargetKind::sustainToggle, -1,
+               { NoteActionKind::sustainToggle, -1 });
+
+    // Every persisted parameter mapping must be manageable. Built-in rows
+    // consume their exact map above; active hosted plug-ins/inserts and every
+    // pending/unresolved map receive a row here instead of disappearing.
+    std::vector<std::pair<MidiControlKey, CCTarget>> persistedParameterMappings;
+    {
+        const juce::ScopedLock sl (mapLock);
+        persistedParameterMappings.reserve (ccMappings.size());
+        for (const auto& mapping : ccMappings)
+            persistedParameterMappings.push_back (mapping);
+    }
+
+    for (const auto& mapping : persistedParameterMappings)
+    {
+        const auto& key = mapping.first;
+        const auto& target = mapping.second;
+        const bool consumed = std::any_of (
+            consumedParameterMappings.begin(),
+            consumedParameterMappings.end(),
+            [&mapping] (const auto& candidate)
+            {
+                return ChurchDAWMidiMapping::controllerKeysExactlyEqual (
+                           candidate.first, mapping.first)
+                    && ChurchDAWMidiMapping::persistedTargetsExactlyEqual (
+                           candidate.second, mapping.second);
+            });
+
+        juce::String currentIdentity;
+        auto* processor = resolveCurrentMidiMappingProcessor (
+            target.slot, target.insert, currentIdentity);
+        const auto identityState =
+            ChurchDAWMidiMapping::MidiTargetIdentityPolicy::classifyProcessor (
+                target.pluginId, currentIdentity, processor != nullptr);
+
+        int resolvedIndex = -1;
+        if (processor != nullptr)
+            resolvedIndex =
+                ChurchDAWMidiMapping::resolveParameterIndexForTargetLocation (
+                    processor->getParameters(), target.paramId,
+                    target.paramName,
+                    ChurchDAWMidiMapping::classifyMidiTargetLocation (
+                        target.slot, target.insert, numSlots,
+                        padSlotId, padSynthSlotId));
+        const bool parameterResolved = processor != nullptr
+            && juce::isPositiveAndBelow (
+                resolvedIndex, processor->getParameters().size());
+        const auto rowKind =
+            ChurchDAWMidiMapping::classifyPersistedTargetPanelRow (
+                consumed, identityState, parameterResolved);
+        if (rowKind
+              == ChurchDAWMidiMapping::PersistedTargetPanelRow::consumedByBuiltInRow)
+            continue;
+
+        MidiMappingPanel::Command command;
+        juce::String currentParameterName = target.paramName;
+        juce::String currentParameterId = target.paramId;
+        if (parameterResolved)
+        {
+            auto* parameter = processor->getParameters()[resolvedIndex];
+            currentParameterName = parameter->getName (32);
+            currentParameterId = ChurchDAWMidiMapping::stableParameterId (
+                parameter);
+        }
+
+        if (rowKind == ChurchDAWMidiMapping::PersistedTargetPanelRow::active)
+        {
+            command.name = (processor != nullptr ? processor->getName()
+                                                  : juce::String ("Plugin"))
+                         + "  -  " + currentParameterName;
+            command.category = target.insert >= 0
+                ? "Plugins / Inserts"
+                : target.pluginId.startsWith ("hosted:v2:")
+                    ? "Plugins externos" : "Outros controles";
+        }
+        else if (rowKind
+                  == ChurchDAWMidiMapping::PersistedTargetPanelRow::unavailable)
+        {
+            command.name = "Mapa pendente (motor indisponivel)  - "
+                         + target.paramName;
+            command.category = "Mapas pendentes";
+        }
+        else if (rowKind
+                  == ChurchDAWMidiMapping::PersistedTargetPanelRow::unresolvedParameter)
+        {
+            command.name = "Mapa pendente (parametro nao encontrado)  - "
+                         + target.paramName;
+            command.category = "Mapas pendentes";
+        }
+        else
+        {
+            command.name = target.pluginId.isEmpty()
+                ? "Revalidar mapa antigo  - " + target.paramName
+                : "Revalidar identidade  - " + target.paramName;
+            command.category = "Revalidar mapas";
+        }
+        command.target = MidiMappingPanel::TargetKind::processorParameter;
+        command.parameterSlot = target.slot;
+        command.parameterIndex = parameterResolved ? resolvedIndex
+                                                   : target.param;
+        command.parameterInsert = target.insert;
+        command.parameterId = currentParameterId;
+        command.parameterName = currentParameterName;
+        command.expectedCurrentPluginId = currentIdentity;
+        command.expectedParameterEntryPresent = true;
+        command.persistedParameterSlot = target.slot;
+        command.persistedParameterIndex = target.param;
+        command.persistedParameterInsert = target.insert;
+        command.persistedParameterId = target.paramId;
+        command.persistedParameterName = target.paramName;
+        command.persistedPluginId = target.pluginId;
+        command.mappedSourceId = key.sourceId;
+        command.mappedSourceName = key.sourceName;
+        command.mappedChannel = key.channel;
+        command.mappedNumber = key.cc;
+        command.mappedWasNote = key.isNote;
+        command.type = key.isNote ? "Nota" : "CC";
+        command.midiChannel = key.channel;
+        command.number = key.cc;
+        command.device = describeDevice (key);
+        command.control = (key.isNote ? "Nota " : "CC ")
+                            + juce::String (key.cc);
+        command.mapped = true;
+        command.needsRelink = rowKind
+                == ChurchDAWMidiMapping::PersistedTargetPanelRow::needsRelink
+            && parameterResolved
+            && currentIdentity.isNotEmpty();
+        commands.add (std::move (command));
+    }
+
+    const auto& devices = midiInputsCached (juce::Time::getMillisecondCounter());
+    juce::String connectedName;
+    for (const auto& device : devices)
+        if (deviceManager.isMidiInputDeviceEnabled (device.identifier))
+        {
+            connectedName = prettifyDeviceName (device.name);
+            break;
+        }
+
+    midiMappingPanel.setDevice (connectedName, connectedName.isNotEmpty());
+    midiMappingPanel.setMappingCount (getMidiMappingCount());
+    midiMappingPanel.setCommands (std::move (commands));
+}
+
+bool MainComponent::validateCurrentParameterCommand (
+    const MidiMappingPanel::Command& command,
+    const CCTarget& currentTarget,
+    juce::String& failureReason) const
+{
+    ChurchDAWMidiMapping::ParameterCommandSnapshot expected;
+    expected.selectedTarget = {
+        command.parameterSlot,
+        command.parameterIndex,
+        command.parameterInsert,
+        command.parameterName,
+        command.parameterId,
+        command.expectedCurrentPluginId
+    };
+    expected.expectedCurrentPluginId = command.expectedCurrentPluginId;
+    expected.expectedEntryPresent =
+        command.expectedParameterEntryPresent;
+    expected.persistedControl = {
+        command.mappedSourceId,
+        command.mappedChannel,
+        command.mappedNumber,
+        command.mappedWasNote,
+        command.mappedSourceName
+    };
+    expected.persistedTarget = {
+        command.persistedParameterSlot,
+        command.persistedParameterIndex,
+        command.persistedParameterInsert,
+        command.persistedParameterName,
+        command.persistedParameterId,
+        command.persistedPluginId
+    };
+
+    ChurchDAWMidiMapping::ParameterCommandObservation current;
+    juce::String observedPluginId;
+    auto* const observedProcessor =
+        resolveCurrentMidiMappingProcessor (
+            currentTarget.slot, currentTarget.insert,
+            observedPluginId);
+    current.currentPluginId = observedPluginId;
+    current.selectedTarget = currentTarget;
+    current.selectedTarget.pluginId = observedPluginId;
+
+    if (observedProcessor != nullptr && observedPluginId.isNotEmpty())
+    {
+        if (currentTarget.slot == -1 && currentTarget.insert < 0)
+        {
+            current.selectedTarget = {
+                -1, -1, -1, "Master", "master", observedPluginId
+            };
+        }
+        else
+        {
+            const auto& parameters = observedProcessor->getParameters();
+            const auto observedIndex =
+                ChurchDAWMidiMapping::resolveParameterIndexForTargetLocation (
+                    parameters, currentTarget.paramId,
+                    currentTarget.paramName,
+                    ChurchDAWMidiMapping::classifyMidiTargetLocation (
+                        currentTarget.slot, currentTarget.insert,
+                        numSlots, padSlotId, padSynthSlotId));
+            if (juce::isPositiveAndBelow (
+                    observedIndex, parameters.size())
+                 && parameters[observedIndex] != nullptr)
+            {
+                current.selectedTarget = {
+                    currentTarget.slot,
+                    observedIndex,
+                    currentTarget.insert,
+                    parameters[observedIndex]->getName (32),
+                    ChurchDAWMidiMapping::stableParameterId (
+                        parameters[observedIndex]),
+                    observedPluginId
+                };
+            }
+            else
+            {
+                // Preserve location/plugin for diagnostics while making the
+                // selected target comparison fail closed.
+                current.selectedTarget.param = -1;
+                current.selectedTarget.paramName.clear();
+                current.selectedTarget.paramId.clear();
+            }
+        }
+    }
+
+    {
+        const juce::ScopedLock sl (mapLock);
+        if (expected.expectedEntryPresent)
+        {
+            const auto existing = ccMappings.find (
+                expected.persistedControl);
+            if (existing != ccMappings.end()
+                 && ChurchDAWMidiMapping::controllerKeysExactlyEqual (
+                        existing->first, expected.persistedControl))
+            {
+                current.entryPresent = true;
+                current.persistedControl = existing->first;
+                current.persistedTarget = existing->second;
+            }
+        }
+        else
+        {
+            const auto existing = std::find_if (
+                ccMappings.begin(), ccMappings.end(),
+                [&current] (const auto& mapping)
+                {
+                    return ChurchDAWMidiMapping::MidiTargetIdentityPolicy::
+                        sameTarget (
+                            mapping.second, current.selectedTarget);
+                });
+            if (existing != ccMappings.end())
+            {
+                current.entryPresent = true;
+                current.persistedControl = existing->first;
+                current.persistedTarget = existing->second;
+            }
+        }
+    }
+
+    const auto result =
+        ChurchDAWMidiMapping::validateParameterCommandSnapshot (
+            expected, current);
+    switch (result)
+    {
+        case ChurchDAWMidiMapping::ParameterCommandValidation::valid:
+            failureReason.clear();
+            return true;
+        case ChurchDAWMidiMapping::ParameterCommandValidation::
+                currentProcessorChanged:
+        case ChurchDAWMidiMapping::ParameterCommandValidation::
+                selectedTargetChanged:
+            failureReason =
+                "O plugin ou parametro mudou desde a selecao";
+            break;
+        case ChurchDAWMidiMapping::ParameterCommandValidation::
+                entryPresenceChanged:
+        case ChurchDAWMidiMapping::ParameterCommandValidation::
+                persistedEntryChanged:
+            failureReason =
+                "O mapa mudou desde a selecao";
+            break;
+    }
+    return false;
+}
+
+bool MainComponent::armMidiLearnParameter (juce::AudioProcessor* processor,
+                                           int parameterIndex,
+                                           juce::Component* visualTarget,
+                                           const juce::String& customName)
+{
+    if (processor == nullptr || ! midiLearnActive.load())
+        return false;
+
+    // Tags are only lookup keys. Resolve ownership before dereferencing a
+    // processor: a plugin may have been replaced since its UI was created.
+    int slot = -2;
+    int insert = -1;
+    juce::String processorIdentity;
+
+    if (processor == masterProcessor)
+    {
+        slot = -1;
+        processorIdentity = ChurchDAWMidiMapping::masterProcessorIdentity();
+    }
+    else if (processor == padProcessor)
+    {
+        slot = padSlotId;
+        processorIdentity = ChurchDAWMidiMapping::padProcessorIdentity();
+    }
+    else if (processor == padSynthProcessor)
+    {
+        slot = padSynthSlotId;
+        processorIdentity = ChurchDAWMidiMapping::padSynthProcessorIdentity();
+    }
+    else
+    {
+        for (int s = 0; s < numSlots; ++s)
+        {
+            if (slots[s].proc.load (std::memory_order_acquire) == processor)
+            {
+                slot = s;
+                processorIdentity = cachedProcessorMappingIdentity (s, -1, processor);
+                break;
+            }
+        }
+
+        if (slot == -2)
+        {
+            if (auto* live = getChurchLive())
+            {
+                if (processor == live)
+                {
+                    slot = 0;
+                    processorIdentity = cachedProcessorMappingIdentity (0, -1, live);
+                }
+                else
+                {
+                    for (int i = 0; i < 4; ++i)
+                    {
+                        juce::AudioProcessor* insertProc = nullptr;
+                        juce::String insertId;
+                        if (live->getInsertMappingIdentitySnapshot (i, insertProc, insertId)
+                             && insertProc == processor)
+                        {
+                            slot = 0;
+                            insert = i;
+                            processorIdentity = insertId;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (slot == -2)
+        return false;
+
+    const auto& parameters = processor->getParameters();
+    if (! juce::isPositiveAndBelow (parameterIndex, parameters.size())
+         || parameters[parameterIndex] == nullptr)
+        return false;
+    auto* param = parameters[parameterIndex];
+
+    const bool isMaster = (slot == -1);
+    juce::String name = customName.isNotEmpty() ? customName : param->getName (32);
+    juce::String id = ChurchDAWMidiMapping::stableParameterId (param);
+    if (isMaster)
+    {
+        name = "Master Volume";
+        id = "master";
+    }
+
+    const bool uniqueIdentity = isMaster
+        || ChurchDAWMidiMapping::parameterIdentityIsUnique (parameters, parameterIndex);
+
+    {
+        const juce::ScopedLock sl (mapLock);
+        lastTouchedParamName = name;
+        lastTouchedParamId = id;
+        lastTouchedPluginId = processorIdentity;
+        lastTouchedSlot.store (slot, std::memory_order_relaxed);
+        lastTouchedParam.store (isMaster ? -1 : parameterIndex, std::memory_order_relaxed);
+        lastTouchedInsert.store (insert, std::memory_order_relaxed);
+        lastTouchedTopologyGeneration.store (
+            parameterTargetGeneration.load (std::memory_order_acquire),
+            std::memory_order_relaxed);
+        lastTouchedParameterIdentityUnique.store (
+            uniqueIdentity, std::memory_order_relaxed);
+        pendingNoteAction = {};
+        parameterLearnSelectionGeneration.fetch_add (1, std::memory_order_release);
+    }
+
+    midiLearnPanel.showMoveHardware (name);
+    midiLearnConsoleOverlay.setTarget (visualTarget, name);
+
+    juce::Logger::writeToLog ("MIDI MAP: controle selecionado: " + name
+                              + " (slot=" + juce::String (slot)
+                              + " param=" + juce::String (parameterIndex) + ")");
+    return true;
+}
+
+bool MainComponent::armMidiLearnAction (int actionKind,
+                                        int arg,
+                                        const juce::String& displayName,
+                                        juce::Component* visualTarget,
+                                        juce::Rectangle<int> visualBounds)
+{
+    if (actionKind <= 0)
+        return false;
+
+    {
+        const juce::ScopedLock sl (mapLock);
+        lastTouchedSlot.store (-2, std::memory_order_relaxed);
+        lastTouchedParam.store (-1, std::memory_order_relaxed);
+        lastTouchedInsert.store (-1, std::memory_order_relaxed);
+        lastTouchedParamName.clear();
+        lastTouchedParamId.clear();
+        lastTouchedPluginId.clear();
+        lastTouchedParameterIdentityUnique.store (false, std::memory_order_relaxed);
+        pendingNoteAction = { (NoteActionKind) actionKind, arg };
+        parameterLearnSelectionGeneration.fetch_add (1, std::memory_order_release);
+    }
+
+    juce::String desc = displayName;
+    if (desc.isEmpty())
+    {
+        switch ((NoteActionKind) actionKind)
+        {
+            case NoteActionKind::panic: desc = "Panic"; break;
+            case NoteActionKind::sustainToggle: desc = "Sustain"; break;
+            case NoteActionKind::padOff: desc = "Pad Parar"; break;
+            case NoteActionKind::cena: desc = "Cena " + juce::String (arg + 1); break;
+            case NoteActionKind::padKey: desc = "Pad " + juce::String (PadPanel::noteName (arg)); break;
+            case NoteActionKind::nextScene: desc = "Próxima Cena"; break;
+            case NoteActionKind::previousScene: desc = "Cena Anterior"; break;
+            case NoteActionKind::tapTempo: desc = "Tap Tempo"; break;
+            default: desc = "Ação"; break;
+        }
+    }
+
+    midiLearnPanel.showPlayNote (desc);
+    midiLearnConsoleOverlay.setTarget (visualTarget, desc, visualBounds);
+
+    juce::Logger::writeToLog ("MIDI MAP: ação selecionada: " + desc
+                              + " (kind=" + juce::String (actionKind)
+                              + " arg=" + juce::String (arg) + ")");
+    return true;
+}
+
+void MainComponent::armMidiMappingCommand (const MidiMappingPanel::Command& command)
+{
+    auto armParameter = [this, &command]
+        (int slot, int insert, juce::AudioProcessor* processor,
+         juce::AudioProcessorParameter* parameter)
+    {
+        if (processor == nullptr || parameter == nullptr)
+        {
+            midiMappingPanel.setStatus (
+                "Este alvo fica disponivel quando o motor correspondente estiver carregado",
+                MidiMappingPanel::Status::warning);
+            return false;
+        }
+
+        const int index = processor->getParameters().indexOf (parameter);
+        if (index < 0)
+            return false;
+
+        const bool uniqueIdentity =
+            ChurchDAWMidiMapping::parameterIdentityIsUnique (
+                processor->getParameters(), index);
+        juce::String processorIdentity;
+        auto* const currentProcessor = resolveCurrentMidiMappingProcessor (
+            slot, insert, processorIdentity);
+        if (processorIdentity.isEmpty() || currentProcessor != processor)
+        {
+            midiMappingPanel.setStatus (
+                "A identidade deste motor ainda nao esta pronta; tente novamente",
+                MidiMappingPanel::Status::warning);
+            return false;
+        }
+
+        CCTarget currentTarget {
+            slot,
+            slot == -1 ? -1 : index,
+            insert,
+            slot == -1 ? juce::String ("Master")
+                       : parameter->getName (32),
+            slot == -1 ? juce::String ("master")
+                       : ChurchDAWMidiMapping::stableParameterId (parameter),
+            processorIdentity
+        };
+        juce::String staleReason;
+        if (! validateCurrentParameterCommand (
+                command, currentTarget, staleReason))
+        {
+            refreshMidiMappingPanel();
+            midiMappingPanel.setStatus (
+                staleReason + "; escolha o alvo novamente",
+                MidiMappingPanel::Status::warning);
+            return false;
+        }
+
+        {
+            const juce::ScopedLock sl (mapLock);
+            lastTouchedParamName = parameter->getName (32);
+            lastTouchedParamId = ChurchDAWMidiMapping::stableParameterId (parameter);
+            lastTouchedPluginId = processorIdentity;
+            lastTouchedSlot.store (slot, std::memory_order_relaxed);
+            lastTouchedParam.store (
+                slot == -1 ? -1 : index, std::memory_order_relaxed);
+            lastTouchedInsert.store (insert, std::memory_order_relaxed);
+            lastTouchedTopologyGeneration.store (
+                parameterTargetGeneration.load (
+                    std::memory_order_acquire),
+                std::memory_order_relaxed);
+            lastTouchedParameterIdentityUnique.store (
+                uniqueIdentity, std::memory_order_relaxed);
+            pendingNoteAction = {};
+        }
+        midiMappingPanel.setStatus (
+            midiLearnActive.load()
+                ? "Mova agora o controle MIDI para  " + command.name
+                : "Alvo selecionado. Ative o modo de aprendizado para mapear.",
+            midiLearnActive.load() ? MidiMappingPanel::Status::learning
+                                   : MidiMappingPanel::Status::neutral);
+        return true;
+    };
+
+    auto* live = getChurchLive();
+    int liveSlot = -1;
+    if (live != nullptr)
+        for (int slot = 0; slot < numSlots; ++slot)
+            if (slots[slot].proc.load() == live)
+            {
+                liveSlot = slot;
+                break;
+            }
+
+    switch (command.target)
+    {
+        case MidiMappingPanel::TargetKind::layerVolume:
+            (void) armParameter (liveSlot, -1, live,
+                                 live != nullptr ? live->getLayerVolParam (command.argument) : nullptr);
+            return;
+        case MidiMappingPanel::TargetKind::layerReverb:
+            (void) armParameter (liveSlot, -1, live,
+                                 live != nullptr ? live->getLayerReverbSendParam (command.argument) : nullptr);
+            return;
+        case MidiMappingPanel::TargetKind::layerComp:
+            (void) armParameter (liveSlot, -1, live,
+                                 live != nullptr ? live->getLayerCompParam (command.argument) : nullptr);
+            return;
+        case MidiMappingPanel::TargetKind::padCutoff:
+        case MidiMappingPanel::TargetKind::padVolume:
+            if (padProcessor != nullptr)
+                for (auto* parameter : padProcessor->getParameters())
+                {
+                    const auto id = ChurchDAWMidiMapping::stableParameterId (parameter);
+                    const bool wanted = command.target == MidiMappingPanel::TargetKind::padCutoff
+                                          ? id == "padCutoff" : id == "padVolume";
+                    if (wanted)
+                    {
+                        (void) armParameter (
+                            padSlotId, -1, padProcessor, parameter);
+                        return;
+                    }
+                }
+            break;
+        case MidiMappingPanel::TargetKind::masterVolume:
+            if (masterProcessor != nullptr && ! masterProcessor->getParameters().isEmpty())
+                (void) armParameter (
+                    -1, -1, masterProcessor,
+                    masterProcessor->getParameters()[0]);
+            return;
+        case MidiMappingPanel::TargetKind::processorParameter:
+        {
+            juce::String currentIdentity;
+            auto* processor = resolveCurrentMidiMappingProcessor (
+                command.parameterSlot, command.parameterInsert,
+                currentIdentity);
+
+            if (processor != nullptr
+                 && (command.parameterId.isNotEmpty()
+                      || command.parameterName.isNotEmpty()))
+            {
+                const auto& parameters = processor->getParameters();
+                const int index =
+                    ChurchDAWMidiMapping::resolveParameterIndexForTargetLocation (
+                        parameters, command.parameterId,
+                        command.parameterName,
+                        ChurchDAWMidiMapping::classifyMidiTargetLocation (
+                            command.parameterSlot, command.parameterInsert,
+                            numSlots, padSlotId, padSynthSlotId));
+                if (juce::isPositiveAndBelow (index, parameters.size()))
+                {
+                    (void) armParameter (
+                        command.parameterSlot, command.parameterInsert,
+                        processor, parameters[index]);
+                    return;
+                }
+            }
+            break;
+        }
+        default:
+            break;
+    }
+
+    NoteAction action;
+    switch (command.target)
+    {
+        case MidiMappingPanel::TargetKind::panic:         action = { NoteActionKind::panic, -1 }; break;
+        case MidiMappingPanel::TargetKind::nextScene:     action = { NoteActionKind::nextScene, -1 }; break;
+        case MidiMappingPanel::TargetKind::previousScene: action = { NoteActionKind::previousScene, -1 }; break;
+        case MidiMappingPanel::TargetKind::scene:          action = { NoteActionKind::cena, command.argument }; break;
+        case MidiMappingPanel::TargetKind::padProgram:     action = { NoteActionKind::padSynthProgram, command.argument }; break;
+        case MidiMappingPanel::TargetKind::tapTempo:       action = { NoteActionKind::tapTempo, -1 }; break;
+        case MidiMappingPanel::TargetKind::sustainToggle:  action = { NoteActionKind::sustainToggle, -1 }; break;
+        case MidiMappingPanel::TargetKind::padEngineToggle: action = { NoteActionKind::padSynthEngineToggle, -1 }; break;
+        default: break;
+    }
+
+    if (action.kind == NoteActionKind::none)
+    {
+        midiMappingPanel.setStatus ("Alvo indisponivel", MidiMappingPanel::Status::warning);
+        return;
+    }
+
+    {
+        const juce::ScopedLock sl (mapLock);
+        lastTouchedSlot.store (-2, std::memory_order_relaxed);
+        lastTouchedParam.store (-1, std::memory_order_relaxed);
+        lastTouchedInsert.store (-1, std::memory_order_relaxed);
+        lastTouchedParamName.clear();
+        lastTouchedParamId.clear();
+        lastTouchedPluginId.clear();
+        lastTouchedParameterIdentityUnique.store (
+            false, std::memory_order_relaxed);
+        pendingNoteAction = action;
+    }
+
+    midiMappingPanel.setStatus (
+        midiLearnActive.load()
+            ? "Aperte uma tecla, pad ou pedal para  " + command.name
+            : "Alvo selecionado. Ative o modo de aprendizado para mapear.",
+        midiLearnActive.load() ? MidiMappingPanel::Status::learning
+                               : MidiMappingPanel::Status::neutral);
+}
+
+void MainComponent::saveMidiMappingCommand (const MidiMappingPanel::Command& command)
+{
+    const int channel = juce::jlimit (1, 16, command.midiChannel);
+    const int number = juce::jlimit (0, 127, command.number);
+    const bool wantsNote = command.type == "Nota";
+
+    const auto& devices = midiInputsCached (juce::Time::getMillisecondCounter());
+    juce::MidiDeviceInfo selectedDevice;
+    bool foundDevice = false;
+
+    for (const auto& device : devices)
+        if (device.name == command.device
+             || prettifyDeviceName (device.name) == command.device)
+        {
+            selectedDevice = device;
+            foundDevice = true;
+            break;
+        }
+
+    if (! foundDevice)
+        for (const auto& device : devices)
+            if (deviceManager.isMidiInputDeviceEnabled (device.identifier))
+            {
+                selectedDevice = device;
+                foundDevice = true;
+                break;
+            }
+
+    if (! foundDevice)
+    {
+        midiMappingPanel.setStatus (
+            "Conecte um controlador MIDI antes de salvar a atribuicao",
+            MidiMappingPanel::Status::warning);
+        return;
+    }
+
+    const auto sourceId = ChurchDAWMidiMapping::normalizeMidiSourceId (
+        selectedDevice.identifier);
+    const auto sourceName = selectedDevice.name;
+    const MidiControlKey actionKey { sourceId, channel, number, false, sourceName };
+    const MidiControlKey parameterKey { sourceId, channel, number, wantsNote, sourceName };
+    const MidiControlKey originallyMappedKey {
+        command.mappedSourceId, command.mappedChannel,
+        command.mappedNumber, command.mappedWasNote,
+        command.mappedSourceName
+    };
+    const CCTarget persistedCommandTarget {
+        command.persistedParameterSlot,
+        command.persistedParameterIndex,
+        command.persistedParameterInsert,
+        command.persistedParameterName,
+        command.persistedParameterId,
+        command.persistedPluginId
+    };
+    const bool explicitRelinkRequest = command.needsRelink
+        && ChurchDAWMidiMapping::samePhysicalMidiControl (
+            parameterKey, originallyMappedKey, midiSourcesCached);
+    if (command.needsRelink && ! explicitRelinkRequest)
+    {
+        midiMappingPanel.setStatus (
+            "Para revalidar, mantenha o mesmo dispositivo, canal e controle fisico",
+            MidiMappingPanel::Status::warning);
+        return;
+    }
+
+    auto* live = getChurchLive();
+    int liveSlot = -1;
+    if (live != nullptr)
+        for (int slot = 0; slot < numSlots; ++slot)
+            if (slots[slot].proc.load() == live)
+            {
+                liveSlot = slot;
+                break;
+            }
+
+    CCTarget parameterTarget;
+    bool hasParameterTarget = false;
+    bool ambiguousParameterIdentity = false;
+
+    auto resolveParameter = [this, &parameterTarget, &hasParameterTarget,
+                             &ambiguousParameterIdentity]
+        (int slot, int insert, juce::AudioProcessor* processor,
+         juce::AudioProcessorParameter* parameter, bool master)
+    {
+        if (processor == nullptr || parameter == nullptr)
+            return;
+
+        const int index = processor->getParameters().indexOf (parameter);
+        if (index < 0)
+            return;
+        if (! master
+             && ! ChurchDAWMidiMapping::parameterIdentityIsUnique (
+                    processor->getParameters(), index))
+        {
+            ambiguousParameterIdentity = true;
+            return;
+        }
+
+        juce::String processorIdentity;
+        auto* const currentProcessor = resolveCurrentMidiMappingProcessor (
+            slot, insert, processorIdentity);
+        if (processorIdentity.isEmpty() || currentProcessor != processor)
+            return;
+
+        parameterTarget = { slot, master ? -1 : index, insert,
+                            master ? juce::String ("Master") : parameter->getName (32),
+                            master ? juce::String ("master")
+                                   : ChurchDAWMidiMapping::stableParameterId (parameter),
+                            processorIdentity };
+        hasParameterTarget = true;
+    };
+
+    switch (command.target)
+    {
+        case MidiMappingPanel::TargetKind::layerVolume:
+            resolveParameter (liveSlot, -1, live,
+                              live != nullptr ? live->getLayerVolParam (command.argument) : nullptr,
+                              false);
+            break;
+        case MidiMappingPanel::TargetKind::layerReverb:
+            resolveParameter (liveSlot, -1, live,
+                              live != nullptr ? live->getLayerReverbSendParam (command.argument) : nullptr,
+                              false);
+            break;
+        case MidiMappingPanel::TargetKind::layerComp:
+            resolveParameter (liveSlot, -1, live,
+                              live != nullptr ? live->getLayerCompParam (command.argument) : nullptr,
+                              false);
+            break;
+        case MidiMappingPanel::TargetKind::padCutoff:
+        case MidiMappingPanel::TargetKind::padVolume:
+            if (padProcessor != nullptr)
+                for (auto* parameter : padProcessor->getParameters())
+                {
+                    const auto id = ChurchDAWMidiMapping::stableParameterId (parameter);
+                    if ((command.target == MidiMappingPanel::TargetKind::padCutoff && id == "padCutoff")
+                         || (command.target == MidiMappingPanel::TargetKind::padVolume && id == "padVolume"))
+                        resolveParameter (
+                            padSlotId, -1, padProcessor, parameter, false);
+                }
+            break;
+        case MidiMappingPanel::TargetKind::masterVolume:
+            resolveParameter (-1, -1, masterProcessor,
+                              masterProcessor != nullptr
+                                && ! masterProcessor->getParameters().isEmpty()
+                                  ? masterProcessor->getParameters()[0] : nullptr,
+                              true);
+            break;
+        case MidiMappingPanel::TargetKind::processorParameter:
+        {
+            juce::String currentIdentity;
+            auto* processor = resolveCurrentMidiMappingProcessor (
+                command.parameterSlot, command.parameterInsert,
+                currentIdentity);
+
+            if (processor != nullptr
+                 && (command.parameterId.isNotEmpty()
+                      || command.parameterName.isNotEmpty()))
+            {
+                const auto& parameters = processor->getParameters();
+                const int index =
+                    ChurchDAWMidiMapping::resolveParameterIndexForTargetLocation (
+                        parameters, command.parameterId,
+                        command.parameterName,
+                        ChurchDAWMidiMapping::classifyMidiTargetLocation (
+                            command.parameterSlot, command.parameterInsert,
+                            numSlots, padSlotId, padSynthSlotId));
+                if (juce::isPositiveAndBelow (index, parameters.size()))
+                    resolveParameter (
+                        command.parameterSlot, command.parameterInsert,
+                        processor, parameters[index],
+                        command.parameterSlot == -1);
+            }
+            break;
+        }
+        default:
+            break;
+    }
+
+    NoteAction actionTarget;
+    if (! hasParameterTarget)
+        switch (command.target)
+        {
+            case MidiMappingPanel::TargetKind::panic:
+                actionTarget = { NoteActionKind::panic, -1 }; break;
+            case MidiMappingPanel::TargetKind::nextScene:
+                actionTarget = { NoteActionKind::nextScene, -1 }; break;
+            case MidiMappingPanel::TargetKind::previousScene:
+                actionTarget = { NoteActionKind::previousScene, -1 }; break;
+            case MidiMappingPanel::TargetKind::scene:
+                actionTarget = { NoteActionKind::cena, command.argument }; break;
+            case MidiMappingPanel::TargetKind::padProgram:
+                actionTarget = { NoteActionKind::padSynthProgram, command.argument }; break;
+            case MidiMappingPanel::TargetKind::tapTempo:
+                actionTarget = { NoteActionKind::tapTempo, -1 }; break;
+            case MidiMappingPanel::TargetKind::sustainToggle:
+                actionTarget = { NoteActionKind::sustainToggle, -1 }; break;
+            case MidiMappingPanel::TargetKind::padEngineToggle:
+                actionTarget = { NoteActionKind::padSynthEngineToggle, -1 }; break;
+            default:
+                break;
+        }
+
+    if (ambiguousParameterIdentity)
+    {
+        midiMappingPanel.setStatus (
+            "O plugin publicou um identificador de parametro duplicado",
+            MidiMappingPanel::Status::warning);
+        return;
+    }
+
+    if (! hasParameterTarget && actionTarget.kind == NoteActionKind::none)
+    {
+        midiMappingPanel.setStatus (
+            "O motor correspondente a este comando ainda nao esta carregado",
+            MidiMappingPanel::Status::warning);
+        return;
+    }
+
+    if (hasParameterTarget)
+    {
+        juce::String staleReason;
+        if (! validateCurrentParameterCommand (
+                command, parameterTarget, staleReason))
+        {
+            refreshMidiMappingPanel();
+            midiMappingPanel.setStatus (
+                staleReason + "; atualize o painel e tente novamente",
+                MidiMappingPanel::Status::warning);
+            return;
+        }
+    }
+
+    if (command.needsRelink)
+    {
+        const bool compatibleExplicitRelink = hasParameterTarget
+            && ChurchDAWMidiMapping::MidiTargetIdentityPolicy::
+                mayExplicitlyRelink (
+                    persistedCommandTarget, parameterTarget);
+        if (! compatibleExplicitRelink)
+        {
+            refreshMidiMappingPanel();
+            midiMappingPanel.setStatus (
+                "O parametro atual nao e compativel com o mapa pendente",
+                MidiMappingPanel::Status::warning);
+            return;
+        }
+    }
+
+    if (hasParameterTarget && ! wantsNote
+         && ! ChurchDAWMidiMapping::isMappableController (number))
+    {
+        midiMappingPanel.setStatus (
+            "Esse CC e reservado para pedais ou controle de sistema",
+            MidiMappingPanel::Status::error);
+        return;
+    }
+
+    if (! hasParameterTarget && ! wantsNote
+         && ! ChurchDAWMidiMapping::isMappableAction (number))
+    {
+        midiMappingPanel.setStatus (
+            "Esse CC e reservado pelo protocolo e nao pode ser usado como botao",
+            MidiMappingPanel::Status::error);
+        return;
+    }
+
+    const auto sameParameter = [&parameterTarget] (const CCTarget& value)
+    {
+        return ChurchDAWMidiMapping::MidiTargetIdentityPolicy::sameTarget (
+            value, parameterTarget);
+    };
+    const auto sameAction = [&actionTarget] (const NoteAction& value)
+    {
+        const bool argumentMatters = actionTarget.kind == NoteActionKind::cena
+                                  || actionTarget.kind == NoteActionKind::padKey
+                                  || actionTarget.kind == NoteActionKind::padSynthProgram;
+        return value.kind == actionTarget.kind
+                && (! argumentMatters || value.arg == actionTarget.arg);
+    };
+
+    bool conflict = false;
+    juce::String conflictName;
+    bool checkpointReady = false;
+    bool committed = false;
+    bool rollbackOk = true;
+    bool diskStillOwned = false;
+    bool savedCC = false;
+    bool savedNotes = false;
+    juce::uint64 ccEpoch = 0;
+    juce::uint64 noteEpoch = 0;
+    const auto ccFile = arquivoDoMapaDeCCs();
+    const auto noteFile = arquivoDoMapaDeNotas();
+    ChurchDAWMidiMapping::MidiMapPairRollback diskRollback (
+        ccFile, noteFile, *midiMapFileLock, &midiMapDiskRevision);
+    decltype (ccMappings) previousCC;
+    decltype (ccActionMappings) previousActions;
+    decltype (noteMappings) previousNotes;
+    const bool previousBlockedCC = bloquearSalvamentoCCVazio;
+    const bool previousBlockedNotes = bloquearSalvamentoNotasVazio;
+    const bool previousProfilesSuspended = automaticControllerProfilesSuspended;
+
+    beginMidiMapRoutingTransaction();
+    if (hasParameterTarget)
+    {
+        // Close the validation-to-mutation race: a MIDI callback admitted just
+        // before beginMidiMapRoutingTransaction() may have changed the map
+        // after the first UI-time check. The callback barrier is now drained,
+        // so this second snapshot remains stable through the mutation below.
+        juce::String staleReason;
+        if (! validateCurrentParameterCommand (
+                command, parameterTarget, staleReason))
+        {
+            finishMidiMapRoutingTransaction();
+            refreshMidiMappingPanel();
+            midiMappingPanel.setStatus (
+                staleReason + "; atualize o painel e tente novamente",
+                MidiMappingPanel::Status::warning);
+            return;
+        }
+    }
+
+    checkpointReady = diskRollback.capture ("before-command");
+    if (! checkpointReady)
+        rollbackOk = false;
+    if (checkpointReady)
+    {
+        const juce::ScopedLock sl (mapLock);
+        previousCC = ccMappings;
+        previousActions = ccActionMappings;
+        previousNotes = noteMappings;
+        const auto findPhysicalWhere =
+            [this] (const auto& mappings, const MidiControlKey& key,
+                    const auto& predicate)
+        {
+            return ChurchDAWMidiMapping::findPhysicalMidiControlIf (
+                mappings, key, midiSourcesCached, predicate);
+        };
+        const auto isExactRelinkEntry = [&] (const auto& entry)
+        {
+            return explicitRelinkRequest
+                && ChurchDAWMidiMapping::controllerKeysExactlyEqual (
+                    entry.first, originallyMappedKey)
+                && ChurchDAWMidiMapping::persistedTargetsExactlyEqual (
+                    entry.second, persistedCommandTarget);
+        };
+
+        if (hasParameterTarget)
+        {
+            const auto parameterConflict = findPhysicalWhere (
+                ccMappings, parameterKey, [&] (const auto& mapping)
+                {
+                    return ! sameParameter (mapping.second)
+                        && ! isExactRelinkEntry (mapping);
+                });
+            if (parameterConflict != ccMappings.end())
+            {
+                conflict = true;
+                conflictName = describeCCTarget (
+                    parameterConflict->second);
+            }
+
+            const auto actionConflict = wantsNote
+                ? findPhysicalWhere (
+                    noteMappings, actionKey,
+                    [] (const auto&) { return true; })
+                                                  : noteMappings.end();
+            if (actionConflict != noteMappings.end())
+            {
+                conflict = true;
+                conflictName = "outro comando por nota";
+            }
+            if (! wantsNote)
+                if (const auto it = findPhysicalWhere (
+                        ccActionMappings, actionKey,
+                        [] (const auto& mapping)
+                        {
+                            return mapping.second.acao.kind
+                                != NoteActionKind::none;
+                        });
+                    it != ccActionMappings.end()
+                )
+                {
+                    conflict = true;
+                    conflictName = "outro comando por CC";
+                }
+        }
+        else if (wantsNote)
+        {
+            if (const auto it = findPhysicalWhere (
+                    noteMappings, actionKey,
+                    [&] (const auto& mapping)
+                    {
+                        return ! sameAction (mapping.second);
+                    });
+                it != noteMappings.end())
+            {
+                conflict = true;
+                conflictName = "outro comando por nota";
+            }
+
+            const MidiControlKey noteParameterKey {
+                sourceId, channel, number, true, sourceName };
+            if (const auto it = findPhysicalWhere (
+                    ccMappings, noteParameterKey,
+                    [] (const auto&) { return true; });
+                it != ccMappings.end())
+            {
+                conflict = true;
+                conflictName = describeCCTarget (it->second);
+            }
+        }
+        else
+        {
+            if (const auto it = findPhysicalWhere (
+                    ccActionMappings, actionKey,
+                    [&] (const auto& mapping)
+                    {
+                        return ! sameAction (mapping.second.acao);
+                    });
+                it != ccActionMappings.end())
+            {
+                conflict = true;
+                conflictName = "outro comando por CC";
+            }
+            if (const auto it = findPhysicalWhere (
+                    ccMappings, parameterKey,
+                    [] (const auto&) { return true; });
+                it != ccMappings.end())
+            {
+                conflict = true;
+                conflictName = describeCCTarget (it->second);
+            }
+        }
+
+        if (! conflict && hasParameterTarget)
+        {
+            if (explicitRelinkRequest)
+            {
+                const auto exact = ccMappings.find (originallyMappedKey);
+                if (exact == ccMappings.end()
+                     || ! isExactRelinkEntry (*exact))
+                {
+                    conflict = true;
+                    conflictName = "mapa alterado enquanto era revalidado";
+                }
+                else
+                {
+                    // Remove the exact old source/key before inserting the
+                    // replugged key. Never leave legacy + new-source twins.
+                    ccMappings.erase (exact);
+                }
+            }
+            else
+            {
+                for (auto it = ccMappings.begin(); it != ccMappings.end();)
+                {
+                    if (sameParameter (it->second))
+                        it = ccMappings.erase (it);
+                    else
+                        ++it;
+                }
+            }
+            if (! conflict)
+                ccMappings[parameterKey] = parameterTarget;
+        }
+        else if (! conflict)
+        {
+            for (auto it = noteMappings.begin(); it != noteMappings.end();)
+                if (sameAction (it->second))
+                    it = noteMappings.erase (it);
+                else
+                    ++it;
+            for (auto it = ccActionMappings.begin(); it != ccActionMappings.end();)
+                if (sameAction (it->second.acao))
+                    it = ccActionMappings.erase (it);
+                else
+                    ++it;
+
+            if (wantsNote)
+                noteMappings[actionKey] = actionTarget;
+            else
+            {
+                AcaoDeCC entry;
+                entry.acao = actionTarget;
+                entry.modo = command.mode == 4
+                               ? ChurchDAWMidiMapping::ModoDeBotaoCC::seguirNivel
+                               : ChurchDAWMidiMapping::ModoDeBotaoCC::alternar;
+                ccActionMappings[actionKey] = entry;
+            }
+        }
+    }
+
+    if (checkpointReady && ! conflict)
+    {
+        ccDirtyEpoch.markDirty();
+        noteDirtyEpoch.markDirty();
+        ccEpoch = ccDirtyEpoch.snapshot();
+        noteEpoch = noteDirtyEpoch.snapshot();
+        diskStillOwned =
+            diskRollback.targetsUnchangedSinceCapture()
+            && ! ChurchDAWMidiMapping::midiMapPairHasFutureSchema (
+                ccFile, noteFile);
+        savedCC = diskStillOwned && saveMidiMap();
+        savedNotes = savedCC && saveNoteMap();
+        committed = savedCC && savedNotes && diskRollback.commit();
+    }
+
+    if (checkpointReady && (! committed || conflict))
+    {
+        if (diskStillOwned && ! conflict)
+            rollbackOk =
+                ChurchDAWMidiMapping::rollbackMidiMapPairPreservingFutureSchema (
+                    diskRollback, ccFile, noteFile);
+        else
+        {
+            rollbackOk = diskRollback.closeWithoutMutation();
+        }
+        if (! conflict)
+        {
+            const juce::ScopedLock sl (mapLock);
+            ccMappings = std::move (previousCC);
+            ccActionMappings = std::move (previousActions);
+            noteMappings = std::move (previousNotes);
+            bloquearSalvamentoCCVazio = previousBlockedCC;
+            bloquearSalvamentoNotasVazio = previousBlockedNotes;
+            automaticControllerProfilesSuspended = previousProfilesSuspended;
+            bumpMidiMappingGeneration();
+        }
+    }
+
+    if (committed)
+    {
+        finishMidiMapDirtyEpochsAfterPairCommit (
+            ccEpoch, savedCC, noteEpoch, savedNotes);
+        bumpMidiMappingGeneration();
+        cancelPendingUpdate();
+        lastMappedCC.store (-1);
+        lastMappedNote.store (-1);
+        lastMappedCCAcao.store (-1);
+        lastNoteActionRejected.store (-1);
+        lastParameterMappingRejectedCC.store (-1);
+    }
+    finishMidiMapRoutingTransaction();
+
+    if (! rollbackOk || diskRollback.preservedExternalChanges())
+        midiMapPairRecoveryFailed = true;
+
+    reconstruirMascaraDeNotas();
+    reconstruirMascaraDeCCsDeAcao();
+    atualizarEtiquetasDoPad();
+    atualizarBotoesDeCCDoPad();
+    ccPickup.clear();
+    refreshMidiMappingPanel();
+
+    if (conflict)
+    {
+        midiMappingPanel.showConflict (
+            "Esse controle ja esta atribuido a  "
+              + (conflictName.isNotEmpty() ? conflictName : juce::String ("outro comando")));
+        return;
+    }
+    if (! checkpointReady || ! committed)
+    {
+        midiMappingPanel.setStatus (
+            rollbackOk
+                ? "Nao foi possivel salvar; a atribuicao anterior foi preservada"
+                : "Falha grave ao restaurar os mapas; gravacao suspensa",
+            MidiMappingPanel::Status::error);
+        return;
+    }
+
+    midiMappingPanel.showMapped (command.name, channel, number, true, wantsNote);
+}
+
+void MainComponent::deleteMidiMappingCommand (const MidiMappingPanel::Command& command)
+{
+    juce::AudioProcessorParameter* parameter = nullptr;
+    int targetSlot = -2;
+    int targetInsert = -1;
+    auto* live = getChurchLive();
+
+    if (live != nullptr)
+        for (int slot = 0; slot < numSlots; ++slot)
+            if (slots[slot].proc.load() == live)
+                targetSlot = slot;
+
+    switch (command.target)
+    {
+        case MidiMappingPanel::TargetKind::layerVolume:
+            parameter = live != nullptr ? live->getLayerVolParam (command.argument) : nullptr; break;
+        case MidiMappingPanel::TargetKind::layerReverb:
+            parameter = live != nullptr ? live->getLayerReverbSendParam (command.argument) : nullptr; break;
+        case MidiMappingPanel::TargetKind::layerComp:
+            parameter = live != nullptr ? live->getLayerCompParam (command.argument) : nullptr; break;
+        case MidiMappingPanel::TargetKind::padCutoff:
+        case MidiMappingPanel::TargetKind::padVolume:
+            targetSlot = padSlotId;
+            if (padProcessor != nullptr)
+                for (auto* candidate : padProcessor->getParameters())
+                {
+                    const auto id = ChurchDAWMidiMapping::stableParameterId (candidate);
+                    if ((command.target == MidiMappingPanel::TargetKind::padCutoff && id == "padCutoff")
+                         || (command.target == MidiMappingPanel::TargetKind::padVolume && id == "padVolume"))
+                        parameter = candidate;
+                }
+            break;
+        case MidiMappingPanel::TargetKind::masterVolume:
+            targetSlot = -1;
+            parameter = masterProcessor != nullptr && ! masterProcessor->getParameters().isEmpty()
+                          ? masterProcessor->getParameters()[0] : nullptr;
+            break;
+        case MidiMappingPanel::TargetKind::processorParameter:
+        {
+            targetSlot = command.parameterSlot;
+            targetInsert = command.parameterInsert;
+            juce::String currentIdentity;
+            auto* processor = resolveCurrentMidiMappingProcessor (
+                targetSlot, targetInsert, currentIdentity);
+
+            if (processor != nullptr
+                 && (command.parameterId.isNotEmpty()
+                      || command.parameterName.isNotEmpty()))
+            {
+                const auto& parameters = processor->getParameters();
+                const int index =
+                    ChurchDAWMidiMapping::resolveParameterIndexForTargetLocation (
+                        parameters, command.parameterId,
+                        command.parameterName,
+                        ChurchDAWMidiMapping::classifyMidiTargetLocation (
+                            targetSlot, targetInsert, numSlots,
+                            padSlotId, padSynthSlotId));
+                if (juce::isPositiveAndBelow (index, parameters.size()))
+                    parameter = parameters[index];
+            }
+            break;
+        }
+        default:
+            break;
+    }
+
+    const bool hasPersistedParameterEntry =
+        command.persistedParameterSlot != -2
+        && command.mappedNumber >= 0;
+    if (hasPersistedParameterEntry
+         && command.expectedCurrentPluginId.isNotEmpty())
+    {
+        juce::String currentIdentity;
+        auto* const currentProcessor =
+            resolveCurrentMidiMappingProcessor (
+                targetSlot, targetInsert, currentIdentity);
+        const int parameterIndex =
+            currentProcessor != nullptr && parameter != nullptr
+                ? currentProcessor->getParameters().indexOf (parameter)
+                : -1;
+        if (currentProcessor == nullptr || currentIdentity.isEmpty()
+             || currentIdentity != command.expectedCurrentPluginId)
+        {
+            refreshMidiMappingPanel();
+            midiMappingPanel.setStatus (
+                "O plugin mudou desde a selecao; escolha o mapa novamente",
+                MidiMappingPanel::Status::warning);
+            return;
+        }
+
+        // An unresolved parameter mapping must remain deletable. Its exact
+        // persisted key/payload is checked atomically below; when the
+        // parameter is still resolvable, retain the stronger full snapshot
+        // validation as well.
+        if (parameter != nullptr && parameterIndex >= 0)
+        {
+            const CCTarget currentTarget {
+                targetSlot,
+                targetSlot == -1 ? -1 : parameterIndex,
+                targetInsert,
+                targetSlot == -1 ? juce::String ("Master")
+                                 : parameter->getName (32),
+                targetSlot == -1
+                    ? juce::String ("master")
+                    : ChurchDAWMidiMapping::stableParameterId (parameter),
+                currentIdentity
+            };
+            juce::String staleReason;
+            if (! validateCurrentParameterCommand (
+                    command, currentTarget, staleReason))
+            {
+                refreshMidiMappingPanel();
+                midiMappingPanel.setStatus (
+                    staleReason + "; escolha o mapa novamente",
+                    MidiMappingPanel::Status::warning);
+                return;
+            }
+        }
+    }
+
+    const auto ccFile = arquivoDoMapaDeCCs();
+    const auto noteFile = arquivoDoMapaDeNotas();
+    ChurchDAWMidiMapping::MidiMapPairRollback diskRollback (
+        ccFile, noteFile, *midiMapFileLock, &midiMapDiskRevision);
+    decltype (ccMappings) previousCC;
+    decltype (ccActionMappings) previousActions;
+    decltype (noteMappings) previousNotes;
+    const bool previousBlockedCC = bloquearSalvamentoCCVazio;
+    const bool previousBlockedNotes = bloquearSalvamentoNotasVazio;
+    const bool previousProfilesSuspended = automaticControllerProfilesSuspended;
+
+    beginMidiMapRoutingTransaction();
+    const bool checkpointReady = diskRollback.capture ("before-delete");
+    const bool targetsUnchanged = checkpointReady
+        && diskRollback.targetsUnchangedSinceCapture();
+    if (! targetsUnchanged)
+    {
+        const bool closed = checkpointReady
+            && diskRollback.closeWithoutMutation();
+        finishMidiMapRoutingTransaction();
+        if (! checkpointReady
+             && diskRollback.hadUninspectableTargetConflict())
+            bloquearQuartetoMidiDesconhecido (
+                "checkpoint de remocao MIDI");
+        if (! closed || diskRollback.preservedExternalChanges())
+            midiMapPairRecoveryFailed = true;
+        midiMappingPanel.setStatus (
+            "Nao foi possivel iniciar a remocao com seguranca",
+            MidiMappingPanel::Status::error);
+        return;
+    }
+    {
+        const juce::ScopedLock sl (mapLock);
+        previousCC = ccMappings;
+        previousActions = ccActionMappings;
+        previousNotes = noteMappings;
+    }
+
+    bool changedCC = false;
+    bool changedNote = false;
+
+    if (hasPersistedParameterEntry)
+    {
+        const CCTarget persistedTarget {
+            command.persistedParameterSlot,
+            command.persistedParameterIndex,
+            command.persistedParameterInsert,
+            command.persistedParameterName,
+            command.persistedParameterId,
+            command.persistedPluginId
+        };
+        const MidiControlKey selectedStoredControl {
+            command.mappedSourceId, command.mappedChannel,
+            command.mappedNumber, command.mappedWasNote,
+            command.mappedSourceName
+        };
+        const juce::ScopedLock sl (mapLock);
+        const auto exact = ccMappings.find (selectedStoredControl);
+        if (exact != ccMappings.end()
+             && ChurchDAWMidiMapping::controllerKeysExactlyEqual (
+                    exact->first, selectedStoredControl)
+             && ChurchDAWMidiMapping::persistedTargetsExactlyEqual (
+                    exact->second, persistedTarget))
+        {
+            ccMappings.erase (exact);
+            changedCC = true;
+        }
+    }
+    else
+    {
+        NoteAction wanted;
+        switch (command.target)
+        {
+            case MidiMappingPanel::TargetKind::panic:         wanted = { NoteActionKind::panic, -1 }; break;
+            case MidiMappingPanel::TargetKind::nextScene:     wanted = { NoteActionKind::nextScene, -1 }; break;
+            case MidiMappingPanel::TargetKind::previousScene: wanted = { NoteActionKind::previousScene, -1 }; break;
+            case MidiMappingPanel::TargetKind::scene:          wanted = { NoteActionKind::cena, command.argument }; break;
+            case MidiMappingPanel::TargetKind::padProgram:     wanted = { NoteActionKind::padSynthProgram, command.argument }; break;
+            case MidiMappingPanel::TargetKind::tapTempo:       wanted = { NoteActionKind::tapTempo, -1 }; break;
+            case MidiMappingPanel::TargetKind::sustainToggle:  wanted = { NoteActionKind::sustainToggle, -1 }; break;
+            case MidiMappingPanel::TargetKind::padEngineToggle: wanted = { NoteActionKind::padSynthEngineToggle, -1 }; break;
+            default: break;
+        }
+
+        const auto matches = [&wanted] (const NoteAction& value)
+        {
+            const bool argumentMatters = wanted.kind == NoteActionKind::cena
+                                      || wanted.kind == NoteActionKind::padKey
+                                      || wanted.kind == NoteActionKind::padSynthProgram;
+            return value.kind == wanted.kind
+                    && (! argumentMatters || value.arg == wanted.arg);
+        };
+
+        if (wanted.kind != NoteActionKind::none)
+        {
+            const juce::ScopedLock sl (mapLock);
+            for (auto it = noteMappings.begin(); it != noteMappings.end();)
+                if (matches (it->second))
+                {
+                    it = noteMappings.erase (it);
+                    changedNote = true;
+                }
+                else
+                    ++it;
+
+            for (auto it = ccActionMappings.begin(); it != ccActionMappings.end();)
+                if (matches (it->second.acao))
+                {
+                    it = ccActionMappings.erase (it);
+                    changedCC = true;
+                }
+                else
+                    ++it;
+        }
+    }
+
+    if (! changedCC && ! changedNote)
+    {
+        const bool closed = diskRollback.closeWithoutMutation();
+        finishMidiMapRoutingTransaction();
+        if (! closed)
+            midiMapPairRecoveryFailed = true;
+        midiMappingPanel.setStatus ("Este comando ainda nao possui mapeamento",
+                                    MidiMappingPanel::Status::neutral);
+        return;
+    }
+
+    if (changedCC)
+        ccDirtyEpoch.markDirty();
+    if (changedNote)
+        noteDirtyEpoch.markDirty();
+    const auto ccEpoch = ccDirtyEpoch.snapshot();
+    const auto noteEpoch = noteDirtyEpoch.snapshot();
+
+    const auto activeCCAction = [] (const AcaoDeCC& action)
+    {
+        return action.acao.kind != NoteActionKind::none;
+    };
+    const int conflictsBefore =
+        ChurchDAWMidiMapping::midiMapCollectionNoteConflictCount (
+            previousCC, previousNotes)
+        + ChurchDAWMidiMapping::midiMapCollectionCCConflictCount (
+            previousCC, previousActions, activeCCAction);
+    int conflictsAfter = 0;
+    {
+        const juce::ScopedLock sl (mapLock);
+        conflictsAfter =
+            ChurchDAWMidiMapping::midiMapCollectionNoteConflictCount (
+                ccMappings, noteMappings)
+            + ChurchDAWMidiMapping::midiMapCollectionCCConflictCount (
+                ccMappings, ccActionMappings, activeCCAction);
+    }
+
+    // Um mapa legado pode conter mais de um conflito. Permitir o save somente
+    // quando ESTA remocao reduziu a quantidade deixa o cliente reparar um por
+    // vez, sem abrir uma porta geral para persistir novos conflitos.
+    const bool repairMadeProgress = conflictsAfter < conflictsBefore;
+    // Every committed journal generation must stamp both files with the same
+    // transactionId, even when this command changed only one in-memory map.
+    // Publishing one half would leave an apparently committed mixed pair that
+    // startup must recover instead of the deletion surviving normally.
+    const bool savedCC = saveMidiMap (false, repairMadeProgress);
+    const bool savedNote = savedCC
+        && saveNoteMap (false, repairMadeProgress);
+    const bool committed = savedCC && savedNote && diskRollback.commit();
+    bool rollbackOk = true;
+    if (! committed)
+    {
+        rollbackOk =
+            ChurchDAWMidiMapping::rollbackMidiMapPairPreservingFutureSchema (
+                diskRollback, ccFile, noteFile);
+        const juce::ScopedLock sl (mapLock);
+        ccMappings = std::move (previousCC);
+        ccActionMappings = std::move (previousActions);
+        noteMappings = std::move (previousNotes);
+        bloquearSalvamentoCCVazio = previousBlockedCC;
+        bloquearSalvamentoNotasVazio = previousBlockedNotes;
+        automaticControllerProfilesSuspended = previousProfilesSuspended;
+        bumpMidiMappingGeneration();
+    }
+    if (committed)
+    {
+        finishMidiMapDirtyEpochsAfterPairCommit (
+            ccEpoch, savedCC, noteEpoch, savedNote);
+        {
+            const juce::ScopedLock sl (mapLock);
+            automaticControllerProfilesSuspended =
+                ChurchDAWMidiMapping::midiMapCollectionsHaveConflictingNoteControls (
+                    ccMappings, noteMappings)
+                || ChurchDAWMidiMapping::midiMapCollectionsHaveConflictingCCControls (
+                    ccMappings, ccActionMappings, activeCCAction)
+                || ChurchDAWMidiMapping::hasUnresolvedUnnamedMidiSource (
+                    ccMappings, midiSourcesCached)
+                || ChurchDAWMidiMapping::hasUnresolvedUnnamedMidiSource (
+                    ccActionMappings, midiSourcesCached)
+                || ChurchDAWMidiMapping::hasUnresolvedUnnamedMidiSource (
+                    noteMappings, midiSourcesCached);
+        }
+        bumpMidiMappingGeneration();
+    }
+    finishMidiMapRoutingTransaction();
+    if (! rollbackOk || diskRollback.preservedExternalChanges())
+        midiMapPairRecoveryFailed = true;
+    reconstruirMascaraDeNotas();
+    reconstruirMascaraDeCCsDeAcao();
+    atualizarEtiquetasDoPad();
+    atualizarBotoesDeCCDoPad();
+    ccPickup.clear();
+    refreshMidiMappingPanel();
+    midiMappingPanel.setStatus (
+        committed ? "Mapeamento removido"
+                  : rollbackOk
+                      ? "Falha ao remover; o mapeamento anterior foi restaurado"
+                      : "Falha grave ao restaurar os mapas",
+        committed ? MidiMappingPanel::Status::success
+                  : MidiMappingPanel::Status::error);
+}
+
+void MainComponent::setMidiLearningFromPage (bool enabled)
+{
+    resetMidiLearnTargetUnderCallbackBarrier (enabled);
+
+    if (! enabled)
+    {
+        if (limparBotoesDeCCVazios())
+            (void) saveMidiMap();
+        atualizarBotoesDeCCDoPad();
+    }
+
+    if (padPanel != nullptr)
+        padPanel->setMidiLearnMode (enabled);
+
+    midiMappingPanel.setLearning (enabled, false);
+    midiMappingPanel.setStatus (
+        enabled ? "Selecione um comando e mova um controle MIDI"
+                : "Modo de aprendizado pausado",
+        enabled ? MidiMappingPanel::Status::learning
+                : MidiMappingPanel::Status::neutral);
+}
+
+void MainComponent::beginQuickMidiMapping()
+{
+   #if JUCE_ANDROID || JUCE_IOS
+    // A tela compacta ja usa o fluxo direto historico; a central desktop e a
+    // unica origem deste comando.
+    return;
+   #else
+    startMidiLearn();
+    quickMidiMappingMode = true;
+    clearMapButton.setVisible (false);
+
+    juce::Logger::writeToLog (
+        "MIDI MAP: modo rapido aberto; toque um controle da tela e mova o MIDI");
+   #endif
+}
+
+void MainComponent::exportMidiMappings()
+{
+    if (! saveMidiMapPair())
+    {
+        midiMappingPanel.setStatus (
+            "Nao foi possivel preparar os mapas para exportacao",
+            MidiMappingPanel::Status::error);
+        return;
+    }
+
+    if (midiMapFileLock == nullptr)
+    {
+        midiMappingPanel.setStatus (
+            "Protecao dos mapas MIDI indisponivel",
+            MidiMappingPanel::Status::error);
+        return;
+    }
+
+    juce::String bundleText;
+    {
+        const auto ccFile = arquivoDoMapaDeCCs();
+        const auto noteFile = arquivoDoMapaDeNotas();
+        ChurchDAWMidiMapping::MidiMapPairFileLock::ScopedAccess exportAccess (
+            *midiMapFileLock, 5000);
+        ChurchDAWMidiMapping::MidiMapPairRevision exportRevision;
+        if (! exportAccess.isLocked()
+             || ! ChurchDAWMidiMapping::midiMapPairJournalAllowsWrite (
+                    ccFile, {})
+             || ! midiMapDiskRevision.matches (ccFile, noteFile)
+             || ! exportRevision.refresh (ccFile, noteFile))
+        {
+            midiMappingPanel.setStatus (
+                "Os mapas mudaram durante a exportacao; tente novamente",
+                MidiMappingPanel::Status::error);
+            return;
+        }
+
+        // Parse the exact bounded bytes read under one lock. The post-read
+        // quartet revision also detects a writer that bypasses our lock and
+        // changes either primary or either last-good between the two reads.
+        juce::MemoryBlock ccBytes;
+        juce::MemoryBlock noteBytes;
+        const bool readStablePair =
+            ChurchDAWMidiMapping::loadBoundedFileData (
+                ccFile, ccBytes,
+                ChurchDAWMidiMapping::maxMidiMapFileBytes)
+            && ChurchDAWMidiMapping::loadBoundedFileData (
+                noteFile, noteBytes,
+                ChurchDAWMidiMapping::maxMidiMapFileBytes)
+            && exportRevision.matches (ccFile, noteFile);
+        auto ccXml = readStablePair
+            ? ChurchDAWMidiMapping::parseBoundedXmlData (ccBytes) : nullptr;
+        auto noteXml = readStablePair
+            ? ChurchDAWMidiMapping::parseBoundedXmlData (noteBytes) : nullptr;
+        const auto ccTransaction = ccXml != nullptr
+            ? ccXml->getStringAttribute ("transactionId") : juce::String();
+        const auto noteTransaction = noteXml != nullptr
+            ? noteXml->getStringAttribute ("transactionId") : juce::String();
+        if (ccXml == nullptr
+             || ! ChurchDAWMidiMapping::isMidiMapXmlValid (
+                    *ccXml, "MIDIMAP", "MAP", "CCACAO")
+             || noteXml == nullptr
+             || ! ChurchDAWMidiMapping::isMidiMapXmlValid (
+                    *noteXml, "NOTEMAP", "NOTE")
+             || ChurchDAWMidiMapping::midiMapPairHasConflictingNoteControls (
+                    *ccXml, *noteXml)
+             || ccTransaction.isEmpty()
+             || ccTransaction != noteTransaction)
+        {
+            midiMappingPanel.setStatus (
+                "Os arquivos MIDI nao puderam ser validados",
+                MidiMappingPanel::Status::error);
+            return;
+        }
+
+        const auto exportFormat =
+            juce::XmlElement::TextFormat().singleLine();
+        const auto ccExportText = ccXml->toString (exportFormat);
+        const auto noteExportText = noteXml->toString (exportFormat);
+        if (! ChurchDAWMidiMapping::midiMapSerializedPayloadFitsSafetyLimits (
+                ccExportText)
+             || ! ChurchDAWMidiMapping::midiMapSerializedPayloadFitsSafetyLimits (
+                noteExportText))
+        {
+            midiMappingPanel.setStatus (
+                "Os mapas excedem os limites seguros de exportacao",
+                MidiMappingPanel::Status::error);
+            return;
+        }
+
+        juce::XmlElement bundle ("CHURCHDAW_MIDI_MAP_BUNDLE");
+        bundle.setAttribute ("version", 1);
+        bundle.setAttribute (
+            "exportedAt", juce::Time::getCurrentTime().toISO8601 (true));
+        bundle.createNewChildElement ("CC_MAP")->addTextElement (
+            ccExportText);
+        bundle.createNewChildElement ("NOTE_MAP")->addTextElement (
+            noteExportText);
+        bundleText = bundle.toString();
+        if (! ChurchDAWMidiMapping::midiMapSerializedBundleFitsSafetyLimits (
+                bundleText))
+        {
+            midiMappingPanel.setStatus (
+                "O pacote MIDI excede o limite seguro de importacao",
+                MidiMappingPanel::Status::error);
+            return;
+        }
+    }
+
+    auto initial = juce::File::getSpecialLocation (juce::File::userDocumentsDirectory)
+                       .getChildFile ("ChurchDAW-MIDI.churchdaw-midi.xml");
+    midiMapFileChooser = std::make_unique<juce::FileChooser> (
+        "Exportar mapeamentos MIDI", initial, "*.xml");
+
+    auto safe = juce::Component::SafePointer<MainComponent> (this);
+    midiMapFileChooser->launchAsync (
+        juce::FileBrowserComponent::saveMode
+          | juce::FileBrowserComponent::canSelectFiles
+          | juce::FileBrowserComponent::warnAboutOverwriting,
+        [safe, bundleText] (const juce::FileChooser& chooser)
+        {
+            if (auto* self = safe.getComponent())
+            {
+                const auto selected = chooser.getResult();
+                bool saved = false;
+                if (selected != juce::File())
+                {
+                    juce::TemporaryFile temp (selected);
+                    saved = temp.getFile().replaceWithText (bundleText)
+                              && temp.overwriteTargetFileWithTemporary();
+                    if (saved)
+                    {
+                        juce::MemoryBlock expectedBytes;
+                        juce::MemoryBlock writtenBytes;
+                        expectedBytes.append (
+                            bundleText.toRawUTF8(),
+                            (size_t) bundleText.getNumBytesAsUTF8());
+                        saved = ChurchDAWMidiMapping::loadBoundedFileData (
+                                    selected, writtenBytes,
+                                    ChurchDAWMidiMapping::maxMidiMapBundleBytes)
+                            && writtenBytes == expectedBytes
+                            && ChurchDAWMidiMapping::loadBoundedXmlFile (
+                                   selected,
+                                   ChurchDAWMidiMapping::midiMapBundleXmlLimits())
+                               != nullptr;
+                    }
+                }
+
+                self->midiMappingPanel.setStatus (
+                    selected == juce::File() ? "Exportacao cancelada"
+                      : saved ? "Mapeamentos MIDI exportados"
+                              : "Falha ao exportar os mapeamentos",
+                    selected == juce::File() ? MidiMappingPanel::Status::neutral
+                      : saved ? MidiMappingPanel::Status::success
+                              : MidiMappingPanel::Status::error);
+                self->midiMapFileChooser.reset();
+            }
+        });
+}
+
+void MainComponent::exportCultSession()
+{
+    // Salva primeiro, para o arquivo compartilhado representar exatamente o
+    // que esta na tela e nunca uma versao anterior do culto.
+    const bool scenesSaved = salvarCenas();
+    const bool chainSaved = saveChainState();
+    auto scenes = juce::parseXML (arquivoDeCenas());
+    auto chain = appProperties.getUserSettings()->getXmlValue ("chain");
+
+    if (! scenesSaved || ! chainSaved || scenes == nullptr
+         || ! scenes->hasTagName ("LIVESCENES") || chain == nullptr
+         || ! chain->hasTagName ("CHAIN"))
+    {
+        juce::AlertWindow::showMessageBoxAsync (
+            juce::MessageBoxIconType::WarningIcon,
+            "Exportar culto",
+            "Nao foi possivel validar as cenas e a cadeia no disco. "
+            "O arquivo compartilhavel nao foi criado.", "Entendi");
+        return;
+    }
+
+    juce::XmlElement bundle ("CHURCHDAW_CULT_SESSION");
+    bundle.setAttribute ("schema", 1);
+    bundle.setAttribute ("exportedAt", juce::Time::getCurrentTime().toISO8601 (true));
+    bundle.addChildElement (scenes.release());
+    bundle.addChildElement (chain.release());
+    const auto bundleText = bundle.toString();
+
+    auto initial = juce::File::getSpecialLocation (juce::File::userDocumentsDirectory)
+                       .getChildFile ("ChurchDAW-Culto.churchset.xml");
+    sessionBundleFileChooser = std::make_unique<juce::FileChooser> (
+        "Exportar culto completo", initial, "*.churchset.xml");
+    auto safe = juce::Component::SafePointer<MainComponent> (this);
+    sessionBundleFileChooser->launchAsync (
+        juce::FileBrowserComponent::saveMode
+          | juce::FileBrowserComponent::canSelectFiles
+          | juce::FileBrowserComponent::warnAboutOverwriting,
+        [safe, bundleText] (const juce::FileChooser& chooser)
+        {
+            if (auto* self = safe.getComponent())
+            {
+                const auto selected = chooser.getResult();
+                bool saved = false;
+                if (selected != juce::File())
+                {
+                    juce::TemporaryFile temp (selected);
+                    saved = temp.getFile().replaceWithText (bundleText)
+                         && temp.overwriteTargetFileWithTemporary();
+                }
+                juce::AlertWindow::showMessageBoxAsync (
+                    saved ? juce::MessageBoxIconType::InfoIcon
+                          : juce::MessageBoxIconType::WarningIcon,
+                    "Exportar culto",
+                    selected == juce::File() ? "Exportacao cancelada."
+                      : saved ? "Culto exportado com cenas, setlist e cadeia."
+                              : "Falha ao gravar o arquivo do culto.", "Entendi");
+                self->sessionBundleFileChooser.reset();
+            }
+        });
+}
+
+void MainComponent::activateEmergencyPiano()
+{
+    // A troca de emergencia e deliberadamente temporaria: o setup original
+    // continua no disco para que o proximo boot possa tentar recupera-lo.
+    performGlobalPanic();
+
+    loadInternalTimbres (0, nullptr, 0);
+    slots[0].box.setSelectedId (timbresComboId, juce::dontSendNotification);
+    refreshSlotChoices();
+    refreshPerformanceSessionPanel();
+    juce::Logger::writeToLog (
+        "SAFE_PIANO: Church Live nativo carregado; setup original preservado");
+}
+
+void MainComponent::runStageDiagnostic()
+{
+    auto* device = deviceManager.getCurrentAudioDevice();
+    const auto midiInputs = midiInputsCached (juce::Time::getMillisecondCounter());
+    int enabledMidi = 0;
+    for (const auto& input : midiInputs)
+        if (deviceManager.isMidiInputDeviceEnabled (input.identifier))
+            ++enabledMidi;
+
+    const auto audioName = device != nullptr
+        ? device->getName() : juce::String ("Nenhum dispositivo");
+    const auto sampleRate = device != nullptr ? device->getCurrentSampleRate() : 0.0;
+    const auto blockSize = device != nullptr ? device->getCurrentBufferSizeSamples() : 0;
+    const auto xruns = deviceManager.getXRunCount();
+
+    int activeSlots = 0;
+    for (int i = 0; i < numSlots; ++i)
+        if (slots[i].proc.load() != nullptr)
+            ++activeSlots;
+
+    const bool audioOk = device != nullptr && sampleRate > 0.0 && blockSize > 0;
+    const bool midiOk = enabledMidi > 0;
+    const bool stable = xruns == 0;
+
+    juce::String report;
+    report << (audioOk
+                   ? juce::String::fromUTF8 (u8"✅ AUDIO OK")
+                   : juce::String::fromUTF8 (u8"❌ AUDIO INDISPONÍVEL")) << "\n"
+           << juce::String::fromUTF8 (u8"Saída: ") << audioName << "\n"
+           << juce::String::fromUTF8 (u8"Configuração: ")
+           << juce::String (sampleRate, 0) << " Hz / "
+           << blockSize << " samples\n\n"
+           << (midiOk
+                   ? juce::String::fromUTF8 (u8"✅ MIDI OK")
+                   : juce::String::fromUTF8 (u8"⚠️ MIDI: nenhum controlador ativo")) << "\n"
+           << juce::String::fromUTF8 (u8"Entradas ativas: ")
+           << enabledMidi << " de " << midiInputs.size() << "\n"
+           << juce::String::fromUTF8 (u8"Instrumentos carregados: ")
+           << activeSlots << "\n\n"
+           << (stable
+                   ? juce::String::fromUTF8 (u8"✅ SEM XRUNS")
+                   : juce::String::fromUTF8 (u8"⚠️ XRUNS DETECTADOS: ")
+                         + juce::String (xruns))
+           << "\n\n"
+           << (safeMode
+                   ? juce::String::fromUTF8 (
+                         u8"MODO SEGURO: plugins externos não foram restaurados.\n")
+                   : juce::String::fromUTF8 (
+                         u8"Modo normal: cadeia salva habilitada.\n"))
+           << (audioOk && stable
+                   ? "Pronto para o culto."
+                   : "Se aparecer falha, use PIANO SEGURO antes de tocar.");
+
+    juce::Logger::writeToLog ("STAGE_TEST: " + report.replaceCharacters ("\n", " | "));
+    juce::AlertWindow::showMessageBoxAsync (
+        juce::AlertWindow::InfoIcon, "TESTE DE PALCO", report);
+}
+
+void MainComponent::showPlaybackFileChooser()
+{
+    playbackFileChooser = std::make_unique<juce::FileChooser> (
+        "Abrir playback / stems (selecione ate 4 arquivos)",
+        juce::File::getSpecialLocation (juce::File::userMusicDirectory),
+        "*.wav;*.flac;*.mp3;*.aiff");
+    auto safe = juce::Component::SafePointer<MainComponent> (this);
+    playbackFileChooser->launchAsync (
+        juce::FileBrowserComponent::openMode
+          | juce::FileBrowserComponent::canSelectFiles
+          | juce::FileBrowserComponent::canSelectMultipleItems,
+        [safe] (const juce::FileChooser& chooser)
+        {
+            if (auto* self = safe.getComponent())
+            {
+                const auto files = chooser.getResults();
+                bool loadedAny = false;
+                for (int i = 0; i < juce::jmin (files.size(),
+                                                ChurchDAWPlaybackEngine::maxStems); ++i)
+                    loadedAny = self->playbackEngine.loadStem (i, files[i]) || loadedAny;
+
+                if (loadedAny)
+                {
+                    const int scene = juce::isPositiveAndBelow (
+                        self->cenaAtiva, ChurchDAWLive::numeroDeCenas)
+                        ? self->cenaAtiva : 0;
+                    self->playbackEngine.setBpm (self->cenas[scene].bpm);
+                    self->playbackEngine.setClickEnabled (false);
+                    self->startPlayback();
+                    juce::Logger::writeToLog (
+                        "PLAYBACK: " + juce::String (juce::jmin (
+                            files.size(), ChurchDAWPlaybackEngine::maxStems))
+                        + " stem(s) carregado(s)");
+                }
+                self->playbackFileChooser.reset();
+            }
+        });
+}
+
+void MainComponent::startPlayback()
+{
+    playbackEngine.start();
+    juce::Logger::writeToLog ("PLAYBACK: iniciado");
+}
+
+void MainComponent::stopPlayback()
+{
+    playbackEngine.stop();
+    juce::Logger::writeToLog ("PLAYBACK: parado");
+}
+
+void MainComponent::showAutoPatchBuilder()
+{
+    auto options = juce::MessageBoxOptions()
+        .withIconType (juce::MessageBoxIconType::InfoIcon)
+        .withTitle ("AUTO PATCH WORSHIP")
+        .withMessage (juce::String::fromUTF8 (
+            u8"Escolha a intenção musical. O ChurchDAW monta uma sugestão nativa e deixa o áudio sob seu controle."))
+        .withButton (juce::String::fromUTF8 (u8"ORAÇÃO"))
+        .withButton (juce::String::fromUTF8 (u8"MINISTRAÇÃO"))
+        .withButton (juce::String::fromUTF8 (u8"CELEBRAÇÃO"))
+        .withButton ("CANCELAR")
+        .withAssociatedComponent (this);
+
+    juce::AlertWindow::showAsync (
+        options,
+        [safe = juce::Component::SafePointer<MainComponent> (this)] (int result)
+        {
+            auto* self = safe.getComponent();
+            if (self == nullptr || result < 1 || result > 3)
+                return;
+
+            // O showroom nativo é uma base determinística: piano, pad e
+            // strings sem depender de plugin externo ou rede. A escolha de
+            // intenção fica registrada para o próximo passo do builder e
+            // também aparece no log do culto.
+            if (auto* live = self->getChurchLive())
+                live->requestShowroomPreset();
+
+            const char* moods[] = { "oracao", "ministracao", "celebracao" };
+            juce::Logger::writeToLog (
+                "AUTO_PATCH: sugestao worship aplicada, intencao="
+                + juce::String (moods[result - 1]) + " intensidade=3");
+            self->refreshPerformanceSessionPanel();
+            juce::AlertWindow::showMessageBoxAsync (
+                juce::MessageBoxIconType::InfoIcon,
+                "AUTO PATCH WORSHIP",
+                juce::String::fromUTF8 (
+                    u8"Sugestão preparada: piano + pad + camadas worship.\n\nRevise volumes e confirme gravando a cena."));
+        });
+}
+
+juce::String MainComponent::handleRemoteRequest (const juce::String& rawPath)
+{
+    auto jsonEscape = [] (juce::String value)
+    {
+        return value.replace ("\\", "\\\\")
+                    .replace ("\"", "\\\"")
+                    .replace ("\n", "\\n");
+    };
+
+    const auto path = rawPath.upToFirstOccurrenceOf ("?", false, false);
+    const auto query = rawPath.fromFirstOccurrenceOf ("?", false, false);
+    const auto token = query.fromFirstOccurrenceOf ("token=", false, false)
+                           .upToFirstOccurrenceOf ("&", false, false);
+
+    if (path == "/pair")
+        return "{\"churchdaw\":\"remote\",\"port\":19765,"
+               "\"pairing\":\"manual_token_required\","
+               "\"commands\":[\"status\",\"next\",\"previous\",\"panic\",\"safe-piano\",\"scene/N\",\"playback/start\",\"playback/stop\",\"playback/click/on\",\"playback/click/off\"]}";
+
+    if (token != remoteToken)
+        return "{\"error\":\"token_required\"}";
+
+    if (path == "/status")
+    {
+        juce::MessageManagerLock messageLock;
+        if (! messageLock.lockWasGained())
+            return "{\"error\":\"busy\"}";
+        const auto index = juce::isPositiveAndBelow (cenaAtiva,
+                                                     ChurchDAWLive::numeroDeCenas)
+                             ? cenaAtiva : 0;
+        const auto& scene = cenas[index];
+        return "{\"scene\":" + juce::String (index + 1)
+            + ",\"song\":\"" + jsonEscape (scene.musica)
+            + "\",\"section\":\"" + jsonEscape (scene.secao)
+            + "\",\"key\":\"" + jsonEscape (scene.tonalidade)
+            + "\",\"bpm\":" + juce::String (scene.bpm, 2)
+            + ",\"playback\":" + juce::String (playbackEngine.isPlaying() ? "true" : "false")
+            + ",\"click\":" + juce::String (playbackEngine.isClickEnabled() ? "true" : "false")
+            + ",\"safeMode\":" + juce::String (safeMode ? "true" : "false")
+            + "}";
+    }
+
+    juce::MessageManager::callAsync (
+        [safe = juce::Component::SafePointer<MainComponent> (this), path]
+        {
+            if (auto* self = safe.getComponent())
+            {
+                if (path == "/panic")
+                {
+                    self->performGlobalPanic();
+                }
+                else if (path == "/safe-piano")
+                    self->activateEmergencyPiano();
+                else if (path == "/playback/start")
+                    self->startPlayback();
+                else if (path == "/playback/stop")
+                    self->stopPlayback();
+                else if (path == "/playback/click/on")
+                    self->playbackEngine.setClickEnabled (true);
+                else if (path == "/playback/click/off")
+                    self->playbackEngine.setClickEnabled (false);
+                else if (path == "/next" || path == "/previous")
+                {
+                    const int direction = path == "/next" ? 1 : -1;
+                    int position = self->setlist.posicao;
+                    if (! juce::isPositiveAndBelow (position, self->setlist.tamanho))
+                        position = direction > 0 ? -1 : self->setlist.tamanho;
+                    const int targetPosition = position + direction;
+                    if (juce::isPositiveAndBelow (targetPosition, self->setlist.tamanho))
+                        (void) self->aplicarCena (
+                            self->setlist.ordem[(size_t) targetPosition]);
+                }
+                else if (path.startsWith ("/scene/"))
+                {
+                    const int scene = path.substring (7).getIntValue() - 1;
+                    if (juce::isPositiveAndBelow (scene,
+                                                  ChurchDAWLive::numeroDeCenas))
+                        (void) self->aplicarCena (scene);
+                }
+            }
+        });
+    return "{\"ok\":true}";
+}
+
+void MainComponent::importCultSession()
+{
+    auto initial = juce::File::getSpecialLocation (juce::File::userDocumentsDirectory);
+    sessionBundleFileChooser = std::make_unique<juce::FileChooser> (
+        "Importar culto completo", initial, "*.churchset.xml");
+    auto safe = juce::Component::SafePointer<MainComponent> (this);
+    sessionBundleFileChooser->launchAsync (
+        juce::FileBrowserComponent::openMode
+          | juce::FileBrowserComponent::canSelectFiles,
+        [safe] (const juce::FileChooser& chooser)
+        {
+            if (auto* self = safe.getComponent())
+            {
+                const auto selected = chooser.getResult();
+                auto bundle = selected != juce::File() ? juce::parseXML (selected)
+                                                       : nullptr;
+                auto* scenes = bundle != nullptr
+                    ? bundle->getChildByName ("LIVESCENES") : nullptr;
+                auto* chain = bundle != nullptr
+                    ? bundle->getChildByName ("CHAIN") : nullptr;
+                const bool valid = bundle != nullptr
+                    && bundle->hasTagName ("CHURCHDAW_CULT_SESSION")
+                    && bundle->getIntAttribute ("schema", 0) == 1
+                    && scenes != nullptr && chain != nullptr
+                    && scenes->getIntAttribute ("schema", 0) <= 3;
+
+                bool imported = false;
+                if (valid)
+                {
+                    const auto destination = self->arquivoDeCenas();
+                    const auto backup = destination.getSiblingFile (
+                        "live-scenes.xml.before-cult-import");
+                    const bool backupOk = ! destination.existsAsFile()
+                        || destination.copyFileTo (backup);
+                    juce::TemporaryFile temp (destination);
+                    const bool scenesOk = backupOk
+                        && scenes->writeTo (temp.getFile())
+                        && temp.overwriteTargetFileWithTemporary();
+                    if (scenesOk)
+                    {
+                        self->appProperties.getUserSettings()->setValue (
+                            "chain", chain);
+                        imported = self->appProperties.getUserSettings()->saveIfNeeded();
+                    }
+                    if (! imported && backup.existsAsFile())
+                        backup.copyFileTo (destination);
+                }
+
+                juce::AlertWindow::showMessageBoxAsync (
+                    imported ? juce::MessageBoxIconType::InfoIcon
+                             : juce::MessageBoxIconType::WarningIcon,
+                    "Importar culto",
+                    selected == juce::File() ? "Importacao cancelada."
+                      : imported ? "Culto importado. Reinicie o ChurchDAW para aplicar a cadeia com seguranca."
+                                 : "Arquivo invalido ou falha ao gravar; o culto anterior foi preservado.",
+                    "Entendi");
+                self->sessionBundleFileChooser.reset();
+            }
+        });
+}
+
+void MainComponent::importMidiMappings()
+{
+    auto initial = juce::File::getSpecialLocation (juce::File::userDocumentsDirectory);
+    midiMapFileChooser = std::make_unique<juce::FileChooser> (
+        "Importar mapeamentos MIDI", initial, "*.xml");
+
+    auto safe = juce::Component::SafePointer<MainComponent> (this);
+    midiMapFileChooser->launchAsync (
+        juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
+        [safe] (const juce::FileChooser& chooser)
+        {
+            auto* self = safe.getComponent();
+            if (self == nullptr)
+                return;
+
+            const auto selected = chooser.getResult();
+            if (selected == juce::File())
+            {
+                self->midiMappingPanel.setStatus ("Importacao cancelada",
+                                                  MidiMappingPanel::Status::neutral);
+                self->midiMapFileChooser.reset();
+                return;
+            }
+
+            auto bundle = ChurchDAWMidiMapping::loadBoundedXmlFile (
+                selected, ChurchDAWMidiMapping::midiMapBundleXmlLimits());
+            int ccNodeCount = 0;
+            int noteNodeCount = 0;
+            if (bundle != nullptr)
+                for (auto* child : bundle->getChildIterator())
+                {
+                    if (child->hasTagName ("CC_MAP"))
+                        ++ccNodeCount;
+                    else if (child->hasTagName ("NOTE_MAP"))
+                        ++noteNodeCount;
+                }
+
+            auto* ccNode = bundle != nullptr ? bundle->getChildByName ("CC_MAP") : nullptr;
+            auto* noteNode = bundle != nullptr ? bundle->getChildByName ("NOTE_MAP") : nullptr;
+            const auto ccText = ccNode != nullptr ? ccNode->getAllSubText() : juce::String();
+            const auto noteText = noteNode != nullptr ? noteNode->getAllSubText() : juce::String();
+            auto ccXml = ChurchDAWMidiMapping::parseBoundedXmlText (ccText);
+            auto noteXml = ChurchDAWMidiMapping::parseBoundedXmlText (noteText);
+
+            const bool valid = bundle != nullptr
+                                && bundle->hasTagName ("CHURCHDAW_MIDI_MAP_BUNDLE")
+                                && ChurchDAWMidiMapping::hasStrictIntegerAttribute (
+                                    *bundle, "version")
+                                && bundle->getIntAttribute ("version", 0) == 1
+                                && ccNodeCount == 1 && noteNodeCount == 1
+                                && bundle->getNumChildElements() == 2
+                                && ccXml != nullptr
+                                && ChurchDAWMidiMapping::isMidiMapXmlReadable (
+                                    *ccXml, "MIDIMAP", "MAP", "CCACAO")
+                                && noteXml != nullptr
+                                && ChurchDAWMidiMapping::isMidiMapXmlReadable (
+                                    *noteXml, "NOTEMAP", "NOTE")
+                                && ! ChurchDAWMidiMapping::midiMapPairHasConflictingNoteControls (
+                                    *ccXml, *noteXml);
+
+            if (! valid)
+            {
+                self->midiMappingPanel.setStatus (
+                    "Arquivo invalido ou criado por uma versao mais nova",
+                    MidiMappingPanel::Status::error);
+                self->midiMapFileChooser.reset();
+                return;
+            }
+
+            const auto ccTarget = self->arquivoDoMapaDeCCs();
+            const auto noteTarget = self->arquivoDoMapaDeNotas();
+            const auto fileHasFutureSchema = [] (const juce::File& file,
+                                                  const juce::String& root)
+            {
+                const auto xml =
+                    ChurchDAWMidiMapping::loadBoundedXmlFile (file);
+                return xml != nullptr
+                    && ChurchDAWMidiMapping::hasFutureMidiMapSchema (*xml, root);
+            };
+            const bool protectedFutureState = self->esquemaDeCCsDesconhecido
+                || self->esquemaDeNotasDesconhecido
+                || fileHasFutureSchema (ccTarget, "MIDIMAP")
+                || fileHasFutureSchema (noteTarget, "NOTEMAP")
+                || fileHasFutureSchema (ccTarget.getSiblingFile (
+                       ccTarget.getFileName() + ".last-good"), "MIDIMAP")
+                || fileHasFutureSchema (noteTarget.getSiblingFile (
+                       noteTarget.getFileName() + ".last-good"), "NOTEMAP");
+
+            if (protectedFutureState)
+            {
+                self->midiMappingPanel.setStatus (
+                    "Existe um mapa de uma versao mais nova; importacao cancelada para protege-lo",
+                    MidiMappingPanel::Status::error);
+                self->midiMapFileChooser.reset();
+                return;
+            }
+
+            ChurchDAWMidiMapping::MidiMapPairRollback diskRollback (
+                ccTarget, noteTarget, *self->midiMapFileLock,
+                &self->midiMapDiskRevision);
+            decltype (self->ccMappings) previousCC;
+            decltype (self->ccActionMappings) previousActions;
+            decltype (self->noteMappings) previousNotes;
+            NoteAction previousPendingAction;
+            juce::String previousTouchedName;
+            juce::String previousTouchedId;
+            juce::String previousTouchedPluginId;
+            int previousTouchedSlot = -2;
+            int previousTouchedParam = -1;
+            int previousTouchedInsert = -1;
+            bool previousTouchedIdentityUnique = false;
+            const bool previousUnknownCC = self->esquemaDeCCsDesconhecido;
+            const bool previousUnknownNotes = self->esquemaDeNotasDesconhecido;
+            const bool previousBlockedCC = self->bloquearSalvamentoCCVazio;
+            const bool previousBlockedNotes = self->bloquearSalvamentoNotasVazio;
+            const bool previousProfilesSuspended =
+                self->automaticControllerProfilesSuspended;
+            const bool previousPendingCCMigration = self->pendingLegacyCCMigration;
+            const bool previousPendingNoteMigration = self->pendingLegacyNoteMigration;
+
+            bool checkpointReady = false;
+            bool imported = false;
+            bool rollbackOk = true;
+            bool transactionStarted = false;
+            bool ccWasWritten = false;
+            bool noteWasWritten = false;
+            juce::uint64 ccEpoch = 0;
+            juce::uint64 noteEpoch = 0;
+
+            self->beginMidiMapRoutingTransaction();
+
+            checkpointReady = diskRollback.capture ("before-import");
+            const bool protectedAfterCheckpoint =
+                self->esquemaDeCCsDesconhecido
+                || self->esquemaDeNotasDesconhecido
+                || fileHasFutureSchema (ccTarget, "MIDIMAP")
+                || fileHasFutureSchema (noteTarget, "NOTEMAP")
+                || fileHasFutureSchema (ccTarget.getSiblingFile (
+                       ccTarget.getFileName() + ".last-good"), "MIDIMAP")
+                || fileHasFutureSchema (noteTarget.getSiblingFile (
+                       noteTarget.getFileName() + ".last-good"), "NOTEMAP");
+            const bool mayInstall = checkpointReady
+                && diskRollback.targetsUnchangedSinceCapture()
+                && ! protectedAfterCheckpoint
+                && ! self->midiMapPairRecoveryFailed;
+
+            if (mayInstall)
+            {
+                const auto importTransactionId =
+                    self->midiMapFileLock->getActiveTransactionId();
+                ccXml->setAttribute ("transactionId", importTransactionId);
+                noteXml->setAttribute ("transactionId", importTransactionId);
+                const auto ccInstallText = ccXml->toString (
+                    juce::XmlElement::TextFormat().singleLine());
+                const auto noteInstallText = noteXml->toString (
+                    juce::XmlElement::TextFormat().singleLine());
+
+                const bool installPayloadsAreInspectable =
+                    ChurchDAWMidiMapping::midiMapSerializedPayloadFitsSafetyLimits (
+                        ccInstallText)
+                    && ChurchDAWMidiMapping::midiMapSerializedPayloadFitsSafetyLimits (
+                        noteInstallText);
+
+                {
+                    const juce::ScopedLock sl (self->mapLock);
+                    previousCC = self->ccMappings;
+                    previousActions = self->ccActionMappings;
+                    previousNotes = self->noteMappings;
+                    previousPendingAction = self->pendingNoteAction;
+                    previousTouchedName = self->lastTouchedParamName;
+                    previousTouchedId = self->lastTouchedParamId;
+                    previousTouchedPluginId = self->lastTouchedPluginId;
+                    previousTouchedSlot = self->lastTouchedSlot.load (
+                        std::memory_order_relaxed);
+                    previousTouchedParam = self->lastTouchedParam.load (
+                        std::memory_order_relaxed);
+                    previousTouchedInsert = self->lastTouchedInsert.load (
+                        std::memory_order_relaxed);
+                    previousTouchedIdentityUnique =
+                        self->lastTouchedParameterIdentityUnique.load (
+                            std::memory_order_relaxed);
+                }
+
+                transactionStarted = installPayloadsAreInspectable;
+                const bool ccInstalled = transactionStarted
+                    && ChurchDAWMidiMapping::replaceFileWithTextAtomically (
+                        ccTarget, ccInstallText);
+                const bool noteInstalled = ccInstalled
+                    && ChurchDAWMidiMapping::replaceFileWithTextAtomically (
+                        noteTarget, noteInstallText);
+                auto installedCC =
+                    ChurchDAWMidiMapping::loadBoundedXmlFile (ccTarget);
+                auto installedNotes =
+                    ChurchDAWMidiMapping::loadBoundedXmlFile (noteTarget);
+                const bool installedVerified = noteInstalled
+                    && installedCC != nullptr
+                    && ChurchDAWMidiMapping::isMidiMapXmlReadable (
+                        *installedCC, "MIDIMAP", "MAP", "CCACAO")
+                    && installedNotes != nullptr
+                    && ChurchDAWMidiMapping::isMidiMapXmlReadable (
+                        *installedNotes, "NOTEMAP", "NOTE")
+                    && ! ChurchDAWMidiMapping::midiMapPairHasConflictingNoteControls (
+                        *installedCC, *installedNotes)
+                    && installedCC->getStringAttribute ("transactionId")
+                         == importTransactionId
+                    && installedNotes->getStringAttribute ("transactionId")
+                         == importTransactionId;
+
+                if (installedVerified)
+                {
+                    {
+                        const juce::ScopedLock sl (self->mapLock);
+                        self->ccMappings.clear();
+                        self->ccActionMappings.clear();
+                        self->noteMappings.clear();
+                        self->pendingNoteAction = {};
+                        self->lastTouchedParamName.clear();
+                        self->lastTouchedParamId.clear();
+                        self->lastTouchedPluginId.clear();
+                        self->lastTouchedParameterIdentityUnique.store (
+                            false, std::memory_order_relaxed);
+                    }
+                    self->esquemaDeCCsDesconhecido = false;
+                    self->esquemaDeNotasDesconhecido = false;
+                    self->bloquearSalvamentoCCVazio = false;
+                    self->bloquearSalvamentoNotasVazio = false;
+                    self->pendingLegacyCCMigration = false;
+                    self->pendingLegacyNoteMigration = false;
+
+                    self->restoreMidiMap();
+                    self->restoreNoteMap();
+
+                    int restoredCC = 0;
+                    int restoredNotes = 0;
+                    bool pairConflictAfterRekey = false;
+                    {
+                        const juce::ScopedLock sl (self->mapLock);
+                        restoredCC = (int) self->ccMappings.size()
+                                   + (int) self->ccActionMappings.size();
+                        restoredNotes = (int) self->noteMappings.size();
+                        pairConflictAfterRekey =
+                            ChurchDAWMidiMapping::midiMapCollectionsHaveConflictingNoteControls (
+                                self->ccMappings, self->noteMappings)
+                            || ChurchDAWMidiMapping::midiMapCollectionsHaveConflictingCCControls (
+                                self->ccMappings, self->ccActionMappings,
+                                [] (const AcaoDeCC& action)
+                                {
+                                    return action.acao.kind != NoteActionKind::none;
+                                });
+                    }
+                    const bool countsMatch =
+                        restoredCC == ccXml->getNumChildElements()
+                        && restoredNotes == noteXml->getNumChildElements();
+
+                    self->ccDirtyEpoch.markDirty();
+                    self->noteDirtyEpoch.markDirty();
+                    ccEpoch = self->ccDirtyEpoch.snapshot();
+                    noteEpoch = self->noteDirtyEpoch.snapshot();
+                    ccWasWritten = countsMatch
+                        && ! pairConflictAfterRekey
+                        && self->saveMidiMap();
+                    noteWasWritten = ccWasWritten
+                        && self->saveNoteMap();
+                    auto finalCC =
+                        ChurchDAWMidiMapping::loadBoundedXmlFile (ccTarget);
+                    auto finalNotes =
+                        ChurchDAWMidiMapping::loadBoundedXmlFile (noteTarget);
+                    auto finalCCBackup =
+                        ChurchDAWMidiMapping::loadBoundedXmlFile (
+                        ccTarget.getSiblingFile (
+                            ccTarget.getFileName() + ".last-good"));
+                    auto finalNoteBackup =
+                        ChurchDAWMidiMapping::loadBoundedXmlFile (
+                        noteTarget.getSiblingFile (
+                            noteTarget.getFileName() + ".last-good"));
+                    juce::MemoryBlock finalCCBytes;
+                    juce::MemoryBlock finalNoteBytes;
+                    juce::MemoryBlock finalCCBackupBytes;
+                    juce::MemoryBlock finalNoteBackupBytes;
+                    const bool exactPairCopies =
+                        ChurchDAWMidiMapping::loadBoundedFileData (
+                            ccTarget, finalCCBytes,
+                            ChurchDAWMidiMapping::maxMidiMapFileBytes)
+                        && ChurchDAWMidiMapping::loadBoundedFileData (
+                            noteTarget, finalNoteBytes,
+                            ChurchDAWMidiMapping::maxMidiMapFileBytes)
+                        && ChurchDAWMidiMapping::loadBoundedFileData (
+                            ccTarget.getSiblingFile (
+                                ccTarget.getFileName() + ".last-good"),
+                            finalCCBackupBytes,
+                            ChurchDAWMidiMapping::maxMidiMapFileBytes)
+                        && ChurchDAWMidiMapping::loadBoundedFileData (
+                            noteTarget.getSiblingFile (
+                                noteTarget.getFileName() + ".last-good"),
+                            finalNoteBackupBytes,
+                            ChurchDAWMidiMapping::maxMidiMapFileBytes)
+                        && finalCCBytes == finalCCBackupBytes
+                        && finalNoteBytes == finalNoteBackupBytes;
+                    imported = noteWasWritten
+                        && finalCC != nullptr
+                        && ChurchDAWMidiMapping::isMidiMapXmlValid (
+                            *finalCC, "MIDIMAP", "MAP", "CCACAO")
+                        && finalNotes != nullptr
+                        && ChurchDAWMidiMapping::isMidiMapXmlValid (
+                            *finalNotes, "NOTEMAP", "NOTE")
+                        && ! ChurchDAWMidiMapping::midiMapPairHasConflictingNoteControls (
+                            *finalCC, *finalNotes)
+                        && finalCCBackup != nullptr
+                        && ChurchDAWMidiMapping::isMidiMapXmlValid (
+                            *finalCCBackup, "MIDIMAP", "MAP", "CCACAO")
+                        && finalNoteBackup != nullptr
+                        && ChurchDAWMidiMapping::isMidiMapXmlValid (
+                            *finalNoteBackup, "NOTEMAP", "NOTE")
+                        && ! ChurchDAWMidiMapping::midiMapPairHasConflictingNoteControls (
+                            *finalCCBackup, *finalNoteBackup)
+                        && exactPairCopies
+                        && finalCC->getStringAttribute ("transactionId")
+                            == importTransactionId
+                        && finalNotes->getStringAttribute ("transactionId")
+                            == importTransactionId;
+
+                    imported = imported && diskRollback.commit();
+                    if (imported)
+                    {
+                        self->finishMidiMapDirtyEpochsAfterPairCommit (
+                            ccEpoch, ccWasWritten,
+                            noteEpoch, noteWasWritten);
+                        const juce::ScopedLock sl (self->mapLock);
+                        self->automaticControllerProfilesSuspended =
+                            ChurchDAWMidiMapping::hasUnresolvedUnnamedMidiSource (
+                                self->ccMappings, self->midiSourcesCached)
+                            || ChurchDAWMidiMapping::hasUnresolvedUnnamedMidiSource (
+                                self->ccActionMappings, self->midiSourcesCached)
+                            || ChurchDAWMidiMapping::hasUnresolvedUnnamedMidiSource (
+                                    self->noteMappings, self->midiSourcesCached);
+                    }
+                }
+            }
+
+            if (checkpointReady && ! transactionStarted)
+            {
+                // We did not change any target; close our journal while
+                // preserving a concurrent/future-schema writer.
+                rollbackOk = diskRollback.closeWithoutMutation();
+            }
+            else if (transactionStarted && ! imported)
+            {
+                rollbackOk =
+                    ChurchDAWMidiMapping::rollbackMidiMapPairPreservingFutureSchema (
+                        diskRollback, ccTarget, noteTarget);
+                const juce::ScopedLock sl (self->mapLock);
+                self->ccMappings = std::move (previousCC);
+                self->ccActionMappings = std::move (previousActions);
+                self->noteMappings = std::move (previousNotes);
+                self->pendingNoteAction = previousPendingAction;
+                self->lastTouchedParamName = previousTouchedName;
+                self->lastTouchedParamId = previousTouchedId;
+                self->lastTouchedPluginId = previousTouchedPluginId;
+                self->lastTouchedSlot.store (
+                    previousTouchedSlot, std::memory_order_relaxed);
+                self->lastTouchedParam.store (
+                    previousTouchedParam, std::memory_order_relaxed);
+                self->lastTouchedInsert.store (
+                    previousTouchedInsert, std::memory_order_relaxed);
+                self->lastTouchedParameterIdentityUnique.store (
+                    previousTouchedIdentityUnique, std::memory_order_relaxed);
+                self->esquemaDeCCsDesconhecido = previousUnknownCC;
+                self->esquemaDeNotasDesconhecido = previousUnknownNotes;
+                self->bloquearSalvamentoCCVazio = previousBlockedCC;
+                self->bloquearSalvamentoNotasVazio = previousBlockedNotes;
+                self->automaticControllerProfilesSuspended =
+                    previousProfilesSuspended;
+                self->pendingLegacyCCMigration = previousPendingCCMigration;
+                self->pendingLegacyNoteMigration = previousPendingNoteMigration;
+                self->bumpMidiMappingGeneration();
+            }
+
+            if (imported)
+            {
+                self->bumpMidiMappingGeneration();
+                self->cancelPendingUpdate();
+                self->lastMappedCC.store (-1);
+                self->lastMappedNote.store (-1);
+                self->lastMappedCCAcao.store (-1);
+                self->lastCCAcaoRecusada.store (-1);
+                self->lastCCAcaoDesmapeada.store (-1);
+                self->lastNoteActionRejected.store (-1);
+                self->lastParameterMappingRejectedCC.store (-1);
+                {
+                    const juce::ScopedLock sl (self->mapLock);
+                    self->lastTouchedSlot.store (-2, std::memory_order_relaxed);
+                    self->lastTouchedParam.store (-1, std::memory_order_relaxed);
+                    self->lastTouchedInsert.store (-1, std::memory_order_relaxed);
+                    self->lastTouchedParamName.clear();
+                    self->lastTouchedParamId.clear();
+                    self->lastTouchedPluginId.clear();
+                    self->lastTouchedParameterIdentityUnique.store (
+                        false, std::memory_order_relaxed);
+                }
+            }
+            self->finishMidiMapRoutingTransaction();
+
+            if (! checkpointReady
+                 && diskRollback.hadUninspectableTargetConflict())
+                self->bloquearQuartetoMidiDesconhecido (
+                    "checkpoint de importacao MIDI");
+            if (! rollbackOk
+                 || diskRollback.preservedExternalChanges())
+                self->midiMapPairRecoveryFailed = true;
+            self->reconstruirMascaraDeNotas();
+            self->reconstruirMascaraDeCCsDeAcao();
+
+            self->ccPickup.clear();
+            self->atualizarEtiquetasDoPad();
+            self->atualizarBotoesDeCCDoPad();
+            self->refreshMidiMappingPanel();
+            const int mappingCount = self->getMidiMappingCount();
+            self->midiLearnPanel.setMappingCount (mappingCount);
+            self->deviceBar.setMappingCount (mappingCount);
+            self->midiMappingPanel.setStatus (
+                imported
+                    ? "Mapeamentos MIDI importados, verificados e salvos"
+                    : rollbackOk
+                        ? "Falha na importacao; os mapeamentos anteriores foram restaurados"
+                        : "Falha grave ao restaurar a importacao; preserve os backups",
+                imported ? MidiMappingPanel::Status::success
+                         : MidiMappingPanel::Status::error);
+            juce::Logger::writeToLog (
+                imported ? "MIDI MAP: importacao transacional concluida"
+                         : rollbackOk
+                             ? "MIDI MAP: importacao falhou; rollback concluido"
+                             : "MIDI MAP: ERRO GRAVE no rollback da importacao");
+            self->midiMapFileChooser.reset();
+        });
 }
 
 //==============================================================================
@@ -5368,6 +13585,7 @@ ChurchDAWLive::Resultado MainComponent::capturarCena (int indice)
         return ChurchDAWLive::Resultado::naoGravou;
 
     const ChurchDAWLive::EstadoAntesDePersistirCena antes { cenas[indice], cenaAtiva };
+    const int posicaoAnteriorDoSetlist = setlist.posicao;
     auto& cena = cenas[indice];
     const auto estadoIdAnterior = cena.estadoDoMotorId;
     cena.estadoDoMotorId = novoEstadoId;
@@ -5405,6 +13623,7 @@ ChurchDAWLive::Resultado MainComponent::capturarCena (int indice)
 
         if (auto* p = live->getLayerVolParam (l))    canal.volume = p->getValue();
         if (auto* p = live->getLayerTransposeParam (l)) canal.transpose = p->get();
+        if (auto* p = live->getLayerOctaveParam (l)) canal.octave = p->get();
         if (auto* p = live->getLayerReverbSendParam (l)) canal.envioDeReverb = p->get();
 
         canal.rotuloDoTimbre = live->getLayerTimbre (l);
@@ -5442,6 +13661,7 @@ ChurchDAWLive::Resultado MainComponent::capturarCena (int indice)
     // exatamente ela. Sem isto o painel fica sem nenhuma cena acesa logo
     // depois de gravar, e no palco o musico perde a referencia de onde esta.
     cenaAtiva = indice;
+    setlist.reposicionarPara (indice);
 
     // GRAVOU NA MEMORIA NAO E GRAVOU.
     //
@@ -5454,6 +13674,7 @@ ChurchDAWLive::Resultado MainComponent::capturarCena (int indice)
 
     if (resultado != ChurchDAWLive::Resultado::ok)
     {
+        setlist.posicao = posicaoAnteriorDoSetlist;
         removerPaginaDeCenaSeOrfa (novoEstadoId);
         juce::Logger::writeToLog ("LIVE: cena " + juce::String (indice + 1)
                                     + " NAO gravada; memoria e cena ativa restauradas");
@@ -5461,8 +13682,159 @@ ChurchDAWLive::Resultado MainComponent::capturarCena (int indice)
     }
 
     removerPaginaDeCenaSeOrfa (estadoIdAnterior);
+    cenaEmPreparacao = -1;
+    liveScenePanel.selecionarCenaAtiva (indice);
+    refreshPerformanceSessionPanel();
     juce::Logger::writeToLog ("LIVE: cena " + juce::String (indice + 1) + " gravada");
     return ChurchDAWLive::Resultado::ok;
+}
+
+void MainComponent::limparMotorLiveParaPaginaVazia (TimbresProcessor& live)
+{
+    live.panic();
+
+    for (int slot = 0; slot < TimbresProcessor::numInserts; ++slot)
+        live.unloadInsert (slot);
+
+    for (int l = 0; l < TimbresProcessor::numLayers; ++l)
+    {
+        live.clearLayer (l);
+
+        if (live.getLayerInstrument (l) != nullptr)
+            live.clearInstrumentPlugin (l);
+
+        // clearLayer() preserva a regulagem quando o usuario apenas troca um
+        // timbre. Uma pagina vazia e deliberadamente diferente: fader no
+        // fundo, canal OFF e todos os knobs/rotas em estado neutro.
+        live.resetClearedLayerForEmptyScene (l);
+    }
+
+    const ChurchDAWLive::Cena paginaNova;
+
+    if (auto* p = live.getVolumeGeralParam())
+        *p = paginaNova.volumeGeral;
+
+    if (auto* p = live.getTransposeGeralParam())
+        *p = paginaNova.transposeGeral;
+
+    if (auto* p = live.getRetornoDeReverbParam())
+        *p = paginaNova.retornoDeReverb;
+
+    if (padProcessor != nullptr)
+    {
+        padProcessor->setKey (-1);
+        padProcessor->setGain (paginaNova.padVolume);
+        padProcessor->setCutoff (paginaNova.padCorte);
+    }
+
+    if (masterProcessor != nullptr)
+    {
+        masterProcessor->setMasterDb (paginaNova.masterDb);
+        masterProcessor->setAutoEq (paginaNova.masterAutoEq);
+        masterProcessor->setPunch (paginaNova.masterPunch);
+        masterSlider.setValue (paginaNova.masterDb,
+                               juce::dontSendNotification);
+    }
+
+    // Faders fisicos continuam na posicao da cena apagada. Exigir pickup no
+    // proximo gesto impede que o primeiro toque ressuscite aquele valor.
+    ccPickup.clear();
+
+    if (padPanel != nullptr)
+        padPanel->refreshState();
+
+    refreshPerformanceSessionPanel();
+}
+
+bool MainComponent::zerarTimbresDoProjeto()
+{
+    auto* live = getChurchLive();
+
+    if (live == nullptr)
+        return false;
+
+    // Primeiro persiste que nenhuma cena esta no ar. Se o disco recusar, nao
+    // toca no audio: assim o proximo arranque nunca carrega automaticamente
+    // uma cena antiga por cima de um setup que o usuario acreditou ter zerado.
+    const int ativaAntes = cenaAtiva;
+    const int preparacaoAntes = cenaEmPreparacao;
+    const int posicaoAntes = setlist.posicao;
+
+    cenaAtiva = -1;
+    cenaEmPreparacao = -1;
+    setlist.posicao = -1;
+
+    if (! salvarCenas())
+    {
+        cenaAtiva = ativaAntes;
+        cenaEmPreparacao = preparacaoAntes;
+        setlist.posicao = posicaoAntes;
+        return false;
+    }
+
+    ++geracaoDaCena;
+    cenaPendenteNoStartup = -1;
+    controleDeGravacaoDoSetup.iniciarSupressao (geracaoDaCena);
+
+    limparMotorLiveParaPaginaVazia (*live);
+    if (padSynthProcessor != nullptr)
+    {
+        padSynthProcessor->requestPanic();
+        padSynthProcessor->setEngineEnabled (false);
+    }
+    resetMidiTransportState (false);
+    liveScenePanel.limparSelecao();
+    liveScenePanel.atualizar (cenas, cenaAtiva);
+    refreshPerformanceSessionPanel();
+    repaint (desktopSidebarBounds);
+
+    // Reset e um gesto explicito de projeto, portanto o estado vazio tambem
+    // precisa sobreviver ao fechamento do app. As cenas salvas permanecem no
+    // banco; apenas o que esta no mixer e o setup de abertura sao zerados.
+    const bool setupOk = saveChainState();
+    agendarFimDaSupressaoDeGravacaoDaCena (geracaoDaCena);
+
+    juce::Logger::writeToLog (setupOk
+        ? "LIVE: todos os timbres e canais foram zerados"
+        : "LIVE: timbres zerados, mas o setup vazio NAO foi gravado");
+    return setupOk;
+}
+
+void MainComponent::pedirConfirmacaoParaZerarTimbres()
+{
+    auto options = juce::MessageBoxOptions::makeOptionsOkCancel (
+        juce::MessageBoxIconType::WarningIcon,
+        "Zerar todos os timbres",
+        juce::String::fromUTF8 (
+            "Isso remove os timbres e plugins dos canais e deixa todos os "
+            "faders no fundo.\n\nAs cenas que ja foram salvas nao serao "
+            "apagadas."),
+        "Zerar", "Cancelar", this);
+
+    // A caixa nativa nao compartilha a superficie OpenGL da interface. Assim,
+    // ao fechar, ela nao deixa uma copia visual por cima dos canais zerados.
+    juce::NativeMessageBox::showAsync (
+        options,
+        [safe = juce::Component::SafePointer<MainComponent> (this)]
+        (int resultado)
+        {
+            // NativeMessageBox::showAsync devolve o indice do botao: o
+            // primeiro (Zerar) e zero e o segundo (Cancelar) e um.
+            if (resultado != 0 || safe == nullptr)
+                return;
+
+            juce::Timer::callAfterDelay (20, [safe]
+            {
+                auto* self = safe.getComponent();
+                if (self == nullptr)
+                    return;
+
+                const bool ok = self->zerarTimbresDoProjeto();
+                self->liveScenePanel.avisar (ok
+                    ? "TIMBRES ZERADOS - CENAS SALVAS PRESERVADAS"
+                    : "NAO FOI POSSIVEL ZERAR COM SEGURANCA");
+            });
+        });
 }
 
 ChurchDAWLive::Resultado MainComponent::aplicarCena (
@@ -5495,7 +13867,11 @@ ChurchDAWLive::Resultado MainComponent::aplicarCena (
         return ChurchDAWLive::Resultado::indisponivel;
     }
 
+    if (tentativa == 0)
+        capturarInicioDaTransicao (*live, geracaoDaRequisicao);
+
     const auto& cena = cenas[indice];
+    playbackEngine.setBpm (cena.bpm);
 
     const auto safeThis = juce::Component::SafePointer<MainComponent> (this);
     const auto reagendar = [this, safeThis, indice, tentativa] (
@@ -5652,66 +14028,11 @@ ChurchDAWLive::Resultado MainComponent::aplicarCena (
             return ChurchDAWLive::Resultado::naoGravou;
         }
 
-        live->panic();
-
-        for (int slot = 0; slot < TimbresProcessor::numInserts; ++slot)
-            live->unloadInsert (slot);
-
-        for (int l = 0; l < TimbresProcessor::numLayers; ++l)
-        {
-            live->clearLayer (l);
-
-            if (live->getLayerInstrument (l) != nullptr)
-                live->clearInstrumentPlugin (l);
-
-            if (auto* on = live->getLayerOnParam (l))
-                on->setValueNotifyingHost (0.0f);
-
-            if (auto* mute = live->getLayerMuteParam (l))
-                *mute = false;
-
-            if (auto* solo = live->getLayerSoloParam (l))
-                *solo = false;
-        }
-
-        // Pagina nova nao herda os controles globais da musica anterior.
-        // Como nao ha canal carregado, neutralizar agora nao produz salto de
-        // audio e entrega ao cliente um ponto de partida realmente novo.
-        const ChurchDAWLive::Cena paginaNova;
-
-        if (auto* p = live->getVolumeGeralParam())
-            *p = paginaNova.volumeGeral;
-
-        if (auto* p = live->getTransposeGeralParam())
-            *p = paginaNova.transposeGeral;
-
-        if (auto* p = live->getRetornoDeReverbParam())
-            *p = paginaNova.retornoDeReverb;
-
-        if (padProcessor != nullptr)
-        {
-            padProcessor->setKey (-1);
-            padProcessor->setGain (paginaNova.padVolume);
-            padProcessor->setCutoff (paginaNova.padCorte);
-        }
-
-        if (masterProcessor != nullptr)
-        {
-            masterProcessor->setMasterDb (paginaNova.masterDb);
-            masterProcessor->setAutoEq (paginaNova.masterAutoEq);
-            masterProcessor->setPunch (paginaNova.masterPunch);
-            masterSlider.setValue (paginaNova.masterDb,
-                                   juce::dontSendNotification);
-        }
-
-        // A pagina vazia tambem move Pad/Master por baixo dos controles MIDI.
-        // Ela precisa do mesmo refresh/rearme de uma cena preenchida; sem isto
-        // o card do Pad mostrava o tom anterior e o primeiro CC saltava direto
-        // para a posicao fisica antiga.
-        ccPickup.clear();
-
-        if (padPanel != nullptr)
-            padPanel->refreshState();
+        limparMotorLiveParaPaginaVazia (*live);
+        cenaEmPreparacao = indice;
+        liveScenePanel.selecionarDestinoNovo (indice);
+        refreshPerformanceSessionPanel();
+        repaint (desktopSidebarBounds);
 
         agendarFimDaSupressaoDeGravacaoDaCena (geracaoDaRequisicao);
         juce::Logger::writeToLog (
@@ -5782,12 +14103,21 @@ ChurchDAWLive::Resultado MainComponent::aplicarCena (
 
     // PASSO 2 — o que so afeta nota NOVA: seguro em qualquer instante.
     for (int l = 0; l < ChurchDAWLive::numeroDeCanais; ++l)
+    {
         if (auto* p = live->getLayerTransposeParam (l))
             *p = cena.canais[l].transpose;
+        if (auto* p = live->getLayerOctaveParam (l))
+            *p = cena.canais[l].octave;
+    }
 
     if (cena.temGlobais)
         if (auto* p = live->getTransposeGeralParam())
             *p = cena.transposeGeral;
+
+    // O Pad acompanha o Transpose Global como os demais instrumentos.
+    if (padProcessor != nullptr)
+        if (auto* p = live->getTransposeGeralParam())
+            padProcessor->setTransposeSemis ((int) *p);
 
     // PASSO 3 — VOLUME, MUTE E SEND ANTES DE LIGAR.
     //
@@ -5892,7 +14222,9 @@ ChurchDAWLive::Resultado MainComponent::aplicarCena (
     ccPickup.clear();
 
     const int ativaAntes = cenaAtiva;
+    const int posicaoAnteriorDoSetlist = setlist.posicao;
     cenaAtiva = indice;
+    setlist.reposicionarPara (indice);
 
     // UMA fonte de verdade para a cena corrente: o mesmo XML que guarda as 10.
     // Guardar o indice numa chave separada ja custou um bug — a chave era
@@ -5901,6 +14233,7 @@ ChurchDAWLive::Resultado MainComponent::aplicarCena (
     if (! salvarCenas())
     {
         cenaAtiva = ativaAntes;
+        setlist.posicao = posicaoAnteriorDoSetlist;
         liveScenePanel.atualizar (cenas, cenaAtiva);
         bool rollbackSolicitado = false;
 
@@ -5938,6 +14271,9 @@ ChurchDAWLive::Resultado MainComponent::aplicarCena (
         return ChurchDAWLive::Resultado::naoGravou;
     }
 
+    cenaEmPreparacao = -1;
+    liveScenePanel.selecionarCenaAtiva (indice);
+
     // NAO agendar a gravacao do setup aqui. Ja tentei, e o remedio era muito
     // pior que a doenca.
     //
@@ -5956,7 +14292,12 @@ ChurchDAWLive::Resultado MainComponent::aplicarCena (
     if (padPanel != nullptr)
         padPanel->refreshState();
 
-    agendarFimDaSupressaoDeGravacaoDaCena (geracaoDaRequisicao);
+    refreshPerformanceSessionPanel();
+
+    const bool transitionStarted = iniciarTransicaoDaCena (
+        cena, geracaoDaRequisicao);
+    if (! transitionStarted)
+        agendarFimDaSupressaoDeGravacaoDaCena (geracaoDaRequisicao);
     juce::Logger::writeToLog ("LIVE: cena " + juce::String (indice + 1) + " aplicada");
     return ChurchDAWLive::Resultado::ok;
 }
@@ -5967,11 +14308,8 @@ void MainComponent::renomearCena (int indice, juce::String nome)
          || ! cenas[indice].preenchida)
         return;
 
-    // Limite curto de proposito: o botao tem a largura de um dedo. Um nome que
-    // nao cabe vira reticencias e deixa de servir para achar a musica, que e a
-    // unica razao de existir o nome.
     const ChurchDAWLive::EstadoAntesDePersistirCena antes { cenas[indice], cenaAtiva };
-    cenas[indice].nome = nome.trim().substring (0, 18);
+    cenas[indice].nome = nome.trim().substring (0, 42);
 
     const auto resultado = ChurchDAWLive::concluirPersistenciaDeCena (
         salvarCenas(), antes, cenas[indice], cenaAtiva);
@@ -5982,6 +14320,56 @@ void MainComponent::renomearCena (int indice, juce::String nome)
     if (resultado != ChurchDAWLive::Resultado::ok)
         liveScenePanel.avisar (
             ChurchDAWLive::avisoDoResultado (resultado, indice));
+
+    refreshPerformanceSessionPanel();
+}
+
+void MainComponent::atualizarMetadadosDaCena (
+    int indice, const ChurchDAWLive::Cena& novosDados)
+{
+    if (! juce::isPositiveAndBelow (indice, ChurchDAWLive::numeroDeCenas))
+        return;
+
+    const auto anterior = cenas[indice];
+    auto& cena = cenas[indice];
+    cena.musica = novosDados.musica.trim().substring (0, 56);
+    cena.nome = novosDados.nome.trim().substring (0, 42);
+    cena.tonalidade = novosDados.tonalidade.trim().substring (0, 8);
+    cena.compasso = novosDados.compasso.trim().substring (0, 8);
+    cena.secao = novosDados.secao.trim().substring (0, 28);
+    cena.bpm = juce::jlimit (30.0, 300.0, novosDados.bpm);
+    cena.duracaoSegundos = juce::jlimit (
+        0.0, 86400.0, novosDados.duracaoSegundos);
+    cena.transicaoSegundos = juce::jlimit (
+        0.0, 15.0, novosDados.transicaoSegundos);
+
+    if (cena.tonalidade.isEmpty()) cena.tonalidade = "C";
+    if (cena.compasso.isEmpty()) cena.compasso = "4/4";
+    if (cena.secao.isEmpty()) cena.secao = "Cena";
+
+    if (! salvarCenas())
+        cena = anterior;
+
+    liveScenePanel.atualizar (cenas, cenaAtiva);
+    refreshPerformanceSessionPanel();
+    repaint (desktopSidebarBounds);
+    repaint (desktopHeaderExtrasBounds);
+}
+
+void MainComponent::atualizarSetlist (
+    const ChurchDAWLive::Setlist& novoSetlist)
+{
+    const auto anterior = setlist;
+    setlist = novoSetlist;
+    if (juce::isPositiveAndBelow (cenaAtiva, ChurchDAWLive::numeroDeCenas))
+        setlist.reposicionarPara (cenaAtiva);
+
+    if (! salvarCenas())
+        setlist = anterior;
+
+    refreshPerformanceSessionPanel();
+    resized();
+    repaint (desktopSidebarBounds);
 }
 
 void MainComponent::apagarCena (int indice)
@@ -6016,9 +14404,15 @@ void MainComponent::apagarCena (int indice)
                 const ChurchDAWLive::EstadoAntesDePersistirCena antes {
                     self->cenas[indice], self->cenaAtiva
                 };
+                const auto setlistAntes = self->setlist;
                 const auto paginaAnterior =
                     self->cenas[indice].estadoDoMotorId;
+                const bool eraCenaAtiva = self->cenaAtiva == indice;
                 self->cenas[indice] = ChurchDAWLive::Cena{};   // volta a ser slot vazio
+
+                for (int i = self->setlist.tamanho; --i >= 0;)
+                    if (self->setlist.ordem[(size_t) i] == indice)
+                        self->setlist.removerNaPosicao (i);
 
                 // A cena apagada nao pode continuar acesa como "tocando".
                 if (self->cenaAtiva == indice)
@@ -6028,10 +14422,38 @@ void MainComponent::apagarCena (int indice)
                     self->salvarCenas(), antes,
                     self->cenas[indice], self->cenaAtiva);
                 const bool gravou = persistencia == ChurchDAWLive::Resultado::ok;
+                if (! gravou)
+                    self->setlist = setlistAntes;
                 self->liveScenePanel.atualizar (self->cenas, self->cenaAtiva);
+                self->refreshPerformanceSessionPanel();
+                self->repaint (self->desktopSidebarBounds);
 
                 if (gravou)
+                {
                     self->removerPaginaDeCenaSeOrfa (paginaAnterior);
+
+                    // Apagar um slot INATIVO nao toca no som que esta no ar.
+                    // Apagar a cena ATIVA, entretanto, precisa cumprir o gesto
+                    // por inteiro: remove timbres/plugins, desliga canais e
+                    // deixa todos os faders no fundo. Antes o painel apagava o
+                    // nome da cena, mas o mixer antigo continuava tocando.
+                    if (eraCenaAtiva)
+                    {
+                        self->cenaEmPreparacao = -1;
+                        ++self->geracaoDaCena;
+                        self->cenaPendenteNoStartup = -1;
+                        self->controleDeGravacaoDoSetup.iniciarSupressao (
+                            self->geracaoDaCena);
+
+                        if (auto* live = self->getChurchLive())
+                            self->limparMotorLiveParaPaginaVazia (*live);
+
+                        self->liveScenePanel.limparSelecao();
+
+                        self->agendarFimDaSupressaoDeGravacaoDaCena (
+                            self->geracaoDaCena);
+                    }
+                }
 
                 // Apagar que nao foi ao disco e pior que gravar que nao foi: a
                 // cena some da tela e VOLTA INTEIRA no proximo arranque.
@@ -6063,32 +14485,18 @@ void MainComponent::guardarCopiaDeArquivoIlegivel (const juce::File& arquivo,
     if (! arquivo.existsAsFile())
         return;
 
-    const auto guardado = arquivo.getSiblingFile (arquivo.getFileName() + ".corrompido");
-    const auto novo = arquivo.getSiblingFile (arquivo.getFileName() + ".corrompido.novo");
+    const auto guardado = ChurchDAWMidiMapping::uniqueCorruptCopyTarget (arquivo);
 
-    novo.deleteFile();
-
-    if (arquivo.getSize() <= 0 || ! arquivo.copyFileTo (novo))
+    if (arquivo.getSize() <= 0
+         || ! ChurchDAWMidiMapping::atomicCopyFile (arquivo, guardado))
     {
         juce::Logger::writeToLog (rotulo + ": arquivo ILEGIVEL e sem copia nova "
                                            "(o backup anterior foi preservado)");
         return;
     }
 
-    bool trocou = novo.moveFileTo (guardado);
-
-    if (! trocou)
-    {
-        guardado.deleteFile();
-        trocou = novo.moveFileTo (guardado);
-    }
-
-    if (trocou)
-        juce::Logger::writeToLog (rotulo + ": arquivo ILEGIVEL; copia em "
-                                    + guardado.getFileName());
-    else
-        juce::Logger::writeToLog (rotulo + ": arquivo ILEGIVEL e NAO consegui guardar a copia; "
-                                           "ela ficou em " + novo.getFileName());
+    juce::Logger::writeToLog (rotulo + ": arquivo ILEGIVEL; copia em "
+                                + guardado.getFileName());
 }
 
 // Arquivo de versao futura = a sessao abre SEM aquilo, e isso tem de aparecer
@@ -6243,7 +14651,8 @@ void MainComponent::removerPaginaDeCenaSeOrfa (const juce::String& estadoId)
 
     if (arquivo.existsAsFile() && ! arquivo.deleteFile())
         juce::Logger::writeToLog (
-            "LIVE: pagina orfa nao pôde ser removida " + arquivo.getFileName());
+            juce::String::fromUTF8 (u8"LIVE: pagina orfa não pôde ser removida ")
+                + arquivo.getFileName());
 }
 
 bool MainComponent::assegurarPaginaDaCenaAtiva (TimbresProcessor& live)
@@ -6311,11 +14720,13 @@ bool MainComponent::salvarCenas()
     }
 
     juce::XmlElement xml ("LIVESCENES");
-    xml.setAttribute ("schema", 2);   // v2 referencia paginas de audio por SHA-256
+    xml.setAttribute ("schema", 3);   // v3 normaliza o default legado do Pad Church
     xml.setAttribute ("active", cenaAtiva);
 
     for (int i = 0; i < ChurchDAWLive::numeroDeCenas; ++i)
         ChurchDAWLive::escreverCena (xml, cenas[i], i);
+
+    ChurchDAWLive::escreverSetlist (xml, setlist);
 
     // ARQUIVO PROPRIO, fora do settings.
     //
@@ -6394,7 +14805,9 @@ void MainComponent::restaurarCenas()
         return;
     }
 
-    if (xml->getIntAttribute ("schema", 1) > 2)
+    const int sceneSchema = xml->getIntAttribute ("schema", 1);
+
+    if (sceneSchema > 3)
     {
         // Igual ao mapa de notas: nao le E nao grava. Sem isto, o primeiro
         // toque de GRAVAR reescreveria no formato velho o arquivo que uma
@@ -6408,6 +14821,7 @@ void MainComponent::restaurarCenas()
     }
 
     esquemaDeCenasDesconhecido = false;
+    bool migratedLegacyPadOctave = false;
 
     cenaAtiva = juce::jlimit (-1, ChurchDAWLive::numeroDeCenas - 1,
                               xml->getIntAttribute ("active", -1));
@@ -6417,8 +14831,26 @@ void MainComponent::restaurarCenas()
         const int i = c->getIntAttribute ("index", -1);
 
         if (juce::isPositiveAndBelow (i, ChurchDAWLive::numeroDeCenas))
-            ChurchDAWLive::lerCena (*c, cenas[i]);
+        {
+            std::array<int, ChurchDAWLive::numeroDeCanais> beforeOctaves {};
+
+            for (int layer = 0; layer < ChurchDAWLive::numeroDeCanais; ++layer)
+                beforeOctaves[(size_t) layer] = cenas[i].canais[layer].octave;
+
+            ChurchDAWLive::lerCena (*c, cenas[i], sceneSchema < 3);
+
+            for (int layer = 0; layer < ChurchDAWLive::numeroDeCanais; ++layer)
+                migratedLegacyPadOctave = migratedLegacyPadOctave
+                    || beforeOctaves[(size_t) layer]
+                           != cenas[i].canais[layer].octave;
+        }
     }
+
+    ChurchDAWLive::lerSetlist (*xml, setlist);
+
+    if (migratedLegacyPadOctave && ! salvarCenas())
+        juce::Logger::writeToLog (
+            "LIVE: migracao da oitava do Pad Church sera repetida na proxima abertura");
 
     // Uma cena que aponta para um slot vazio nao pode ficar acesa.
     if (cenaAtiva >= 0 && ! cenas[cenaAtiva].preenchida)
@@ -6458,6 +14890,9 @@ void MainComponent::restaurarCenas()
 
 void MainComponent::reconciliarCenaAtivaNoStartup (int tentativa)
 {
+    if (componentShutdownStarted.load (std::memory_order_acquire))
+        return;
+
     if (! juce::isPositiveAndBelow (cenaPendenteNoStartup,
                                     ChurchDAWLive::numeroDeCenas))
         return;
@@ -6486,7 +14921,9 @@ void MainComponent::reconciliarCenaAtivaNoStartup (int tentativa)
                  indice, tentativa]
                 {
                     if (auto* self = safe.getComponent())
-                        if (self->cenaPendenteNoStartup == indice)
+                        if (! self->componentShutdownStarted.load (
+                                std::memory_order_acquire)
+                             && self->cenaPendenteNoStartup == indice)
                             self->reconciliarCenaAtivaNoStartup (tentativa + 1);
                 });
             return;
@@ -6520,7 +14957,9 @@ void MainComponent::reconciliarCenaAtivaNoStartup (int tentativa)
              indice, tentativa]
             {
                 if (auto* self = safe.getComponent())
-                    if (self->cenaPendenteNoStartup == indice)
+                    if (! self->componentShutdownStarted.load (
+                            std::memory_order_acquire)
+                         && self->cenaPendenteNoStartup == indice)
                         self->reconciliarCenaAtivaNoStartup (tentativa + 1);
             });
         return;
@@ -6624,10 +15063,45 @@ void MainComponent::atualizarEtiquetasDoPad()
     padPanel->setTeclasMapeadas (porTom, paraParar);
 }
 
+// Diz ao painel do Pad quais tons tem um pad de borracha / pedal de CC, e se o
+// musico ja marcou que aquele pad tem trava. So isso: o painel nao precisa
+// saber de nivel, de alcance aprendido nem de tipo de aparelho.
+void MainComponent::atualizarBotoesDeCCDoPad()
+{
+    if (padPanel == nullptr)
+        return;
+
+    std::array<PadPanel::BotaoDeCC, 12> porTom {};
+    PadPanel::BotaoDeCC paraParar;
+
+    {
+        const juce::ScopedLock sl (mapLock);
+
+        for (const auto& par : ccActionMappings)
+        {
+            const bool comTrava =
+                par.second.modo == ChurchDAWMidiMapping::ModoDeBotaoCC::seguirNivel;
+
+            if (par.second.acao.kind == NoteActionKind::padKey
+                 && juce::isPositiveAndBelow (par.second.acao.arg, 12))
+            {
+                auto& alvo = porTom[(size_t) par.second.acao.arg];
+                alvo.existe = true;
+                alvo.comTrava = alvo.comTrava || comTrava;
+            }
+            else if (par.second.acao.kind == NoteActionKind::padOff)
+            {
+                paraParar.existe = true;
+                paraParar.comTrava = paraParar.comTrava || comTrava;
+            }
+        }
+    }
+
+    padPanel->setBotoesDeCC (porTom, paraParar);
+}
+
 void MainComponent::reconstruirMascaraDeNotas()
 {
-    juce::uint32 nova[4] = { 0, 0, 0, 0 };
-
     // O SNAPSHOT E OS STORE PRECISAM ESTAR SOB O MESMO LOCK.
     //
     // Com o store fora, existia esta corrida — e ela apagava um mapeamento
@@ -6644,6 +15118,12 @@ void MainComponent::reconstruirMascaraDeNotas()
     // lock, snapshot anterior ao insert implica store anterior ao insert, e a
     // janela deixa de existir.
     const juce::ScopedLock sl (mapLock);
+    reconstruirMascaraDeNotasUnderMapLock();
+}
+
+void MainComponent::reconstruirMascaraDeNotasUnderMapLock()
+{
+    juce::uint32 nova[4] = { 0, 0, 0, 0 };
 
     for (const auto& par : noteMappings)
         if (juce::isPositiveAndBelow (par.first.cc, 128)
@@ -6659,6 +15139,148 @@ juce::File MainComponent::arquivoDoMapaDeNotas()
     return appProperties.getUserSettings()->getFile().getSiblingFile ("midi-note-map.xml");
 }
 
+bool MainComponent::exigirQuartetoMidiInspecionavel (
+    const juce::String& contexto)
+{
+    if (ChurchDAWMidiMapping::midiMapPairTargetsInspectable (
+            arquivoDoMapaDeCCs(), arquivoDoMapaDeNotas()))
+        return true;
+
+    bloquearQuartetoMidiDesconhecido (contexto);
+    return false;
+}
+
+void MainComponent::bloquearQuartetoMidiDesconhecido (
+    const juce::String& contexto)
+{
+    // "Nao consegui ler" is not evidence of corruption. Protect the complete
+    // generation so an older build cannot replace an oversized/newer file (or
+    // an inaccessible/non-regular path) with an older last-good snapshot.
+    esquemaDeCCsDesconhecido = true;
+    esquemaDeNotasDesconhecido = true;
+    midiMapPairRecoveryFailed = true;
+    midiMapPersistenceError.store (true, std::memory_order_release);
+    juce::Logger::writeToLog (
+        "MIDI MAP: quarteto nao inspecionavel em " + contexto
+        + "; leitura, reparo e gravacao do par suspensos");
+}
+
+void MainComponent::finishMidiMapDirtyEpochsAfterPairCommit (
+    juce::uint64 ccEpoch, bool ccWasWritten,
+    juce::uint64 noteEpoch, bool noteWasWritten)
+{
+    // Empty autosave becomes safe only after the complete CC + NOTE generation
+    // is committed. A successful half-save must never grant this permission:
+    // its peer or the journal commit can still fail and roll the files back.
+    ChurchDAWMidiMapping::applyMidiMapPairCommitToEmptySaveProtection (
+        true, ccWasWritten, noteWasWritten,
+        bloquearSalvamentoCCVazio, bloquearSalvamentoNotasVazio);
+
+    if (ccWasWritten)
+    {
+        if (ccDirtyEpoch.finish (ccEpoch, true))
+            ccSaveRescheduleCount.store (0);
+        else if (ccSaveRescheduleCount.fetch_add (1) < 8)
+            triggerAsyncUpdate();
+    }
+
+    if (noteWasWritten)
+    {
+        if (noteDirtyEpoch.finish (noteEpoch, true))
+            noteSaveRescheduleCount.store (0);
+        else if (noteSaveRescheduleCount.fetch_add (1) < 8)
+            triggerAsyncUpdate();
+    }
+}
+
+// Publishes CC + note maps as one durable generation. This is used by the
+// global Save button and export: neither path may leave a newer CC file paired
+// with an older note file if the second write or commit marker fails.
+bool MainComponent::saveMidiMapPair()
+{
+    if (midiMapFileLock == nullptr
+         || ! midiMapLifecycle.canSave()
+         || midiMapPairRecoveryFailed)
+        return false;
+
+    if (! exigirQuartetoMidiInspecionavel ("inicio do save do par"))
+        return false;
+
+    const auto ccFile = arquivoDoMapaDeCCs();
+    const auto noteFile = arquivoDoMapaDeNotas();
+    ChurchDAWMidiMapping::MidiMapPairRollback transaction (
+        ccFile, noteFile, *midiMapFileLock, &midiMapDiskRevision);
+
+    bool saved = false;
+    bool transactionClosed = false;
+    bool ccWritten = false;
+    bool noteWritten = false;
+    juce::uint64 ccEpoch = 0;
+    juce::uint64 noteEpoch = 0;
+    beginMidiMapRoutingTransaction();
+
+    const bool checkpointReady = transaction.capture ("save-midi-map-pair");
+    if (checkpointReady)
+    {
+        if (! transaction.targetsUnchangedSinceCapture())
+        {
+            // A non-cooperating external writer changed a target while our
+            // lock was held. We touched nothing, so preserve it and close only
+            // our checkpoint without teaching this stale instance the newer
+            // disk revision.
+            transactionClosed = transaction.closeWithoutMutation();
+        }
+        else
+        {
+            ccEpoch = ccDirtyEpoch.snapshot();
+            noteEpoch = noteDirtyEpoch.snapshot();
+            ccWritten = saveMidiMap();
+            noteWritten = ccWritten && saveNoteMap();
+            if (ccWritten && noteWritten)
+            {
+                transactionClosed = transaction.commit();
+                saved = transactionClosed;
+            }
+
+            // commit(false) intentionally still owns the lock. Restore while
+            // it is held, before any second process can publish another journal.
+            if (! saved)
+                transactionClosed = transaction.restore();
+        }
+    }
+
+    if (saved)
+        finishMidiMapDirtyEpochsAfterPairCommit (
+            ccEpoch, ccWritten, noteEpoch, noteWritten);
+    finishMidiMapRoutingTransaction();
+
+    if (! checkpointReady && transaction.hadRevisionConflict())
+        midiMapPairRecoveryFailed = true;
+    if (! checkpointReady && transaction.hadFutureSchemaConflict())
+    {
+        esquemaDeCCsDesconhecido = true;
+        esquemaDeNotasDesconhecido = true;
+        midiMapPairRecoveryFailed = true;
+    }
+    if (! checkpointReady && transaction.hadUninspectableTargetConflict())
+        bloquearQuartetoMidiDesconhecido (
+            "checkpoint do save do par");
+    if (transaction.preservedExternalChanges())
+        midiMapPairRecoveryFailed = true;
+    if (checkpointReady && ! transactionClosed)
+        midiMapPairRecoveryFailed = true;
+
+    if (! saved)
+        juce::Logger::writeToLog (
+            transactionClosed
+                ? "MIDI MAP: save do par falhou; geracao anterior restaurada"
+                : "MIDI MAP: save do par nao fechou com seguranca");
+
+    midiMapPersistenceError.store (! saved, std::memory_order_release);
+
+    return saved;
+}
+
 // Devolve TRUE so quando o arquivo novo foi realmente gravado.
 //
 // Era void, e a migracao decidia apagar a chave antiga perguntando
@@ -6666,35 +15288,141 @@ juce::File MainComponent::arquivoDoMapaDeNotas()
 // migracao tambem existe. Bastava a gravacao falhar (arquivo ainda travado por
 // quem o corrompeu, permissao, disco cheio) para o app apagar a unica copia
 // boa e o cliente perder todas as teclas mapeadas.
-bool MainComponent::saveNoteMap()
+bool MainComponent::saveNoteMap (bool autorizarVazioExplicito,
+                                 bool permitirConflitosDeReparo)
 {
+    if (! midiMapLifecycle.canSave())
+        return false;
+
+    if (midiMapPairRecoveryFailed)
+    {
+        juce::Logger::writeToLog (
+            "MIDI MAP: notas nao gravadas porque a recuperacao do par esta bloqueada");
+        return false;
+    }
+
+    if (midiMapFileLock == nullptr)
+        return false;
+    ChurchDAWMidiMapping::MidiMapPairFileLock::ScopedAccess fileAccess (
+        *midiMapFileLock);
+    if (! fileAccess.isLocked())
+    {
+        juce::Logger::writeToLog (
+            "MIDI MAP: notas nao gravadas porque outra instancia esta escrevendo");
+        return false;
+    }
+
+    const auto ccFile = arquivoDoMapaDeCCs();
+    const auto destino = arquivoDoMapaDeNotas();
+    if (! exigirQuartetoMidiInspecionavel ("save de notas"))
+        return false;
+    const auto activeTransactionId =
+        midiMapFileLock->getActiveTransactionId();
+    if (activeTransactionId.isEmpty())
+    {
+        // No half-map publication is allowed. The recursive pair lock remains
+        // held by fileAccess until saveMidiMapPair returns.
+        return saveMidiMapPair();
+    }
+    const bool deferDirtyEpochCompletion =
+        activeTransactionId.isNotEmpty();
+    if (! ChurchDAWMidiMapping::midiMapPairJournalAllowsWrite (
+            ccFile, activeTransactionId))
+    {
+        midiMapPairRecoveryFailed = true;
+        juce::Logger::writeToLog (
+            "MIDI MAP: notas nao gravadas; outra instancia alterou o par ou deixou transacao pendente");
+        return false;
+    }
+
+    {
+        const juce::ScopedLock sl (mapLock);
+        const bool noteConflict =
+            ChurchDAWMidiMapping::midiMapCollectionsHaveConflictingNoteControls (
+                ccMappings, noteMappings);
+        const bool ccConflict =
+            ChurchDAWMidiMapping::midiMapCollectionsHaveConflictingCCControls (
+                ccMappings, ccActionMappings,
+                [] (const AcaoDeCC& action)
+                {
+                    return action.acao.kind != NoteActionKind::none;
+                });
+        if ((noteConflict || ccConflict) && ! permitirConflitosDeReparo)
+        {
+            juce::Logger::writeToLog (
+                "MIDI MAP: notas nao gravadas enquanto existe conflito corrigivel; use Limpar ou Importar");
+            return false;
+        }
+    }
+
+    const auto backup = destino.getSiblingFile (
+        destino.getFileName() + ".last-good");
+
     // Arquivo de uma versao futura: nao encostar. Devolve false para que a
     // migracao (e qualquer outro chamador) saiba que nada foi gravado.
-    if (esquemaDeNotasDesconhecido)
+    // A consulta ao disco cobre outra instancia que gravou o schema novo
+    // depois que esta instancia terminou o restore de startup.
+    if (esquemaDeNotasDesconhecido || esquemaDeCCsDesconhecido
+         || ChurchDAWMidiMapping::midiMapPairHasFutureSchema (
+                ccFile, destino))
     {
+        esquemaDeCCsDesconhecido = true;
+        esquemaDeNotasDesconhecido = true;
         juce::Logger::writeToLog ("MIDI MAP: gravacao ignorada, o arquivo em disco "
                                   "e de uma versao mais nova");
         return false;
     }
+
+    const auto capturedEpoch = noteDirtyEpoch.snapshot();
 
     juce::XmlElement xml ("NOTEMAP");
 
     // Versao de esquema: o mapa das cenas ja tem, este nao tinha. Sem ela nao
     // ha como migrar um formato futuro sem adivinhacao.
     xml.setAttribute ("schema", 1);
+    xml.setAttribute ("complete", 1);
+    if (activeTransactionId.isNotEmpty())
+        xml.setAttribute ("transactionId", activeTransactionId);
 
+    const auto currentNameFor = [this] (const MidiControlKey& key)
+    {
+        for (const auto& source : midiSourcesCached)
+            if (ChurchDAWMidiMapping::normalizeMidiSourceId (source.identifier)
+                    == ChurchDAWMidiMapping::normalizeMidiSourceId (key.sourceId))
+                return source.name;
+        return juce::String();
+    };
     {
         const juce::ScopedLock sl (mapLock);
 
-        for (const auto& par : noteMappings)
+        const bool vazio = noteMappings.empty();
+        if (! ChurchDAWMidiMapping::mayWriteMidiMapSnapshot (
+                bloquearSalvamentoNotasVazio, vazio,
+                autorizarVazioExplicito))
         {
-            auto* n = xml.createNewChildElement ("NOTE");
-            n->setAttribute ("source", par.first.sourceId);
-            n->setAttribute ("channel", par.first.channel);
-            n->setAttribute ("note", par.first.cc);
-            n->setAttribute ("action", (int) par.second.kind);
-            n->setAttribute ("arg", par.second.arg);
+            juce::Logger::writeToLog (
+                "MIDI MAP: autosave vazio de notas bloqueado após falha de leitura");
+            return false;
         }
+
+        xml.setAttribute ("entryCount", (int) noteMappings.size());
+        xml.setAttribute ("explicitEmpty", vazio ? 1 : 0);
+
+        for (const auto& par : noteMappings)
+            ChurchDAWMidiMapping::appendPersistedNoteMapping (
+                xml, par.first, (int) par.second.kind, par.second.arg,
+                ChurchDAWMidiMapping::sourceNameForPersistence (
+                    par.first.sourceName, currentNameFor (par.first)));
+    }
+
+    const auto serialized = xml.toString (
+        juce::XmlElement::TextFormat().singleLine());
+    if (! ChurchDAWMidiMapping::midiMapSerializedPayloadFitsSafetyLimits (
+            serialized))
+    {
+        juce::Logger::writeToLog (
+            "MIDI MAP: notas nao gravadas; snapshot final excede os limites seguros");
+        return false;
     }
 
     // ARQUIVO PROPRIO, pelo mesmo motivo das cenas.
@@ -6705,23 +15433,195 @@ bool MainComponent::saveNoteMap()
     // cenas fugiram, escrito sincronamente na thread da interface. No ensaio
     // dava um engasgo; junto com o botao Salvar durante o culto, dava a tela
     // travando.
-    auto destino = arquivoDoMapaDeNotas();
     destino.getParentDirectory().createDirectory();
 
-    juce::TemporaryFile temp (destino);
-    const bool gravou = xml.writeTo (temp.getFile()) && temp.overwriteTargetFileWithTemporary();
+    // Building the XML can take long enough for another process to publish a
+    // newer schema. Revalidate immediately before the first target mutation.
+    if (! exigirQuartetoMidiInspecionavel (
+            "save de notas antes da primeira escrita"))
+        return false;
+    if (ChurchDAWMidiMapping::midiMapPairHasFutureSchema (
+            ccFile, destino))
+    {
+        esquemaDeCCsDesconhecido = true;
+        esquemaDeNotasDesconhecido = true;
+        juce::Logger::writeToLog (
+            "MIDI MAP: schema futuro de notas apareceu durante a gravacao; snapshot preservado");
+        return false;
+    }
+    if (backup.existsAsFile())
+    {
+        const auto backupXml =
+            ChurchDAWMidiMapping::loadBoundedXmlFile (backup);
+        if (backupXml == nullptr
+             || ! ChurchDAWMidiMapping::isMidiMapXmlValid (
+                    *backupXml, "NOTEMAP", "NOTE"))
+            guardarCopiaDeArquivoIlegivel (
+                backup, "MIDI MAP (last-good de notas invalido)");
+    }
+    if (destino.existsAsFile())
+    {
+        if (ChurchDAWMidiMapping::promoteValidMidiMapToLastGood (
+                destino, backup,
+                "NOTEMAP", "NOTE"))
+        {
+            // valid snapshot promoted
+        }
+        else
+            guardarCopiaDeArquivoIlegivel (destino, "MIDI MAP (notas principal inválido)");
+    }
+
+    const bool gravou =
+        ChurchDAWMidiMapping::replaceFileWithTextAtomically (
+            destino, serialized);
+    bool backupAtualizado = false;
 
     if (! gravou)
         juce::Logger::writeToLog ("MIDI MAP: FALHA ao gravar " + destino.getFullPathName());
+    else
+    {
+        backupAtualizado = ChurchDAWMidiMapping::promoteValidMidiMapToLastGood (
+            destino, backup, "NOTEMAP", "NOTE");
+        juce::MemoryBlock primaryBytes;
+        juce::MemoryBlock backupBytes;
+        juce::MemoryBlock expectedBytes;
+        expectedBytes.append (serialized.toRawUTF8(),
+                              (size_t) serialized.getNumBytesAsUTF8());
+        backupAtualizado = backupAtualizado
+            && ChurchDAWMidiMapping::loadBoundedFileData (
+                   destino, primaryBytes,
+                   ChurchDAWMidiMapping::maxMidiMapFileBytes)
+            && ChurchDAWMidiMapping::loadBoundedFileData (
+                   backup, backupBytes,
+                   ChurchDAWMidiMapping::maxMidiMapFileBytes)
+            && primaryBytes == expectedBytes
+            && backupBytes == expectedBytes;
+        if (! backupAtualizado)
+            juce::Logger::writeToLog (
+                "MIDI MAP: notas salvas, mas last-good nao foi atualizado");
 
-    return gravou;
+    }
+
+    // The loaded CAS is advanced only by the pair transaction's commit after
+    // both halves and both last-good files have been verified.
+    const bool revisionUpdated = true;
+
+    if (gravou && ! deferDirtyEpochCompletion)
+    {
+        if (! noteDirtyEpoch.finish (
+                capturedEpoch, backupAtualizado && revisionUpdated))
+        {
+            if (noteSaveRescheduleCount.fetch_add (1) < 8)
+                triggerAsyncUpdate();
+            else
+                juce::Logger::writeToLog (
+                    "MIDI MAP: dirty epoch de notas mudou durante escrita; retry limitado");
+        }
+        else
+            noteSaveRescheduleCount.store (0);
+    }
+
+    return gravou && backupAtualizado && revisionUpdated;
 }
 
 void MainComponent::restoreNoteMap()
 {
+    if (midiMapFileLock == nullptr)
+        return;
+    ChurchDAWMidiMapping::MidiMapPairFileLock::ScopedAccess fileAccess (
+        *midiMapFileLock, 5000);
+    if (! fileAccess.isLocked())
+    {
+        midiMapPairRecoveryFailed = true;
+        return;
+    }
+
+    if (! exigirQuartetoMidiInspecionavel ("restore de notas"))
+        return;
+
     const auto arquivo = arquivoDoMapaDeNotas();
-    auto xml = juce::parseXML (arquivo);
+    juce::MemoryBlock primaryBytes;
+    const auto primaryInspection =
+        ChurchDAWMidiMapping::inspectMidiMapTarget (
+            arquivo, primaryBytes);
+    if (primaryInspection
+          == ChurchDAWMidiMapping::MidiMapTargetInspection::unknown)
+    {
+        bloquearQuartetoMidiDesconhecido (
+            "leitura exata do mapa de notas");
+        return;
+    }
+    auto xml = primaryInspection
+          == ChurchDAWMidiMapping::MidiMapTargetInspection::readable
+        ? ChurchDAWMidiMapping::parseBoundedXmlData (primaryBytes)
+        : nullptr;
     bool veioDoFormatoAntigo = false;
+
+    if (xml != nullptr
+         && ChurchDAWMidiMapping::hasFutureMidiMapSchema (*xml, "NOTEMAP"))
+    {
+        esquemaDeNotasDesconhecido = true;
+        juce::Logger::writeToLog ("MIDI MAP: notas de schema futuro protegidas");
+        return;
+    }
+
+    const auto lastGood = arquivo.getSiblingFile (
+        arquivo.getFileName() + ".last-good");
+    juce::MemoryBlock backupBytes;
+    const auto backupInspection =
+        ChurchDAWMidiMapping::inspectMidiMapTarget (
+            lastGood, backupBytes);
+    if (backupInspection
+          == ChurchDAWMidiMapping::MidiMapTargetInspection::unknown)
+    {
+        bloquearQuartetoMidiDesconhecido (
+            "leitura exata do last-good de notas");
+        return;
+    }
+    if (auto backupXml = backupInspection
+              == ChurchDAWMidiMapping::MidiMapTargetInspection::readable
+            ? ChurchDAWMidiMapping::parseBoundedXmlData (backupBytes)
+            : nullptr;
+        backupXml != nullptr
+         && ChurchDAWMidiMapping::hasFutureMidiMapSchema (
+                *backupXml, "NOTEMAP"))
+    {
+        esquemaDeNotasDesconhecido = true;
+        juce::Logger::writeToLog (
+            "MIDI MAP: last-good de notas pertence a schema futuro; arquivos protegidos");
+        return;
+    }
+
+    const bool primaryNoteReadable = xml != nullptr
+        && ChurchDAWMidiMapping::isMidiMapXmlReadable (
+            *xml, "NOTEMAP", "NOTE");
+    if (! primaryNoteReadable)
+    {
+        if (arquivo.existsAsFile())
+            guardarCopiaDeArquivoIlegivel (arquivo, "MIDI MAP (notas)");
+        auto fallback = ChurchDAWMidiMapping::recoverMidiMapXml (
+            arquivo, lastGood, "NOTEMAP", "NOTE");
+        if (fallback != nullptr)
+        {
+            xml = std::move (fallback);
+            bloquearSalvamentoNotasVazio = false;
+            juce::Logger::writeToLog (
+                "MIDI MAP: notas restauradas do last-good; principal reparado quando permitido");
+        }
+        else
+        {
+            if (lastGood.existsAsFile())
+                guardarCopiaDeArquivoIlegivel (
+                    lastGood, "MIDI MAP (last-good de notas invalido)");
+            // Nunca continue usando o ponteiro para o XML principal que acabou
+            // de ser rejeitado; os loops abaixo carregariam apenas os filhos
+            // conhecidos e o proximo save destruiria o restante.
+            xml.reset();
+            bloquearSalvamentoNotasVazio =
+                ChurchDAWMidiMapping::shouldBlockEmptySaveAfterFailedRecovery (
+                    arquivo.existsAsFile(), lastGood.existsAsFile());
+        }
+    }
 
     // MIGRACAO do formato antigo (chave dentro do settings). Quem ja mapeou
     // teclas nao pode perde-las ao atualizar.
@@ -6730,7 +15630,23 @@ void MainComponent::restoreNoteMap()
         guardarCopiaDeArquivoIlegivel (arquivo, "MIDI MAP (notas)");
 
         xml = appProperties.getUserSettings()->getXmlValue ("midiNoteMap");
+        if (xml != nullptr
+             && ! ChurchDAWMidiMapping::isMidiMapXmlReadable (
+                    *xml, "NOTEMAP", "NOTE"))
+        {
+            if (ChurchDAWMidiMapping::hasFutureMidiMapSchema (
+                    *xml, "NOTEMAP"))
+                esquemaDeNotasDesconhecido = true;
+            else
+                bloquearSalvamentoNotasVazio = true;
+            juce::Logger::writeToLog (
+                "MIDI MAP: chave antiga de notas invalida/desconhecida; mantida intacta");
+            return;
+        }
+
         veioDoFormatoAntigo = xml != nullptr;
+        if (veioDoFormatoAntigo)
+            bloquearSalvamentoNotasVazio = false;
     }
 
     if (xml == nullptr || ! xml->hasTagName ("NOTEMAP"))
@@ -6769,11 +15685,15 @@ void MainComponent::restoreNoteMap()
 
         for (auto* n : xml->getChildWithTagNameIterator ("NOTE"))
         {
-            const int nota  = n->getIntAttribute ("note", -1);
-            const int canal = n->getIntAttribute ("channel", 0);
-            const int tipo  = n->getIntAttribute ("action", 0);
-            const int arg   = n->getIntAttribute ("arg", -1);
-            const auto fonte = n->getStringAttribute ("source");
+            ChurchDAWMidiMapping::PersistedNoteMapping persisted;
+            if (! ChurchDAWMidiMapping::readPersistedNoteMapping (*n, persisted))
+                continue;
+
+            const int nota  = persisted.control.cc;
+            const int canal = persisted.control.channel;
+            const int tipo  = persisted.action;
+            const int arg   = persisted.argument;
+            const auto fonte = persisted.control.sourceId;
 
             // Validacao estrita: um XML mexido a mao nao pode fazer o app
             // sequestrar uma nota qualquer do teclado.
@@ -6788,11 +15708,39 @@ void MainComponent::restoreNoteMap()
                 acao = { NoteActionKind::padKey, arg };
             else if (tipo == (int) NoteActionKind::padOff)
                 acao = { NoteActionKind::padOff, -1 };
+            else if (tipo == (int) NoteActionKind::cena
+                      && juce::isPositiveAndBelow (arg, ChurchDAWLive::numeroDeCenas))
+                acao = { NoteActionKind::cena, arg };
+            else if (tipo == (int) NoteActionKind::panic)
+                acao = { NoteActionKind::panic, -1 };
+            else if (tipo == (int) NoteActionKind::nextScene)
+                acao = { NoteActionKind::nextScene, -1 };
+            else if (tipo == (int) NoteActionKind::previousScene)
+                acao = { NoteActionKind::previousScene, -1 };
+            else if (tipo == (int) NoteActionKind::padSynthProgram
+                      && juce::isPositiveAndBelow (arg,
+                                                   PadSynthProcessor::numPrograms))
+                acao = { NoteActionKind::padSynthProgram, arg };
+            else if (tipo == (int) NoteActionKind::tapTempo)
+                acao = { NoteActionKind::tapTempo, -1 };
+            else if (tipo == (int) NoteActionKind::sustainToggle)
+                acao = { NoteActionKind::sustainToggle, -1 };
+            else if (tipo == (int) NoteActionKind::padSynthEngineToggle)
+                acao = { NoteActionKind::padSynthEngineToggle, -1 };
             else
                 continue;
 
-            noteMappings[ChurchDAWMidiMapping::ControllerKey { fonte, canal, nota }] = acao;
+            noteMappings.emplace (
+                ChurchDAWMidiMapping::ControllerKey {
+                    fonte, canal, nota, false, persisted.control.sourceName },
+                acao);
         }
+
+        // Resolve IDs efemeros only after every raw key exists. Resolving one
+        // child at a time followed by operator[] allowed two old IDs with the
+        // same device name to collapse and silently discard one mapping.
+        (void) ChurchDAWMidiMapping::rekeyMidiMapByUniqueSourceName (
+            noteMappings, midiSourcesCached);
     }
 
     reconstruirMascaraDeNotas();
@@ -6803,20 +15751,8 @@ void MainComponent::restoreNoteMap()
     // nunca em nenhum dos dois.
     if (veioDoFormatoAntigo)
     {
-        // So solta a chave antiga se a gravacao NOVA deu certo de verdade.
-        // Perguntar "o arquivo existe?" respondia sim para o arquivo ilegivel
-        // que motivou a migracao — e o cliente perdia o mapa inteiro.
-        if (saveNoteMap())
-        {
-            appProperties.getUserSettings()->removeValue ("midiNoteMap");
-            juce::Logger::writeToLog ("MIDI MAP: mapa de notas migrado para "
-                                        + arquivoDoMapaDeNotas().getFileName());
-        }
-        else
-        {
-            juce::Logger::writeToLog ("MIDI MAP: migracao adiada, o mapa antigo "
-                                      "continua no setup");
-        }
+        pendingLegacyNoteMigration = true;
+        juce::Logger::writeToLog ("MIDI MAP: migracao de notas agendada apos ambos restores");
     }
 }
 
@@ -6825,33 +15761,194 @@ juce::File MainComponent::arquivoDoMapaDeCCs()
     return appProperties.getUserSettings()->getFile().getSiblingFile ("midi-cc-map.xml");
 }
 
-bool MainComponent::saveMidiMap()
+// Nome do aparelho a partir de um sourceId ("midi:<id>"). Usado para
+// persistir o NOME (estavel) junto do id (efemero no Android) e reescrever
+// o id no restore quando o mesmo aparelho voltar com um id novo.
+juce::String MainComponent::nomeDoAparelho (const juce::String& sourceId) const
 {
-    if (esquemaDeCCsDesconhecido)
+    if (! sourceId.startsWith ("midi:"))
+        return {};
+
+    const auto normalized = ChurchDAWMidiMapping::normalizeMidiSourceId (sourceId);
+    const juce::ScopedLock sl (mapLock);
+    for (const auto& source : midiSourcesCached)
+        if (ChurchDAWMidiMapping::normalizeMidiSourceId (source.identifier)
+                == normalized)
+            return source.name;
+
+    return {};
+}
+
+// Resolve o sourceId de um mapa salvo para o id ATUAL do aparelho. Se o
+// aparelho (mesmo NOME) voltou com um id novo — o caso do Android no replug/
+// reinicio — devolve o id novo; senao devolve o id salvo.
+juce::String MainComponent::resolverSourceId (const juce::String& sourceId,
+                                              const juce::String& sourceName) const
+{
+    const juce::ScopedLock sl (mapLock);
+    return ChurchDAWMidiMapping::resolveUniqueMidiSourceId (
+        sourceId, sourceName, midiSourcesCached);
+}
+
+bool MainComponent::saveMidiMap (bool autorizarVazioExplicito,
+                                 bool permitirConflitosDeReparo)
+{
+    if (! midiMapLifecycle.canSave())
+        return false;
+
+    if (midiMapPairRecoveryFailed)
     {
+        juce::Logger::writeToLog (
+            "MIDI MAP: CCs nao gravados porque a recuperacao do par esta bloqueada");
+        return false;
+    }
+
+    if (midiMapFileLock == nullptr)
+        return false;
+    ChurchDAWMidiMapping::MidiMapPairFileLock::ScopedAccess fileAccess (
+        *midiMapFileLock);
+    if (! fileAccess.isLocked())
+    {
+        juce::Logger::writeToLog (
+            "MIDI MAP: CCs nao gravados porque outra instancia esta escrevendo");
+        return false;
+    }
+
+    const auto destino = arquivoDoMapaDeCCs();
+    const auto noteFile = arquivoDoMapaDeNotas();
+    if (! exigirQuartetoMidiInspecionavel ("save de CCs"))
+        return false;
+    const auto activeTransactionId =
+        midiMapFileLock->getActiveTransactionId();
+    if (activeTransactionId.isEmpty())
+    {
+        // Standalone CC saves are promoted to the complete pair transaction.
+        return saveMidiMapPair();
+    }
+    const bool deferDirtyEpochCompletion =
+        activeTransactionId.isNotEmpty();
+    if (! ChurchDAWMidiMapping::midiMapPairJournalAllowsWrite (
+            destino, activeTransactionId))
+    {
+        midiMapPairRecoveryFailed = true;
+        juce::Logger::writeToLog (
+            "MIDI MAP: CCs nao gravados; outra instancia alterou o par ou deixou transacao pendente");
+        return false;
+    }
+
+    {
+        const juce::ScopedLock sl (mapLock);
+        const bool noteConflict =
+            ChurchDAWMidiMapping::midiMapCollectionsHaveConflictingNoteControls (
+                ccMappings, noteMappings);
+        const bool ccConflict =
+            ChurchDAWMidiMapping::midiMapCollectionsHaveConflictingCCControls (
+                ccMappings, ccActionMappings,
+                [] (const AcaoDeCC& action)
+                {
+                    return action.acao.kind != NoteActionKind::none;
+                });
+        if ((noteConflict || ccConflict) && ! permitirConflitosDeReparo)
+        {
+            juce::Logger::writeToLog (
+                "MIDI MAP: CCs nao gravados enquanto existe conflito corrigivel; use Limpar ou Importar");
+            return false;
+        }
+    }
+
+    const auto backup = destino.getSiblingFile (
+        destino.getFileName() + ".last-good");
+
+    if (esquemaDeCCsDesconhecido || esquemaDeNotasDesconhecido
+         || ChurchDAWMidiMapping::midiMapPairHasFutureSchema (
+                destino, noteFile))
+    {
+        esquemaDeCCsDesconhecido = true;
+        esquemaDeNotasDesconhecido = true;
         juce::Logger::writeToLog ("MIDI MAP: gravacao de CCs ignorada, o arquivo em disco "
                                   "e de uma versao mais nova");
         return false;
     }
 
+    const auto capturedEpoch = ccDirtyEpoch.snapshot();
+
     juce::XmlElement xml ("MIDIMAP");
     xml.setAttribute ("schema", 1);
+    xml.setAttribute ("complete", 1);
+    if (activeTransactionId.isNotEmpty())
+        xml.setAttribute ("transactionId", activeTransactionId);
+
+    const auto currentNameFor = [this] (const MidiControlKey& key)
+    {
+        for (const auto& source : midiSourcesCached)
+            if (ChurchDAWMidiMapping::normalizeMidiSourceId (source.identifier)
+                    == ChurchDAWMidiMapping::normalizeMidiSourceId (key.sourceId))
+                return source.name;
+        return juce::String();
+    };
 
     {
         const juce::ScopedLock sl (mapLock);
 
-        for (const auto& pair : ccMappings)
+        int entryCount = (int) ccMappings.size();
+        for (const auto& action : ccActionMappings)
+            if (action.second.acao.kind != NoteActionKind::none)
+                ++entryCount;
+        const bool vazio = entryCount == 0;
+        if (! ChurchDAWMidiMapping::mayWriteMidiMapSnapshot (
+                bloquearSalvamentoCCVazio, vazio,
+                autorizarVazioExplicito))
         {
-            auto* m = xml.createNewChildElement ("MAP");
-            m->setAttribute ("source", pair.first.sourceId);
-            m->setAttribute ("channel", pair.first.channel);
-            m->setAttribute ("cc", pair.first.cc);
-            m->setAttribute ("slot", pair.second.slot);
-            m->setAttribute ("param", pair.second.param);
-            m->setAttribute ("insert", pair.second.insert);
-            m->setAttribute ("name", pair.second.paramName);
-            m->setAttribute ("id", pair.second.paramId);
+            juce::Logger::writeToLog (
+                "MIDI MAP: autosave vazio de CCs bloqueado após falha de leitura");
+            return false;
         }
+
+        xml.setAttribute ("entryCount", entryCount);
+        xml.setAttribute ("explicitEmpty", vazio ? 1 : 0);
+
+        for (const auto& pair : ccMappings)
+            ChurchDAWMidiMapping::appendPersistedCCMapping (
+                xml, pair.first, pair.second,
+                ChurchDAWMidiMapping::sourceNameForPersistence (
+                    pair.first.sourceName, currentNameFor (pair.first)));
+
+        // BOTOES DO PAD POR CC — tag IRMA, e o schema CONTINUA 1.
+        //
+        // Nao virou valor novo no enum de acoes nem coluna nova em <MAP>: um
+        // build anterior itera so por <MAP> (o proprio comentario do restore diz
+        // que essa trava existe "para o dia em que houver outro filho"), entao
+        // ele simplesmente ignora <CCACAO> e continua carregando os CCs do
+        // cliente. E o schema fica em 1 de proposito: com schema 2 um build
+        // antigo SUSPENDE leitura E gravacao, e o cliente ficaria sem NENHUM
+        // mapeamento. Preco assumido: voltar uma versao e salvar perde os
+        // botoes do Pad — nunca o resto do mapa.
+        for (const auto& pair : ccActionMappings)
+        {
+            if (pair.second.acao.kind == NoteActionKind::none)
+                continue;
+
+            auto* a = xml.createNewChildElement ("CCACAO");
+            a->setAttribute ("source", pair.first.sourceId);
+            a->setAttribute ("channel", pair.first.channel);
+            a->setAttribute ("cc", pair.first.cc);
+            a->setAttribute ("action", (int) pair.second.acao.kind);
+            a->setAttribute ("arg", pair.second.acao.arg);
+            a->setAttribute ("modo", (int) pair.second.modo);
+            a->setAttribute ("sourceName",
+                             ChurchDAWMidiMapping::sourceNameForPersistence (
+                                 pair.first.sourceName, currentNameFor (pair.first)));
+        }
+    }
+
+    const auto serialized = xml.toString (
+        juce::XmlElement::TextFormat().singleLine());
+    if (! ChurchDAWMidiMapping::midiMapSerializedPayloadFitsSafetyLimits (
+            serialized))
+    {
+        juce::Logger::writeToLog (
+            "MIDI MAP: CCs nao gravados; snapshot final excede os limites seguros");
+        return false;
     }
 
     // ARQUIVO PROPRIO, o ultimo dos tres a sair do settings.
@@ -6860,26 +15957,191 @@ bool MainComponent::saveMidiMap()
     // base64 — varios MB com um Kontakt aberto — e a cada CC aprendido. As
     // cenas sairam de la primeiro, depois o mapa de notas; este ficou para
     // tras pelo mesmo motivo de sempre: ninguem tinha olhado.
-    auto destino = arquivoDoMapaDeCCs();
     destino.getParentDirectory().createDirectory();
 
-    juce::TemporaryFile temp (destino);
-    const bool gravou = xml.writeTo (temp.getFile()) && temp.overwriteTargetFileWithTemporary();
+    if (! exigirQuartetoMidiInspecionavel (
+            "save de CCs antes da primeira escrita"))
+        return false;
+    if (ChurchDAWMidiMapping::midiMapPairHasFutureSchema (
+            destino, noteFile))
+    {
+        esquemaDeCCsDesconhecido = true;
+        esquemaDeNotasDesconhecido = true;
+        juce::Logger::writeToLog (
+            "MIDI MAP: schema futuro de CCs apareceu durante a gravacao; snapshot preservado");
+        return false;
+    }
+    if (backup.existsAsFile())
+    {
+        const auto backupXml =
+            ChurchDAWMidiMapping::loadBoundedXmlFile (backup);
+        if (backupXml == nullptr
+             || ! ChurchDAWMidiMapping::isMidiMapXmlValid (
+                    *backupXml, "MIDIMAP", "MAP", "CCACAO"))
+            guardarCopiaDeArquivoIlegivel (
+                backup, "MIDI MAP (last-good de CCs invalido)");
+    }
+    if (destino.existsAsFile())
+    {
+        if (ChurchDAWMidiMapping::promoteValidMidiMapToLastGood (
+                destino, backup,
+                "MIDIMAP", "MAP", "CCACAO"))
+        {
+            // valid snapshot promoted
+        }
+        else
+            guardarCopiaDeArquivoIlegivel (destino, "MIDI MAP (CC principal inválido)");
+    }
+
+    const bool gravou =
+        ChurchDAWMidiMapping::replaceFileWithTextAtomically (
+            destino, serialized);
+    bool backupAtualizado = false;
 
     if (! gravou)
         juce::Logger::writeToLog ("MIDI MAP: FALHA ao gravar " + destino.getFullPathName());
+    else
+    {
+        backupAtualizado = ChurchDAWMidiMapping::promoteValidMidiMapToLastGood (
+            destino, backup, "MIDIMAP", "MAP", "CCACAO");
+        juce::MemoryBlock primaryBytes;
+        juce::MemoryBlock backupBytes;
+        juce::MemoryBlock expectedBytes;
+        expectedBytes.append (serialized.toRawUTF8(),
+                              (size_t) serialized.getNumBytesAsUTF8());
+        backupAtualizado = backupAtualizado
+            && ChurchDAWMidiMapping::loadBoundedFileData (
+                   destino, primaryBytes,
+                   ChurchDAWMidiMapping::maxMidiMapFileBytes)
+            && ChurchDAWMidiMapping::loadBoundedFileData (
+                   backup, backupBytes,
+                   ChurchDAWMidiMapping::maxMidiMapFileBytes)
+            && primaryBytes == expectedBytes
+            && backupBytes == expectedBytes;
+        if (! backupAtualizado)
+            juce::Logger::writeToLog (
+                "MIDI MAP: CCs salvos, mas last-good nao foi atualizado");
 
-    return gravou;
+    }
+
+    const bool revisionUpdated = true;
+
+    if (gravou && ! deferDirtyEpochCompletion)
+    {
+        if (! ccDirtyEpoch.finish (
+                capturedEpoch, backupAtualizado && revisionUpdated))
+        {
+            if (ccSaveRescheduleCount.fetch_add (1) < 8)
+                triggerAsyncUpdate();
+            else
+                juce::Logger::writeToLog (
+                    "MIDI MAP: dirty epoch de CC mudou durante escrita; retry limitado");
+        }
+        else
+            ccSaveRescheduleCount.store (0);
+    }
+
+    return gravou && backupAtualizado && revisionUpdated;
 }
 
 void MainComponent::restoreMidiMap()
 {
+    if (midiMapFileLock == nullptr)
+        return;
+    ChurchDAWMidiMapping::MidiMapPairFileLock::ScopedAccess fileAccess (
+        *midiMapFileLock, 5000);
+    if (! fileAccess.isLocked())
+    {
+        midiMapPairRecoveryFailed = true;
+        return;
+    }
+
+    if (! exigirQuartetoMidiInspecionavel ("restore de CCs"))
+        return;
+
     int restored = 0;
     int rejectedUnsafe = 0;
 
     const auto arquivo = arquivoDoMapaDeCCs();
-    auto xml = juce::parseXML (arquivo);
+    juce::MemoryBlock primaryBytes;
+    const auto primaryInspection =
+        ChurchDAWMidiMapping::inspectMidiMapTarget (
+            arquivo, primaryBytes);
+    if (primaryInspection
+          == ChurchDAWMidiMapping::MidiMapTargetInspection::unknown)
+    {
+        bloquearQuartetoMidiDesconhecido (
+            "leitura exata do mapa de CCs");
+        return;
+    }
+    auto xml = primaryInspection
+          == ChurchDAWMidiMapping::MidiMapTargetInspection::readable
+        ? ChurchDAWMidiMapping::parseBoundedXmlData (primaryBytes)
+        : nullptr;
     bool veioDoFormatoAntigo = false;
+
+    if (xml != nullptr
+         && ChurchDAWMidiMapping::hasFutureMidiMapSchema (*xml, "MIDIMAP"))
+    {
+        esquemaDeCCsDesconhecido = true;
+        juce::Logger::writeToLog ("MIDI MAP: CCs de schema futuro protegidos");
+        return;
+    }
+
+    const auto lastGood = arquivo.getSiblingFile (
+        arquivo.getFileName() + ".last-good");
+    juce::MemoryBlock backupBytes;
+    const auto backupInspection =
+        ChurchDAWMidiMapping::inspectMidiMapTarget (
+            lastGood, backupBytes);
+    if (backupInspection
+          == ChurchDAWMidiMapping::MidiMapTargetInspection::unknown)
+    {
+        bloquearQuartetoMidiDesconhecido (
+            "leitura exata do last-good de CCs");
+        return;
+    }
+    if (auto backupXml = backupInspection
+              == ChurchDAWMidiMapping::MidiMapTargetInspection::readable
+            ? ChurchDAWMidiMapping::parseBoundedXmlData (backupBytes)
+            : nullptr;
+        backupXml != nullptr
+         && ChurchDAWMidiMapping::hasFutureMidiMapSchema (
+                *backupXml, "MIDIMAP"))
+    {
+        esquemaDeCCsDesconhecido = true;
+        juce::Logger::writeToLog (
+            "MIDI MAP: last-good de CCs pertence a schema futuro; arquivos protegidos");
+        return;
+    }
+
+    const bool primaryCCReadable = xml != nullptr
+        && ChurchDAWMidiMapping::isMidiMapXmlReadable (
+            *xml, "MIDIMAP", "MAP", "CCACAO");
+    if (! primaryCCReadable)
+    {
+        if (arquivo.existsAsFile())
+            guardarCopiaDeArquivoIlegivel (arquivo, "MIDI MAP (CCs)");
+        auto fallback = ChurchDAWMidiMapping::recoverMidiMapXml (
+            arquivo, lastGood, "MIDIMAP", "MAP", "CCACAO");
+        if (fallback != nullptr)
+        {
+            xml = std::move (fallback);
+            bloquearSalvamentoCCVazio = false;
+            juce::Logger::writeToLog (
+                "MIDI MAP: CCs restaurados do last-good; principal reparado quando permitido");
+        }
+        else
+        {
+            if (lastGood.existsAsFile())
+                guardarCopiaDeArquivoIlegivel (
+                    lastGood, "MIDI MAP (last-good de CCs invalido)");
+            xml.reset();
+            bloquearSalvamentoCCVazio =
+                ChurchDAWMidiMapping::shouldBlockEmptySaveAfterFailedRecovery (
+                    arquivo.existsAsFile(), lastGood.existsAsFile());
+        }
+    }
 
     if (xml == nullptr || ! xml->hasTagName ("MIDIMAP"))
     {
@@ -6897,14 +16159,23 @@ void MainComponent::restoreMidiMap()
         // a chave do settings.
         xml = appProperties.getUserSettings()->getXmlValue ("midiMap");
 
-        if (xml != nullptr && ! xml->hasTagName ("MIDIMAP"))
+        if (xml != nullptr
+             && ! ChurchDAWMidiMapping::isMidiMapXmlReadable (
+                    *xml, "MIDIMAP", "MAP", "CCACAO"))
         {
-            juce::Logger::writeToLog ("MIDI MAP: chave antiga de CCs com formato irreconhecivel; "
-                                      "mantida intacta");
+            if (ChurchDAWMidiMapping::hasFutureMidiMapSchema (
+                    *xml, "MIDIMAP"))
+                esquemaDeCCsDesconhecido = true;
+            else
+                bloquearSalvamentoCCVazio = true;
+            juce::Logger::writeToLog (
+                "MIDI MAP: chave antiga de CCs invalida/desconhecida; mantida intacta");
             return;
         }
 
         veioDoFormatoAntigo = xml != nullptr;
+        if (veioDoFormatoAntigo)
+            bloquearSalvamentoCCVazio = false;
     }
 
     if (xml != nullptr && xml->hasTagName ("MIDIMAP")
@@ -6924,6 +16195,8 @@ void MainComponent::restoreMidiMap()
         if (xml->hasTagName ("MIDIMAP"))
         {
             const juce::ScopedLock sl (mapLock);
+            ccMappings.clear();
+            ccActionMappings.clear();
 
             // Iterar so por <MAP>, como o mapa de notas faz por <NOTE>. Com o
             // iterador solto, qualquer filho de outro tipo reprovava na
@@ -6932,19 +16205,13 @@ void MainComponent::restoreMidiMap()
             // nao existe outro filho; isto e a trava para o dia em que existir.
             for (auto* m : xml->getChildWithTagNameIterator ("MAP"))
             {
-                CCTarget target {
-                    m->getIntAttribute ("slot", -2),
-                    m->getIntAttribute ("param", -1),
-                    m->getIntAttribute ("insert", -1),
-                    m->getStringAttribute ("name"),
-                    m->getStringAttribute ("id")
-                };
-                const int cc = m->getIntAttribute ("cc", -1);
-                const MidiControlKey control {
-                    m->getStringAttribute ("source"),
-                    m->getIntAttribute ("channel", 0),
-                    cc
-                };
+                ChurchDAWMidiMapping::PersistedCCMapping persisted;
+                if (! ChurchDAWMidiMapping::readPersistedCCMapping (
+                        *m, persisted))
+                    continue;
+                auto target = std::move (persisted.target);
+                auto control = std::move (persisted.control);
+                const int cc = control.cc;
 
                 // Mapas muito antigos guardavam somente o indice. Depois que
                 // Attack/Release/EQ/Rotary foram adicionados, esse indice pode
@@ -6953,7 +16220,7 @@ void MainComponent::restoreMidiMap()
                 // Mapa sem origem/canal tambem e descartado: torna-lo wildcard
                 // faria outro teclado com o mesmo CC mudar o tom.
                 if (! control.isValid()
-                     || ! ChurchDAWMidiMapping::isMappableController (cc)
+                     || (!control.isNote && ! ChurchDAWMidiMapping::isMappableController (cc))
                      || ! ChurchDAWMidiMapping::isSafeStoredTarget (
                             target.slot, target.paramId, target.paramName))
                 {
@@ -6961,10 +16228,87 @@ void MainComponent::restoreMidiMap()
                     continue;
                 }
 
-                ccMappings[control] = std::move (target);
-                ++restored;
+                if (ccMappings.emplace (control, std::move (target)).second)
+                    ++restored;
+                else
+                    ++rejectedUnsafe;
             }
+
+            // Botoes do Pad por CC. Iterador proprio, validacao propria: um XML
+            // mexido a mao nao pode fazer um CC qualquer trocar o tom no culto.
+            for (auto* a : xml->getChildWithTagNameIterator ("CCACAO"))
+            {
+                const MidiControlKey control {
+                    ChurchDAWMidiMapping::normalizeMidiSourceId (
+                        a->getStringAttribute ("source")),
+                    a->getIntAttribute ("channel", 0),
+                    a->getIntAttribute ("cc", -1),
+                    false,
+                    a->getStringAttribute ("sourceName")
+                };
+
+                if (! control.isValid()
+                     || ! ChurchDAWMidiMapping::isMappableAction (control.cc))
+                    continue;
+
+                const int tipo = a->getIntAttribute ("action", 0);
+                const int arg  = a->getIntAttribute ("arg", -1);
+
+                AcaoDeCC entrada;
+
+                if (tipo == (int) NoteActionKind::padKey
+                     && juce::isPositiveAndBelow (arg, 12))
+                    entrada.acao = { NoteActionKind::padKey, arg };
+                else if (tipo == (int) NoteActionKind::padOff)
+                    entrada.acao = { NoteActionKind::padOff, -1 };
+                else if (tipo == (int) NoteActionKind::cena
+                          && juce::isPositiveAndBelow (arg, ChurchDAWLive::numeroDeCenas))
+                    entrada.acao = { NoteActionKind::cena, arg };
+                else if (tipo == (int) NoteActionKind::panic)
+                    entrada.acao = { NoteActionKind::panic, -1 };
+                else if (tipo == (int) NoteActionKind::nextScene)
+                    entrada.acao = { NoteActionKind::nextScene, -1 };
+                else if (tipo == (int) NoteActionKind::previousScene)
+                    entrada.acao = { NoteActionKind::previousScene, -1 };
+                else if (tipo == (int) NoteActionKind::padSynthProgram
+                          && juce::isPositiveAndBelow (
+                              arg, PadSynthProcessor::numPrograms))
+                    entrada.acao = { NoteActionKind::padSynthProgram, arg };
+                else if (tipo == (int) NoteActionKind::tapTempo)
+                    entrada.acao = { NoteActionKind::tapTempo, -1 };
+                else if (tipo == (int) NoteActionKind::sustainToggle)
+                    entrada.acao = { NoteActionKind::sustainToggle, -1 };
+                else if (tipo == (int) NoteActionKind::padSynthEngineToggle)
+                    entrada.acao = { NoteActionKind::padSynthEngineToggle, -1 };
+                else
+                    continue;
+
+                entrada.modo =
+                    a->getIntAttribute ("modo", 0)
+                            == (int) ChurchDAWMidiMapping::ModoDeBotaoCC::seguirNivel
+                        ? ChurchDAWMidiMapping::ModoDeBotaoCC::seguirNivel
+                        : ChurchDAWMidiMapping::ModoDeBotaoCC::alternar;
+
+                // Somente a curta janela de boot silencia um dump inicial. Fora
+                // dela, o primeiro toque real nao exige um segundo aperto.
+                entrada.estado.armarSincronizacaoDeBoot (
+                    juce::Time::getMillisecondCounter());
+                if (ccActionMappings.emplace (control, entrada).second)
+                    ++restored;
+                else
+                    ++rejectedUnsafe;
+            }
+
+            // Re-key the complete maps in one pass so collisions are kept as
+            // stale recoverable entries instead of being overwritten.
+            (void) ChurchDAWMidiMapping::rekeyMidiMapByUniqueSourceName (
+                ccMappings, midiSourcesCached);
+            (void) ChurchDAWMidiMapping::rekeyMidiMapByUniqueSourceName (
+                ccActionMappings, midiSourcesCached);
         }
+
+    reconstruirMascaraDeCCsDeAcao();
+    atualizarBotoesDeCCDoPad();
 
     juce::Logger::writeToLog ("MIDI MAP: " + juce::String (restored)
                               + " mapeamento(s) restaurado(s), "
@@ -6976,20 +16320,13 @@ void MainComponent::restoreMidiMap()
     // nao voltar na proxima inicializacao.
     if (veioDoFormatoAntigo || rejectedUnsafe > 0)
     {
-        if (saveMidiMap())
+        if (veioDoFormatoAntigo)
         {
-            if (veioDoFormatoAntigo)
-            {
-                appProperties.getUserSettings()->removeValue ("midiMap");
-                juce::Logger::writeToLog ("MIDI MAP: mapa de CCs migrado para "
-                                            + arquivoDoMapaDeCCs().getFileName());
-            }
+            pendingLegacyCCMigration = true;
+            juce::Logger::writeToLog ("MIDI MAP: migracao de CCs agendada apos ambos restores");
         }
-        else if (veioDoFormatoAntigo)
-        {
-            juce::Logger::writeToLog ("MIDI MAP: migracao de CCs adiada, o mapa antigo "
-                                      "continua no setup");
-        }
+        else if (rejectedUnsafe > 0 && midiMapsLoaded)
+            (void) saveMidiMap();
     }
 }
 
@@ -7117,16 +16454,17 @@ bool MainComponent::rebuildGraphConnections (
         if (const auto nodeID = nodeForSlot (i); nodeID.uid != 0)
             fxChain.add (nodeID);
 
-    const auto instrument = nodeForSlot (0);
+    const auto timbresNode = nodeForSlot (0);
+    const auto instrument = timbresNode;
     const auto midiCh = juce::AudioProcessorGraph::midiChannelIndex;
 
     // fontes que alimentam o comeco da cadeia de efeitos
     const auto firstDest = fxChain.isEmpty() ? masterNode : fxChain.getFirst();
 
-    if (instrument.uid != 0)
-        connectAudio (instrument, firstDest, "instrument_to_chain", true);
+    if (timbresNode.uid != 0)
+        connectAudio (timbresNode, firstDest, "timbres_to_chain", true);
 
-    if (inputToggle.getToggleState())
+    if (audioInputAuthorised.load (std::memory_order_acquire))
     {
         juce::AudioProcessorGraph::Node::Ptr inputNode (
             graph.getNodeForId (audioInNode));
@@ -7146,12 +16484,20 @@ bool MainComponent::rebuildGraphConnections (
     if (padNode.uid != 0)
         connectAudio (padNode, masterNode, "pad_to_master", true);
 
+    // Sintetizador polifonico do PAD EDITOR. Nasce com o parametro de engine
+    // desligado, portanto a conexao permanente nao altera setups antigos.
+    if (padSynthNode.uid != 0)
+        connectAudio (padSynthNode, masterNode, "pad_synth_to_master", true);
+
     // master sempre alimenta a saida
     juce::AudioProcessorGraph::Node::Ptr outputNode (
         graph.getNodeForId (audioOutNode));
     const bool outputIsAvailable = outputNode != nullptr
         && outputNode->getProcessor()->getTotalNumInputChannels() > 0;
-    connectAudio (masterNode, audioOutNode, "master_to_device_output",
+    // Master -> Sabrina -> saida. Com o Sabrina em bypass (padrao) o caminho
+    // e o mesmo de sempre: o processBlock dele nao encosta no buffer.
+    connectAudio (masterNode, sabrinaNode, "master_to_sabrina", true);
+    connectAudio (sabrinaNode, audioOutNode, "sabrina_to_device_output",
                   outputIsAvailable);
 
     // MIDI vai para o instrumento e tambem para os efeitos (controle externo)
@@ -7164,6 +16510,18 @@ bool MainComponent::rebuildGraphConnections (
             requiredConnectionsOk = false;
             juce::Logger::writeToLog (
                 "AUDIO_GRAPH connection_failed edge=midi_to_instrument required=1");
+        }
+    }
+
+    if (padSynthNode.uid != 0)
+    {
+        if (! graph.addConnection (
+                { { midiInNode, midiCh }, { padSynthNode, midiCh } },
+                juce::AudioProcessorGraph::UpdateKind::none))
+        {
+            requiredConnectionsOk = false;
+            juce::Logger::writeToLog (
+                "AUDIO_GRAPH connection_failed edge=midi_to_pad_synth required=1");
         }
     }
 
@@ -7204,15 +16562,203 @@ bool MainComponent::rebuildGraphConnections (
 //==============================================================================
 void MainComponent::saveAudioStateNow()
 {
-    if (auto* device = deviceManager.getCurrentAudioDevice())
+    if (auto* device = deviceManager.getCurrentAudioDevice();
+        device != nullptr && device->isOpen() && device->isPlaying())
     {
         if (auto xml = deviceManager.createStateXml())
-            appProperties.getUserSettings()->setValue ("audioSetup", xml.get());
+        {
+            ChurchDAWAudioInputPolicy::applyToSavedSetup (
+                xml.get(), audioInputAuthorised.load (
+                               std::memory_order_acquire));
 
-        appProperties.getUserSettings()->setValue ("bufferSize", device->getCurrentBufferSizeSamples());
+            // Pendencia: um setup recem-escolhido so vira "bom" depois de
+            // rodar. Se ele matar o app, o boot seguinte descarta e volta
+            // para a ultima configuracao comprovada.
+            auto* props = appProperties.getUserSettings();
+            const auto anterior = [&] {
+                if (auto antigo = props->getXmlValue ("audioSetup"))
+                    return antigo->toString();
+                return juce::String();
+            }();
+            if (anterior != xml->toString())
+                props->setValue ("audioSetupPending", 1);
+
+            props->setValue ("audioSetup", xml.get());
+        }
+
+       #if JUCE_ANDROID
+        // Um degrau elevado automaticamente por xruns e apenas runtime. O
+        // botao Salvar nao pode transforma-lo em preferencia permanente.
+        const int userBuffer = appProperties.getUserSettings()->getIntValue (
+            "androidUserBufferSize", device->getCurrentBufferSizeSamples());
+        appProperties.getUserSettings()->setValue ("bufferSize", userBuffer);
+       #else
+        appProperties.getUserSettings()->setValue (
+            "bufferSize", device->getCurrentBufferSizeSamples());
+       #endif
         appProperties.getUserSettings()->setValue ("sampleRate", device->getCurrentSampleRate());
         appProperties.getUserSettings()->saveIfNeeded();
     }
+}
+
+void MainComponent::setSabrinaEnabled (bool enabled)
+{
+    sabrinaEnabled = enabled;
+
+    if (sabrinaProcessor != nullptr)
+        sabrinaProcessor->setSabrinaBypassed (! enabled);
+
+    juce::Logger::writeToLog (juce::String ("SABRINA: ")
+                                  + (enabled ? "ligada" : "em bypass"));
+}
+
+void MainComponent::promoteGoodAudioNow()
+{
+   #if JUCE_WINDOWS || JUCE_MAC
+    if (deviceManager.getCurrentAudioDevice() == nullptr)
+        return;
+
+    if (auto xml = deviceManager.createStateXml())
+    {
+        ChurchDAWAudioInputPolicy::applyToSavedSetup (
+            xml.get(), audioInputAuthorised.load (std::memory_order_acquire));
+
+        auto* props = appProperties.getUserSettings();
+        props->setValue ("audioSetupGood", xml.get());
+        props->setValue ("audioSetupPending", 0);
+        props->saveIfNeeded();
+        juce::Logger::writeToLog (
+            "AUDIO_GOOD: setup de audio atual promovido a ultima configuracao boa");
+    }
+   #endif
+}
+
+bool MainComponent::setAudioInputChannelsEnabled (bool enabled)
+{
+   #if JUCE_ANDROID || JUCE_IOS
+    return ! enabled;
+   #else
+    if (! enabled)
+        audioInputAuthorised.store (false, std::memory_order_release);
+
+    auto setup = deviceManager.getAudioDeviceSetup();
+
+    if (enabled)
+    {
+        setup.useDefaultInputChannels = false;
+
+        if (setup.inputDeviceName.isEmpty())
+        {
+            if (auto* type = deviceManager.getCurrentDeviceTypeObject())
+            {
+                const auto names = type->getDeviceNames (true);
+                const int defaultIndex = type->getDefaultDeviceIndex (true);
+
+                if (names.contains (setup.outputDeviceName))
+                    setup.inputDeviceName = setup.outputDeviceName;
+                else if (juce::isPositiveAndBelow (defaultIndex, names.size()))
+                    setup.inputDeviceName = names[defaultIndex];
+                else if (! names.isEmpty())
+                    setup.inputDeviceName = names[0];
+            }
+        }
+
+        auto* device = deviceManager.getCurrentAudioDevice();
+        int available = device != nullptr
+                          ? device->getInputChannelNames().size()
+                          : 0;
+
+        // Ao acrescentar agora um input separado, o dispositivo corrente foi
+        // criado sem ele e ainda nao consegue enumerar seus canais. O app pede
+        // no maximo o par estereo; o driver valida a mascara na reabertura.
+        if (available <= 0 && setup.inputDeviceName.isNotEmpty())
+            available = 2;
+
+        if (available <= 0)
+        {
+            juce::Logger::writeToLog (
+                "AUDIO_INPUT enable_failed reason=no_input_channels");
+            return false;
+        }
+
+        juce::BigInteger selected;
+        for (int channel = 0; channel < available; ++channel)
+            if (setup.inputChannels[channel])
+                selected.setBit (channel);
+
+        // Preserva a selecao explicita existente; so escolhe 1/2 quando ainda
+        // nao havia mascara valida (primeira ativacao ou interface nova).
+        if (selected.isZero())
+            selected.setRange (0, juce::jmin (2, available), true);
+
+        setup.inputChannels = selected;
+    }
+    else
+    {
+        ChurchDAWAudioInputPolicy::disableRuntimeChannels (setup);
+    }
+
+    const auto error = deviceManager.setAudioDeviceSetup (setup, true);
+    juce::Logger::writeToLog (
+        "AUDIO_INPUT enabled=" + juce::String (enabled ? 1 : 0)
+        + " active_channels="
+        + juce::String (deviceManager.getAudioDeviceSetup()
+                            .inputChannels.countNumberOfSetBits())
+        + (error.isEmpty() ? juce::String()
+                           : " error=\"" + error + "\""));
+    return error.isEmpty();
+   #endif
+}
+
+bool MainComponent::reconcileAudioInputPolicy()
+{
+   #if JUCE_ANDROID || JUCE_IOS
+    return true;
+   #else
+    // Sem dispositivo aberto nao existe canal de runtime para reconciliar.
+    // AudioDeviceManager::getAudioDeviceSetup() devolve o setup padrao quando
+    // nao ha device aberto (useDefaultInputChannels volta a true), entao
+    // aplicar setAudioDeviceSetup aqui reemite change e cai de novo neste
+    // callback para sempre. Em modo seguro isso virava ~1.000 AUDIO_CHANGE/s
+    // no log e o motivo de o fechamento nao terminar. A intencao salva
+    // (audioDeviceInChans=0) continua valendo quando um device abrir.
+    if (deviceManager.getCurrentAudioDevice() == nullptr)
+        return true;
+
+    const bool authorised =
+        audioInputAuthorised.load (std::memory_order_acquire);
+    const auto setup = deviceManager.getAudioDeviceSetup();
+
+    if (! authorised)
+    {
+        if (! ChurchDAWAudioInputPolicy::runtimeSetupIsBlocked (setup))
+            if (! setAudioInputChannelsEnabled (false))
+                return false;
+    }
+    else if (setup.useDefaultInputChannels || setup.inputChannels.isZero())
+    {
+        // A intencao continua verdadeira se a interface estiver ausente. Assim
+        // um hotplug posterior pode reaplicar a entrada em vez de apagar uma
+        // escolha que o usuario fez de proposito.
+        if (! setAudioInputChannelsEnabled (true))
+            return false;
+    }
+
+    const auto stable = deviceManager.getAudioDeviceSetup();
+    if (! authorised
+         && ! ChurchDAWAudioInputPolicy::runtimeSetupIsBlocked (stable))
+        return false;
+
+    if (const auto* device = deviceManager.getCurrentAudioDevice())
+    {
+        const int active =
+            device->getActiveInputChannels().countNumberOfSetBits();
+        if (! authorised && active != 0)
+            return false;
+    }
+
+    return true;
+   #endif
 }
 
 // painel do seletor de audio EMBUTIDO na DAW: card premium com sombra, acento
@@ -7228,15 +16774,21 @@ struct AudioSettingsHolder : public juce::Component,
    #if JUCE_ANDROID || JUCE_IOS
     static constexpr int margin = 0, headerH = 64, footerPad = 14;
    #else
-    static constexpr int margin = 12, headerH = 56;
+    static constexpr int margin = 12, headerH = 82;
    #endif
 
     explicit AudioSettingsHolder (MainComponent& mc)
         : owner (&mc),
-          selector (mc.deviceManager, 0, 2, 0, 2, true, false, true, false)
+          selector (mc.deviceManager, [safe = juce::Component::SafePointer<MainComponent> (&mc)]
+          {
+              if (auto* host = safe.getComponent()) host->startDiagnosticOutputTest();
+          })
     {
         mc.audioDialogOpen = true;
-        brandIcon = juce::ImageCache::getFromMemory (BinaryData::icon_png, BinaryData::icon_pngSize);
+        setWantsKeyboardFocus (true);
+        setTitle (juce::String::fromUTF8 ("Áudio e MIDI"));
+        brandIcon = juce::ImageCache::getFromMemory (BinaryData::logo_round_png,
+                                                     BinaryData::logo_round_pngSize);
 
        #if JUCE_ANDROID || JUCE_IOS
         selector.setItemHeight (44);
@@ -7270,8 +16822,12 @@ struct AudioSettingsHolder : public juce::Component,
         statusChip.setJustificationType (juce::Justification::centredLeft);
         addAndMakeVisible (statusChip);
        #else
-        selector.setItemHeight (26);
-        addAndMakeVisible (selector);
+        selector.setItemHeight (30);
+        selectorViewport.setViewedComponent (&selector, false);
+        selectorViewport.setScrollBarsShown (true, false);
+        selectorViewport.setScrollBarThickness (8);
+        selectorViewport.setWantsKeyboardFocus (false);
+        addAndMakeVisible (selectorViewport);
        #endif
 
         // O seletor de audio e do JUCE: reescrever ele so pra ficar bonito seria
@@ -7294,9 +16850,23 @@ struct AudioSettingsHolder : public juce::Component,
         audioInputNote.setColour (juce::Label::textColourId, NordLookAndFeel::greenOk());
         addAndMakeVisible (audioInputNote);
        #else
-        // No desktop a entrada de guitarra/mic e opcional e vive aqui.
-        addAndMakeVisible (mc.inputToggle);
+         // No desktop a entrada de guitarra/mic e opcional e vive aqui.
+         addAndMakeVisible (mc.inputToggle);
        #endif
+
+         launchkeyToggle.setButtonText (juce::String::fromUTF8 (
+             "Mapeamento autom\xc3\xa1tico do Launchkey"));
+         launchkeyToggle.setTooltip (juce::String::fromUTF8 (
+             "Quando desligado, o Launchkey funciona apenas como entrada MIDI comum; "
+             "faders, knobs e pads deixam de controlar o ChurchDAW automaticamente."));
+         launchkeyToggle.setToggleState (mc.launchkeyMappingEnabled,
+                                         juce::dontSendNotification);
+         launchkeyToggle.onClick = [this]
+         {
+             if (auto* mc2 = owner.getComponent())
+                 mc2->setLaunchkeyMappingEnabled (launchkeyToggle.getToggleState());
+         };
+         addAndMakeVisible (launchkeyToggle);
 
         // RESPOSTA DO TECLADO: cada controlador manda uma velocity diferente
         // pra mesma forca. Fica aqui, e nao na regua master, porque e do mesmo
@@ -7347,6 +16917,7 @@ struct AudioSettingsHolder : public juce::Component,
         addAndMakeVisible (velCombo);
 
         // fecha o card (o destrutor salva a config)
+        closeBtn.setComponentID ("timbrePickerClose");
         closeBtn.setButtonText (juce::String::fromUTF8 ("\xc3\x97"));   // ×
        #if JUCE_ANDROID || JUCE_IOS
         closeBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff2a3038));
@@ -7361,7 +16932,10 @@ struct AudioSettingsHolder : public juce::Component,
             juce::MessageManager::callAsync ([mc2]
             {
                 if (auto* m = mc2.getComponent())
+                {
                     m->audioPanel.reset();
+                    m->audioSettingsButton.repaint();
+                }
             });
         };
         addAndMakeVisible (closeBtn);
@@ -7375,7 +16949,7 @@ struct AudioSettingsHolder : public juce::Component,
             "\xe2\x86\xbb Reiniciar \xc3\xa1udio");   // ↻
        #endif
         restartBtn.setButtonText (restartLabel);
-        restartBtn.setColour (juce::TextButton::buttonColourId, NordLookAndFeel::nordRed());
+        restartBtn.setColour (juce::TextButton::buttonColourId, NordLookAndFeel::bgControlHi());
         restartBtn.setColour (juce::TextButton::buttonOnColourId, NordLookAndFeel::nordRedBright());
         restartBtn.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
         restartBtn.setColour (juce::TextButton::textColourOnId, juce::Colours::white);
@@ -7418,16 +16992,24 @@ struct AudioSettingsHolder : public juce::Component,
         };
         addAndMakeVisible (restartBtn);
 
-       #if JUCE_ANDROID
+       #if JUCE_ANDROID || JUCE_IOS
         // MIDI BLE: permissoes + atalho para Ajustes de Bluetooth (pareamento).
         bleMidiBtn.setButtonText (juce::String::fromUTF8 ("MIDI Bluetooth"));
         bleMidiBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff252a32));
         bleMidiBtn.setColour (juce::TextButton::textColourOffId, NordLookAndFeel::txtPrimary());
         bleMidiBtn.setTooltip (juce::String::fromUTF8 (
-            "Pede permissao de Bluetooth e abre os ajustes para parear um "
-            "teclado MIDI BLE. Depois o app lista a porta automaticamente."));
+            "Abre o pareamento de dispositivos MIDI Bluetooth e atualiza as "
+            "portas de entrada automaticamente."));
         bleMidiBtn.onClick = [this]
         {
+           #if JUCE_IOS
+            if (juce::BluetoothMidiDevicePairingDialogue::isAvailable())
+            {
+                juce::BluetoothMidiDevicePairingDialogue::open();
+                if (auto* mc2 = owner.getComponent())
+                    mc2->refreshMidiInputs();
+            }
+           #else
             // Manter LocalRef vivo: getMainActivity().get() em temporário
             // invalida o jobject e causa SIGSEGV em openBluetoothSettings.
             auto launch = [safeOwner = owner]
@@ -7456,36 +17038,13 @@ struct AudioSettingsHolder : public juce::Component,
                     return;
                 }
 
-                jboolean requestedPerms = JNI_FALSE;
-                if (jmethodID method = env->GetStaticMethodID (
-                        clazz, "requestMidiBlePermissions",
-                        "(Landroid/app/Activity;I)Z"))
-                {
-                    requestedPerms = env->CallStaticBooleanMethod (
-                        clazz, method, activity.get(), (jint) 0x41DA);
-                    if (env->ExceptionCheck())
-                        env->ExceptionClear();
-                }
+                jmethodID mid = env->GetStaticMethodID (
+                    clazz, "openBluetoothSettings",
+                    "(Landroid/app/Activity;)V");
+                if (mid != nullptr)
+                    env->CallStaticVoidMethod (clazz, mid, activity.get());
                 else
-                {
                     env->ExceptionClear();
-                }
-
-                if (requestedPerms == JNI_FALSE)
-                {
-                    if (jmethodID method = env->GetStaticMethodID (
-                            clazz, "openBluetoothSettings",
-                            "(Landroid/app/Activity;)Z"))
-                    {
-                        env->CallStaticBooleanMethod (clazz, method, activity.get());
-                        if (env->ExceptionCheck())
-                            env->ExceptionClear();
-                    }
-                    else
-                    {
-                        env->ExceptionClear();
-                    }
-                }
 
                 env->DeleteLocalRef (clazz);
 
@@ -7506,6 +17065,7 @@ struct AudioSettingsHolder : public juce::Component,
             }
 
             juce::MessageManager::callAsync (launch);
+           #endif
         };
         addAndMakeVisible (bleMidiBtn);
        #endif
@@ -7514,7 +17074,7 @@ struct AudioSettingsHolder : public juce::Component,
         // O tamanho final vem de showAudioSettings(), usando a janela real.
         setSize (360, 640);
        #else
-        setSize (620 + margin * 2, 542 + margin * 2);
+         setSize (1020, 650);
        #endif
     }
 
@@ -7522,9 +17082,7 @@ struct AudioSettingsHolder : public juce::Component,
     {
         stopTimer();
 
-       #if JUCE_ANDROID || JUCE_IOS
         selectorViewport.setViewedComponent (nullptr, false);
-       #endif
 
         if (auto* c = owner.getComponent())
         {
@@ -7617,6 +17175,13 @@ struct AudioSettingsHolder : public juce::Component,
                 toggle->setColour (juce::ToggleButton::tickDisabledColourId,
                                    NordLookAndFeel::txtDisabled());
             }
+            else if (auto* listBox = dynamic_cast<juce::ListBox*> (child))
+            {
+                listBox->setColour (juce::ListBox::backgroundColourId, juce::Colour (0xff1c2027));
+                listBox->setColour (juce::ListBox::outlineColourId, NordLookAndFeel::borderSoft());
+                listBox->setColour (juce::ListBox::textColourId, NordLookAndFeel::txtPrimary());
+                listBox->setOutlineThickness (1);
+            }
 
             restyleSelector (*child);   // as listas de canais/MIDI tem filhos proprios
         }
@@ -7630,10 +17195,15 @@ struct AudioSettingsHolder : public juce::Component,
     {
         auto full = getLocalBounds();
        #if JUCE_ANDROID || JUCE_IOS
-        const int maxW = juce::jmin (680, juce::jmax (320, full.getWidth() - 48));
-        return full.withSizeKeepingCentre (maxW, full.getHeight()).reduced (0, 10);
+        const bool shortMobile = full.getHeight() < 480 && full.getWidth() >= 540;
+        const int maxW = juce::jmin (shortMobile ? 820 : 680,
+                                     juce::jmax (320, full.getWidth() - (shortMobile ? 24 : 48)));
+        return full.withSizeKeepingCentre (maxW, full.getHeight())
+                   .reduced (0, shortMobile ? 6 : 10);
        #else
-        return full.reduced (margin);
+        const int width = juce::jmin (1020, juce::jmax (320, full.getWidth() - 40));
+        const int height = juce::jmin (650, juce::jmax (360, full.getHeight() - 32));
+        return full.withSizeKeepingCentre (width, height);
        #endif
     }
 
@@ -7647,10 +17217,10 @@ struct AudioSettingsHolder : public juce::Component,
         auto col = contentColumn().toFloat();
         const float rad = 18.0f;
         {
-            juce::Path sp;
-            sp.addRoundedRectangle (col, rad);
-            juce::DropShadow (juce::Colours::black.withAlpha (0.65f), 36, { 0, 10 })
-                .drawForPath (g, sp);
+            g.setColour (juce::Colours::black.withAlpha (0.28f));
+            g.fillRoundedRectangle (col.expanded (10.0f).translated (0.0f, 8.0f), rad + 8.0f);
+            g.setColour (juce::Colours::black.withAlpha (0.38f));
+            g.fillRoundedRectangle (col.expanded (4.0f).translated (0.0f, 4.0f), rad + 3.0f);
         }
 
         g.setGradientFill (juce::ColourGradient (
@@ -7667,108 +17237,111 @@ struct AudioSettingsHolder : public juce::Component,
         g.fillRoundedRectangle (col.getX() + 20.0f, col.getY() + 1.0f,
                                 col.getWidth() - 40.0f, 3.0f, 1.5f);
 
-        auto head = col.toNearestInt().removeFromTop (headerH);
+        const bool shortMobile = col.getHeight() < 480.0f && col.getWidth() >= 540.0f;
+        const int mobileHeadH = shortMobile ? 52 : headerH;
+        auto head = col.toNearestInt().removeFromTop (mobileHeadH);
         if (brandIcon.isValid())
         {
             g.setOpacity (1.0f);
-            g.drawImageWithin (brandIcon, head.getX() + 18, head.getY() + 14, 34, 34,
+            g.drawImageWithin (brandIcon, head.getX() + 18, head.getY() + (shortMobile ? 10 : 14),
+                               shortMobile ? 32 : 34, shortMobile ? 32 : 34,
                                juce::RectanglePlacement::centred);
         }
         else
         {
             NordLookAndFeel::drawChurchDAWMark (
-                g, { (float) head.getX() + 16.0f, (float) head.getY() + 12.0f, 38.0f, 38.0f });
+                g, { (float) head.getX() + 16.0f, (float) head.getY() + (shortMobile ? 8.0f : 12.0f),
+                     shortMobile ? 34.0f : 38.0f, shortMobile ? 34.0f : 38.0f });
         }
 
         g.setColour (NordLookAndFeel::txtPrimary());
-        g.setFont (juce::Font (juce::FontOptions (17.0f)).boldened()
+        g.setFont (juce::Font (juce::FontOptions (shortMobile ? 15.5f : 17.0f)).boldened()
                        .withExtraKerningFactor (0.04f));
         g.drawText (juce::String::fromUTF8 ("\xc3\x81UDIO / MIDI"),
-                    head.withTrimmedLeft (60).withTrimmedRight (52)
-                        .withTrimmedTop (8),
+                    head.withTrimmedLeft (58).withTrimmedRight (52)
+                        .withTop (head.getY() + (shortMobile ? 7 : 10)).withHeight (22),
                     juce::Justification::centredLeft);
 
         g.setColour (NordLookAndFeel::txtSecondary().withAlpha (0.85f));
         g.setFont (juce::Font (juce::FontOptions (11.5f)));
         g.drawText (juce::String::fromUTF8 ("Sa\xc3\xad" "da, lat\xc3\xaa" "ncia e teclado"),
-                    head.withTrimmedLeft (60).withTrimmedRight (52)
-                        .withTrimmedTop (30),
+                    head.withTrimmedLeft (58).withTrimmedRight (52)
+                        .withTop (head.getY() + (shortMobile ? 27 : 33)).withHeight (18),
                     juce::Justification::centredLeft);
 
         g.setColour (NordLookAndFeel::borderDefault().withAlpha (0.8f));
         g.fillRect (head.getX() + 16, head.getBottom() - 1, head.getWidth() - 32, 1);
 
-        // Faixa de acoes no rodape do card
+        // Faixa de acoes (rodape no tablet/retrato, coluna lateral no landscape compacto)
         if (! footerBand.isEmpty())
         {
-            g.setColour (juce::Colour (0xff161a20));
-            g.fillRoundedRectangle (footerBand.toFloat().getX(),
-                                    (float) footerBand.getY(),
-                                    footerBand.toFloat().getWidth(),
-                                    footerBand.toFloat().getHeight() + 8.0f,
-                                    0.0f);
-            // arredonda so a base do card cobrindo o footer
-            g.setColour (juce::Colour (0xff161a20));
             auto foot = footerBand.toFloat();
-            juce::Path p;
-            p.addRoundedRectangle (foot.getX(), foot.getY() - 1.0f,
-                                   foot.getWidth(), foot.getHeight() + 10.0f,
-                                   0.0f, 0.0f, false, false, true, true);
-            g.fillPath (p);
-            g.setColour (NordLookAndFeel::borderDefault().withAlpha (0.55f));
-            g.fillRect (foot.getX() + 16.0f, foot.getY(), foot.getWidth() - 32.0f, 1.0f);
+            if (shortMobile)
+            {
+                g.setColour (juce::Colour (0xff161a20));
+                g.fillRoundedRectangle (foot, 10.0f);
+                g.setColour (NordLookAndFeel::borderDefault().withAlpha (0.55f));
+                g.drawRoundedRectangle (foot.reduced (0.5f), 10.0f, 1.0f);
+            }
+            else
+            {
+                g.setColour (juce::Colour (0xff161a20));
+                g.fillRoundedRectangle (foot.getX(), (float) footerBand.getY(),
+                                        foot.getWidth(), foot.getHeight() + 8.0f, 0.0f);
+                juce::Path p;
+                p.addRoundedRectangle (foot.getX(), foot.getY() - 1.0f,
+                                       foot.getWidth(), foot.getHeight() + 10.0f,
+                                       0.0f, 0.0f, false, false, true, true);
+                g.fillPath (p);
+                g.setColour (NordLookAndFeel::borderDefault().withAlpha (0.55f));
+                g.fillRect (foot.getX() + 16.0f, foot.getY(), foot.getWidth() - 32.0f, 1.0f);
+            }
         }
        #else
-        auto bounds = getLocalBounds().toFloat();
-        auto card = bounds.reduced ((float) margin);
-        const float rad = 14.0f;
-
-        // sombra: card flutuando sobre o mixer
-        {
-            juce::Path sp;
-            sp.addRoundedRectangle (card, rad);
-            juce::DropShadow (juce::Colours::black.withAlpha (0.55f), 26, { 0, 7 }).drawForPath (g, sp);
-        }
-
-        // corpo "vidro escuro" + borda da marca
-        g.setGradientFill (juce::ColourGradient (juce::Colour (0xff1b1c22), card.getX(), card.getY(),
-                                                 juce::Colour (0xff101013), card.getX(), card.getBottom(), false));
-        g.fillRoundedRectangle (card, rad);
-        g.setColour (juce::Colours::white.withAlpha (0.06f));
-        g.drawLine (card.getX() + 14.0f, card.getY() + 1.5f, card.getRight() - 14.0f, card.getY() + 1.5f, 1.0f);
-        g.setColour (NordLookAndFeel::nordRed().withAlpha (0.45f));
-        g.drawRoundedRectangle (card, rad, 1.2f);
-
-        // acento vermelho no topo (mesma linguagem dos outros cards)
+        g.fillAll (juce::Colours::black.withAlpha (0.64f));
+        const auto card = contentColumn();
+        g.setColour (NordLookAndFeel::bgCard());
+        g.fillRoundedRectangle (card.toFloat(), 14.0f);
+        g.setColour (juce::Colours::white.withAlpha (0.085f));
+        g.drawRoundedRectangle (card.toFloat().reduced (0.5f), 14.0f, 1.0f);
         g.setColour (NordLookAndFeel::nordRed());
-        g.fillRoundedRectangle (card.reduced (16.0f, 0.0f).removeFromTop (9.0f).withTrimmedTop (6.0f), 1.5f);
-
-        // cabecalho: icone + titulo + subtitulo + regua
-        auto head = card.toNearestInt().removeFromTop (headerH);
-
-        if (brandIcon.isValid())
+        g.fillRoundedRectangle ((float) card.getX() + 28.0f, (float) card.getY() + 1.0f,
+                                (float) card.getWidth() - 56.0f, 2.5f, 1.25f);
+        auto head = card.reduced (28, 0).removeFromTop (headerH);
+        g.setColour (NordLookAndFeel::txtPrimary());
+        g.setFont (juce::Font (juce::FontOptions (24.0f)).boldened());
+        g.drawText (juce::String::fromUTF8 ("Áudio e MIDI"), head.withTrimmedTop (16).withHeight (32), juce::Justification::centredLeft);
+        g.setColour (NordLookAndFeel::txtSecondary());
+        g.setFont (juce::Font (juce::FontOptions (13.0f)));
+        g.drawText (juce::String::fromUTF8 ("Seu equipamento, pronto para tocar."), head.withTrimmedTop (51).withHeight (22), juce::Justification::centredLeft);
+        g.setColour (juce::Colours::white.withAlpha (0.055f));
+        g.fillRect (head.getX(), head.getBottom() - 2, head.getWidth(), 1);
+        auto section = [&] (juce::Rectangle<int> rect, const juce::String& title)
         {
-            g.setOpacity (1.0f);   // imagem herda o alpha do ultimo setColour
-            g.drawImageWithin (brandIcon, head.getX() + 16, head.getY() + 13, 34, 34,
-                               juce::RectanglePlacement::centred);
-        }
-
-        g.setColour (juce::Colours::white);
-        g.setFont (juce::Font (juce::FontOptions (17.0f)).boldened().withExtraKerningFactor (0.06f));
-        g.drawText (juce::String::fromUTF8 ("\xc3\x81UDIO / MIDI"),
-                    head.withTrimmedLeft (62).withTrimmedTop (6), juce::Justification::centredLeft);
-
-        if (getWidth() >= 500)
+            g.setColour (NordLookAndFeel::bgApp().withAlpha (0.55f));
+            g.fillRoundedRectangle (rect.toFloat(), 10.0f);
+            g.setColour (juce::Colours::white.withAlpha (0.055f));
+            g.drawRoundedRectangle (rect.toFloat().reduced (0.5f), 10.0f, 1.0f);
+            g.setColour (NordLookAndFeel::txtSecondary());
+            g.setFont (juce::Font (juce::FontOptions (13.0f)).boldened());
+            g.drawText (title, rect.reduced (20, 12).removeFromTop (20), juce::Justification::centredLeft);
+        };
+        if (card.getWidth() >= 850)
         {
-            g.setColour (NordLookAndFeel::dimText().withAlpha (0.8f));
-            g.setFont (juce::Font (juce::FontOptions (11.5f)));
-            g.drawText (juce::String::fromUTF8 ("Dispositivo, lat\xc3\xaancia e entradas MIDI"),
-                        head.reduced (16, 0).withTrimmedRight (36).withTrimmedTop (6),
-                        juce::Justification::centredRight);
+            auto body = card.reduced (24, 20).withTrimmedTop (headerH);
+            auto right = body.removeFromRight (290);
+            body.removeFromRight (20);
+            section (body, juce::String::fromUTF8 ("Dispositivo e conexões"));
+            section (right, "Teclado e controle");
+            auto hint = right.reduced (20, 0).withTrimmedTop (126).withHeight (44);
+            g.setColour (NordLookAndFeel::txtDisabled());
+            g.setFont (juce::Font (juce::FontOptions (12.0f)));
+            g.drawMultiLineText (juce::String::fromUTF8 ("Ajuste como a força das teclas responde no instrumento."),
+                                 hint.getX(), hint.getY() + 14, hint.getWidth(), juce::Justification::left, 3.0f);
+            auto recoveryHint = right.reduced (20, 0).withTrimmedTop (right.getHeight() - 108);
+            g.drawMultiLineText (juce::String::fromUTF8 ("Se o som parar, reabra o dispositivo mantendo suas configurações."),
+                                 recoveryHint.getX(), recoveryHint.getY() + 14, recoveryHint.getWidth(), juce::Justification::left, 3.0f);
         }
-
-        g.setColour (NordLookAndFeel::nordRed().withAlpha (0.55f));
-        g.fillRect (head.getX() + 14, head.getBottom() - 1, head.getWidth() - 28, 1);
        #endif
     }
 
@@ -7776,48 +17349,76 @@ struct AudioSettingsHolder : public juce::Component,
     {
        #if JUCE_ANDROID || JUCE_IOS
         auto col = contentColumn();
-        closeBtn.setBounds (col.getRight() - 50, col.getY() + 12, 40, 40);
+        const bool shortMobile = col.getHeight() < 480 && col.getWidth() >= 540;
+        const int mobileHeadH = shortMobile ? 52 : headerH;
+        closeBtn.setBounds (col.getRight() - 48, col.getY() + (shortMobile ? 6 : 12), 40, 40);
 
         auto body = col;
-        body.removeFromTop (headerH + 6);
-        body = body.reduced (18, 0).withTrimmedBottom (12);
+        body.removeFromTop (mobileHeadH + 6);
+        body = body.reduced (shortMobile ? 14 : 18, 0).withTrimmedBottom (shortMobile ? 8 : 12);
 
-        // Rodape compacto: velocity + 2 botoes + status. Sem "metade da tela".
-        constexpr int footerH = 168;
-        footerBand = body.removeFromBottom (juce::jmin (footerH, body.getHeight() - 120));
-        auto foot = footerBand.reduced (4, 8);
-
-        sectionMidi.setBounds (foot.removeFromTop (16));
-        foot.removeFromTop (4);
-
-        // velocity: label esquerda, combo direita (uma linha)
-        auto velRow = foot.removeFromTop (40);
-        velLabel.setJustificationType (juce::Justification::centredLeft);
-        velLabel.setBounds (velRow.removeFromLeft (juce::jmin (150, velRow.getWidth() / 3))
-                               .withSizeKeepingCentre (juce::jmin (150, velRow.getWidth()), 22));
-        velRow.removeFromLeft (8);
-        velCombo.setBounds (velRow.withSizeKeepingCentre (velRow.getWidth(), 36));
-
-        foot.removeFromTop (8);
-        auto actions = foot.removeFromTop (44);
-       #if JUCE_ANDROID
+        if (shortMobile)
         {
+            const int rightW = juce::jlimit (244, 304, body.getWidth() * 43 / 100);
+            footerBand = body.removeFromRight (rightW);
+            body.removeFromRight (12);
+
+            auto foot = footerBand.reduced (10, 8);
+            sectionMidi.setBounds (foot.removeFromTop (16));
+            foot.removeFromTop (4);
+            velLabel.setJustificationType (juce::Justification::centredLeft);
+            velLabel.setBounds (foot.removeFromTop (18));
+            foot.removeFromTop (2);
+            velCombo.setBounds (foot.removeFromTop (36));
+            foot.removeFromTop (8);
+
+            auto actions = foot.removeFromTop (40);
+            const int gap = 8;
+            const int w = (actions.getWidth() - gap) / 2;
+            bleMidiBtn.setBounds (actions.removeFromLeft (w));
+            actions.removeFromLeft (gap);
+            restartBtn.setBounds (actions);
+
+            foot.removeFromTop (6);
+            launchkeyToggle.setBounds (foot.removeFromTop (34));
+            foot.removeFromTop (2);
+            audioInputNote.setBounds (foot.removeFromTop (20));
+        }
+        else
+        {
+            // Rodape compacto: velocity + 2 botoes + status. Sem "metade da tela".
+            constexpr int footerH = 206;
+            footerBand = body.removeFromBottom (juce::jmin (footerH, body.getHeight() - 120));
+            auto foot = footerBand.reduced (4, 8);
+
+            sectionMidi.setBounds (foot.removeFromTop (16));
+            foot.removeFromTop (4);
+
+            // velocity: label esquerda, combo direita (uma linha)
+            auto velRow = foot.removeFromTop (40);
+            velLabel.setJustificationType (juce::Justification::centredLeft);
+            velLabel.setBounds (velRow.removeFromLeft (juce::jmin (150, velRow.getWidth() / 3))
+                                   .withSizeKeepingCentre (juce::jmin (150, velRow.getWidth()), 22));
+            velRow.removeFromLeft (8);
+            velCombo.setBounds (velRow.withSizeKeepingCentre (velRow.getWidth(), 36));
+
+            foot.removeFromTop (8);
+            auto actions = foot.removeFromTop (44);
             const int gap = 10;
             const int w = (actions.getWidth() - gap) / 2;
             bleMidiBtn.setBounds (actions.removeFromLeft (w));
             actions.removeFromLeft (gap);
             restartBtn.setBounds (actions);
-        }
-       #else
-        restartBtn.setBounds (actions);
-       #endif
 
-        foot.removeFromTop (6);
-        audioInputNote.setBounds (foot.removeFromTop (20));
+            foot.removeFromTop (6);
+            launchkeyToggle.setBounds (foot.removeFromTop (34));
+            foot.removeFromTop (4);
+            audioInputNote.setBounds (foot.removeFromTop (20));
+        }
 
         // Corpo: titulo da secao + seletor com LARGURA do card (nao da tela).
         sectionDevice.setBounds (body.removeFromTop (16));
-        body.removeFromTop (4);
+        body.removeFromTop (shortMobile ? 2 : 4);
         statusChip.setBounds (body.removeFromTop (18));
         body.removeFromTop (4);
 
@@ -7825,52 +17426,68 @@ struct AudioSettingsHolder : public juce::Component,
         // Altura do seletor ~ conteudo real (item 44 * ~6 linhas + labels).
         // Nao esticar ate o fundo — o "mar" preto some.
         const int contentH = juce::jmax (260, selector.getItemHeight() * 7 + 48);
-        selector.setBounds (0, 0, juce::jmax (260, body.getWidth()), contentH);
+        selector.setBounds (0, 0, juce::jmax (240, body.getWidth() - 8), contentH);
        #else
-        auto card = getLocalBounds().reduced (margin);
-        closeBtn.setBounds (card.getRight() - 38, card.getY() + 12, 26, 22);
-
-        auto area = card;
-        area.removeFromTop (headerH + 4);
-
-        auto extra = area.removeFromBottom (46).reduced (20, 10);
-        restartBtn.setBounds (extra.removeFromRight (160));
-        extra.removeFromRight (12);
-        owner->inputToggle.setBounds (extra);
-
-        auto velRow = area.removeFromBottom (42).reduced (20, 8);
-        velLabel.setBounds (velRow.removeFromLeft (150));
-        velRow.removeFromLeft (10);
-        velCombo.setBounds (velRow.removeFromLeft (190).withSizeKeepingCentre (190, 26));
-
-        selector.setBounds (area.reduced (18, 8));
+        auto card = contentColumn();
+        closeBtn.setBounds (card.getRight() - 62, card.getY() + 24, 36, 36);
+        auto area = card.reduced (24, 20).withTrimmedTop (headerH);
+        if (card.getWidth() >= 850)
+        {
+            auto right = area.removeFromRight (290).reduced (20, 0);
+            area.removeFromRight (20);
+            selectorViewport.setBounds (area.reduced (12, 0).withTrimmedTop (42));
+            selector.setSize (juce::jmax (1, selectorViewport.getWidth() - 10), 600);
+            right.removeFromTop (52);
+            velLabel.setJustificationType (juce::Justification::centredLeft);
+            velLabel.setBounds (right.removeFromTop (24));
+            right.removeFromTop (4);
+            velCombo.setBounds (right.removeFromTop (36));
+            right.removeFromTop (76);
+            launchkeyToggle.setButtonText (juce::String::fromUTF8 ("Launchkey automático"));
+            launchkeyToggle.setBounds (right.removeFromTop (44));
+            right.removeFromTop (18);
+            if (owner != nullptr)
+                owner->inputToggle.setBounds (right.removeFromTop (44));
+            restartBtn.setBounds (right.removeFromBottom (54).withTrimmedBottom (16));
+        }
+        else
+        {
+            auto launchRow = area.removeFromBottom (34);
+            launchkeyToggle.setBounds (launchRow);
+            auto extras = area.removeFromBottom (42);
+            restartBtn.setBounds (extras.removeFromRight (158).reduced (0, 4));
+            if (owner != nullptr) owner->inputToggle.setBounds (extras);
+            auto vel = area.removeFromBottom (40);
+            velLabel.setBounds (vel.removeFromLeft (150));
+            velCombo.setBounds (vel.reduced (4));
+            selectorViewport.setBounds (area);
+            selector.setSize (juce::jmax (1, selectorViewport.getWidth() - 10), 600);
+        }
        #endif
     }
 
     void paintOverChildren (juce::Graphics& g) override
     {
-       #if ! (JUCE_ANDROID || JUCE_IOS)
-        // separador acima da secao de baixo (resposta do teclado + entrada + reiniciar)
-        auto row = getLocalBounds().reduced (margin).removeFromBottom (46 + 42);
-        g.setColour (NordLookAndFeel::panelOutline());
-        g.fillRect (row.removeFromTop (1).reduced (14, 0));
-       #else
         juce::ignoreUnused (g);
-       #endif
+    }
+
+    bool keyPressed (const juce::KeyPress& key) override
+    {
+        if (key.isKeyCode (juce::KeyPress::escapeKey))
+        {
+            closeBtn.triggerClick();
+            return true;
+        }
+        return false;
     }
 
     // arrasta o card pela faixa do cabecalho (desktop). No mobile a pagina
     // e full-bleed e nao se arrasta.
     void mouseDown (const juce::MouseEvent& e) override
     {
-       #if JUCE_ANDROID || JUCE_IOS
-        juce::ignoreUnused (e);
         dragging = false;
-       #else
-        dragging = e.position.y < (float) (margin + headerH);
-        if (dragging)
-            dragger.startDraggingComponent (this, e);
-       #endif
+        if (! contentColumn().contains (e.getPosition()))
+            closeBtn.triggerClick();
     }
 
     void mouseDrag (const juce::MouseEvent& e) override
@@ -7886,14 +17503,15 @@ struct AudioSettingsHolder : public juce::Component,
     void mouseUp (const juce::MouseEvent&) override   { dragging = false; }
 
     juce::Component::SafePointer<MainComponent> owner;
-    juce::AudioDeviceSelectorComponent selector;
-   #if JUCE_ANDROID || JUCE_IOS
+    GuardedAudioDeviceSelector selector;
     juce::Viewport selectorViewport;
+   #if JUCE_ANDROID || JUCE_IOS
     juce::Label sectionDevice, sectionMidi, statusChip;
     juce::Rectangle<int> footerBand;
    #endif
-    juce::TextButton restartBtn, closeBtn;
-   #if JUCE_ANDROID
+     juce::TextButton restartBtn, closeBtn;
+     juce::ToggleButton launchkeyToggle;
+   #if JUCE_ANDROID || JUCE_IOS
     juce::TextButton bleMidiBtn;
    #endif
     juce::Label velLabel, audioInputNote;
@@ -7920,10 +17538,217 @@ void MainComponent::restartAudioDevice()
     androidAudioReconcileScheduled = false;
     reconcileAndroidAudioTopology();
    #else
+    // restartLastAudioDevice reaplica currentSetup literalmente. Normalize-o
+    // antes de fechar para que um setup antigo/default nao ressuscite entradas.
+    (void) reconcileAudioInputPolicy();
     deviceManager.closeAudioDevice();
     deviceManager.restartLastAudioDevice();
+    (void) reconcileAudioInputPolicy();
+    auto* reopened = deviceManager.getCurrentAudioDevice();
+    if (reopened == nullptr || ! reopened->isOpen() || ! reopened->isPlaying())
+    {
+        lastAudioDriverError = juce::String::fromUTF8 ("A interface n\xc3\xa3o foi reaberta. Confira a conex\xc3\xa3o e a sa\xc3\xad" "da escolhida.");
+        juce::Logger::writeToLog ("AUDIO_RESTART failed: " + lastAudioDriverError);
+        statusInfo.setTooltip (lastAudioDriverError);
+    }
+    else
+    {
+        lastAudioDriverError.clear();
+        juce::Logger::writeToLog ("AUDIO_RESTART ready: " + reopened->getName());
+    }
    #endif
 }
+
+#if ! (JUCE_ANDROID || JUCE_IOS)
+// Ajuste de latencia da PRIMEIRA ABERTURA no desktop (ver o comentario no
+// construtor): prefere ASIO ou Windows Audio Low Latency e aplica ~10 ms.
+void MainComponent::tuneDesktopFirstRunAudio()
+{
+    auto* settings = appProperties.getUserSettings();
+
+    if (settings->getIntValue ("bufferSize", 0) != 0
+         || settings->getIntValue ("desktopFirstRunAudioTuned", 0) != 0)
+        return;
+
+    const juce::String preferredType = [this]() -> juce::String
+    {
+        const auto& types = deviceManager.getAvailableDeviceTypes();
+
+        // Enumerar driver ASIO quebrado pode lancar (ou abrir modal do
+        // vendor) dentro do construtor, antes de existir janela: nao pode
+        // impedir o app de abrir.
+        auto scanNoThrow = [] (juce::AudioIODeviceType* t) -> bool
+        {
+            try
+            {
+                t->scanForDevices();
+                return ! t->getDeviceNames().isEmpty();
+            }
+            catch (...)
+            {
+                juce::Logger::writeToLog (
+                    "AUDIO_DESKTOP scan_failed type=\""
+                    + t->getTypeName() + "\"");
+                return false;
+            }
+        };
+
+        for (int i = 0; i < types.size(); ++i)
+        {
+            auto* t = types.getUnchecked (i);
+
+            if (t->getTypeName() == "ASIO" && scanNoThrow (t))
+                return "ASIO";
+        }
+
+        for (int i = 0; i < types.size(); ++i)
+        {
+            auto* t = types.getUnchecked (i);
+
+            if (t->getTypeName() == "Windows Audio (Low Latency Mode)"
+                 && scanNoThrow (t))
+                return "Windows Audio (Low Latency Mode)";
+        }
+
+        return {};
+    }();
+
+    // Sem NENHUMA saida (fone desplugado na primeira abertura, PC sem caixa)
+    // nao ha o que ajustar. Gravar a marca aqui fazia a primeira abertura COM
+    // saida nunca mais passar por este ajuste: o app ficava para sempre no
+    // WASAPI compartilhado, o de maior atraso. A marca continua sendo gravada
+    // ANTES de qualquer troca de driver (protecao contra crash-loop).
+    if (preferredType.isEmpty() && deviceManager.getCurrentAudioDevice() == nullptr)
+        return;
+
+    settings->setValue ("desktopFirstRunAudioTuned", 1);
+
+    const juce::String tipoAnterior =
+        deviceManager.getCurrentAudioDeviceType();
+
+    if (preferredType.isEmpty() || tipoAnterior == preferredType)
+        return;
+
+    deviceManager.setCurrentAudioDeviceType (preferredType, true);
+
+    if (deviceManager.getCurrentAudioDevice() == nullptr)
+    {
+        // O tipo preferido nao abriu nenhum dispositivo (placa ASIO
+        // desconectada, em uso exclusivo, ASIO4ALL sem hardware). Sem
+        // este rollback o app abriria MUDO -- e o tipo ja teria sido
+        // persistido pelo "true" acima.
+        juce::Logger::writeToLog (
+            "AUDIO_DESKTOP preferred_type_failed preferred=\""
+            + preferredType + "\" reverting_to=\""
+            + tipoAnterior + "\"");
+        deviceManager.setCurrentAudioDeviceType (tipoAnterior, true);
+    }
+
+    if (auto* dev = deviceManager.getCurrentAudioDevice())
+    {
+        const auto& sizes = dev->getAvailableBufferSizes();
+        const double rate = dev->getCurrentSampleRate() > 0.0
+                               ? dev->getCurrentSampleRate() : 48000.0;
+
+        int chosen = 0;
+        for (const auto s : sizes)
+            if (((double) s / rate) * 1000.0 >= 10.0)
+            {
+                chosen = s;
+                break;
+            }
+
+        if (chosen == 0 && ! sizes.isEmpty())
+            chosen = sizes.getLast();      // aparelho so oferece buffers curtos
+
+        if (chosen > 0)
+        {
+            auto setup = deviceManager.getAudioDeviceSetup();
+
+            if (setup.bufferSize != chosen)
+            {
+                setup.bufferSize = chosen;
+                deviceManager.setAudioDeviceSetup (setup, true);
+            }
+
+            // persiste so o buffer; o tipo ja foi gravado por
+            // setCurrentAudioDeviceType(..., true). Assim as aberturas
+            // seguintes nao recaem aqui (bufferSize != 0).
+            settings->setValue ("bufferSize", chosen);
+        }
+
+        juce::Logger::writeToLog (
+            "AUDIO_DESKTOP first_run_tuned type=\"" + deviceManager.getCurrentAudioDeviceType()
+            + "\" buffer=" + juce::String (dev->getCurrentBufferSizeSamples())
+            + " rate=" + juce::String (dev->getCurrentSampleRate(), 0));
+    }
+}
+#endif
+
+#if JUCE_WINDOWS || JUCE_MAC
+// App aberto sem saida -- o Beelink de teste abriu assim, com o fone
+// desplugado e o monitor sem caixa -- ficava mudo ate o musico abrir Audio e
+// escolher de novo, mesmo depois de plugar o fone. O WASAPI/CoreAudio avisa o
+// AudioDeviceManager quando a lista muda; aqui usamos a saida padrao do
+// sistema. Uma tentativa por mudanca REAL da lista: se falhar, nao insiste em
+// loop (cada setAudioDeviceSetup gera outra notificacao).
+void MainComponent::reconnectAudioOutputIfAvailable()
+{
+    auto* type = deviceManager.getCurrentDeviceTypeObject();
+    if (type == nullptr)
+        return;
+
+    // A lista ja chega atualizada: o proprio tipo reescaneia antes de avisar.
+    // Reescanear aqui (ASIO!) seria lento e desnecessario.
+    const auto outputs = type->getDeviceNames (false);
+    const auto fingerprint = type->getTypeName() + "|" + outputs.joinIntoString ("|");
+
+    if (outputs.isEmpty() || fingerprint == lastAutoReconnectOutputs)
+        return;
+
+    lastAutoReconnectOutputs = fingerprint;
+
+    // Primeira saida que este PC oferece: e aqui que o ajuste de latencia
+    // da primeira abertura acontece de verdade (Low Latency/ASIO + ~10 ms).
+    tuneDesktopFirstRunAudio();
+
+    if (deviceManager.getCurrentAudioDevice() == nullptr)
+    {
+        // Cabo da interface esbarrado no meio do culto e plugado de volta: a
+        // saida certa e a ULTIMA que o musico escolheu, nao o padrao do Windows
+        // (que pode ser o HDMI do monitor). Sem escolha conhecida, o padrao.
+        juce::String preferredOutput;
+        if (const auto lastChoice = deviceManager.createStateXml())
+            preferredOutput = lastChoice->getStringAttribute ("audioOutputDeviceName");
+
+        if (preferredOutput.isEmpty() || ! outputs.contains (preferredOutput))
+        {
+            const int defaultIndex = type->getDefaultDeviceIndex (false);
+            preferredOutput = outputs[juce::isPositiveAndBelow (defaultIndex, outputs.size())
+                                          ? defaultIndex : 0];
+        }
+
+        auto setup = deviceManager.getAudioDeviceSetup();
+        setup.outputDeviceName = preferredOutput;
+        setup.useDefaultOutputChannels = true;
+
+        if (! audioInputAuthorised.load (std::memory_order_acquire))
+        {
+            setup.inputDeviceName.clear();
+            setup.inputChannels.clear();
+            setup.useDefaultInputChannels = false;
+        }
+
+        const auto error = deviceManager.setAudioDeviceSetup (setup, false);
+        juce::Logger::writeToLog (
+            "AUDIO_AUTORECONNECT output=\"" + setup.outputDeviceName + "\""
+            + (error.isEmpty() ? juce::String (" ok") : " error=\"" + error + "\""));
+    }
+
+    if (deviceManager.getCurrentAudioDevice() != nullptr)
+        lastAudioDriverError.clear();
+}
+#endif
 
 #if JUCE_ANDROID
 void MainComponent::updateAndroidPreferredUsbSetupFromCurrent()
@@ -8102,6 +17927,10 @@ void MainComponent::reconcileAndroidAudioTopology()
 
     if (auto* device = deviceManager.getCurrentAudioDevice())
     {
+        // A topologia acabou de mudar. Esta e a unica sondagem Oboe adicional
+        // permitida para a nova rota; o tuner reutiliza o resultado e nunca
+        // abre streams temporarios enquanto o musico esta tocando.
+        androidAvailableBufferSizes = device->getAvailableBufferSizes();
         const auto activeOutputs = device->getActiveOutputChannels().countNumberOfSetBits();
         juce::Logger::writeToLog (
             "AUDIO_ANDROID open_succeeded generation=" + juce::String (generation)
@@ -8111,8 +17940,10 @@ void MainComponent::reconcileAndroidAudioTopology()
             + " buffer_actual=" + juce::String (device->getCurrentBufferSizeSamples())
             + " output_channels=" + juce::String (activeOutputs));
 
-        androidLastXRunCount = deviceManager.getXRunCount();
+        androidLastXRunCount = juce::jmax (0, device->getXRunCount());
         androidLastBufferTuneMs = juce::Time::getMillisecondCounter();
+        androidXRunPressure = 0;
+        androidStableBufferWindows = 0;
     }
     else
     {
@@ -8125,6 +17956,11 @@ void MainComponent::reconcileAndroidAudioTopology()
 
 bool MainComponent::handleBackButton()
 {
+    if (auto* window = dynamic_cast<churchstudio::Window*> (liveCamWindow.getComponent()))
+    {
+        window->closeButtonPressed();
+        return true;
+    }
     // Ordem: a camada mais "por cima" primeiro. Cada fechamento usa o
     // caminho normal do painel (o destrutor do Audio/MIDI salva a config;
     // o reset das Bibliotecas encerra rede antes de desmontar).
@@ -8137,6 +17973,35 @@ bool MainComponent::handleBackButton()
     if (librariesPanel != nullptr)
     {
         librariesPanel.reset();
+        return true;
+    }
+
+    // O Pad NAO e criado sob demanda: nasce no construtor e vive escondido a
+    // sessao inteira. Antes este ramo testava a EXISTENCIA do ponteiro (sempre
+    // verdadeira) e o destrua em todo BACK — matando o Pad Continuo para sempre
+    // e engolindo o gesto das camadas abaixo (MIDI Learn, orgao, Live). So
+    // fecha quem esta visivel, pelo caminho normal (sem destruir), e dispara
+    // onClose para desarmar o alvo de nota e o pendingNoteAction do mapeamento.
+    if (padPanel != nullptr && padPanel->isVisible())
+    {
+        padPanel->setVisible (false);
+        padButton.setToggleState (padEditorVisible,
+                                  juce::dontSendNotification);
+        if (padPanel->onClose != nullptr)
+            padPanel->onClose();
+        return true;
+    }
+
+    if (padEditorVisible)
+    {
+        closePadEditor();
+        return true;
+    }
+
+    if (midiLearnActive.load() || mapButton.getToggleState())
+    {
+        // Fecha o MIDI Learn no BACK (mesmo gesto que Concluir).
+        finishMidiLearn (true);
         return true;
     }
 
@@ -8210,14 +18075,29 @@ void MainComponent::showAudioSettings()
         {
             return safe != nullptr ? safe->getChurchLive() : nullptr;
         },
+        [safe = juce::Component::SafePointer<MainComponent> (this)] (bool enabled)
+        {
+            if (auto* c = safe.getComponent())
+                c->setLaunchkeyMappingEnabled (enabled);
+        },
+        launchkeyMappingEnabled,
         audioDialogOpen
+    };
+    host.startOutputTest = [safe = juce::Component::SafePointer<MainComponent> (this)]
+    {
+        if (auto* owner = safe.getComponent()) owner->startDiagnosticOutputTest();
+    };
+    host.stopOutputTest = [safe = juce::Component::SafePointer<MainComponent> (this)]
+    {
+        if (auto* owner = safe.getComponent()) owner->stopDiagnosticOutputTest();
     };
     auto* center = new AndroidAudioMidiCenter (std::move (host));
     audioPanel.reset (center);
     audioSettingsButton.repaint();
     addAndMakeVisible (center);
-    // Full-screen (não modal desktop). resized() do MainComponent re-aplica.
-    center->setBounds (getLocalBounds());
+    // Respeita safeAreaInsets para nao entrar sob camera/barra gestual.
+    center->setBounds (layoutContentBounds.isEmpty() ? getLocalBounds()
+                                                     : layoutContentBounds);
     center->toFront (true);
     center->grabKeyboardFocus();
    #else
@@ -8230,23 +18110,10 @@ void MainComponent::showAudioSettings()
     holder->setBounds (layoutContentBounds.isEmpty() ? getLocalBounds()
                                                      : layoutContentBounds);
    #else
-    // Desktop conserva o card original e so reduz se a janela for menor.
-    const float fitX = (float) juce::jmax (1, getWidth()  - 8) / (float) holder->getWidth();
-    const float fitY = (float) juce::jmax (1, getHeight() - 8) / (float) holder->getHeight();
-    const float panelScale = juce::jmin (1.0f, juce::jmin (fitX, fitY));
-
-    if (panelScale < 0.999f)
-        holder->setTransform (juce::AffineTransform::scale (panelScale));
-
-    const int visualW = juce::roundToInt ((float) holder->getWidth()  * panelScale);
-    const int visualH = juce::roundToInt ((float) holder->getHeight() * panelScale);
-
-    const int visualX = juce::jmax (2, (getWidth()  - visualW) / 2);
-    const int visualY = juce::jmax (2, (getHeight() - visualH) / 2);
-    holder->setTopLeftPosition (juce::roundToInt ((float) visualX / panelScale),
-                                juce::roundToInt ((float) visualY / panelScale));
+    holder->setBounds (getLocalBounds());
    #endif
     holder->toFront (true);
+    holder->grabKeyboardFocus();
    #endif
 }
 
@@ -8255,26 +18122,204 @@ void MainComponent::showAudioSettings()
 // e o lugar onde todo mundo procura os creditos.
 juce::Rectangle<int> MainComponent::brandArea() const
 {
+    if (desktopReferenceLayout)
+        return DesktopHeaderLayout::calculate (layoutContentBounds).brand;
+
     return { layoutContentBounds.getX() + 6, layoutContentBounds.getY() + 2,
              juce::jmax (1, layoutBrandWidth - 4),
-             juce::jmax (1, (mobilePortraitLayout ? 48 : layoutHeaderHeight) - 4) };
+             juce::jmax (1, (mobileTwoRowHeader ? 48 : layoutHeaderHeight) - 4) };
 }
 
 void MainComponent::mouseDown (const juce::MouseEvent& e)
 {
+    // Eventos dos filhos chegam aqui somente por causa do listener recursivo do
+    // modo rapido. Nao execute os hit-tests do shell com coordenadas locais de
+    // um Slider: procure a tag do parametro no controle ou em seus pais.
+    if (e.eventComponent != this)
+    {
+        if (e.eventComponent == &mapButton || mapButton.isParentOf (e.eventComponent))
+        {
+            // Button::onClick owns this transition. Finishing on mouseDown
+            // made mouseUp run onClick again and reopen learn mode.
+            return;
+        }
+
+        if (e.eventComponent == &clearMapButton || clearMapButton.isParentOf (e.eventComponent))
+            return;
+
+        if (midiLearnActive.load())
+        {
+            juce::AudioProcessor* processor = nullptr;
+            int parameterIndex = -1;
+            int actionKind = 0;
+            int actionArg = -1;
+            juce::String actionDisplayName;
+
+            for (auto* component = e.eventComponent;
+                 component != nullptr && component != this;
+                 component = component->getParentComponent())
+            {
+                if (ChurchDAWMidiLearnTarget::read (*component, processor, parameterIndex))
+                {
+                    const auto name = ChurchDAWMidiLearnTarget::readDisplayName (*component);
+                    armMidiLearnParameter (processor, parameterIndex, component, name);
+                    return;
+                }
+
+                if (ChurchDAWMidiLearnTarget::readAction (*component, actionKind, actionArg, actionDisplayName))
+                {
+                    armMidiLearnAction (actionKind, actionArg, actionDisplayName, component);
+                    return;
+                }
+            }
+        }
+
+        return;
+    }
+
+    if (desktopReferenceLayout && midiLearnActive.load())
+    {
+        for (int i = 0; i < ChurchDAWLive::numeroDeCenas; ++i)
+        {
+            if (desktopSceneBounds[i].contains (e.getPosition()))
+            {
+                const int sceneIdx = desktopSceneIndexAtRow[i];
+                if (juce::isPositiveAndBelow (sceneIdx, ChurchDAWLive::numeroDeCenas))
+                {
+                    const auto name = "Cena " + juce::String (sceneIdx + 1);
+                    const auto boundsInOverlay = midiLearnConsoleOverlay.getLocalArea (this, desktopSceneBounds[i]);
+                    armMidiLearnAction ((int) NoteActionKind::cena, sceneIdx, name, nullptr, boundsInOverlay);
+                    return;
+                }
+            }
+        }
+
+        if (desktopTapBounds.contains (e.getPosition()))
+        {
+            const auto boundsInOverlay = midiLearnConsoleOverlay.getLocalArea (this, desktopTapBounds);
+            armMidiLearnAction ((int) NoteActionKind::tapTempo, -1, "Tap Tempo", nullptr, boundsInOverlay);
+            return;
+        }
+    }
+
+    if (desktopReferenceLayout)
+    {
+        if (desktopSceneAddBounds.contains (e.getPosition()))
+        {
+            int primeiraVazia = -1;
+            for (int i = 0; i < ChurchDAWLive::numeroDeCenas; ++i)
+                if (! cenas[i].preenchida)
+                {
+                    primeiraVazia = i;
+                    break;
+                }
+
+            if (primeiraVazia >= 0)
+                (void) aplicarCena (primeiraVazia);
+            else
+                liveScenePanel.avisar ("TODAS AS CENAS JA ESTAO PREENCHIDAS");
+
+            showDesktopWorkspace (DesktopWorkspace::session);
+            return;
+        }
+
+        static constexpr int favouriteCategories[5] { 3, 3, 5, 5, 8 };
+        for (int i = 0; i < 5; ++i)
+        {
+            if (desktopFavouriteBounds[i].contains (e.getPosition()))
+            {
+                openSidebarTimbreCategory (favouriteCategories[i]);
+                return;
+            }
+        }
+
+        if (desktopTapBounds.contains (e.getPosition()))
+        {
+            if (performanceSessionPanel != nullptr)
+                performanceSessionPanel->triggerTapTempo();
+            repaint (desktopHeaderExtrasBounds);
+            return;
+        }
+
+        if (desktopSettingsBounds.contains (e.getPosition()))
+        {
+            showAudioSettings();
+            return;
+        }
+
+        if (desktopMixerTabBounds.contains (e.getPosition()))
+        {
+            showDesktopWorkspace (DesktopWorkspace::mixer);
+            return;
+        }
+
+        for (int i = 0; i < ChurchDAWLive::numeroDeCenas; ++i)
+        {
+            if (desktopSceneBounds[i].contains (e.getPosition()))
+            {
+                const int sceneIndex = desktopSceneIndexAtRow[i];
+                if (juce::isPositiveAndBelow (sceneIndex,
+                                               ChurchDAWLive::numeroDeCenas))
+                {
+                    const auto resultado = aplicarCena (sceneIndex);
+                    if (resultado == ChurchDAWLive::Resultado::ok
+                         || resultado == ChurchDAWLive::Resultado::vazia)
+                        liveScenePanel.atualizar (cenas, cenaAtiva);
+                    repaint (desktopSidebarBounds);
+                }
+                return;
+            }
+        }
+
+        if (desktopResetBounds.contains (e.getPosition()))
+        {
+            pedirConfirmacaoParaZerarTimbres();
+            return;
+        }
+
+        if (desktopSaveBounds.contains (e.getPosition()))
+        {
+            saveButton.triggerClick();
+            return;
+        }
+
+        if (desktopAudioBounds.contains (e.getPosition()))
+        {
+            showAudioSettings();
+            return;
+        }
+    }
+
     if (brandArea().contains (e.getPosition()))
         showAbout();
 }
 
 void MainComponent::mouseMove (const juce::MouseEvent& e)
 {
-    const bool over = brandArea().contains (e.getPosition());
+    const bool over = brandArea().contains (e.getPosition())
+                   || desktopSceneAddBounds.contains (e.getPosition())
+                   || desktopSaveBounds.contains (e.getPosition())
+                   || desktopResetBounds.contains (e.getPosition())
+                   || desktopAudioBounds.contains (e.getPosition())
+                   || desktopTapBounds.contains (e.getPosition())
+                   || desktopSettingsBounds.contains (e.getPosition())
+                   || desktopMixerTabBounds.contains (e.getPosition())
+                   || desktopPerformanceTabBounds.contains (e.getPosition())
+                   || desktopSessionTabBounds.contains (e.getPosition());
 
-    if (over != brandHover)
+    bool overFavourite = false;
+    for (const auto& bounds : desktopFavouriteBounds)
+        overFavourite = overFavourite || bounds.contains (e.getPosition());
+
+    bool overScene = false;
+    for (const auto& bounds : desktopSceneBounds)
+        overScene = overScene || bounds.contains (e.getPosition());
+
+    if ((over || overFavourite || overScene) != brandHover)
     {
-        brandHover = over;
-        setMouseCursor (over ? juce::MouseCursor::PointingHandCursor
-                             : juce::MouseCursor::NormalCursor);
+        brandHover = over || overFavourite || overScene;
+        setMouseCursor (brandHover ? juce::MouseCursor::PointingHandCursor
+                                   : juce::MouseCursor::NormalCursor);
         repaint (brandArea());
     }
 }
@@ -8287,6 +18332,97 @@ void MainComponent::mouseExit (const juce::MouseEvent&)
         setMouseCursor (juce::MouseCursor::NormalCursor);
         repaint (brandArea());
     }
+}
+
+bool MainComponent::keyPressed (const juce::KeyPress& key)
+{
+    if (auto* focus = juce::Component::getCurrentlyFocusedComponent())
+    {
+        if (dynamic_cast<juce::TextEditor*> (focus) != nullptr)
+            return false;
+    }
+
+    // Stage shortcuts must not change the scene while selecting a MIDI target.
+    if (midiLearnActive.load())
+    {
+        if (key.isKeyCode (juce::KeyPress::escapeKey))
+        {
+            finishMidiLearn (true);
+            return true;
+        }
+        return false;
+    }
+
+    const int code = key.getKeyCode();
+
+    // 1 a 8: Disparo instantaneo das cenas 1 a 8 no palco
+    if (code >= '1' && code <= '8')
+    {
+        const int sceneIdx = code - '1';
+        (void) aplicarCena (sceneIdx);
+        return true;
+    }
+
+    // Setas esquerda/direita: Navegacao rapida entre cenas
+    if (key.isKeyCode (juce::KeyPress::leftKey))
+    {
+        const int previous = cenaAtiva < 0 ? 0 : juce::jmax (0, cenaAtiva - 1);
+        (void) aplicarCena (previous);
+        return true;
+    }
+    if (key.isKeyCode (juce::KeyPress::rightKey))
+    {
+        const int next = cenaAtiva < 0 ? 0 : juce::jmin (ChurchDAWLive::numeroDeCenas - 1, cenaAtiva + 1);
+        (void) aplicarCena (next);
+        return true;
+    }
+
+    // Esc: Concluir MIDI Learn se ativo; caso contrario Panic global (corta todas as vozes/notas presas instantaneamente)
+    if (key.isKeyCode (juce::KeyPress::escapeKey))
+    {
+        if (mapButton.getToggleState() || midiLearnActive.load())
+        {
+            finishMidiLearn (true);
+            return true;
+        }
+
+        performGlobalPanic();
+        return true;
+    }
+
+    // Espaço: Alternar reproducao continua do Pad
+    if (key.isKeyCode (juce::KeyPress::spaceKey))
+    {
+        togglePadContinuous();
+        return true;
+    }
+
+    return false;
+}
+
+void MainComponent::togglePadContinuous()
+{
+    if (padProcessor == nullptr)
+        return;
+
+    const int currentKey = padProcessor->getKey();
+    if (currentKey >= 0)
+    {
+        padProcessor->setKey (-1);
+    }
+    else
+    {
+        int keyToPlay = 0;
+        if (juce::isPositiveAndBelow (cenaAtiva, ChurchDAWLive::numeroDeCenas)
+            && cenas[cenaAtiva].preenchida && cenas[cenaAtiva].padTom >= 0)
+        {
+            keyToPlay = cenas[cenaAtiva].padTom;
+        }
+        padProcessor->setKey (keyToPlay);
+    }
+
+    if (padPanel != nullptr)
+        padPanel->refreshState();
 }
 
 void MainComponent::showAbout()
@@ -8318,8 +18454,10 @@ void MainComponent::showAbout()
 
     // O card completo tem informacao e botoes no rodape. Em telefone deitado,
     // ele era maior que a tela e escondia justamente "WhatsApp" e "Fechar".
-    const float fitX = (float) juce::jmax (1, getWidth()  - 8) / (float) p->getWidth();
-    const float fitY = (float) juce::jmax (1, getHeight() - 8) / (float) p->getHeight();
+    const auto hostBounds = layoutContentBounds.isEmpty() ? getLocalBounds()
+                                                          : layoutContentBounds;
+    const float fitX = (float) juce::jmax (1, hostBounds.getWidth()  - 8) / (float) p->getWidth();
+    const float fitY = (float) juce::jmax (1, hostBounds.getHeight() - 8) / (float) p->getHeight();
     const float panelScale = juce::jmin (1.0f, juce::jmin (fitX, fitY));
 
     if (panelScale < 0.999f)
@@ -8328,8 +18466,8 @@ void MainComponent::showAbout()
     const int visualW = juce::roundToInt ((float) p->getWidth()  * panelScale);
     const int visualH = juce::roundToInt ((float) p->getHeight() * panelScale);
 
-    const int visualX = juce::jmax (2, (getWidth()  - visualW) / 2);
-    const int visualY = juce::jmax (2, (getHeight() - visualH) / 2);
+    const int visualX = hostBounds.getX() + juce::jmax (2, (hostBounds.getWidth()  - visualW) / 2);
+    const int visualY = hostBounds.getY() + juce::jmax (2, (hostBounds.getHeight() - visualH) / 2);
     p->setTopLeftPosition (juce::roundToInt ((float) visualX / panelScale),
                            juce::roundToInt ((float) visualY / panelScale));
     p->toFront (true);
@@ -8344,6 +18482,7 @@ void MainComponent::showLibraries()
     // Um modal por vez. Fechar o painel de audio tambem persiste a configuracao
     // pelo destrutor de AudioSettingsHolder.
     audioPanel.reset();
+    audioSettingsButton.repaint();
     aboutPanel.reset();
 
     auto* panel = new LibraryCatalogPanel();
@@ -8365,7 +18504,12 @@ void MainComponent::showLibraries()
     };
 
     addAndMakeVisible (panel);
+   #if JUCE_IOS || JUCE_ANDROID
+    panel->setBounds (layoutContentBounds.isEmpty() ? getLocalBounds()
+                                                    : layoutContentBounds);
+   #else
     panel->setBounds (getLocalBounds());
+   #endif
     panel->grabKeyboardFocus();
     panel->toFront (true);
 }
@@ -8441,9 +18585,338 @@ struct PluginListHolder final : public juce::Component,
         bool explicitIdentifiers = false;
     };
 
+    using LocationKind = ChurchDAWPluginScan::PluginScanLocationKind;
+    using ScanLocation = ChurchDAWPluginScan::PluginScanLocation;
+
+    class PluginManagerLookAndFeel final : public NordLookAndFeel
+    {
+    public:
+        void drawButtonText (juce::Graphics& g, juce::TextButton& button,
+                             bool, bool) override
+        {
+            const bool sidebar = static_cast<bool> (button.getProperties()["pluginSidebar"]);
+            auto area = button.getLocalBounds().reduced (sidebar ? 14 : 10, 2);
+            const auto label = button.getButtonText();
+            const auto colour = button.findColour (button.getToggleState()
+                ? juce::TextButton::textColourOnId : juce::TextButton::textColourOffId)
+                    .withMultipliedAlpha (button.isEnabled() ? 1.0f : 0.40f);
+            g.setColour (colour);
+            g.setFont (juce::Font (juce::FontOptions (sidebar ? 13.0f : 13.5f)));
+            if (sidebar && label.contains ("     "))
+            {
+                auto count = area.removeFromRight (28);
+                g.drawText (label.upToFirstOccurrenceOf ("     ", false, false), area,
+                            juce::Justification::centredLeft, true);
+                g.setColour (colour.withMultipliedAlpha (0.62f));
+                g.setFont (juce::Font (juce::FontOptions (11.5f)));
+                g.drawText (label.fromFirstOccurrenceOf ("     ", false, false), count, juce::Justification::centredRight);
+            }
+            else
+                g.drawFittedText (label, area, juce::Justification::centred, 1);
+    }
+
+        void positionComboBoxText (juce::ComboBox& box,
+                                   juce::Label& label) override
+        {
+            label.setBounds (10, 1, box.getWidth() - 34, box.getHeight() - 2);
+            label.setFont (juce::Font (juce::FontOptions (12.0f)));
+        }
+    };
+
+    class FolderRow final : public juce::Component
+    {
+    public:
+        std::function<void()> onSelect;
+        std::function<void(bool)> onToggle;
+
+        void setData (const ScanLocation& locationToUse, bool selectedToUse,
+                      int pluginCountToUse)
+        {
+            location = locationToUse;
+            selected = selectedToUse;
+            pluginCount = pluginCountToUse;
+            repaint();
+        }
+
+        void mouseDown (const juce::MouseEvent& event) override
+        {
+            if (event.x < 42)
+            {
+                location.enabled = ! location.enabled;
+                if (onToggle != nullptr) onToggle (location.enabled);
+            }
+            else if (onSelect != nullptr)
+                onSelect();
+        }
+
+        void mouseEnter (const juce::MouseEvent&) override { hovered = true; repaint(); }
+        void mouseExit (const juce::MouseEvent&) override { hovered = false; repaint(); }
+
+        void paint (juce::Graphics& g) override
+        {
+            auto area = getLocalBounds().toFloat();
+            if (selected || hovered)
+            {
+                g.setColour (selected ? juce::Colour (0xff33151c)
+                                      : juce::Colour (0xff171b21));
+                g.fillRect (area);
+            }
+            g.setColour (juce::Colours::white.withAlpha (0.055f));
+            g.fillRect (area.getX(), area.getBottom() - 1.0f,
+                        area.getWidth(), 1.0f);
+
+            auto check = juce::Rectangle<float> (14.0f,
+                area.getCentreY() - 8.0f, 16.0f, 16.0f);
+            g.setColour (location.enabled ? juce::Colour (0xffe8294b)
+                                          : juce::Colour (0xff101319));
+            g.fillRoundedRectangle (check, 3.0f);
+            g.setColour (location.enabled ? juce::Colour (0xffff6680)
+                                          : juce::Colour (0xff3b414b));
+            g.drawRoundedRectangle (check, 3.0f, 1.0f);
+            if (location.enabled)
+            {
+                juce::Path tick;
+                tick.startNewSubPath (check.getX() + 4.0f, check.getCentreY());
+                tick.lineTo (check.getX() + 7.0f, check.getBottom() - 4.0f);
+                tick.lineTo (check.getRight() - 3.0f, check.getY() + 4.0f);
+                g.setColour (juce::Colours::white);
+                g.strokePath (tick, juce::PathStrokeType (1.6f));
+            }
+
+            const auto folder = juce::Rectangle<float> (48.0f,
+                area.getCentreY() - 9.0f, 20.0f, 16.0f);
+            g.setColour (juce::Colour (0xffaeb4bd));
+            g.drawRoundedRectangle (folder, 2.0f, 1.4f);
+            g.drawLine (folder.getX() + 2.0f, folder.getY(),
+                        folder.getX() + 8.0f, folder.getY(), 1.4f);
+
+            g.setColour (juce::Colour (0xffe7e9ed));
+            g.setFont (juce::Font (juce::FontOptions (11.0f)));
+            g.drawFittedText (location.folder.getFullPathName(),
+                              78, 0, juce::jmax (20, getWidth() - 250), getHeight(),
+                              juce::Justification::centredLeft, 1);
+
+            const bool exists = location.folder.isDirectory();
+            const auto dot = juce::Colour (exists ? 0xff44d477 : 0xfff1b648);
+            g.setColour (dot);
+            g.fillEllipse ((float) getWidth() - 185.0f,
+                           area.getCentreY() - 3.0f, 6.0f, 6.0f);
+            g.setColour (juce::Colour (0xffaeb4bd));
+            g.setFont (juce::Font (juce::FontOptions (10.5f)));
+            const auto status = exists ? (location.kind == LocationKind::system
+                                               ? juce::String ("Padrao")
+                                               : juce::String ("Personalizado"))
+                                       : juce::String ("Nao encontrada");
+            g.drawText (status, getWidth() - 171, 0, 112, getHeight(),
+                        juce::Justification::centredLeft);
+            g.setColour (juce::Colour (0xff737b86));
+            g.drawText (juce::String (pluginCount), getWidth() - 54, 0, 42,
+                        getHeight(), juce::Justification::centredRight);
+        }
+
+    private:
+        ScanLocation location;
+        bool selected = false, hovered = false;
+        int pluginCount = 0;
+    };
+
+    struct PluginItem
+    {
+        juce::PluginDescription description;
+        std::vector<juce::PluginDescription> variants;
+        juce::String usage;
+        juce::String errorIdentifier;
+        bool error = false;
+        bool favourite = false;
+        bool active = false;
+
+        juce::String key() const
+        {
+            if (error)
+                return "error:" + errorIdentifier;
+
+            return ChurchDAWPluginProduct::key (description);
+
+        }
+
+        juce::String displayName() const
+        {
+            if (! error)
+                return description.descriptiveName.isNotEmpty()
+                         ? description.descriptiveName
+                         : description.name;
+
+            const juce::File file (errorIdentifier);
+            const auto fileName = file.getFileNameWithoutExtension();
+            return fileName.isNotEmpty() ? fileName : errorIdentifier;
+        }
+
+        juce::String formatName() const
+        {
+            if (! error)
+            {
+                juce::StringArray formats;
+                for (const auto& variant : variants)
+                    formats.addIfNotAlreadyThere (variant.pluginFormatName == "AudioUnit" ? "AU" : variant.pluginFormatName);
+                return formats.joinIntoString (" / ");
+            }
+
+            if (errorIdentifier.endsWithIgnoreCase (".dll")) return "VST2";
+            if (errorIdentifier.containsIgnoreCase (".vst3")) return "VST3";
+            if (errorIdentifier.containsIgnoreCase ("AudioUnit")) return "AU";
+            return "Plugin";
+        }
+
+        juce::String categoryName() const
+        {
+            if (error) return "Falha na verificacao";
+            if (description.isInstrument) return "Instrumento";
+            return description.category.isNotEmpty() ? description.category
+                                                      : juce::String ("Efeito");
+        }
+    };
+
+    class PluginRow final : public juce::Component
+    {
+    public:
+        PluginRow() { setWantsKeyboardFocus (true); }
+        std::function<void()> onSelect;
+        std::function<void()> onOpen;
+        std::function<void()> onFavourite;
+        std::function<void()> onMenu;
+
+        void setData (const PluginItem& itemToUse, bool selectedToUse)
+        {
+            item = itemToUse;
+            selected = selectedToUse;
+            setTitle (item.displayName());
+            repaint();
+        }
+
+        void mouseDown (const juce::MouseEvent& event) override
+        {
+            if (event.y < 38 && event.x >= getWidth() - 34)
+            {
+                if (onMenu != nullptr) onMenu();
+                return;
+            }
+            if (event.y < 38 && event.x >= getWidth() - 68)
+            {
+                if (onFavourite != nullptr) onFavourite();
+                return;
+            }
+            if (onSelect != nullptr) onSelect();
+    }
+
+        void mouseDoubleClick (const juce::MouseEvent& event) override
+        {
+            if (event.y >= 38 && ! item.error && onOpen != nullptr) onOpen();
+        }
+        bool keyPressed (const juce::KeyPress& key) override
+        {
+            if (key.isKeyCode (juce::KeyPress::returnKey))
+            {
+                if (! item.error && onOpen != nullptr) onOpen();
+                return true;
+            }
+            return false;
+        }
+        std::unique_ptr<juce::AccessibilityHandler> createAccessibilityHandler() override
+        {
+            return std::make_unique<juce::AccessibilityHandler> (*this, juce::AccessibilityRole::button,
+                juce::AccessibilityActions().addAction (juce::AccessibilityActionType::press, [this]
+                { if (onSelect != nullptr) onSelect(); }));
+        }
+
+        void mouseEnter (const juce::MouseEvent&) override
+        {
+            hovered = true;
+            repaint();
+        }
+
+        void mouseExit (const juce::MouseEvent&) override
+        {
+            hovered = false;
+            repaint();
+        }
+
+        void paint (juce::Graphics& g) override
+        {
+            const auto bounds = getLocalBounds().toFloat().reduced (1.0f);
+            g.setColour (selected ? juce::Colour (0xff262930) : hovered ? juce::Colour (0xff24272d) : juce::Colour (0xff1d2026));
+            g.fillRoundedRectangle (bounds, 12.0f);
+            auto art = bounds.reduced (10.0f, 0.0f).withTrimmedTop (31).withHeight (110);
+            ChurchDAWArtwork::plugin (g, art, item.displayName(), item.description.isInstrument);
+            g.setColour (hasKeyboardFocus (false) ? NordLookAndFeel::nordRedBright()
+                                  : selected ? NordLookAndFeel::nordRed().withAlpha (0.60f)
+                                             : juce::Colours::white.withAlpha (hovered ? 0.13f : 0.065f));
+            g.drawRoundedRectangle (bounds.reduced (0.5f), 12.0f, 1.0f);
+            auto top = getLocalBounds().reduced (14, 8).removeFromTop (24);
+            g.setFont (juce::Font (juce::FontOptions (10.0f)).boldened());
+            g.setColour (NordLookAndFeel::txtSecondary());
+            g.drawText (item.formatName() == "AudioUnit" ? "AU" : item.formatName(), top.removeFromLeft (68), juce::Justification::centredLeft);
+            g.setColour (item.favourite ? NordLookAndFeel::amberSolo() : NordLookAndFeel::txtSecondary());
+            g.setFont (juce::Font (juce::FontOptions (19.0f)));
+            g.drawText (item.favourite ? juce::String::fromUTF8 ("★") : juce::String::fromUTF8 ("☆"),
+                        getWidth() - 67, 7, 30, 24, juce::Justification::centred);
+            g.setColour (NordLookAndFeel::txtSecondary());
+            for (int i = -1; i <= 1; ++i) g.fillEllipse ((float) getWidth() - 21, 19.0f + i * 4, 2.0f, 2.0f);
+            auto copy = getLocalBounds().reduced (15, 0).withTrimmedTop (147);
+            g.setColour (NordLookAndFeel::txtPrimary());
+            g.setFont (juce::Font (juce::FontOptions (16.0f)).boldened());
+            g.drawText (item.displayName(), copy.removeFromTop (24), juce::Justification::centredLeft, true);
+            g.setColour (NordLookAndFeel::txtSecondary());
+            g.setFont (juce::Font (juce::FontOptions (11.5f)));
+            const auto maker = item.error ? juce::String::fromUTF8 (u8"Requer verificação") : item.description.manufacturerName;
+            g.drawText (maker.isNotEmpty() ? maker : item.categoryName(), copy.removeFromTop (20), juce::Justification::centredLeft, true);
+            if (item.error || item.active)
+            {
+                g.setColour (item.error ? NordLookAndFeel::redClip() : NordLookAndFeel::greenOk());
+                g.fillEllipse ((float) getWidth() - 22, (float) getHeight() - 22, 5, 5);
+            }
+    }
+
+    private:
+        PluginItem item;
+        bool selected = false;
+        bool hovered = false;
+    };
+
+    class PluginPreviewWindow final : public juce::DocumentWindow
+    {
+    public:
+        PluginPreviewWindow (const juce::String& title,
+                             std::function<void()> close)
+            : juce::DocumentWindow (title, juce::Colour (0xff0c1015),
+                                    juce::DocumentWindow::closeButton),
+              closeCallback (std::move (close))
+        {
+            setUsingNativeTitleBar (false);
+            setResizable (true, true);
+            setResizeLimits (360, 260, 1800, 1200);
+        }
+
+        void closeButtonPressed() override
+        {
+            // A janela de preview pode estar empilhada sobre o gerenciador,
+            // que tambem e modal. Adie a destruicao para nao apagar `this`
+            // enquanto o JUCE ainda esta processando o clique do titulo.
+            auto callback = closeCallback;
+            juce::MessageManager::callAsync (
+                [callback = std::move (callback)]
+                {
+                    if (callback != nullptr) callback();
+                });
+        }
+
+    private:
+        std::function<void()> closeCallback;
+    };
+
     PluginListHolder (juce::AudioPluginFormatManager& fm, juce::KnownPluginList& kl,
                       const juce::File& deadMansPedal, juce::PropertiesFile* props,
-                      juce::StringArray& quarantine)
+                      juce::StringArray& quarantine,
+                      std::function<juce::String(const juce::PluginDescription&)> isActive)
         // O 5o argumento (allowPluginsWhichRequireAsynchronousInstantiation)
         // NAO e so sobre AUv3: com ele em "false" o PluginListComponent usa
         // numThreads = 0 (juce_PluginListComponent.cpp:446) e a varredura roda
@@ -8453,6 +18926,7 @@ struct PluginListHolder final : public juce::Component,
         // "travou no Korg Vox" e o "AUVectorPanner a 0%" dos clientes.
         : formats (fm), knownPlugins (kl), deadMansPedalFile (deadMansPedal),
           propertiesToUse (props), persistentQuarantine (quarantine),
+          pluginIsActive (std::move (isActive)),
           list (fm, kl, deadMansPedal, props, true)
     {
         // Uma thread so: os plugins ja sao abertos num processo separado, e
@@ -8460,22 +18934,285 @@ struct PluginListHolder final : public juce::Component,
         // Com pool != nullptr o shouldExit() do scanner passa a valer, entao
         // "Cancelar" finalmente interrompe de verdade.
         list.setNumberOfThreadsForScanning (1);
+        list.setUseIntegratedScanProgress (true);
 
         list.setOptionsButtonText (juce::String::fromUTF8 ("Op\xc3\xa7\xc3\xb5" "es..."));
         list.getOptionsButton().onClick = [this] { showOptionsMenu(); };
-        addAndMakeVisible (list);
+        addChildComponent (list);
 
-        scanButton.setButtonText ("Escanear " + formatosDaPlataforma());
-        scanButton.setColour (juce::TextButton::buttonColourId, NordLookAndFeel::nordRed());
-        scanButton.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
+        rowsViewport.setViewedComponent (&rowsContainer, false);
+        rowsViewport.setScrollBarsShown (true, false);
+        rowsViewport.setScrollBarThickness (5);
+        rowsViewport.setColour (juce::ScrollBar::thumbColourId,
+                                juce::Colour (0xff7e2637));
+        rowsViewport.setColour (juce::ScrollBar::trackColourId,
+                                juce::Colour (0xff0d1015));
+        addAndMakeVisible (rowsViewport);
+
+        pluginViewport.setViewedComponent (&pluginRowsContainer, false);
+        pluginViewport.setScrollBarsShown (true, false);
+        pluginViewport.setScrollBarThickness (5);
+        pluginViewport.setColour (juce::ScrollBar::thumbColourId,
+                                  juce::Colour (0xff6d303d));
+        pluginViewport.setColour (juce::ScrollBar::trackColourId,
+                                  juce::Colour (0xff0c0f13));
+        addAndMakeVisible (pluginViewport);
+
+        styleButton (scanButton, true);
+        scanButton.setButtonText ("Escanear plugins");
         scanButton.onClick = [this] { scanNow(); };
         addAndMakeVisible (scanButton);
 
-        setSize (880, 470);
+        styleButton (cancelButton, false);
+        cancelButton.setButtonText ("Fechar");
+        cancelButton.onClick = [this]
+        {
+            if (scanInProgress || list.isScanning() || ! filaDeFormatos.isEmpty())
+            {
+                scanStatus = "Cancelando o escaneamento...";
+                if (list.isScanning())
+                    list.cancelScan();
+                else
+                {
+                    candidateSearch.reset();
+                    candidateSearchFormat = nullptr;
+                    filaDeFormatos.clearQuick();
+                    concluirLote (false);
+                }
+                repaint (footerBounds);
+            }
+            else if (onClose != nullptr)
+                onClose();
+        };
+        addAndMakeVisible (cancelButton);
+
+        styleButton (settingsButton, false);
+        settingsButton.setButtonText (juce::String::fromUTF8 ("\xe2\x9a\x99"));
+        settingsButton.setTooltip (
+            juce::String::fromUTF8 ("Configura\xc3\xa7\xc3\xb5" "es de plugins"));
+        settingsButton.onClick = [this] { showOptionsMenu(); };
+        addAndMakeVisible (settingsButton);
+
+        styleButton (closeButton, false);
+        closeButton.setButtonText ("X");
+        closeButton.setTooltip ("Fechar plugins");
+        closeButton.setTitle ("Fechar plugins");
+        closeButton.onClick = [this]
+        {
+            if (list.isScanning())
+                list.cancelScan();
+            if (onClose != nullptr) onClose();
+        };
+        addAndMakeVisible (closeButton);
+
+        styleButton (addFolderButton, false);
+        addFolderButton.setButtonText ("+ Adicionar pasta");
+        addFolderButton.onClick = [this] { chooseFolder (false); };
+        addAndMakeVisible (addFolderButton);
+       #if JUCE_IOS
+        // AUv3 vem do registro do sistema, nao de pastas: no iPad a coluna
+        // de locais de busca so confundia (spec do dono: tela limpa p/ AUv3).
+        addFolderButton.setVisible (false);
+       #endif
+
+        styleButton (changeFolderButton, false);
+        changeFolderButton.setButtonText ("ALTERAR...");
+        changeFolderButton.onClick = [this] { chooseFolder (true); };
+        addAndMakeVisible (changeFolderButton);
+
+        styleButton (removeFolderButton, false);
+        removeFolderButton.setButtonText ("REMOVER");
+        removeFolderButton.onClick = [this] { removeSelectedLocation(); };
+        addAndMakeVisible (removeFolderButton);
+
+        for (auto* button : { &moveUpButton, &moveDownButton })
+        {
+            styleButton (*button, false);
+            addAndMakeVisible (*button);
+        }
+        moveUpButton.setButtonText (juce::String::fromUTF8 ("\xe2\x86\x91"));
+        moveDownButton.setButtonText (juce::String::fromUTF8 ("\xe2\x86\x93"));
+        moveUpButton.onClick = [this] { moveSelectedLocation (-1); };
+        moveDownButton.onClick = [this] { moveSelectedLocation (+1); };
+
+        static const char* categoryNames[4] = {
+            "Todos os locais", "Padrao do sistema",
+            "Personalizado", "Downloads"
+        };
+        for (int i = 0; i < 4; ++i)
+        {
+            styleButton (categoryButtons[(size_t) i], false);
+            categoryButtons[(size_t) i].setButtonText (categoryNames[i]);
+            categoryButtons[(size_t) i].onClick = [this, i]
+            {
+                selectedCategory = i;
+                rebuildRows();
+            };
+            addAndMakeVisible (categoryButtons[(size_t) i]);
+        }
+
+        static const char* pluginFilterNames[5] = {
+            "Todos os plugins", "Instrumentos", "Efeitos",
+            "Favoritos", "Com erro"
+        };
+        for (int i = 0; i < 5; ++i)
+        {
+            styleButton (pluginFilterButtons[(size_t) i], false);
+            pluginFilterButtons[(size_t) i].setButtonText (pluginFilterNames[i]);
+            pluginFilterButtons[(size_t) i].onClick = [this, i]
+            {
+                selectedPluginFilter = i;
+                rebuildPluginRows();
+            };
+            addAndMakeVisible (pluginFilterButtons[(size_t) i]);
+        }
+
+        searchEditor.setTextToShowWhenEmpty (
+            "Buscar plugin, fabricante ou categoria...",
+            juce::Colour (0xff737b86));
+        searchEditor.setColour (juce::TextEditor::backgroundColourId,
+                                juce::Colour (0xff0d1116));
+        searchEditor.setColour (juce::TextEditor::textColourId,
+                                juce::Colour (0xffeef1f4));
+        searchEditor.setColour (juce::TextEditor::outlineColourId,
+                                juce::Colour (0xff2a3038));
+        searchEditor.setColour (juce::TextEditor::focusedOutlineColourId,
+                                juce::Colour (0xffb52643));
+        searchEditor.setColour (juce::CaretComponent::caretColourId,
+                                juce::Colour (0xffd8274e));
+        searchEditor.setFont (juce::Font (juce::FontOptions (14.0f)));
+        searchEditor.setIndents (14, 0);
+        searchEditor.onTextChange = [this]
+        {
+            searchClearButton.setVisible (searchEditor.getText().isNotEmpty());
+            rebuildPluginRows();
+        };
+        searchEditor.onReturnKey = [this]
+        {
+            if (openPluginButton.isEnabled()) openSelectedPlugin();
+        };
+        searchEditor.onEscapeKey = [this]
+        {
+            if (searchEditor.getText().isNotEmpty())
+                searchEditor.setText ({}, true);
+            else if (! scanInProgress && onClose != nullptr)
+                onClose();
+        };
+        addAndMakeVisible (searchEditor);
+
+        styleButton (searchClearButton, false);
+        searchClearButton.setButtonText ("X");
+        searchClearButton.setTooltip ("Limpar busca");
+        searchClearButton.onClick = [this]
+        {
+            searchEditor.setText ({}, true);
+            searchEditor.grabKeyboardFocus();
+        };
+        addAndMakeVisible (searchClearButton);
+        searchClearButton.setVisible (false);
+
+        sortBox.addItem ("Nome (A-Z)", 1);
+        sortBox.addItem ("Fabricante", 2);
+        sortBox.addItem ("Categoria", 3);
+        sortBox.addItem ("Formato", 4);
+        sortBox.addItem (juce::String::fromUTF8 (u8"Relevância"), 5);
+        sortBox.setSelectedId (5, juce::dontSendNotification);
+        sortBox.setColour (juce::ComboBox::backgroundColourId,
+                           juce::Colour (0xff11161c));
+        sortBox.setColour (juce::ComboBox::outlineColourId,
+                           juce::Colour (0xff2a3038));
+        sortBox.setColour (juce::ComboBox::textColourId,
+                           juce::Colour (0xffd8dce2));
+        sortBox.setColour (juce::ComboBox::arrowColourId,
+                           juce::Colour (0xff8d96a1));
+        sortBox.onChange = [this] { rebuildPluginRows(); };
+        addAndMakeVisible (sortBox);
+
+        styleButton (openPluginButton, true);
+        openPluginButton.setButtonText ("Abrir plugin");
+        openPluginButton.onClick = [this] { openSelectedPlugin(); };
+        addAndMakeVisible (openPluginButton);
+        formatChoice.setTitle ("Formato do plugin");
+        formatChoice.setTooltip ("Escolha qual formato abrir. O plugin carregado no projeto permanece igual.");
+        formatChoice.onChange = [this]
+        {
+            if (! juce::isPositiveAndBelow (selectedPluginIndex, (int) filteredPluginItems.size())) return;
+            auto& item = filteredPluginItems[(size_t) selectedPluginIndex];
+            const int index = formatChoice.getSelectedId() - 1;
+            if (! juce::isPositiveAndBelow (index, (int) item.variants.size())) return;
+            item.description = item.variants[(size_t) index];
+            chosenPluginFormats[item.key()] = item.description.createIdentifierString();
+            refreshPluginRows();
+        };
+        addAndMakeVisible (formatChoice);
+
+
+        styleButton (revealPluginButton, false);
+       #if JUCE_MAC
+        revealPluginButton.setButtonText ("Mostrar no Finder");
+       #else
+        revealPluginButton.setButtonText ("Mostrar no Explorer");
+       #endif
+        revealPluginButton.onClick = [this] { revealSelectedPlugin(); };
+        addAndMakeVisible (revealPluginButton);
+       #if JUCE_IOS
+        // Nao existe Finder/Explorer no iPad; o botao ficava eternamente
+        // desabilitado ocupando lugar.
+        revealPluginButton.setVisible (false);
+       #endif
+
+        styleButton (favouritePluginButton, false);
+        favouritePluginButton.onClick = [this]
+        {
+            if (juce::isPositiveAndBelow (selectedPluginIndex,
+                                           (int) filteredPluginItems.size()))
+                toggleFavourite (filteredPluginItems[(size_t) selectedPluginIndex]);
+        };
+        addAndMakeVisible (favouritePluginButton);
+
+        rowsViewport.setVisible (false);
+        changeFolderButton.setVisible (false);
+        removeFolderButton.setVisible (false);
+        moveUpButton.setVisible (false);
+        moveDownButton.setVisible (false);
+
+        for (auto* button : { &scanButton, &cancelButton, &settingsButton,
+                              &closeButton, &addFolderButton,
+                              &changeFolderButton, &removeFolderButton,
+                              &moveUpButton, &moveDownButton,
+                              &openPluginButton, &revealPluginButton,
+                              &favouritePluginButton, &searchClearButton })
+            button->setLookAndFeel (&pluginManagerLookAndFeel);
+
+        for (auto& button : categoryButtons)
+        {
+            button.setLookAndFeel (&pluginManagerLookAndFeel);
+            button.getProperties().set ("pluginSidebar", true);
+           #if JUCE_IOS
+            // Locais de busca sao coisa de disco/pastas; AUv3 no iPad vem do
+            // registro do sistema. O titulo "LOCAIS DE BUSCA" ja segue esta
+            // visibilidade no paint().
+            button.setVisible (false);
+           #endif
+        }
+        for (auto& button : pluginFilterButtons)
+        {
+            button.setLookAndFeel (&pluginManagerLookAndFeel);
+            button.getProperties().set ("pluginSidebar", true);
+        }
+        sortBox.setLookAndFeel (&pluginManagerLookAndFeel);
+
+        setWantsKeyboardFocus (true);
+        setSize (1240, 760);
+        restoreFavourites();
+        restoreLocations();
+        rebuildRows();
     }
 
     ~PluginListHolder() override
     {
+        closePluginPreview();
+
         // Fechar o dialogo/app durante uma prova nao pode abrir uma janela em
         // que o ID acabou de sair da blacklist mas ainda nao foi validado.
         if (revalidationBatchActive)
@@ -8491,10 +19228,829 @@ struct PluginListHolder final : public juce::Component,
         }
     }
 
+    std::function<void()> onClose;
+
+    static void styleButton (juce::TextButton& button, bool primary)
+    {
+        button.setColour (juce::TextButton::buttonColourId,
+                          primary ? juce::Colour (0xff94172b)
+                                  : juce::Colour (0xff171b21));
+        button.setColour (juce::TextButton::buttonOnColourId,
+                          juce::Colour (0xffb31b36));
+        button.setColour (juce::TextButton::textColourOffId,
+                          primary ? juce::Colours::white
+                                  : juce::Colour (0xffe5e7eb));
+        button.setColour (juce::TextButton::textColourOnId,
+                          juce::Colours::white);
+    }
+
+    void restoreLocations()
+    {
+        locations.clear();
+        bool locationsChanged = false;
+        const auto saved = propertiesToUse != nullptr
+            ? propertiesToUse->getValue ("churchdawPluginScanLocations")
+            : juce::String();
+
+        if (saved.isNotEmpty())
+        {
+            juce::StringArray lines;
+            lines.addLines (saved);
+            for (const auto& line : lines)
+            {
+                const auto fields = juce::StringArray::fromTokens (line, "|", "");
+                if (fields.size() < 3) continue;
+                ScanLocation location;
+                location.enabled = fields[0].getIntValue() != 0;
+                location.kind = static_cast<LocationKind> (
+                    juce::jlimit (0, 2, fields[1].getIntValue()));
+                location.folder = juce::File (fields[2]);
+                if (location.folder != juce::File{})
+                {
+                    const bool added =
+                        ChurchDAWPluginScan::adicionarPastaDeScanSeAusente (
+                            locations, location.folder, location.kind,
+                            location.enabled);
+                    locationsChanged |= ! added;
+                }
+            }
+        }
+
+        const int defaultLocationsAdded =
+            ChurchDAWPluginScan::mesclarPastasPadraoDePlugins (
+                locations, formats,
+               #if JUCE_WINDOWS
+                true
+               #else
+                false
+               #endif
+            );
+        locationsChanged |= defaultLocationsAdded > 0;
+
+        if (locationsChanged)
+        {
+            persistLocations();
+            juce::Logger::writeToLog (
+                "PLUGIN_SCAN locations_merged defaults_added="
+                + juce::String (defaultLocationsAdded)
+                + " total=" + juce::String (locations.size()));
+        }
+
+        selectedLocation = locations.isEmpty() ? -1 : 0;
+        lastVerification = propertiesToUse != nullptr
+            ? propertiesToUse->getValue ("churchdawPluginLastVerification")
+            : juce::String();
+    }
+
+    void persistLocations()
+    {
+        if (propertiesToUse == nullptr) return;
+        juce::StringArray lines;
+        for (const auto& location : locations)
+            lines.add (juce::String (location.enabled ? 1 : 0) + "|"
+                       + juce::String ((int) location.kind) + "|"
+                       + location.folder.getFullPathName());
+        propertiesToUse->setValue ("churchdawPluginScanLocations",
+                                   lines.joinIntoString ("\n"));
+        propertiesToUse->saveIfNeeded();
+    }
+
+    void restoreFavourites()
+    {
+        favouritePluginKeys.clear();
+
+        if (propertiesToUse != nullptr)
+            favouritePluginKeys.addLines (
+                propertiesToUse->getValue ("churchdawPluginFavourites"));
+
+        favouritePluginKeys.removeEmptyStrings();
+        favouritePluginKeys.removeDuplicates (false);
+    }
+
+    void persistFavourites()
+    {
+        if (propertiesToUse == nullptr) return;
+
+        favouritePluginKeys.removeEmptyStrings();
+        favouritePluginKeys.removeDuplicates (false);
+        propertiesToUse->setValue ("churchdawPluginFavourites",
+                                   favouritePluginKeys.joinIntoString ("\n"));
+        propertiesToUse->saveIfNeeded();
+    }
+
+    bool pluginMatchesSelectedLocation (const PluginItem& item) const
+    {
+
+        if (selectedCategory == 0) return true;
+        const auto wanted = static_cast<LocationKind> (selectedCategory - 1);
+        const auto matches = [&] (const juce::String& identifier, const juce::String& format)
+        {
+            if (format.containsIgnoreCase ("AudioUnit")) return wanted == LocationKind::system;
+            const juce::File file (identifier);
+            for (const auto& location : locations)
+                if (location.kind == wanted && (file == location.folder || file.isAChildOf (location.folder))) return true;
+            return false;
+        };
+        if (item.error) return matches (item.errorIdentifier, {});
+        for (const auto& variant : item.variants)
+            if (matches (variant.fileOrIdentifier, variant.pluginFormatName)) return true;
+        return false;
+    }
+
+    bool pluginMatchesSearch (const PluginItem& item) const
+    {
+        const auto query = searchEditor.getText().trim();
+        if (query.isEmpty()) return true;
+
+        const auto& d = item.description;
+        return item.displayName().containsIgnoreCase (query)
+            || d.name.containsIgnoreCase (query)
+            || d.manufacturerName.containsIgnoreCase (query)
+            || item.categoryName().containsIgnoreCase (query)
+            || item.formatName().containsIgnoreCase (query)
+            || (item.error ? item.errorIdentifier : d.fileOrIdentifier)
+                   .containsIgnoreCase (query);
+    }
+
+    bool pluginMatchesFilter (const PluginItem& item) const
+    {
+        if (! pluginMatchesSelectedLocation (item)
+             || ! pluginMatchesSearch (item))
+            return false;
+
+        switch (selectedPluginFilter)
+        {
+            case 1: return ! item.error && item.description.isInstrument;
+            case 2: return ! item.error && ! item.description.isInstrument;
+            case 3: return ! item.error && item.favourite;
+            case 4: return item.error;
+            default: return true;
+        }
+    }
+
+    void updatePluginFilterButtons()
+    {
+        int instruments = 0;
+        int effects = 0;
+        int favourites = 0;
+        int errors = 0;
+
+        for (const auto& item : allPluginItems)
+        {
+            if (item.error) ++errors;
+            else if (item.description.isInstrument) ++instruments;
+            else ++effects;
+
+            if (item.favourite) ++favourites;
+        }
+
+        const int counts[5] = { (int) allPluginItems.size(), instruments,
+                                effects, favourites, errors };
+        static const char* names[5] = { "Todos os plugins", "Instrumentos",
+                                        "Efeitos", "Favoritos", "Com erro" };
+
+        for (int i = 0; i < 5; ++i)
+        {
+            auto& button = pluginFilterButtons[(size_t) i];
+            button.setButtonText (juce::String (names[i]) + "     "
+                                  + juce::String (counts[i]));
+            const bool selected = i == selectedPluginFilter;
+            button.setColour (juce::TextButton::buttonColourId,
+                              selected ? juce::Colour (0xff3a1821)
+                                       : juce::Colour (0xff14191f));
+            button.setColour (juce::TextButton::textColourOffId,
+                              selected ? juce::Colour (0xfff4f5f7)
+                                       : juce::Colour (0xffa9b0b9));
+        }
+    }
+
+    void layoutPluginRows()
+    {
+        const auto layout = ChurchDAWPluginGallery::forWidth (pluginViewport.getWidth() - 8);
+        pluginRowsContainer.setSize (layout.width, juce::jmax (pluginViewport.getHeight(), layout.height ((int) pluginRows.size())));
+        for (int i = 0; i < (int) pluginRows.size(); ++i)
+            pluginRows[(size_t) i]->setBounds (layout.item (i));
+    }
+
+    void refreshPluginRows()
+    {
+        for (int i = 0; i < (int) pluginRows.size(); ++i)
+            pluginRows[(size_t) i]->setData (
+                filteredPluginItems[(size_t) i], i == selectedPluginIndex);
+
+        const bool hasSelection = juce::isPositiveAndBelow (
+            selectedPluginIndex, (int) filteredPluginItems.size());
+        const auto* selected = hasSelection
+                                 ? &filteredPluginItems[(size_t) selectedPluginIndex]
+                                 : nullptr;
+        openPluginButton.setEnabled (selected != nullptr && ! selected->error
+                                     && ! scanInProgress && ! openingPlugin);
+        const juce::File selectedFile (selected != nullptr
+                                        ? (selected->error
+                                             ? selected->errorIdentifier
+                                             : selected->description.fileOrIdentifier)
+                                        : juce::String());
+        revealPluginButton.setEnabled (selected != nullptr
+                                       && (selectedFile.existsAsFile()
+                                            || selectedFile.isDirectory()));
+        favouritePluginButton.setEnabled (selected != nullptr && ! selected->error);
+        favouritePluginButton.setButtonText (
+            selected != nullptr && selected->favourite
+              ? juce::String::fromUTF8 ("\xe2\x98\x85  Favorito")
+              : juce::String::fromUTF8 ("\xe2\x98\x86  Favoritar"));
+        formatChoice.clear (juce::dontSendNotification);
+        if (selected != nullptr && ! selected->error)
+            for (int i = 0; i < (int) selected->variants.size(); ++i)
+            {
+                const auto& variant = selected->variants[(size_t) i];
+                formatChoice.addItem ("Formato: " + variant.pluginFormatName, i + 1);
+                if (variant.createIdentifierString() == selected->description.createIdentifierString())
+                    formatChoice.setSelectedId (i + 1, juce::dontSendNotification);
+            }
+        formatChoice.setEnabled (selected != nullptr && ! selected->error && ! scanInProgress);
+        repaint (infoBounds);
+    }
+
+    void rebuildPluginRows()
+    {
+        juce::String selectedKey;
+        if (juce::isPositiveAndBelow (selectedPluginIndex,
+                                       (int) filteredPluginItems.size()))
+            selectedKey = filteredPluginItems[(size_t) selectedPluginIndex].key();
+
+        allPluginItems.clear();
+        for (const auto& description : knownPlugins.getTypes())
+        {
+            const auto key = ChurchDAWPluginProduct::key (description);
+            auto existing = std::find_if (allPluginItems.begin(), allPluginItems.end(),
+                [&key] (const PluginItem& item) { return item.key() == key; });
+            if (existing == allPluginItems.end())
+            {
+                PluginItem item;
+                item.description = description;
+                allPluginItems.push_back (std::move (item));
+                existing = std::prev (allPluginItems.end());
+            }
+            auto& item = *existing;
+            item.variants.push_back (description);
+            item.favourite |= favouritePluginKeys.contains (description.createIdentifierString(), false);
+            const auto usage = pluginIsActive != nullptr ? pluginIsActive (description) : juce::String();
+            if (usage.isNotEmpty())
+            {
+                if (item.usage.isNotEmpty()) item.usage += " / ";
+                item.usage += usage;
+                item.description = description;
+                item.active = true;
+            }
+            else if (! item.active && description.pluginFormatName == "VST3")
+                item.description = description;
+        }
+        for (auto& item : allPluginItems)
+        {
+            const auto chosen = chosenPluginFormats.find (item.key());
+            if (chosen != chosenPluginFormats.end())
+                for (const auto& variant : item.variants)
+                    if (variant.createIdentifierString() == chosen->second)
+                        item.description = variant;
+        }
+
+        auto disabled = persistentQuarantine;
+        disabled.addArray (knownPlugins.getBlacklistedFiles());
+        disabled.removeEmptyStrings();
+        disabled.removeDuplicates (true);
+
+        for (const auto& identifier : disabled)
+        {
+            bool alreadyListed = false;
+            for (const auto& item : allPluginItems)
+                for (const auto& variant : item.variants)
+                    alreadyListed |= variant.fileOrIdentifier.equalsIgnoreCase (identifier);
+
+            if (! alreadyListed)
+            {
+                PluginItem item;
+                item.error = true;
+                item.errorIdentifier = identifier;
+                item.description.name = juce::File (identifier)
+                                            .getFileNameWithoutExtension();
+                item.description.fileOrIdentifier = identifier;
+                allPluginItems.push_back (std::move (item));
+            }
+        }
+
+        const int sortMode = sortBox.getSelectedId();
+        std::stable_sort (allPluginItems.begin(), allPluginItems.end(),
+            [sortMode] (const PluginItem& a, const PluginItem& b)
+            {
+                if (a.error != b.error) return ! a.error;
+
+                if (sortMode == 5)
+                {
+                    const auto priority = [] (const PluginItem& item)
+                    {
+                        if (item.displayName().containsIgnoreCase ("bigsky")) return 0;
+                        if (item.displayName().containsIgnoreCase ("pianoteq")) return 1;
+                        if (item.displayName().containsIgnoreCase ("keyscape")) return 2;
+                        if (item.favourite) return 3;
+                        if (item.description.manufacturerName.containsIgnoreCase ("apple")) return 10;
+                        return item.description.isInstrument ? 4 : 5;
+                    };
+                    if (priority (a) != priority (b)) return priority (a) < priority (b);
+                }
+                juce::String left, right;
+                switch (sortMode)
+                {
+                    case 2:
+                        left = a.description.manufacturerName;
+                        right = b.description.manufacturerName;
+                        break;
+                    case 3:
+                        left = a.categoryName();
+                        right = b.categoryName();
+                        break;
+                    case 4:
+                        left = a.formatName();
+                        right = b.formatName();
+                        break;
+                    default:
+                        left = a.displayName();
+                        right = b.displayName();
+                        break;
+                }
+
+                const int compared = left.compareNatural (right, true);
+                return compared == 0
+                         ? a.displayName().compareNatural (b.displayName(), true) < 0
+                         : compared < 0;
+            });
+
+        filteredPluginItems.clear();
+        for (const auto& item : allPluginItems)
+            if (pluginMatchesFilter (item))
+                filteredPluginItems.push_back (item);
+
+        selectedPluginIndex = -1;
+        for (int i = 0; i < (int) filteredPluginItems.size(); ++i)
+            if (filteredPluginItems[(size_t) i].key() == selectedKey)
+            {
+                selectedPluginIndex = i;
+                break;
+            }
+
+        if (selectedPluginIndex < 0 && ! filteredPluginItems.empty())
+            selectedPluginIndex = 0;
+
+        for (auto& row : pluginRows)
+            pluginRowsContainer.removeChildComponent (row.get());
+        pluginRows.clear();
+
+        for (int i = 0; i < (int) filteredPluginItems.size(); ++i)
+        {
+            auto row = std::make_unique<PluginRow>();
+            row->onSelect = [this, i]
+            {
+                selectedPluginIndex = i;
+                refreshPluginRows();
+            };
+            row->onOpen = [this, i]
+            {
+                selectedPluginIndex = i;
+                refreshPluginRows();
+                openSelectedPlugin();
+            };
+            row->onFavourite = [this, i]
+            {
+                if (juce::isPositiveAndBelow (i,
+                                               (int) filteredPluginItems.size()))
+                    toggleFavourite (filteredPluginItems[(size_t) i]);
+            };
+            row->onMenu = [this, i] { showPluginMenu (i); };
+            row->setData (filteredPluginItems[(size_t) i],
+                          i == selectedPluginIndex);
+            pluginRowsContainer.addAndMakeVisible (*row);
+            pluginRows.push_back (std::move (row));
+        }
+
+        updatePluginFilterButtons();
+        layoutPluginRows();
+        refreshPluginRows();
+        repaint();
+    }
+
+    void toggleFavourite (const PluginItem& item)
+    {
+        if (item.error) return;
+
+        for (const auto& variant : item.variants)
+        {
+            const auto key = variant.createIdentifierString();
+            if (item.favourite) favouritePluginKeys.removeString (key, false);
+            else favouritePluginKeys.addIfNotAlreadyThere (key);
+        }
+
+        persistFavourites();
+        rebuildPluginRows();
+    }
+
+    void disablePlugin (const PluginItem& item)
+    {
+        if (item.error) return;
+
+        const auto identifier = item.description.fileOrIdentifier;
+        if (identifier.isEmpty()) return;
+
+        persistentQuarantine.addIfNotAlreadyThere (identifier);
+        knownPlugins.addToBlacklist (identifier);
+        knownPlugins.removeType (item.description);
+        (void) persistQuarantineState();
+        rebuildPluginRows();
+    }
+
+    void showPluginMenu (int index)
+    {
+        if (! juce::isPositiveAndBelow (index,
+                                         (int) filteredPluginItems.size()))
+            return;
+
+        const auto item = filteredPluginItems[(size_t) index];
+        selectedPluginIndex = index;
+        refreshPluginRows();
+
+        juce::PopupMenu menu;
+        if (item.error)
+        {
+            menu.addItem ("Revalidar este plugin", ! scanInProgress, false,
+                          [this, identifier = item.errorIdentifier]
+                          {
+                              revalidateDisabledPlugins ({ identifier });
+                          });
+        }
+        else
+        {
+            menu.addItem (item.favourite ? "Remover dos favoritos"
+                                         : "Adicionar aos favoritos",
+                          [this, item] { toggleFavourite (item); });
+            menu.addItem ("Mostrar arquivo", [this] { revealSelectedPlugin(); });
+            menu.addSeparator();
+            menu.addItem ("Desativar com seguranca", ! scanInProgress, false,
+                          [this, item] { disablePlugin (item); });
+        }
+
+        menu.showMenuAsync (
+            juce::PopupMenu::Options().withDeletionCheck (*this));
+    }
+
+    bool categoryMatches (const ScanLocation& location) const noexcept
+    {
+        if (selectedCategory == 0) return true;
+        if (selectedCategory == 1) return location.kind == LocationKind::system;
+        if (selectedCategory == 2) return location.kind == LocationKind::custom;
+        return location.kind == LocationKind::downloads;
+    }
+
+    int pluginCountFor (const juce::File& folder) const
+    {
+        int count = 0;
+        for (const auto& plugin : knownPlugins.getTypes())
+        {
+            const juce::File file (plugin.fileOrIdentifier);
+            if (file == folder || file.isAChildOf (folder)) ++count;
+        }
+        return count;
+    }
+
+    void rebuildRows()
+    {
+        for (auto& row : rows) rowsContainer.removeChildComponent (row.get());
+        rows.clear();
+        visibleLocationIndices.clear();
+
+        for (int i = 0; i < locations.size(); ++i)
+        {
+            if (! categoryMatches (locations.getReference (i))) continue;
+            auto row = std::make_unique<FolderRow>();
+            row->onSelect = [this, i]
+            {
+                selectedLocation = i;
+                refreshRows();
+            };
+            row->onToggle = [this, i] (bool enabled)
+            {
+                locations.getReference (i).enabled = enabled;
+                persistLocations();
+                updateCategoryButtons();
+                refreshRows();
+            };
+            row->setData (locations.getReference (i), i == selectedLocation,
+                          pluginCountFor (locations.getReference (i).folder));
+            rowsContainer.addAndMakeVisible (*row);
+            rows.push_back (std::move (row));
+            visibleLocationIndices.add (i);
+        }
+
+        updateCategoryButtons();
+        rebuildPluginRows();
+        resized();
+        repaint();
+    }
+
+    void refreshRows()
+    {
+        for (int i = 0; i < (int) rows.size(); ++i)
+        {
+            const int locationIndex = visibleLocationIndices[i];
+            if (! juce::isPositiveAndBelow (locationIndex, locations.size()))
+                continue;
+
+            const auto& location = locations.getReference (locationIndex);
+            rows[(size_t) i]->setData (location,
+                                       locationIndex == selectedLocation,
+                                       pluginCountFor (location.folder));
+        }
+
+        const bool hasSelection = juce::isPositiveAndBelow (selectedLocation,
+                                                             locations.size());
+        changeFolderButton.setEnabled (hasSelection && ! scanInProgress);
+        removeFolderButton.setEnabled (hasSelection && ! scanInProgress);
+        moveUpButton.setEnabled (hasSelection && selectedLocation > 0
+                                 && ! scanInProgress);
+        moveDownButton.setEnabled (hasSelection
+                                   && selectedLocation + 1 < locations.size()
+                                   && ! scanInProgress);
+        repaint (infoBounds);
+    }
+
+    void updateCategoryButtons()
+    {
+        int counts[4] = { locations.size(), 0, 0, 0 };
+        for (const auto& location : locations)
+            ++counts[1 + (int) location.kind];
+        static const char* names[4] = {
+            "Todos os locais", "Padrao do sistema",
+            "Personalizado", "Downloads"
+        };
+        for (int i = 0; i < 4; ++i)
+        {
+            categoryButtons[(size_t) i].setButtonText (
+                juce::String (names[i]) + "     " + juce::String (counts[i]));
+            categoryButtons[(size_t) i].setColour (
+                juce::TextButton::buttonColourId,
+                i == selectedCategory ? juce::Colour (0xff78182a)
+                                      : juce::Colour (0xff15191f));
+            categoryButtons[(size_t) i].setColour (
+                juce::TextButton::textColourOffId,
+                i == selectedCategory ? juce::Colours::white
+                                      : juce::Colour (0xffaeb4bd));
+        }
+    }
+
+    void chooseFolder (bool replacing)
+    {
+        const auto initial = juce::isPositiveAndBelow (selectedLocation,
+                                                        locations.size())
+            ? locations.getReference (selectedLocation).folder
+            : juce::File::getSpecialLocation (juce::File::userHomeDirectory);
+        folderChooser = std::make_unique<juce::FileChooser> (
+            replacing ? "Alterar pasta de plugins" : "Adicionar pasta de plugins",
+            initial, "*");
+        auto safe = juce::Component::SafePointer<PluginListHolder> (this);
+        folderChooser->launchAsync (juce::FileBrowserComponent::openMode
+                                  | juce::FileBrowserComponent::canSelectDirectories,
+            [safe, replacing] (const juce::FileChooser& chooser)
+            {
+                if (auto* self = safe.getComponent())
+                {
+                    const auto folder = chooser.getResult();
+                    if (folder != juce::File{})
+                    {
+                        if (replacing && juce::isPositiveAndBelow (
+                                self->selectedLocation, self->locations.size()))
+                            self->locations.getReference (
+                                self->selectedLocation).folder = folder;
+                        else
+                        {
+                            bool duplicate = false;
+                            for (const auto& location : self->locations)
+                                duplicate |= location.folder == folder;
+                            if (! duplicate)
+                            {
+                                self->locations.add ({ folder,
+                                    LocationKind::custom, true });
+                                self->selectedLocation = self->locations.size() - 1;
+                            }
+                        }
+                        self->persistLocations();
+                        self->rebuildRows();
+                    }
+                    self->folderChooser.reset();
+                }
+            });
+    }
+
+    void removeSelectedLocation()
+    {
+        if (! juce::isPositiveAndBelow (selectedLocation, locations.size())) return;
+        locations.remove (selectedLocation);
+        selectedLocation = locations.isEmpty()
+                             ? -1 : juce::jmin (selectedLocation,
+                                                locations.size() - 1);
+        persistLocations();
+        rebuildRows();
+    }
+
+    void moveSelectedLocation (int direction)
+    {
+        if (! juce::isPositiveAndBelow (selectedLocation, locations.size())) return;
+        const int destination = selectedLocation + direction;
+        if (! juce::isPositiveAndBelow (destination, locations.size())) return;
+        locations.move (selectedLocation, destination);
+        selectedLocation = destination;
+        persistLocations();
+        rebuildRows();
+    }
+
+    juce::FileSearchPath selectedSearchPath() const
+    {
+        juce::FileSearchPath path;
+        for (const auto& location : locations)
+            if (location.enabled)
+                path.add (location.folder);
+        return path;
+    }
+
+    const PluginItem* selectedPlugin() const
+    {
+        return juce::isPositiveAndBelow (selectedPluginIndex,
+                                          (int) filteredPluginItems.size())
+                 ? &filteredPluginItems[(size_t) selectedPluginIndex]
+                 : nullptr;
+    }
+
+    void revealSelectedPlugin()
+    {
+        const auto* item = selectedPlugin();
+        if (item == nullptr) return;
+
+        const juce::File file (item->error ? item->errorIdentifier
+                                           : item->description.fileOrIdentifier);
+        if (file.existsAsFile() || file.isDirectory())
+        {
+            file.revealToUser();
+            return;
+        }
+
+        juce::AlertWindow::showMessageBoxAsync (
+            juce::MessageBoxIconType::InfoIcon,
+            "Local do plugin",
+            "Este formato usa um identificador do sistema e nao possui um "
+            "arquivo que possa ser mostrado no Explorer ou Finder.");
+    }
+
+    void closePluginPreview()
+    {
+        // Detach ownership before vendor callbacks: releaseResources may pump
+        // native events that close the manager or request another preview.
+        auto instance = std::move (previewInstance);
+        auto window = std::move (previewWindow);
+        openingPlugin = false;
+        openPluginButton.setButtonText ("Abrir plugin");
+        if (window != nullptr)
+        {
+            if (const auto cleared = ChurchDAWPluginPreview::hideAndClearEditorSafely (*window, instance.get());
+                cleared.failed())
+                juce::Logger::writeToLog ("PLUGIN_PREVIEW close_failed error="
+                                         + cleared.getErrorMessage());
+            window.reset();
+        }
+        if (instance != nullptr)
+            if (const auto released = ChurchDAWPluginPreview::releaseResourcesSafely (*instance);
+                released.failed())
+                juce::Logger::writeToLog ("PLUGIN_PREVIEW release_failed error="
+                                         + released.getErrorMessage());
+    }
+
+    void reportPluginPreviewFailure (const juce::String& pluginName,
+                                      const juce::String& error)
+    {
+        openingPlugin = false;
+        openPluginButton.setButtonText ("Abrir plugin");
+        refreshPluginRows();
+        const auto detail = error.isNotEmpty() ? error
+            : juce::String ("Falha sem detalhe do fabricante.");
+        juce::Logger::writeToLog ("PLUGIN_PREVIEW open_failed plugin=" + pluginName
+                                 + " error=" + detail);
+        juce::AlertWindow::showMessageBoxAsync (
+            juce::MessageBoxIconType::WarningIcon,
+            "Nao foi possivel abrir o plugin", pluginName + "\n\n" + detail);
+    }
+
+    void openSelectedPlugin()
+    {
+        const auto* item = selectedPlugin();
+        if (item == nullptr || item->error || openingPlugin
+             || scanInProgress || list.isScanning())
+            return;
+
+        if (previewWindow != nullptr)
+        {
+            previewWindow->toFront (true);
+            return;
+        }
+
+        openingPlugin = true;
+        openPluginButton.setEnabled (false);
+        openPluginButton.setButtonText ("ABRINDO...");
+        const auto description = item->description;
+        auto safe = juce::Component::SafePointer<PluginListHolder> (this);
+
+        try
+        {
+            formats.createPluginInstanceAsync (
+                description, 44100.0, 512,
+                [safe, description] (
+                    std::unique_ptr<juce::AudioPluginInstance> instance,
+                    const juce::String& error)
+                {
+                    if (safe == nullptr) return;
+                    std::unique_ptr<PluginPreviewWindow> window;
+                    auto opened = juce::Result::fail (error.isNotEmpty() ? error
+                        : juce::String ("Falha sem detalhe do fabricante."));
+                    if (instance != nullptr)
+                    {
+                        try
+                        {
+                            window = std::make_unique<PluginPreviewWindow> (
+                                description.name.isNotEmpty() ? description.name
+                                                               : juce::String ("Plugin"),
+                                [safe]
+                                {
+                                    if (auto* owner = safe.getComponent())
+                                        owner->closePluginPreview();
+                                });
+                            opened = ChurchDAWPluginPreview::prepareAndAttachEditor (
+                                *window, *instance, 44100.0, 512);
+                        }
+                        catch (...)
+                        {
+                            opened = juce::Result::fail (
+                                ChurchDAWPluginPreview::currentExceptionMessage());
+                        }
+                    }
+
+                    // Vendor initialization can pump native events. Keep the
+                    // candidate local until ready and recheck the owner after
+                    // returning, so closing the gallery cannot publish a late UI.
+                    if (opened.failed() || safe == nullptr)
+                    {
+                        if (window != nullptr)
+                            if (const auto cleared = ChurchDAWPluginPreview::hideAndClearEditorSafely (*window, instance.get());
+                                cleared.failed())
+                                juce::Logger::writeToLog ("PLUGIN_PREVIEW close_failed error="
+                                                         + cleared.getErrorMessage());
+                        window.reset();
+                        if (instance != nullptr)
+                            if (const auto released = ChurchDAWPluginPreview::releaseResourcesSafely (*instance);
+                                released.failed())
+                                juce::Logger::writeToLog ("PLUGIN_PREVIEW release_failed plugin="
+                                    + description.name + " error=" + released.getErrorMessage());
+                        instance.reset();
+                        if (auto* self = safe.getComponent())
+                            self->reportPluginPreviewFailure (description.name, opened.getErrorMessage());
+                        return;
+                    }
+
+                    auto* self = safe.getComponent();
+                    self->previewInstance = std::move (instance);
+                    self->previewWindow = std::move (window);
+                    self->openingPlugin = false;
+                    self->openPluginButton.setButtonText ("Abrir plugin");
+                    const auto shown = ChurchDAWPluginPreview::showEditorSafely (*self->previewWindow);
+                    if (shown.failed())
+                    {
+                        if (auto* owner = safe.getComponent()) owner->closePluginPreview();
+                        if (auto* owner = safe.getComponent())
+                            owner->reportPluginPreviewFailure (description.name, shown.getErrorMessage());
+                        return;
+                    }
+                    if (auto* owner = safe.getComponent()) owner->refreshPluginRows();
+                });
+        }
+        catch (...)
+        {
+            if (auto* self = safe.getComponent())
+                self->reportPluginPreviewFailure (description.name,
+                    ChurchDAWPluginPreview::currentExceptionMessage());
+        }
+    }
+
     void showOptionsMenu()
     {
         juce::PopupMenu menu;
-        menu.addItem ("Limpar lista de plugins", [this] { knownPlugins.clear(); });
+        menu.addItem ("Limpar lista de plugins", [this]
+        {
+            knownPlugins.clear();
+            rebuildPluginRows();
+        });
         menu.addItem ("Remover plugins selecionados", [this]
         {
             list.removeSelectedPlugins();
@@ -8523,17 +20079,19 @@ struct PluginListHolder final : public juce::Component,
         menu.showMenuAsync (
             juce::PopupMenu::Options()
                 .withDeletionCheck (*this)
-                .withTargetComponent (list.getOptionsButton()));
+                .withTargetComponent (settingsButton));
     }
 
     bool revalidateDisabledPlugins (const juce::StringArray& quarantined = {})
     {
-        if (list.isScanning() || ! filaDeFormatos.isEmpty())
+        if (scanInProgress || openingPlugin || list.isScanning() || ! filaDeFormatos.isEmpty())
         {
             juce::Logger::writeToLog (
                 "PLUGIN_SCAN revalidate_ignored reason=batch_in_progress");
             return false;
         }
+
+        candidateSearchErrors.clear();
 
         auto disabled = persistentQuarantine;
         disabled.addArray (quarantined);
@@ -8652,6 +20210,10 @@ struct PluginListHolder final : public juce::Component,
         unresolvedTargets.clear();
         activeScanIdentifiers.clear();
         revalidationBatchActive = true;
+        scanInProgress = true;
+        pluginsBeforeScan = knownPlugins.getNumTypes();
+        scanProgress = 0.0;
+        scanButton.setButtonText ("ESCANEANDO...");
         juce::StringArray assigned;
 
         for (auto* format : formats.getFormats())
@@ -8675,7 +20237,13 @@ struct PluginListHolder final : public juce::Component,
                         break;
                     }
 
-                if (knownFormat || format->fileMightContainThisPluginType (identifier))
+                // AU identifiers already encode their format. Asking AU's
+                // fileMightContainThisPluginType here calls the OS registry
+                // on the message thread before the isolated validation.
+                const bool matchesFormat = identifier.startsWithIgnoreCase ("AudioUnit:")
+                    ? format->getName().containsIgnoreCase ("AudioUnit")
+                    : format->fileMightContainThisPluginType (identifier);
+                if (knownFormat || matchesFormat)
                 {
                     // Um pedido por ID. O CustomScanner agrega apenas um bool
                     // inconclusivo por scan; agrupar dez VST3 faria uma falha
@@ -8704,27 +20272,34 @@ struct PluginListHolder final : public juce::Component,
         }
 
         scanButton.setEnabled (false);
+        cancelButton.setButtonText ("CANCELAR");
         dispararProximoFormato();
         return true;
     }
 
     void scanSingleFormat (juce::AudioPluginFormat& format)
     {
-        if (list.isScanning() || ! filaDeFormatos.isEmpty())
+        if (scanInProgress || openingPlugin || list.isScanning())
             return;
 
         revalidationTargets.clear();
         unresolvedTargets.clear();
         activeScanIdentifiers.clear();
         revalidationBatchActive = false;
+        candidateSearchErrors.clear();
         filaDeFormatos.add ({ &format, {}, false });
+        scanInProgress = true;
+        pluginsBeforeScan = knownPlugins.getNumTypes();
+        scanStatus = "Preparando " + format.getName() + "...";
         scanButton.setEnabled (false);
+        cancelButton.setButtonText ("CANCELAR");
+        scanButton.setButtonText ("ESCANEANDO...");
         dispararProximoFormato();
     }
 
     void scanNow()
     {
-        if (list.isScanning() || ! filaDeFormatos.isEmpty())
+        if (scanInProgress || openingPlugin || list.isScanning())
             return;
 
         // UM FORMATO DE CADA VEZ.
@@ -8746,25 +20321,68 @@ struct PluginListHolder final : public juce::Component,
         // ser procurado. AU primeiro garante que o formato nativo do
         // sistema entre na lista mesmo se o VST3 der trabalho depois.
         filaDeFormatos.clearQuick();
+        candidateSearchErrors.clear();
         revalidationTargets.clear();
         unresolvedTargets.clear();
         activeScanIdentifiers.clear();
         revalidationBatchActive = false;
         scanButton.setEnabled (false);
+        cancelButton.setButtonText ("CANCELAR");
+        scanInProgress = true;
+        pluginsBeforeScan = knownPlugins.getNumTypes();
+        scanStatus = "Preparando locais selecionados...";
+        scanProgress = 0.0;
+        scanButton.setButtonText ("ESCANEANDO...");
+
+       #if ! JUCE_IOS
+        // AUv3 no iOS nao vive em pastas: os componentes vem do registro do
+        // sistema. Exigir "uma pasta selecionada" ali impediria o unico scan
+        // que a plataforma tem.
+        if (! ChurchDAWPluginScan::podeIniciarBusca (
+                formats, selectedSearchPath().getNumPaths()))
+        {
+            scanInProgress = false;
+            scanButton.setEnabled (true);
+            cancelButton.setButtonText ("Fechar");
+            scanButton.setButtonText ("Escanear plugins");
+            scanStatus = "Selecione ao menos uma pasta de plugins";
+            repaint();
+            return;
+        }
+       #endif
 
         for (auto* format : formats.getFormats())
-            if (format != nullptr && format->getName().containsIgnoreCase ("AudioUnit"))
+            if (format != nullptr && format->canScanForPlugins()
+                 && format->getName().containsIgnoreCase ("AudioUnit"))
                 filaDeFormatos.add ({ format, {}, false });
 
         for (auto* format : formats.getFormats())
-            if (format != nullptr && ! format->getName().containsIgnoreCase ("AudioUnit"))
+            if (format != nullptr && format->canScanForPlugins()
+                 && ! format->getName().containsIgnoreCase ("AudioUnit"))
                 filaDeFormatos.add ({ format, {}, false });
 
         dispararProximoFormato();
     }
 
+    void startPreparedScan (juce::AudioPluginFormat& format,
+                            const juce::StringArray& identifiers)
+    {
+        activeScanIdentifiers = identifiers;
+        preparedScanFormat = std::make_unique<ChurchDAWPluginScan::PreparedPluginFormat> (
+            format, identifiers);
+        scanStatus = "Escaneando " + format.getName() + " - "
+                   + juce::String (identifiers.size()) + " candidato(s)";
+        scanCurrentItem.clear();
+        scanProgress = 0.0;
+        list.scanFor (*preparedScanFormat, identifiers);
+        startTimer (100);
+        repaint (footerBounds);
+    }
+
     void dispararProximoFormato()
     {
+        // Only called after the preceding JUCE scanner has released its format.
+        preparedScanFormat.reset();
         while (! filaDeFormatos.isEmpty())
         {
             auto request = filaDeFormatos.removeAndReturn (0);
@@ -8782,14 +20400,26 @@ struct PluginListHolder final : public juce::Component,
                     "PLUGIN_SCAN explicit_revalidation format="
                     + format->getName()
                     + " count=" + juce::String (request.identifiers.size()));
-                activeScanIdentifiers = request.identifiers;
-                list.scanFor (*format, request.identifiers);
+                startPreparedScan (*format, request.identifiers);
             }
             else
             {
                 activeScanIdentifiers.clear();
 
-           #if JUCE_MAC
+           #if ! JUCE_IOS
+                const auto formatName = format->getName();
+                const auto paths = selectedSearchPath();
+                candidateSearchFormat = format;
+                scanStatus = "Procurando plugins " + formatName + "...";
+                scanCurrentItem.clear();
+                scanProgress = 0.0;
+                candidateSearch = std::make_unique<ChurchDAWPluginScan::AsyncCandidateSearch> (
+                    [formatName, paths] (const std::atomic<bool>& cancelled)
+                    {
+                        return ChurchDAWPluginScan::searchPluginCandidates (
+                            formatName, paths, cancelled);
+                    });
+           #else
                 if (format->getName().containsIgnoreCase ("AudioUnit"))
                 {
                     const auto allIdentifiers = format->searchPathsForPlugins (
@@ -8810,16 +20440,18 @@ struct PluginListHolder final : public juce::Component,
                     if (hostable.isEmpty())
                         continue;
 
-                    list.scanFor (*format, hostable);
+                    startPreparedScan (*format, hostable);
                 }
                 else
-           #endif
                 {
+                    scanStatus = "Escaneando " + format->getName() + "...";
                     list.scanFor (*format);
                 }
+           #endif
             }
 
-            startTimer (400);
+            startTimer (100);
+            repaint (footerBounds);
             return;
         }
 
@@ -8828,6 +20460,38 @@ struct PluginListHolder final : public juce::Component,
 
     void timerCallback() override
     {
+        if (candidateSearch != nullptr)
+        {
+            auto result = candidateSearch->takeResult();
+            if (! result.has_value()) return;
+
+            auto* format = candidateSearchFormat;
+            candidateSearch.reset();
+            candidateSearchFormat = nullptr;
+            if (result->error.isNotEmpty())
+            {
+                candidateSearchErrors.add (result->error);
+                juce::Logger::writeToLog ("PLUGIN_SCAN enumeration_failed " + result->error);
+                dispararProximoFormato();
+                return;
+            }
+            const auto hostable = ChurchDAWPluginScan::filtrarAudioUnitsHospedaveis (
+                result->identifiers);
+            juce::Logger::writeToLog ("PLUGIN_SCAN enumeration_completed format="
+                + format->getName() + " candidates=" + juce::String (hostable.size()));
+            if (hostable.isEmpty())
+                dispararProximoFormato();
+            else
+                startPreparedScan (*format, hostable);
+            return;
+        }
+
+        scanProgress = list.getScanProgress();
+        const auto current = list.getCurrentlyScannedPlugin();
+        if (current.isNotEmpty())
+            scanCurrentItem = current;
+        repaint (footerBounds);
+
         if (! list.isScanning())
         {
             const bool wasCancelled = list.consumeLastScanWasCancelled();
@@ -8863,8 +20527,28 @@ struct PluginListHolder final : public juce::Component,
     {
         stopTimer();
         scanButton.setEnabled (true);
+        cancelButton.setButtonText ("Fechar");
+        scanButton.setButtonText ("Escanear plugins");
+        scanInProgress = false;
+        scanProgress = completed ? 1.0 : 0.0;
+        const int found = juce::jmax (0, knownPlugins.getNumTypes() - pluginsBeforeScan);
+        scanStatus = completed
+            ? "Concluido - " + juce::String (found) + " plugin(s) novo(s)"
+            : "Escaneamento cancelado";
+        if (completed && ! candidateSearchErrors.isEmpty())
+            scanStatus = "Busca incompleta - " + candidateSearchErrors.joinIntoString (" ");
+        if (completed && candidateSearchErrors.isEmpty())
+        {
+            lastVerification = juce::Time::getCurrentTime().toISO8601 (true);
+            if (propertiesToUse != nullptr)
+            {
+                propertiesToUse->setValue ("churchdawPluginLastVerification",
+                                           lastVerification);
+                propertiesToUse->saveIfNeeded();
+            }
+        }
 
-        bool allRevalidationTargetsResolved = completed;
+        bool allRevalidationTargetsResolved = completed && candidateSearchErrors.isEmpty();
 
         if (revalidationBatchActive)
         {
@@ -8923,6 +20607,8 @@ struct PluginListHolder final : public juce::Component,
             auto callback = std::move (onBatchFinished);
             callback (allRevalidationTargetsResolved);
         }
+
+        rebuildRows();
     }
 
     void normaliseQuarantine()
@@ -8962,35 +20648,304 @@ struct PluginListHolder final : public juce::Component,
 
     static juce::String formatosDaPlataforma()
     {
-       #if JUCE_MAC
+       #if JUCE_IOS
+        return "AUv3";
+       #elif JUCE_MAC && JUCE_PLUGINHOST_VST
+        return "VST2, VST3 e Audio Unit";
+       #elif JUCE_MAC
         return "VST3 e Audio Unit";
+       #elif JUCE_WINDOWS && JUCE_PLUGINHOST_VST
+        return "VST2 e VST3";
        #else
         return "VST3";
        #endif
     }
 
-    void resized() override
+    void paint (juce::Graphics& g) override
     {
-        list.setBounds (getLocalBounds());
-
-        // mesmo rodape do "Opcoes..." (24px, com margem de 2), do lado direito
-        auto strip = getLocalBounds().reduced (2).removeFromBottom (24);
-        scanButton.setBounds (strip.removeFromRight (140));
+        using L = NordLookAndFeel;
+        g.fillAll (L::bgApp());
+        g.setColour (L::bgCard());
+        g.fillRect (headerBounds);
+        g.setColour (L::borderSoft());
+        g.fillRect (headerBounds.withTop (headerBounds.getBottom() - 1));
+        const bool phoneCompact = headerBounds.getHeight() < 68;
+        auto heading = headerBounds.reduced (phoneCompact ? 14 : 26, 0);
+        if (phoneCompact)
+        {
+            g.setColour (L::txtPrimary());
+            g.setFont (juce::Font (juce::FontOptions (20.0f)).boldened());
+            g.drawText ("Plugins", heading.withWidth (118), juce::Justification::centredLeft);
+        }
+        else
+        {
+            g.setColour (L::nordRedBright());
+            g.setFont (juce::Font (juce::FontOptions (10.5f)).boldened().withExtraKerningFactor (0.10f));
+            g.drawText ("CHURCHDAW", heading.withTop (17).withHeight (16), juce::Justification::centredLeft);
+            g.setColour (L::txtPrimary());
+            g.setFont (juce::Font (juce::FontOptions (27.0f)).boldened());
+            g.drawText ("Plugins", heading.withTop (34).withHeight (34), juce::Justification::centredLeft);
+        }
+        g.setColour (L::txtSecondary());
+        g.setFont (juce::Font (juce::FontOptions (10.5f)).boldened().withExtraKerningFactor (0.07f));
+        g.drawText (juce::String::fromUTF8 (u8"COLEÇÃO"), leftBounds.reduced (phoneCompact ? 8 : 15, 0).withTrimmedTop (phoneCompact ? 4 : 10).withHeight (20), juce::Justification::centredLeft);
+        if (categoryButtons[0].isVisible())
+            g.drawText ("LOCAIS", leftBounds.reduced (phoneCompact ? 8 : 15, 0).withTrimmedTop (leftBounds.getHeight() < 480 ? 234 : 255).withHeight (20), juce::Justification::centredLeft);
+        g.setColour (L::borderSoft());
+        g.drawVerticalLine (leftBounds.getRight() + (phoneCompact ? 6 : 12), (float) leftBounds.getY(), (float) leftBounds.getBottom());
+        auto banner = bannerBounds;
+        g.setColour (L::txtPrimary());
+        g.setFont (juce::Font (juce::FontOptions (phoneCompact ? 16.0f : 20.0f)).boldened());
+        const juce::String names[] {juce::String::fromUTF8 (u8"Sua coleção"), "Instrumentos", "Efeitos", "Favoritos", juce::String::fromUTF8 (u8"Requer atenção")};
+        g.drawText (names[juce::jlimit (0, 4, selectedPluginFilter)], banner.withHeight (phoneCompact ? 22 : 28), juce::Justification::centredLeft);
+        g.setColour (L::txtSecondary());
+        g.setFont (juce::Font (juce::FontOptions (phoneCompact ? 11.0f : 12.0f)));
+        g.drawText (juce::String ((int) filteredPluginItems.size()) + juce::String::fromUTF8 (u8" plugins · ") + formatosDaPlataforma(),
+                    banner.withTrimmedTop (phoneCompact ? 23 : 30).withHeight (20), juce::Justification::centredLeft);
+        if (filteredPluginItems.empty())
+        {
+            g.setFont (juce::Font (juce::FontOptions (phoneCompact ? 14.0f : 16.0f)));
+            g.drawFittedText (searchEditor.getText().isNotEmpty() ? "Nenhum plugin encontrado. Tente outro nome."
+                                                               : juce::String::fromUTF8 (u8"Sua coleção começa aqui. Escaneie seus plugins."),
+                              pluginViewport.getBounds().reduced (16), juce::Justification::centred, 3);
+        }
+        g.setColour (juce::Colour (0xff1a1d22));
+        g.fillRoundedRectangle (infoBounds.toFloat(), 14.0f);
+        g.setColour (juce::Colours::white.withAlpha (0.08f));
+        g.drawRoundedRectangle (infoBounds.toFloat().reduced (0.5f), 14.0f, 1.0f);
+        auto info = infoBounds.reduced (phoneCompact ? 12 : 20);
+        g.setColour (L::txtSecondary());
+        g.setFont (juce::Font (juce::FontOptions (10.5f)).boldened().withExtraKerningFactor (0.06f));
+        g.drawText ("SELECIONADO", info.removeFromTop (phoneCompact ? 18 : 22), juce::Justification::centredLeft);
+        if (const auto* item = selectedPlugin())
+        {
+            if (infoBounds.getHeight() >= 340)
+            {
+                const int artH = juce::jlimit (70, 144, infoBounds.getHeight() - 425);
+                auto art = info.removeFromTop (artH);
+                ChurchDAWArtwork::plugin (g, art.toFloat(), item->displayName(), item->description.isInstrument);
+                info.removeFromTop (18);
+            }
+            g.setColour (L::txtPrimary());
+            g.setFont (juce::Font (juce::FontOptions (phoneCompact ? 16.5f : 22.0f)).boldened());
+            g.drawFittedText (item->displayName(), info.removeFromTop (phoneCompact ? 24 : 32), juce::Justification::centredLeft, 1);
+            g.setColour (L::txtSecondary());
+            g.setFont (juce::Font (juce::FontOptions (phoneCompact ? 11.5f : 13.0f)));
+            g.drawText (item->description.manufacturerName, info.removeFromTop (phoneCompact ? 18 : 24), juce::Justification::centredLeft, true);
+            if (! phoneCompact)
+                info.removeFromTop (12);
+            auto status = info.removeFromTop (phoneCompact ? 20 : 24);
+            g.setColour (item->error ? L::redClip() : L::greenOk());
+            g.fillEllipse ((float) status.getX(), (float) status.getCentreY() - 3, 6, 6);
+            g.drawText (item->error ? juce::String::fromUTF8 (u8"Requer verificação") : item->active ? "Em uso no projeto" : "Pronto para usar",
+                        status.withTrimmedLeft (15), juce::Justification::centredLeft);
+            info.removeFromTop (10);
+            g.setColour (L::borderSoft());
+            g.fillRect (info.removeFromTop (1));
+            info.removeFromTop (12);
+            g.setColour (L::txtSecondary());
+            g.setFont (juce::Font (juce::FontOptions (12.0f)));
+            const auto type = item->description.isInstrument ? juce::String ("Instrumento virtual") : juce::String::fromUTF8 (u8"Efeito de áudio");
+            g.drawText (type + juce::String::fromUTF8 (u8" · ") + item->formatName(), info.removeFromTop (23), juce::Justification::centredLeft, true);
+            if (info.getY() + 40 < formatChoice.getY())
+            {
+                g.setColour (L::txtDisabled());
+                g.setFont (juce::Font (juce::FontOptions (11.5f)));
+                const auto hint = item->error ? "Use o menu do card para verificar o plugin novamente."
+                    : item->usage.isNotEmpty() ? "Em uso: " + item->usage
+                    : juce::String::fromUTF8 (u8"Escolha o formato e abra a interface do plugin.");
+                g.drawMultiLineText (hint, info.getX(), info.getY() + 15, info.getWidth(), juce::Justification::left, 3.0f);
+            }
+        }
+        else
+        {
+            auto hint = info.withHeight (juce::jmax (0, formatChoice.getY() - info.getY() - 24));
+            g.setColour (L::txtSecondary());
+            g.setFont (juce::Font (juce::FontOptions (14.0f)));
+            g.drawFittedText (juce::String::fromUTF8 ("Selecione um plugin para ver os detalhes e abrir sua interface."),
+                              hint.reduced (6), juce::Justification::centred, 4);
+        }
+        g.setColour (L::bgApp());
+        g.fillRect (footerBounds);
+        g.setColour (L::borderSoft());
+        g.fillRect (footerBounds.withHeight (1));
+        auto status = footerBounds.reduced (26, 0);
+        status.setRight (cancelButton.getX() - 18);
+        g.setColour (scanInProgress ? L::nordRedBright() : L::greenOk());
+        g.fillEllipse ((float) status.getX(), (float) status.getCentreY() - 3, 6, 6);
+        status.removeFromLeft (16);
+        g.setColour (L::txtSecondary());
+        g.setFont (juce::Font (juce::FontOptions (12.0f)));
+        g.drawText (scanInProgress ? scanStatus : juce::String ((int) allPluginItems.size()) + " produtos / " + juce::String (knownPlugins.getNumTypes()) + " formatos instalados",
+                    status, juce::Justification::centredLeft, true);
+        if (scanInProgress)
+        {
+            g.setColour (L::nordRed());
+            g.fillRect (progressBounds.withWidth (juce::roundToInt (progressBounds.getWidth() * juce::jlimit (0.0, 1.0, scanProgress))));
+        }
     }
 
+    bool keyPressed (const juce::KeyPress& key) override
+    {
+        if (key.isKeyCode (juce::KeyPress::escapeKey))
+        { cancelButton.triggerClick(); return true; }
+        if (pluginRows.empty()) return false;
+        const auto layout = ChurchDAWPluginGallery::forWidth (pluginViewport.getWidth() - 8);
+        int step = 0;
+        if (key.isKeyCode (juce::KeyPress::leftKey)) step = -1;
+        if (key.isKeyCode (juce::KeyPress::rightKey)) step = 1;
+        if (key.isKeyCode (juce::KeyPress::upKey)) step = -layout.columns;
+        if (key.isKeyCode (juce::KeyPress::downKey)) step = layout.columns;
+        if (step == 0) return false;
+        selectedPluginIndex = juce::jlimit (0, (int) pluginRows.size() - 1, selectedPluginIndex + step);
+        refreshPluginRows();
+        auto& row = *pluginRows[(size_t) selectedPluginIndex];
+        row.grabKeyboardFocus();
+        const auto viewport = pluginViewport.getViewArea();
+        if (row.getY() < viewport.getY()) pluginViewport.setViewPosition (0, row.getY());
+        else if (row.getBottom() > viewport.getBottom())
+            pluginViewport.setViewPosition (0, row.getBottom() - viewport.getHeight());
+        return true;
+    }
+
+    void resized() override
+    {
+        list.setBounds ({}); rowsViewport.setBounds ({});
+        for (auto* button : {&changeFolderButton, &removeFolderButton, &moveUpButton, &moveDownButton}) button->setBounds ({});
+        auto area = getLocalBounds();
+        const bool phoneCompact = getWidth() < 920 || getHeight() < 520;
+        headerBounds = area.removeFromTop (phoneCompact ? 54 : 88);
+        footerBounds = area.removeFromBottom (phoneCompact ? 50 : 64);
+        area.reduce (phoneCompact ? 10 : 22, phoneCompact ? 8 : 20);
+        const bool compact = getWidth() < 1120;
+        leftBounds = area.removeFromLeft (phoneCompact ? 132 : (compact ? 166 : 182));
+        area.removeFromLeft (phoneCompact ? 12 : 26);
+        infoBounds = area.removeFromRight (phoneCompact ? 196 : (compact ? 250 : 274));
+        area.removeFromRight (phoneCompact ? 10 : 22);
+        const int bannerH = phoneCompact ? 46 : 60;
+        const int bannerGap = phoneCompact ? 6 : 12;
+        bannerBounds = area.removeFromTop (bannerH);
+        area.removeFromTop (bannerGap);
+        tableBounds = area;
+        pluginViewport.setBounds (tableBounds);
+        layoutPluginRows();
+        auto left = leftBounds;
+        left.removeFromTop (phoneCompact ? 26 : 40);
+        const bool shortPanel = leftBounds.getHeight() < 480;
+        const int filterBtnH = phoneCompact
+            ? juce::jlimit (28, 36, (left.getHeight() - 12) / 5)
+            : (shortPanel ? 34 : 38);
+        const int filterGap = phoneCompact ? 3 : 4;
+        for (auto& button : pluginFilterButtons)
+        { button.setBounds (left.removeFromTop (filterBtnH)); left.removeFromTop (filterGap); }
+        if (categoryButtons[0].isVisible())
+        {
+            left = leftBounds.withTrimmedTop (shortPanel ? 260 : 286);
+            for (auto& button : categoryButtons)
+            { button.setBounds (left.removeFromTop (shortPanel ? 27 : 30)); left.removeFromTop (3); }
+        }
+        else
+        {
+            for (auto& button : categoryButtons)
+                button.setBounds ({});
+        }
+        addFolderButton.setBounds (addFolderButton.isVisible()
+                                       ? leftBounds.withTop (leftBounds.getBottom() - 38)
+                                       : juce::Rectangle<int>());
+        sortBox.setBounds (bannerBounds.removeFromRight (phoneCompact ? 116 : (compact ? 133 : 154)).withHeight (phoneCompact ? 32 : 34));
+        // Keep the heading's complete original bounds for paint.
+        bannerBounds = tableBounds.withY (tableBounds.getY() - (bannerH + bannerGap)).withHeight (bannerH);
+        const int actionsH = revealPluginButton.isVisible()
+            ? (phoneCompact ? 148 : 168)
+            : (phoneCompact ? 116 : 126);
+        auto actions = infoBounds.reduced (phoneCompact ? 12 : 16).removeFromBottom (actionsH);
+        formatChoice.setBounds (actions.removeFromTop (phoneCompact ? 30 : 32)); actions.removeFromTop (phoneCompact ? 6 : 8);
+        openPluginButton.setBounds (actions.removeFromTop (phoneCompact ? 38 : 42)); actions.removeFromTop (phoneCompact ? 6 : 8);
+        favouritePluginButton.setBounds (actions.removeFromTop (phoneCompact ? 34 : 36));
+        if (revealPluginButton.isVisible())
+        {
+            actions.removeFromTop (6);
+            revealPluginButton.setBounds (actions.removeFromTop (34));
+        }
+        else
+        {
+            revealPluginButton.setBounds ({});
+        }
+        auto foot = footerBounds.reduced (phoneCompact ? 12 : 22, phoneCompact ? 5 : 12);
+        scanButton.setBounds (foot.removeFromRight (phoneCompact ? 152 : 172)); foot.removeFromRight (phoneCompact ? 8 : 10);
+        cancelButton.setBounds (foot.removeFromRight (phoneCompact ? 80 : 86));
+        progressBounds = footerBounds.withY (footerBounds.getBottom() - 3).withHeight (3);
+        const int topBtnSize = phoneCompact ? 38 : 36;
+        const int topBtnY = (headerBounds.getHeight() - topBtnSize) / 2;
+        closeButton.setBounds (getWidth() - (phoneCompact ? 48 : 60), topBtnY, topBtnSize, topBtnSize);
+        settingsButton.setBounds (closeButton.getX() - (topBtnSize + 6), topBtnY, topBtnSize, topBtnSize);
+        const int searchX = phoneCompact ? 132 : (compact ? 225 : 265);
+        const int searchH = phoneCompact ? 36 : 40;
+        searchEditor.setBounds (searchX, (headerBounds.getHeight() - searchH) / 2,
+                                juce::jmax (120, settingsButton.getX() - searchX - 10), searchH);
+        searchClearButton.setBounds (searchEditor.getRight() - 32, searchEditor.getY() + (searchH - 28) / 2, 28, 28);
+        searchClearButton.toFront (false);
+        closeButton.toFront (false); cancelButton.toFront (false); scanButton.toFront (false);
+        refreshRows(); refreshPluginRows();
+    }
+
+    juce::ComboBox formatChoice;
+    std::map<juce::String, juce::String> chosenPluginFormats;
+    PluginManagerLookAndFeel pluginManagerLookAndFeel;
     juce::AudioPluginFormatManager& formats;
     juce::KnownPluginList& knownPlugins;
     juce::File deadMansPedalFile;
     juce::PropertiesFile* propertiesToUse = nullptr;
     juce::StringArray& persistentQuarantine;
+    std::function<juce::String(const juce::PluginDescription&)> pluginIsActive;
+    // Declaration order matters: list must stop/destroy its scanner before
+    // the adapter referenced by that scanner is destroyed.
+    std::unique_ptr<ChurchDAWPluginScan::PreparedPluginFormat> preparedScanFormat;
+    std::unique_ptr<ChurchDAWPluginScan::AsyncCandidateSearch> candidateSearch;
+    juce::AudioPluginFormat* candidateSearchFormat = nullptr;
+    juce::StringArray candidateSearchErrors;
     juce::PluginListComponent list;
-    juce::TextButton scanButton;
+    juce::TextButton scanButton, cancelButton, settingsButton, closeButton;
+    juce::TextButton addFolderButton, changeFolderButton, removeFolderButton;
+    juce::TextButton moveUpButton, moveDownButton;
+    std::array<juce::TextButton, 4> categoryButtons;
+    std::array<juce::TextButton, 5> pluginFilterButtons;
+    juce::TextEditor searchEditor;
+    juce::TextButton searchClearButton;
+    juce::ComboBox sortBox;
+    juce::TextButton openPluginButton, revealPluginButton;
+    juce::TextButton favouritePluginButton;
+    juce::Array<ScanLocation> locations;
+    juce::Array<int> visibleLocationIndices;
+    juce::Component rowsContainer;
+    juce::Viewport rowsViewport;
+    std::vector<std::unique_ptr<FolderRow>> rows;
+    juce::Component pluginRowsContainer;
+    juce::Viewport pluginViewport;
+    std::vector<std::unique_ptr<PluginRow>> pluginRows;
+    std::vector<PluginItem> allPluginItems;
+    std::vector<PluginItem> filteredPluginItems;
+    juce::StringArray favouritePluginKeys;
+    std::unique_ptr<juce::FileChooser> folderChooser;
+    int selectedCategory = 0;
+    int selectedLocation = -1;
+    int selectedPluginFilter = 0;
+    int selectedPluginIndex = -1;
+    juce::Rectangle<int> headerBounds, leftBounds, bannerBounds, tableBounds;
+    juce::Rectangle<int> infoBounds, footerBounds, progressBounds;
+    bool scanInProgress = false;
+    bool openingPlugin = false;
+    double scanProgress = 0.0;
+    int pluginsBeforeScan = 0;
+    juce::String scanStatus, scanCurrentItem, lastVerification;
     juce::Array<PendingScan> filaDeFormatos;
     juce::StringArray revalidationTargets;
     juce::StringArray unresolvedTargets;
     juce::StringArray activeScanIdentifiers;
     bool revalidationBatchActive = false;
     std::function<void(bool completed)> onBatchFinished;
+    std::unique_ptr<juce::AudioPluginInstance> previewInstance;
+    std::unique_ptr<PluginPreviewWindow> previewWindow;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (PluginListHolder)
 };
@@ -9006,14 +20961,52 @@ void MainComponent::showPluginScanner()
     const auto deadMansPedal = appProperties.getUserSettings()->getFile()
                                    .getSiblingFile ("PluginsComProblema.txt");
 
-    auto* holder = new PluginListHolder (formatManager, knownPlugins, deadMansPedal,
-                                         appProperties.getUserSettings(),
-                                         pluginScanQuarantine);
+    const auto safeMain = juce::Component::SafePointer<MainComponent> (this);
+    auto* holder = new PluginListHolder (
+        formatManager, knownPlugins, deadMansPedal,
+        appProperties.getUserSettings(), pluginScanQuarantine,
+        [safeMain] (const juce::PluginDescription& description)
+        {
+            juce::StringArray usage;
+            if (auto* self = safeMain.getComponent())
+            {
+                for (int i = 0; i < numSlots; ++i)
+                    if (description.matchesIdentifierString (self->slots[i].pluginIdentifier))
+                        usage.add ("Slot " + juce::String (i + 1));
+                if (auto* live = self->getChurchLive())
+                {
+                    const auto matches = [&description] (juce::AudioPluginInstance* instance)
+                    {
+                        if (instance == nullptr) return false;
+                        juce::PluginDescription loaded;
+                        instance->fillInPluginDescription (loaded);
+                        return loaded.createIdentifierString() == description.createIdentifierString();
+                    };
+                    for (int i = 0; i < TimbresProcessor::numLayers; ++i)
+                        if (matches (live->getLayerInstrument (i)))
+                            usage.add ("Canal " + juce::String (i + 1));
+                    for (int i = 0; i < TimbresProcessor::numInserts; ++i)
+                        if (matches (live->getInsert (i)))
+                            usage.add ("Master FX " + juce::String (i + 1));
+                }
+            }
+            return usage.joinIntoString (", ");
+        });
+
+    holder->onClose = [safe = juce::Component::SafePointer<MainComponent> (this)]
+    {
+        if (auto* self = safe.getComponent())
+            if (auto* dialog = self->pluginScannerDialog.get())
+                dialog->exitModalState (0);
+    };
 
     juce::DialogWindow::LaunchOptions o;
     o.content.setOwned (holder);
-    o.dialogTitle = "Plugins — " + PluginListHolder::formatosDaPlataforma();
-    o.componentToCentreAround = this;
+    o.dialogTitle = juce::String::fromUTF8 (u8"Plugins — ")
+                  + PluginListHolder::formatosDaPlataforma();
+    // The mixer is scaled inside ScaledHolder. Passing it here also scaled the
+    // native dialog, so display-sized bounds overflowed the screen and hid X/Close.
+    o.componentToCentreAround = getTopLevelComponent();
     // LaunchOptions vem com dialogBackgroundColour = lightgrey: era dai o rodape
     // e as bordas claras que destoavam do app inteiro
     o.dialogBackgroundColour = NordLookAndFeel::background();
@@ -9024,6 +21017,19 @@ void MainComponent::showPluginScanner()
     // o modal, o callback apaga a janela, e o destrutor pode apaga-la de forma
     // sincrona antes das referencias que o holder usa.
     pluginScannerDialog.reset (o.create());
+    pluginScannerDialog->setTitleBarHeight (0);
+   #if JUCE_IOS
+    pluginScannerDialog->setResizeLimits (480, 260, 1680, 1020);
+   #else
+    pluginScannerDialog->setResizeLimits (980, 620, 1680, 1020);
+   #endif
+    pluginScannerDialog->setResizable (true, true);
+    auto usable = getScreenBounds();
+    if (const auto* display = juce::Desktop::getInstance().getDisplays().getDisplayForRect (usable))
+        usable = display->userArea.reduced (display->userArea.getWidth() < 960 ? 6 : 16);
+    const int dialogW = juce::jmin (1240, usable.getWidth());
+    const int dialogH = juce::jmin (790, usable.getHeight());
+    pluginScannerDialog->setBounds (usable.withSizeKeepingCentre (dialogW, dialogH));
     pluginScannerDialog->enterModalState (
         true,
         juce::ModalCallbackFunction::create (
@@ -9310,8 +21316,373 @@ struct PadPanel : public juce::Component
 };
 #endif  // bloco antigo do PadPanel
 
+void MainComponent::showPadEditor (int sourceChannel,
+                                   const juce::String& sourceName)
+{
+    if (padEditorPanel == nullptr || padSynthProcessor == nullptr)
+    {
+        padButton.setToggleState (false, juce::dontSendNotification);
+        return;
+    }
+
+    if (desktopWorkspace != DesktopWorkspace::mixer)
+        showDesktopWorkspace (DesktopWorkspace::mixer);
+
+    if (mapButton.getToggleState() || midiLearnActive.load())
+        finishMidiLearn (true);
+    if (liveButton.getToggleState())
+        liveButton.setToggleState (false, juce::dontSendNotification);
+    liveScenePanel.setVisible (false);
+
+    padEditorVisible = true;
+    padButton.setToggleState (true, juce::dontSendNotification);
+    // A central PAD sempre recebe o Church Live atual. O no pode ter sido
+    // recriado por restore/troca de biblioteca desde a construcao da janela;
+    // guardar o ponteiro antigo faria a lista de samples e os attachments
+    // editarem um processador que ja nao toca.
+    padEditorPanel->setSampleProcessor (getChurchLive());
+    padEditorPanel->setSourceChannel (sourceChannel, sourceName);
+    padEditorPanel->refreshFromProcessor();
+    padEditorPanel->setVisible (true);
+    oled.setVisible (false);
+    resized();
+    padEditorPanel->toFront (false);
+    if (quickMidiMappingMode)
+        midiLearnPanel.toFront (false);
+    repaint();
+}
+
+void MainComponent::closePadEditor()
+{
+    if (! padEditorVisible && (padEditorPanel == nullptr
+                               || ! padEditorPanel->isVisible()))
+    {
+        padButton.setToggleState (false, juce::dontSendNotification);
+        return;
+    }
+
+    padEditorVisible = false;
+    padButton.setToggleState (false, juce::dontSendNotification);
+    if (padEditorPanel != nullptr)
+        padEditorPanel->setVisible (false);
+
+    if (padPanel != nullptr && padPanel->isVisible())
+    {
+        padPanel->setVisible (false);
+        if (padPanel->onClose != nullptr)
+            padPanel->onClose();
+    }
+
+    oled.setVisible (! mapButton.getToggleState()
+                     && ! liveScenePanel.isVisible());
+    (void) saveChainState();
+    resized();
+    repaint();
+}
+
+void MainComponent::showDesktopWorkspace (DesktopWorkspace workspace)
+{
+    juce::ignoreUnused (workspace);
+    desktopWorkspace = DesktopWorkspace::mixer;
+    if (performanceSessionPanel != nullptr)
+        performanceSessionPanel->setVisible (false);
+
+    if ((! dockedNative || dockedEditor == nullptr) && slots[0].nodeID.uid != 0)
+        openEditorForSlot (0);
+
+    resized();
+    repaint();
+}
+
+void MainComponent::openSidebarTimbreCategory (int categoryIndex)
+{
+   #if JUCE_ANDROID || JUCE_IOS
+    juce::ignoreUnused (categoryIndex);
+   #else
+    int layer = 0;
+    if (auto* live = getChurchLive())
+    {
+        layer = juce::jmax (0, live->getSelectedLayer());
+        live->setSelectedLayer (layer);
+    }
+
+    showDesktopWorkspace (DesktopWorkspace::mixer);
+    openEditorForSlot (0);
+
+    // dockNode cria o editor no proximo ciclo da message thread. Enfileirar o
+    // filtro depois dele garante que o atalho lateral abra o seletor real, ja
+    // na categoria pedida, tanto se a mesa estava aberta quanto se estava em
+    // Performance/Sessao.
+    juce::MessageManager::callAsync (
+        [safe = juce::Component::SafePointer<MainComponent> (this),
+         layer, categoryIndex]
+        {
+            if (auto* self = safe.getComponent())
+                if (auto* editor = dynamic_cast<TimbresEditor*> (
+                        self->dockedEditor.get()))
+                    editor->openTimbrePickerForLayer (layer, categoryIndex);
+        });
+   #endif
+}
+
+juce::String MainComponent::sceneHistoryFingerprint() const
+{
+    juce::XmlElement xml ("HISTORY");
+    for (int i = 0; i < ChurchDAWLive::numeroDeCenas; ++i)
+        ChurchDAWLive::escreverCena (xml, cenas[(size_t) i], i);
+    ChurchDAWLive::escreverSetlist (xml, setlist);
+    return xml.toString();
+}
+
+void MainComponent::captureSceneHistoryPoint()
+{
+    if (applyingSceneHistory)
+        return;
+
+    const auto fingerprint = sceneHistoryFingerprint();
+    if (sceneHistoryCursor >= 0
+         && sceneHistory[(size_t) sceneHistoryCursor].fingerprint == fingerprint)
+        return;
+
+    if (sceneHistoryCursor + 1 < (int) sceneHistory.size())
+        sceneHistory.resize ((size_t) sceneHistoryCursor + 1);
+
+    SceneHistoryEntry point;
+    for (int i = 0; i < ChurchDAWLive::numeroDeCenas; ++i)
+        point.cenas[(size_t) i] = cenas[i];
+    point.setlist = setlist;
+    point.cenaAtiva = cenaAtiva;
+    point.cenaEmPreparacao = cenaEmPreparacao;
+    point.fingerprint = fingerprint;
+    sceneHistory.push_back (std::move (point));
+
+    // O histórico é uma ferramenta de ensaio, não pode crescer sem limite
+    // durante uma tarde de preparação. Mantemos as 50 últimas alterações.
+    constexpr size_t maxHistory = 50;
+    if (sceneHistory.size() > maxHistory)
+        sceneHistory.erase (sceneHistory.begin());
+    sceneHistoryCursor = (int) sceneHistory.size() - 1;
+}
+
+void MainComponent::applySceneHistoryPoint (const SceneHistoryEntry& point)
+{
+    applyingSceneHistory = true;
+    for (int i = 0; i < ChurchDAWLive::numeroDeCenas; ++i)
+        cenas[i] = point.cenas[(size_t) i];
+    setlist = point.setlist;
+
+    // A persistência usa a mesma escrita atômica das cenas normais. A cadeia
+    // de plugins não é regravada aqui: Undo/Redo de sessão nunca pode tocar
+    // em estados binários nem interromper o áudio.
+    const bool saved = salvarCenas();
+    liveScenePanel.atualizar (cenas, cenaAtiva);
+    refreshPerformanceSessionPanel();
+    applyingSceneHistory = false;
+
+    if (! saved)
+        juce::Logger::writeToLog (
+            "LIVE HISTORY: alteracao aplicada em memoria, mas nao gravada no disco");
+}
+
+void MainComponent::undoSceneHistory()
+{
+    if (sceneHistoryCursor <= 0
+         || sceneHistoryCursor >= (int) sceneHistory.size())
+        return;
+
+    --sceneHistoryCursor;
+    applySceneHistoryPoint (sceneHistory[(size_t) sceneHistoryCursor]);
+    juce::Logger::writeToLog ("LIVE HISTORY: desfazer");
+}
+
+void MainComponent::redoSceneHistory()
+{
+    if (sceneHistoryCursor < 0
+         || sceneHistoryCursor + 1 >= (int) sceneHistory.size())
+        return;
+
+    ++sceneHistoryCursor;
+    applySceneHistoryPoint (sceneHistory[(size_t) sceneHistoryCursor]);
+    juce::Logger::writeToLog ("LIVE HISTORY: refazer");
+}
+
+void MainComponent::refreshPerformanceSessionPanel()
+{
+    if (performanceSessionPanel == nullptr || ! performanceSessionPanel->isVisible())
+        return;
+
+    captureSceneHistoryPoint();
+
+    int key = -1;
+    float padGain = 0.9f;
+    if (padProcessor != nullptr)
+    {
+        key = padProcessor->getKey();
+        padGain = padProcessor->getGain();
+    }
+
+    bool globalSustain = false;
+    int transpose = 0;
+    if (auto* live = getChurchLive())
+    {
+        globalSustain = live->getGlobalSustain();
+        if (auto* parameter = live->getTransposeGeralParam())
+            transpose = parameter->get();
+    }
+
+    performanceSessionPanel->updateState (
+        cenas, setlist, cenaAtiva, cenaEmPreparacao,
+        key, padGain, globalSustain, transpose);
+    performanceSessionPanel->setHistoryAvailability (
+        sceneHistoryCursor > 0,
+        sceneHistoryCursor >= 0
+            && sceneHistoryCursor + 1 < (int) sceneHistory.size());
+}
+
+void MainComponent::startMidiLearn()
+{
+    if (midiLearnActive.load())
+        return;
+
+    lastLearnInputValue = -1;
+    // Switching workspaces may finish learning; do it before arming MIDI.
+    if (desktopWorkspace != DesktopWorkspace::mixer)
+        showDesktopWorkspace (DesktopWorkspace::mixer);
+    if (padEditorVisible)
+        closePadEditor();
+    liveModeBeforeMidiLearn = liveButton.getToggleState();
+    quickMidiMappingMode = false;
+    resetMidiLearnTargetUnderCallbackBarrier (true);
+
+    clearMapConfirmationArmed = false;
+    clearMapButton.setButtonText (desktopReferenceLayout ? "Limpar mapas" : "Limpar");
+    clearMapButton.setVisible (true);
+
+    mapButton.setToggleState (true, juce::dontSendNotification);
+    mapButton.setButtonText (desktopReferenceLayout ? "CONCLUIR MIDI" : "Concluir");
+    mapButton.setColour (juce::TextButton::buttonOnColourId, juce::Colour (0xffb32d2e));
+
+    liveButton.setToggleState (false, juce::dontSendNotification);
+
+    liveScenePanel.setVisible (false);
+    oled.setVisible (false);
+    midiLearnPanel.setVisible (true);
+    midiMappingPanel.setVisible (false);
+    midiMappingPanel.setLearning (false, false);
+    midiLearnConsoleOverlay.setVisible (true);
+    midiLearnConsoleOverlay.clearTarget();
+
+    if (padPanel != nullptr)
+        padPanel->setMidiLearnMode (true);
+
+    midiLearnPanel.setMappingCount (getMidiMappingCount());
+    midiLearnPanel.showChooseTarget();
+
+    midiLearnConsoleOverlay.toFront (false);
+    midiLearnPanel.toFront (false);
+    clearMapButton.toFront (false);
+    mapButton.toFront (false);
+
+    juce::Logger::writeToLog ("MIDI MAP: modo de aprendizado visual aberto sobre o console");
+
+    resized();
+    repaint();
+
+    juce::Component::SafePointer<MainComponent> safe (this);
+    juce::MessageManager::callAsync ([safe]
+    {
+        if (auto* c = safe.getComponent())
+        {
+            c->resized();
+            c->repaint();
+        }
+    });
+}
+
+void MainComponent::finishMidiLearn (bool saveMappings)
+{
+    if (! midiLearnActive.load() && ! mapButton.getToggleState())
+        return;
+
+    quickMidiMappingMode = false;
+    {
+        const juce::ScopedLock callbackDrain (midiCallbackBarrier);
+        // Commit input already received before Concluir, then disarm. Clearing
+        // the queue first lost the last mapping when these events were adjacent.
+        consumeMidiLearnControlEvents();
+        resetMidiLearnTargetUnderCallbackBarrier (false);
+    }
+
+    if (saveMappings)
+    {
+        limparBotoesDeCCVazios();
+        atualizarBotoesDeCCDoPad();
+        // Keep CC and note files in the same durable transaction.
+        const bool salvouPar = saveMidiMapPair();
+        if (! salvouPar)
+            juce::AlertWindow::showMessageBoxAsync (
+                juce::AlertWindow::WarningIcon, "Mapeamentos MIDI",
+                "Os mapas funcionam nesta sessao, mas nao puderam ser salvos. "
+                "Verifique o acesso ao disco e tente concluir novamente.");
+        (void) saveChainState();
+        if (auto* userSettings = appProperties.getUserSettings())
+            userSettings->saveIfNeeded();
+
+        juce::Logger::writeToLog (salvouPar ? "MIDI MAP: mapas salvos com sucesso ao concluir"
+                                            : "MIDI MAP: aviso ao salvar par ao concluir");
+    }
+
+    clearMapConfirmationArmed = false;
+    clearMapButton.setButtonText (desktopReferenceLayout ? "Limpar mapas" : "Limpar");
+    clearMapButton.setVisible (false);
+
+    mapButton.setToggleState (false, juce::dontSendNotification);
+    mapButton.setButtonText (desktopReferenceLayout ? "MAPEAR MIDI" : "Mapear MIDI");
+    mapButton.setColour (juce::TextButton::buttonOnColourId, juce::Colour (0xff2c171d));
+
+    liveButton.setToggleState (liveModeBeforeMidiLearn, juce::dontSendNotification);
+    liveScenePanel.setVisible (! desktopReferenceLayout && liveModeBeforeMidiLearn);
+    oled.setVisible (! liveScenePanel.isVisible());
+    midiLearnPanel.setVisible (false);
+    midiMappingPanel.setVisible (false);
+    midiMappingPanel.setLearning (false, false);
+    midiLearnConsoleOverlay.setVisible (false);
+    midiLearnConsoleOverlay.clearTarget();
+
+    if (padPanel != nullptr)
+        padPanel->setMidiLearnMode (false);
+
+    juce::Logger::writeToLog ("MIDI MAP: concluido com "
+                              + juce::String (getMidiMappingCount()) + " mapeamento(s)");
+
+    resized();
+    repaint();
+
+    juce::Component::SafePointer<MainComponent> safe (this);
+    juce::MessageManager::callAsync ([safe]
+    {
+        if (auto* c = safe.getComponent())
+        {
+            c->resized();
+            c->repaint();
+        }
+    });
+}
+
+void MainComponent::toggleMidiLearn()
+{
+    if (midiLearnActive.load() || mapButton.getToggleState())
+        finishMidiLearn (true);
+    else
+        startMidiLearn();
+}
+
 void MainComponent::showPadWindow()
 {
+    juce::Logger::writeToLog (
+        "PAD_CONTINUO: showPadWindow visible="
+        + juce::String (padPanel != nullptr && padPanel->isVisible() ? 1 : 0));
+
     if (padPanel == nullptr)
         return;
 
@@ -9319,18 +21690,20 @@ void MainComponent::showPadWindow()
 
     if (show && (padProcessor == nullptr || ! PadProcessor::padsAvailable()))
     {
-       #if JUCE_ANDROID
+        padButton.setToggleState (padEditorVisible, juce::dontSendNotification);
+
+       #if JUCE_ANDROID || JUCE_IOS
         const auto help = juce::String::fromUTF8 (
             "Pad Cont\xc3\xadnuo n\xc3\xa3o instalado.\n\n"
             "Instale ou repare o pack Pad Cont\xc3\xadnuo em Bibliotecas "
             "e abra esta tela novamente.");
        #else
         const auto help = juce::String::fromUTF8 (
-            "N\xc3\xa3o achei os WAVs de pad. Coloque pad_C.wav ... pad_B.wav "
-            "na pasta 'ChurchDAW Pads' (ou 'Pads' ao lado do app).");
+            "Pad Cont\xc3\xadnuo n\xc3\xa3o instalado.\n\n"
+            "Baixe o pack em Bibliotecas para tocar agora, ou coloque seus "
+            "arquivos WAV na pasta 'ChurchDAW Pads'.");
        #endif
 
-       #if JUCE_ANDROID
         auto options = juce::MessageBoxOptions()
             .withIconType (juce::MessageBoxIconType::InfoIcon)
             .withTitle (juce::String::fromUTF8 ("Pad Cont\xc3\xadnuo"))
@@ -9347,35 +21720,44 @@ void MainComponent::showPadWindow()
                     if (auto* self = safe.getComponent())
                         self->showLibraries();
             });
-       #else
-        juce::AlertWindow::showMessageBoxAsync (
-            juce::MessageBoxIconType::InfoIcon,
-            juce::String::fromUTF8 ("Pad Cont\xc3\xadnuo"), help);
-       #endif
         return;
     }
 
     padPanel->setVisible (show);
-    padButton.setToggleState (show, juce::dontSendNotification);   // botao acende so com o painel aberto
+    padButton.setToggleState (padEditorVisible || show,
+                              juce::dontSendNotification);
 
     if (show)
     {
         padPanel->refreshState();
-        padPanel->toFront (true);
         resized();
+        padPanel->toFront (true);
+        if (quickMidiMappingMode)
+            midiLearnPanel.toFront (false);
+        juce::Logger::writeToLog ("PAD_CONTINUO: painel aberto");
     }
 }
 
 //==============================================================================
 bool MainComponent::saveChainState()
 {
+    if (safeMode)
+    {
+        juce::Logger::writeToLog (
+            "SAFE_MODE: cadeia salva preservada; nenhuma sobrescrita permitida");
+        return true;
+    }
+
     int slotsQueNaoSalvaram = 0;
     pluginsQueNaoSalvaram.clear();
 
     juce::XmlElement chain ("CHAIN");
-    chain.setAttribute ("inputEnabled", inputToggle.getToggleState());
+    chain.setAttribute (
+        "inputEnabled",
+        audioInputAuthorised.load (std::memory_order_acquire));
     chain.setAttribute ("masterDb", masterSlider.getValue());
     chain.setAttribute ("masterAutoEq", masterProcessor->getAutoEq());
+    chain.setAttribute ("masterPunchSchema", 1);
     chain.setAttribute ("masterPunch", masterProcessor->getPunch());
 
     if (padProcessor != nullptr)
@@ -9385,6 +21767,14 @@ bool MainComponent::saveChainState()
 
         if (! padState.isEmpty())
             chain.setAttribute ("padState", padState.toBase64Encoding());
+    }
+
+    if (padSynthProcessor != nullptr)
+    {
+        juce::MemoryBlock synthState;
+        padSynthProcessor->getStateInformation (synthState);
+        if (! synthState.isEmpty())
+            chain.setAttribute ("padSynthState", synthState.toBase64Encoding());
     }
 
     for (int i = 0; i < numSlots; ++i)
@@ -9401,15 +21791,16 @@ bool MainComponent::saveChainState()
                 auto* processor = node->getProcessor();
                 auto* live = dynamic_cast<TimbresProcessor*> (processor);
                 const bool wasSuspended = processor->isSuspended();
+                const bool shouldSuspendProcessor =
+                    live == nullptr || live->requiresSuspensionForStateCapture();
                 bool captured = false;
 
-                // Plugins de terceiros podem tocar seu estado interno no mesmo
-                // instante em que processBlock o usa. Salvar sem parar o
-                // callback produzia estados corrompidos e, em alguns VST/AU,
-                // crash depois de alguns minutos. A pausa e curta e o lock so
-                // cobre a chamada do plugin; Base64/XML ficam fora da thread
-                // critica.
-                processor->suspendProcessing (true);
+                // Plugins de terceiros e o estado XML do Church Organ exigem
+                // suspensao breve. Ja um setup puramente nativo de samples/SF2
+                // (caso padrao do Android/iPhone) le apenas atomics e strings sob
+                // layerIdentityLock, sem jamais emudecer o som durante o autosave.
+                if (shouldSuspendProcessor)
+                    processor->suspendProcessing (true);
 
                 try
                 {
@@ -9437,7 +21828,8 @@ bool MainComponent::saveChainState()
                         (void) live->consumeLastStateCaptureHadFailure();
                 }
 
-                processor->suspendProcessing (wasSuspended);
+                if (shouldSuspendProcessor)
+                    processor->suspendProcessing (wasSuspended);
 
                 if (captured)
                 {
@@ -9507,7 +21899,12 @@ void MainComponent::restoreChainState()
         return;
     }
 
-    inputToggle.setToggleState (xml->getBoolAttribute ("inputEnabled"), juce::dontSendNotification);
+    const bool restoredInputAuthorisation =
+        xml->getBoolAttribute ("inputEnabled", false);
+    audioInputAuthorised.store (restoredInputAuthorisation,
+                                std::memory_order_release);
+    inputToggle.setToggleState (restoredInputAuthorisation,
+                                juce::dontSendNotification);
 
     // Estado com master em -infinito e ARTEFATO, nao intencao: o fade da
     // licenca (beginLicenseFadeOut) derrubava o master para -60 e o
@@ -9527,7 +21924,11 @@ void MainComponent::restoreChainState()
     masterSlider.setValue (masterDb, juce::dontSendNotification);
     masterProcessor->setMasterDb (masterDb);
     masterProcessor->setAutoEq (xml->getBoolAttribute ("masterAutoEq", false));
-    masterProcessor->setPunch (xml->getBoolAttribute ("masterPunch", true));
+    // Builds antigos gravavam Punch=true por ser o default, mesmo sem escolha
+    // do usuario. Somente a nova schema representa uma escolha confiavel.
+    masterProcessor->setPunch (
+        xml->getIntAttribute ("masterPunchSchema", 0) >= 1
+        && xml->getBoolAttribute ("masterPunch", false));
 
     if (padProcessor != nullptr && xml->hasAttribute ("padState"))
     {
@@ -9539,6 +21940,24 @@ void MainComponent::restoreChainState()
                                                 (int) padState.getSize());
     }
 
+    if (padSynthProcessor != nullptr && xml->hasAttribute ("padSynthState"))
+    {
+        juce::MemoryBlock synthState;
+        if (synthState.fromBase64Encoding (
+                xml->getStringAttribute ("padSynthState"))
+             && ! synthState.isEmpty())
+            padSynthProcessor->setStateInformation (
+                synthState.getData(), (int) synthState.getSize());
+    }
+
+    // Estados de versoes anteriores podem trazer o engine ligado. O editor de
+    // samples nao usa este motor; mantenha-o explicitamente silencioso depois
+    // de qualquer restauracao local.
+    if (padSynthProcessor != nullptr)
+        padSynthProcessor->setEngineEnabled (false);
+
+    bool slotZeroWasRequested = false;
+
     for (auto* slotXml : xml->getChildIterator())
     {
         const int i = slotXml->getIntAttribute ("index", -1);
@@ -9546,6 +21965,9 @@ void MainComponent::restoreChainState()
 
         if (i < 0 || i >= numSlots || id.isEmpty())
             continue;
+
+        if (i == 0)
+            slotZeroWasRequested = true;
 
         int internalLib = -1;
 
@@ -9565,8 +21987,8 @@ void MainComponent::restoreChainState()
 
         if (auto desc = knownPlugins.getTypeForIdentifierString (id);
             desc != nullptr
-            && ! knownPlugins.isBlacklisted (
-                desc->fileOrIdentifier, true)
+            && ! ChurchDAWPluginScan::estaNaBlacklist (
+                knownPlugins, desc->fileOrIdentifier, true)
             && ! pluginScanQuarantine.contains (
                 desc->fileOrIdentifier, true))
         {
@@ -9583,5 +22005,23 @@ void MainComponent::restoreChainState()
             slots[i].pendingIdentifier = id;
             slots[i].pendingState = slotXml->getStringAttribute ("state");
         }
+    }
+
+    // Um CHAIN valido, mas com o slot de instrumento vazio, pode surgir apos
+    // migracao, queda durante autosave ou uma versao antiga que gravava a
+    // cadeia antes do Church Live terminar de subir. A interface principal da
+    // ChurchDAW e a mesa: reabrir numa cadeia generica vazia contradiz o fluxo
+    // "pronto para tocar" e ainda impede a cena ativa de ser reconciliada.
+    // Plugins realmente ausentes continuam preservados acima como pending; o
+    // fallback vale apenas para um slot 0 explicitamente vazio.
+    if (! slotZeroWasRequested)
+    {
+        juce::Logger::writeToLog (
+            "SETUP: slot de instrumento vazio; restaurando Church Live nativo");
+        slots[0].pluginIdentifier = timbresIdentifiers[0];
+        loadInternalTimbres (0, nullptr, 0);
+
+        if (auto* live = getChurchLive())
+            live->requestShowroomPreset();
     }
 }

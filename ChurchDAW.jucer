@@ -14,13 +14,18 @@
      arm64-v8a, que e o que todo celular atual usa. Nao copie de la. -->
 
 <JUCERPROJECT id="ChDW01" name="ChurchDAW" projectType="guiapp"
-              version="1.5.9" bundleIdentifier="com.churchdaw.app"
+               version="1.6.35" bundleIdentifier="com.churchdaw.app"
               companyName="ChurchDAW" companyCopyright="ChurchDAW"
               useAppConfig="0" addUsingNamespaceToJuceHeader="0"
               jucerFormatVersion="1"
-              defines="CHURCHDAW_HOSTS_PLUGINS=0&#10;JUCE_PLUGINHOST_VST3=0&#10;JUCE_PLUGINHOST_AU=0&#10;JUCE_WEB_BROWSER=0&#10;JUCE_USE_CURL=0&#10;JUCE_PUSH_NOTIFICATIONS=0&#10;JUCE_USE_ANDROID_OBOE=1&#10;JUCE_USE_ANDROID_OBOE_STABILIZED_CALLBACK=0">
+              cppLanguageStandard="17"
+              defines="CHURCHDAW_HOSTS_PLUGINS=0&#10;JUCE_PLUGINHOST_VST3=0&#10;JUCE_PLUGINHOST_AU=0&#10;JUCE_WEB_BROWSER=0&#10;JUCE_USE_CURL=0&#10;JUCE_PUSH_NOTIFICATIONS=0&#10;JUCE_USE_ANDROID_OBOE=1&#10;JUCE_USE_ANDROID_OBOE_STABILIZED_CALLBACK=0&#10;JUCE_USE_CAMERA=1&#10;JUCE_CONTENT_SHARING=1">
   <MAINGROUP id="ChDWmg" name="ChurchDAW">
     <GROUP id="ChDWsrc" name="Source">
+      <FILE id="srcSfn" name="SoundFontEngine.cpp" compile="1" resource="0" file="Source/SoundFontEngine.cpp"/>
+      <FILE id="srcSbr" name="SabrinaProcessor.cpp" compile="1" resource="0" file="Source/Plugins/Sabrina/SabrinaProcessor.cpp"/>
+      <FILE id="camAnd" name="StudioCamera_android.cpp" compile="1" resource="0" file="Source/Studio/StudioCamera_android.cpp"/>
+      <FILE id="movAnd" name="StudioMovieWriter_android.cpp" compile="1" resource="0" file="Source/Studio/StudioMovieWriter_android.cpp"/>
       <FILE id="srcMai" name="Main.cpp"             compile="1" resource="0" file="Source/Main.cpp"/>
       <FILE id="srcMcp" name="MainComponent.cpp"    compile="1" resource="0" file="Source/MainComponent.cpp"/>
       <FILE id="srcMch" name="MainComponent.h"      compile="0" resource="0" file="Source/MainComponent.h"/>
@@ -111,10 +116,21 @@
       </GROUP>
     </GROUP>
     <GROUP id="ChDWast" name="Assets">
+      <FILE id="camA00" name="premium_bells.png" compile="0" resource="1" file="Assets/Premium/premium_bells.png"/>
+      <FILE id="camA01" name="premium_bigsky.png" compile="0" resource="1" file="Assets/Premium/premium_bigsky.png"/>
+      <FILE id="camA02" name="premium_electric_piano.png" compile="0" resource="1" file="Assets/Premium/premium_electric_piano.png"/>
+      <FILE id="camA03" name="premium_grand_piano.png" compile="0" resource="1" file="Assets/Premium/premium_grand_piano.png"/>
+      <FILE id="camA04" name="premium_graphite.png" compile="0" resource="1" file="Assets/Premium/premium_graphite.png"/>
+      <FILE id="camA05" name="premium_pianoteq.png" compile="0" resource="1" file="Assets/Premium/premium_pianoteq.png"/>
+      <FILE id="camA06" name="premium_strings.png" compile="0" resource="1" file="Assets/Premium/premium_strings.png"/>
+      <FILE id="camA07" name="premium_synth.png" compile="0" resource="1" file="Assets/Premium/premium_synth.png"/>
+      <FILE id="camA08" name="premium_tonewheel_organ.png" compile="0" resource="1" file="Assets/Premium/premium_tonewheel_organ.png"/>
+      <FILE id="camA09" name="concert_grand.mesh" compile="0" resource="1" file="Assets/3D/concert_grand.mesh"/>
       <FILE id="astIco" name="icon.png"           compile="0" resource="1" file="Assets/icon.png"/>
       <FILE id="astAnd" name="icon-android.png"   compile="0" resource="1" file="Assets/icon-android.png"/>
       <FILE id="astAui" name="app-icon-512.png"   compile="0" resource="1" file="Packaging/PlayStore/app-icon-512.png"/>
       <FILE id="astLgo" name="logo_round.png"     compile="0" resource="1" file="Assets/logo_round.png"/>
+      <FILE id="astSdb" name="churchdaw_sidebar_texture.png" compile="0" resource="1" file="Assets/churchdaw_sidebar_texture.png"/>
       <FILE id="astGpi" name="glyph_piano.png"    compile="0" resource="1" file="Assets/glyph_piano.png"/>
       <FILE id="astGpa" name="glyph_pad.png"      compile="0" resource="1" file="Assets/glyph_pad.png"/>
       <FILE id="astGor" name="glyph_organ.png"    compile="0" resource="1" file="Assets/glyph_organ.png"/>
@@ -131,27 +147,30 @@
     <ANDROIDSTUDIO targetFolder="Builds/Android"
                    androidActivitySubClassName="com.churchdaw.app.ChurchDAWActivity"
                    androidAdditionalJavaFolders="Source/AndroidJava&#10;JUCE/modules/juce_gui_basics/native/javaopt/app"
-                   androidCpp11="1"
+                   androidCppStandard="17"
                    androidMinimumSDK="24"
                    androidTargetSDK="36"
-                   androidVersionCode="14"
+                   androidVersionCode="10642"
                    androidInternetNeeded="1"
+                   cameraPermissionNeeded="1"
+                   androidEnableContentSharing="1"
+                   microphonePermissionNeeded="1"
                    androidReadMediaAudioPermission="1"
                    androidReadMediaImagesPermission="0"
                    androidReadMediaVideoPermission="0"
                    androidExternalWriteNeeded="0"
                    androidPushNotifications="0"
-                   androidScreenOrientation="unspecified"
+                   androidScreenOrientation="landscape"
                    androidTheme="@android:style/Theme.Black.NoTitleBar.Fullscreen"
                    bigIcon="astAnd"
                    smallIcon="astAnd"
                    androidDependencies=""
-                   androidCustomAppBuildGradleContent="&#10;    // A distribuicao e feita pelo churchdaw.com. A chave de release fica fora&#10;    // do projeto; sem as credenciais o Gradle nunca assina um APK de producao.&#10;    def churchStore = System.getenv(&quot;CHURCHDAW_UPLOAD_STORE_FILE&quot;)&#10;    def churchStorePass = System.getenv(&quot;CHURCHDAW_UPLOAD_STORE_PASSWORD&quot;)&#10;    def churchKeyAlias = System.getenv(&quot;CHURCHDAW_UPLOAD_KEY_ALIAS&quot;)&#10;    def churchKeyPass = System.getenv(&quot;CHURCHDAW_UPLOAD_KEY_PASSWORD&quot;)&#10;    if (churchStore &amp;&amp; churchStorePass &amp;&amp; churchKeyAlias &amp;&amp; churchKeyPass) {&#10;        signingConfigs.create(&quot;churchDawWebRelease&quot;) {&#10;            storeFile(file(churchStore))&#10;            storePassword(churchStorePass)&#10;            keyAlias(churchKeyAlias)&#10;            keyPassword(churchKeyPass)&#10;            storeType(&quot;jks&quot;)&#10;        }&#10;        buildTypes.release.signingConfig = signingConfigs.churchDawWebRelease&#10;    } else {&#10;        buildTypes.release.signingConfig = null&#10;    }&#10;"
+                   androidCustomAppBuildGradleContent="&#10;    // Isolated emulator key; release signing remains controlled below.&#10;    def qaStore = System.getenv(&quot;CHURCHDAW_ANDROID_QA_STORE&quot;)&#10;    if (qaStore) {&#10;        signingConfigs.create(&quot;churchDawDebug&quot;) {&#10;            storeFile(file(qaStore))&#10;            storePassword(&quot;android&quot;)&#10;            keyAlias(&quot;androiddebugkey&quot;)&#10;            keyPassword(&quot;android&quot;)&#10;        }&#10;        buildTypes.debug.signingConfig = signingConfigs.churchDawDebug&#10;    }&#10;    sourceSets.debug.java.srcDirs += [&quot;../../../Tests/AndroidChurchCam/java&quot;]&#10;    // A distribuicao e feita pelo churchdaw.com. A chave de release fica fora&#10;    // do projeto; sem as credenciais o Gradle nunca assina um APK de producao.&#10;    def churchStore = System.getenv(&quot;CHURCHDAW_UPLOAD_STORE_FILE&quot;)&#10;    def churchStorePass = System.getenv(&quot;CHURCHDAW_UPLOAD_STORE_PASSWORD&quot;)&#10;    def churchKeyAlias = System.getenv(&quot;CHURCHDAW_UPLOAD_KEY_ALIAS&quot;)&#10;    def churchKeyPass = System.getenv(&quot;CHURCHDAW_UPLOAD_KEY_PASSWORD&quot;)&#10;    if (churchStore &amp;&amp; churchStorePass &amp;&amp; churchKeyAlias &amp;&amp; churchKeyPass) {&#10;        signingConfigs.create(&quot;churchDawWebRelease&quot;) {&#10;            storeFile(file(churchStore))&#10;            storePassword(churchStorePass)&#10;            keyAlias(churchKeyAlias)&#10;            keyPassword(churchKeyPass)&#10;            storeType(&quot;jks&quot;)&#10;        }&#10;        buildTypes.release.signingConfig = signingConfigs.churchDawWebRelease&#10;    } else {&#10;        buildTypes.release.signingConfig = null&#10;    }&#10;"
                    extraCompilerFlags="-funroll-loops"
-                   androidManifestCustomXmlElements="&#10;&lt;manifest&gt;&#10;  &lt;!-- SEM ESTA LINHA O TECLADO NAO TOCA. O Android so entrega dispositivos&#10;       MIDI a um app que declara a feature; sem ela o MidiManager devolve&#10;       lista VAZIA, sem erro nenhum -- o app abre, o timbre carrega, e apertar&#10;       a tecla nao faz nada. Foi exatamente o sintoma no aparelho. --&gt;&#10;  &lt;uses-feature android:name=&quot;android.software.midi&quot; android:required=&quot;true&quot; /&gt;&#10;  &lt;uses-feature android:name=&quot;android.hardware.usb.host&quot; android:required=&quot;false&quot; /&gt;&#10;  &lt;!-- INTERNET faz o JUCE declarar multicast; torne Wi-Fi opcional para nao&#10;       excluir tablets Android com outra conectividade na Play Store. --&gt;&#10;  &lt;uses-feature android:name=&quot;android.hardware.wifi&quot; android:required=&quot;false&quot; /&gt;&#10;  &lt;!-- Libraries pode ocupar dezenas de GB e nunca deve entrar em Auto Backup.&#10;       O icone adaptativo e a fonte oficial do launcher; o roundIcon usa a mesma&#10;       arte para respeitar a mascara escolhida pelo fabricante. --&gt;&#10;  &lt;application android:allowBackup=&quot;false&quot; android:fullBackupContent=&quot;false&quot;&#10;               android:icon=&quot;@mipmap/ic_launcher&quot;&#10;               android:roundIcon=&quot;@mipmap/ic_launcher&quot; /&gt;&#10;  &lt;!-- MIDI Bluetooth LE: sem CONNECT/SCAN (API 31+) o MidiManager nao lista teclados BLE. --&gt;&#10;  &lt;uses-permission android:name=&quot;android.permission.BLUETOOTH&quot; android:maxSdkVersion=&quot;30&quot; /&gt;&#10;  &lt;uses-permission android:name=&quot;android.permission.BLUETOOTH_ADMIN&quot; android:maxSdkVersion=&quot;30&quot; /&gt;&#10;  &lt;uses-permission android:name=&quot;android.permission.BLUETOOTH_CONNECT&quot; /&gt;&#10;  &lt;uses-permission android:name=&quot;android.permission.BLUETOOTH_SCAN&quot; android:usesPermissionFlags=&quot;neverForLocation&quot; /&gt;&#10;  &lt;uses-feature android:name=&quot;android.hardware.bluetooth_le&quot; android:required=&quot;false&quot; /&gt;&#10;&lt;/manifest&gt;&#10;">
+                   androidManifestCustomXmlElements="&#10;&lt;manifest&gt;&#10;  &lt;uses-feature android:name=&quot;android.hardware.camera&quot; android:required=&quot;false&quot; /&gt;&#10;  &lt;uses-feature android:name=&quot;android.hardware.camera.autofocus&quot; android:required=&quot;false&quot; /&gt;&#10;  &lt;uses-feature android:name=&quot;android.hardware.microphone&quot; android:required=&quot;false&quot; /&gt;&#10;  &lt;!-- SEM ESTA LINHA O TECLADO NAO TOCA. O Android so entrega dispositivos&#10;       MIDI a um app que declara a feature; sem ela o MidiManager devolve&#10;       lista VAZIA, sem erro nenhum -- o app abre, o timbre carrega, e apertar&#10;       a tecla nao faz nada. Foi exatamente o sintoma no aparelho. --&gt;&#10;  &lt;uses-feature android:name=&quot;android.software.midi&quot; android:required=&quot;true&quot; /&gt;&#10;  &lt;uses-feature android:name=&quot;android.hardware.usb.host&quot; android:required=&quot;false&quot; /&gt;&#10;  &lt;!-- INTERNET faz o JUCE declarar multicast; torne Wi-Fi opcional para nao&#10;       excluir tablets Android com outra conectividade na Play Store. --&gt;&#10;  &lt;uses-feature android:name=&quot;android.hardware.wifi&quot; android:required=&quot;false&quot; /&gt;&#10;  &lt;!-- Libraries pode ocupar dezenas de GB e nunca deve entrar em Auto Backup.&#10;       O icone adaptativo e a fonte oficial do launcher; o roundIcon usa a mesma&#10;       arte para respeitar a mascara escolhida pelo fabricante. --&gt;&#10;  &lt;application android:allowBackup=&quot;false&quot; android:fullBackupContent=&quot;false&quot;&#10;               android:largeHeap=&quot;true&quot;&#10;               android:icon=&quot;@mipmap/ic_launcher&quot;&#10;               android:roundIcon=&quot;@mipmap/ic_launcher&quot; /&gt;&#10;  &lt;!-- MIDI Bluetooth LE: sem CONNECT/SCAN (API 31+) o MidiManager nao lista teclados BLE. --&gt;&#10;  &lt;uses-permission android:name=&quot;android.permission.BLUETOOTH&quot; android:maxSdkVersion=&quot;30&quot; /&gt;&#10;  &lt;uses-permission android:name=&quot;android.permission.BLUETOOTH_ADMIN&quot; android:maxSdkVersion=&quot;30&quot; /&gt;&#10;  &lt;uses-permission android:name=&quot;android.permission.BLUETOOTH_CONNECT&quot; /&gt;&#10;  &lt;uses-permission android:name=&quot;android.permission.BLUETOOTH_SCAN&quot; android:usesPermissionFlags=&quot;neverForLocation&quot; /&gt;&#10;  &lt;uses-feature android:name=&quot;android.hardware.bluetooth_le&quot; android:required=&quot;false&quot; /&gt;&#10;&lt;/manifest&gt;&#10;">
       <CONFIGURATIONS>
-        <CONFIGURATION name="Debug"   isDebug="1" targetName="ChurchDAW"
-                       androidArchitectures="arm64-v8a"
+        <CONFIGURATION name="Debug"   isDebug="1" optimisation="4" targetName="ChurchDAW"
+                       androidArchitectures="arm64-v8a x86_64"
                        androidAdditionalDrawableResources="Packaging/AndroidResources/drawable-xxhdpi"/>
         <CONFIGURATION name="Release" isDebug="0" optimisation="5" targetName="ChurchDAW"
                        androidArchitectures="arm64-v8a"
@@ -172,6 +191,7 @@
         <MODULEPATH id="juce_audio_processors_headless" path="JUCE/modules"/>
         <MODULEPATH id="juce_audio_utils"               path="JUCE/modules"/>
         <MODULEPATH id="juce_dsp"                       path="JUCE/modules"/>
+        <MODULEPATH id="juce_video" path="JUCE/modules"/>
         <MODULEPATH id="juce_opengl"                    path="JUCE/modules"/>
       </MODULEPATHS>
     </ANDROIDSTUDIO>
@@ -191,9 +211,10 @@
     <MODULE id="juce_graphics"                  showAllCode="1" useLocalCopy="0"/>
     <MODULE id="juce_gui_basics"                showAllCode="1" useLocalCopy="0"/>
     <MODULE id="juce_gui_extra"                 showAllCode="1" useLocalCopy="0"/>
+    <MODULE id="juce_video" showAllCode="1" useLocalCopy="0"/>
     <MODULE id="juce_opengl"                    showAllCode="1" useLocalCopy="0"/>
   </MODULES>
-  <JUCEOPTIONS JUCE_WEB_BROWSER="0"
+  <JUCEOPTIONS JUCE_USE_CAMERA="1" JUCE_CONTENT_SHARING="1" JUCE_WEB_BROWSER="0"
                JUCE_USE_CURL="0"
                JUCE_PUSH_NOTIFICATIONS="0"
                JUCE_PLUGINHOST_VST3="0"

@@ -1,9 +1,9 @@
 {
-  "schema_version": 1,
-  "package_id": "com.churchdaw.app",
-  "latest_version_code": 13,
-  "minimum_version_code": 9,
-  "latest_version_name": "1.5.7",
-  "update_message": "ChurchDAW 1.5.7 traz Modo Palco premium, cenas independentes, atualizacao opcional segura e audio USB mais confiavel no Android.",
-  "play_store_url": "https://churchdaw.com/app/android/ChurchDAW-1.5.7-signed.apk"
+    "schema_version":  1,
+    "package_id":  "com.churchdaw.app",
+    "latest_version_code":  10626,
+    "minimum_version_code":  10623,
+    "latest_version_name":  "1.6.27",
+    "update_message":  "Atualize para a versao 1.6.27: seus mapeamentos MIDI de teclado e plugins agora ficam gravados com protecao total e nunca mais se perdem.",
+    "play_store_url":  "https://churchdaw.com/app/android/ChurchDAW-1.6.27-signed.apk"
 }

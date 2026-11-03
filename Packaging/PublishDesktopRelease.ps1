@@ -65,6 +65,13 @@ param(
     [Parameter(Mandatory = $true)]
     [string] $PrivateKey,
 
+    [ValidateSet('churchdaw-update-2026-01', 'churchdaw-update-2026-08')]
+    [string] $UpdatePolicyKeyId = 'churchdaw-update-2026-08',
+
+    [string] $PolicyPublicKey = '',
+
+    [string] $PreviousPolicyPublicKey = '',
+
     [Parameter(Mandatory = $true)]
     [string] $ExpectedWindowsPublisher,
 
@@ -126,12 +133,22 @@ Set-StrictMode -Version 3.0
 . (Join-Path $PSScriptRoot 'WindowsRelease.Common.ps1')
 
 $openssl = 'C:\Program Files\Git\usr\bin\openssl.exe'
-$publicKey = Join-Path $PSScriptRoot 'AndroidUpdatePolicyPublicKey.pem'
+$publicKey = if ([string]::IsNullOrWhiteSpace($PolicyPublicKey)) {
+    Join-Path $PSScriptRoot 'AndroidUpdatePolicyPublicKey.pem'
+} else {
+    $PolicyPublicKey
+}
+$previousPolicyPublicKeyPath = if (
+    [string]::IsNullOrWhiteSpace($PreviousPolicyPublicKey)) {
+    Join-Path $PSScriptRoot 'AndroidUpdatePolicyPublicKey-2026-01.pem'
+} else {
+    $PreviousPolicyPublicKey
+}
 $policyScript = Join-Path $PSScriptRoot 'SignDesktopUpdatePolicy.ps1'
 $utf8 = [Text.UTF8Encoding]::new($false, $true)
 $writeUtf8 = [Text.UTF8Encoding]::new($false)
 $productId = 'com.churchdaw.app'
-$policyKeyId = 'churchdaw-update-2026-01'
+$policyKeyId = $UpdatePolicyKeyId
 $policyAlgorithm = 'SHA256withRSA'
 $auditEvents = [Collections.Generic.List[object]]::new()
 $uploadedVersioned = [Collections.Generic.List[string]]::new()
@@ -785,11 +802,27 @@ function Read-VerifiedPolicy {
     if (($names -join ',') -cne ($expectedNames -join ',')) {
         throw "$Label tem campos de envelope inesperados"
     }
+    $envelopeKeyId = [string] (Get-RequiredProperty $envelope 'key_id')
     if ((Get-RequiredProperty $envelope 'schema_version') -ne 1 -or
         [string] (Get-RequiredProperty $envelope 'algorithm') -cne
             $policyAlgorithm -or
-        [string] (Get-RequiredProperty $envelope 'key_id') -cne $policyKeyId) {
+        -not @(
+            'churchdaw-update-2026-01',
+            'churchdaw-update-2026-08'
+        ).Contains($envelopeKeyId)) {
         throw "$Label tem metadados de envelope invalidos"
+    }
+    $verificationPublicKey = ''
+    if ($envelopeKeyId -ceq $policyKeyId) {
+        $verificationPublicKey = $publicKey
+    }
+    elseif ($envelopeKeyId -ceq 'churchdaw-update-2026-01' -and
+            $policyKeyId -ceq 'churchdaw-update-2026-08') {
+        $verificationPublicKey = $previousPolicyPublicKeyPath
+    }
+    else {
+        throw ("$Label tenta uma rotacao de chave invalida: " +
+               "$envelopeKeyId -> $policyKeyId")
     }
     try {
         $payloadBytes = [Convert]::FromBase64String(
@@ -809,8 +842,8 @@ function Read-VerifiedPolicy {
     $signaturePath = Join-Path $tempRoot "$id-signature.bin"
     [IO.File]::WriteAllBytes($payloadPath, $payloadBytes)
     [IO.File]::WriteAllBytes($signaturePath, $signatureBytes)
-    & $openssl dgst -sha256 -verify $publicKey -signature $signaturePath `
-        $payloadPath | Out-Null
+    & $openssl dgst -sha256 -verify $verificationPublicKey `
+        -signature $signaturePath $payloadPath | Out-Null
     if ($LASTEXITCODE -ne 0) {
         throw "Assinatura RSA invalida em $Label"
     }
@@ -1003,8 +1036,15 @@ function Write-PromotionManifest {
         $writeUtf8)
 }
 
-foreach ($requiredFile in @($openssl, $publicKey, $policyScript, $PrivateKey,
-                             $NetrcPath, $SiteIndex)) {
+foreach ($requiredFile in @(
+    $openssl,
+    $publicKey,
+    $previousPolicyPublicKeyPath,
+    $policyScript,
+    $PrivateKey,
+    $NetrcPath,
+    $SiteIndex
+)) {
     if (-not (Test-Path -LiteralPath $requiredFile -PathType Leaf)) {
         throw "Arquivo obrigatorio ausente: $requiredFile"
     }
@@ -1290,6 +1330,9 @@ try {
         WindowsVerificationLogPath =
             (Join-Path $auditRoot 'windows-authenticode-policy.log')
         PrivateKey = $PrivateKey
+        PublicKey = $publicKey
+        PreviousPublicKey = $previousPolicyPublicKeyPath
+        KeyId = $policyKeyId
         PreviousPolicy = $policyBackup
         Output = $releasePolicy
     }
@@ -1310,6 +1353,9 @@ try {
         RevokesPolicySerial = $PolicySerial
         AllowRollbackPolicyWithoutInstaller = $true
         PrivateKey = $PrivateKey
+        PublicKey = $publicKey
+        PreviousPublicKey = $previousPolicyPublicKeyPath
+        KeyId = $policyKeyId
         PreviousPolicy = $releasePolicy
         Output = $rollbackPolicy
     }

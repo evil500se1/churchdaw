@@ -51,12 +51,15 @@ final class WebSessionService
             || !$passwordValid) {
             throw new ApiException(401, 'INVALID_CREDENTIALS', 'E-mail ou senha invalidos.');
         }
+        // O cliente pode entrar assim que a senha estiver correta. A antiga
+        // confirmacao de e-mail nao e mais uma etapa obrigatoria da compra.
         if ($user['email_verified_at'] === null) {
-            throw new ApiException(
-                403,
-                'EMAIL_NOT_VERIFIED',
-                'Confirme seu e-mail antes de entrar.'
-            );
+            $this->database->pdo()->prepare(
+                'UPDATE users
+                 SET email_verified_at = CURRENT_TIMESTAMP(6)
+                 WHERE id = :id AND email_verified_at IS NULL'
+            )->execute(['id' => $user['id']]);
+            $user['email_verified_at'] = gmdate('Y-m-d H:i:s.u');
         }
 
         $token = Crypto::randomToken(32);
@@ -135,12 +138,8 @@ final class WebSessionService
         $user = $this->requireUser($request);
         $statement = $this->database->pdo()->prepare(
             "SELECT l.id, l.product_code, l.status, l.issued_at,
-                    d.label AS device_label, d.platform, d.last_seen_at,
-                    a.activated_at
+                    l.activation_policy, l.max_active_devices
              FROM licenses l
-             LEFT JOIN activations a
-               ON a.license_id = l.id AND a.active_slot = 1
-             LEFT JOIN devices d ON d.id = a.device_id
              WHERE l.user_id = :user_id
              ORDER BY l.issued_at DESC LIMIT 1"
         );
@@ -149,6 +148,18 @@ final class WebSessionService
 
         $transfersUsed = 0;
         if (is_array($license)) {
+            $devices = $this->database->pdo()->prepare(
+                "SELECT d.id AS device_id, d.label AS device_label,
+                        d.platform, d.last_seen_at, a.activated_at
+                 FROM activations a
+                 JOIN devices d ON d.id = a.device_id
+                 WHERE a.license_id = :license_id AND a.status = 'active'
+                 ORDER BY FIELD(d.platform, 'windows', 'macos', 'android')"
+            );
+            $devices->execute(['license_id' => $license['id']]);
+            $activeDevices = $devices->fetchAll();
+            $license['devices'] = is_array($activeDevices)
+                ? $activeDevices : [];
             $count = $this->database->pdo()->prepare(
                 'SELECT COUNT(*) FROM license_transfers
                  WHERE license_id = :license_id

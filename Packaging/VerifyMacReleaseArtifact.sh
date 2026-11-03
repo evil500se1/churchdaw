@@ -272,6 +272,9 @@ hdiutil attach "$dmg_path" -readonly -nobrowse -mountpoint "$mount_dir" \
     2>&1 | tee "$temp_root/hdiutil-attach.txt"
 mounted_app="$mount_dir/ChurchDAW.app"
 mounted_executable="$mounted_app/Contents/MacOS/ChurchDAW"
+strings "$mounted_executable" \
+    | grep -F 'CHURCHDAW_RELEASE_LICENSE_GATE=DESKTOP_ENABLED' >/dev/null \
+    || fail "gate comercial de licenca ausente do executavel macOS"
 mounted_plist="$mounted_app/Contents/Info.plist"
 [[ -d "$mounted_app" && -x "$mounted_executable" && -s "$mounted_plist" ]] \
     || fail "ChurchDAW.app valido ausente do DMG"
@@ -425,8 +428,11 @@ import sys
 with open(sys.argv[1], "rb") as handle:
     actual = plistlib.load(handle)
 expected = {
+    "com.apple.security.cs.allow-jit": True,
+    "com.apple.security.cs.allow-unsigned-executable-memory": True,
     "com.apple.security.cs.disable-library-validation": True,
     "com.apple.security.device.audio-input": True,
+    "com.apple.security.device.camera": True,
 }
 if actual != expected:
     raise SystemExit(f"entitlements assinados divergentes: {actual!r}")

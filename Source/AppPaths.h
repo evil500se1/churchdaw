@@ -22,6 +22,24 @@
 #endif
 
 //==============================================================================
+// ESTE BINARIO E UM PLUGIN (VST3/AU) EM VEZ DO APLICATIVO?
+//
+// Vale 0 em tudo que existe hoje (MinhaDAW, sondas, Android, iOS). So o alvo
+// ChurchDAWInstrument do CMake define 1. Existe por um motivo unico e concreto:
+// dentro de um plugin, currentExecutableFile NAO e o ChurchDAW -- e o
+// reaper.exe (ou Cubase, ou Live). Toda a resolucao de caminho abaixo que parte
+// do executavel passa a apontar para a pasta do HOST, e a biblioteca de samples
+// "some" sem nenhuma mensagem de erro. E o pior tipo de bug: o app abre, a mesa
+// aparece, e nao ha um unico timbre.
+//
+// A rede de seguranca (o #ifndef) mantem o valor 0 para quem compilar sem o
+// CMake, porque um binario que ERRA para "sou plugin" perde a pasta portatil
+// ao lado do .exe, que e como muita gente roda o ChurchDAW de pendrive.
+#ifndef CHURCHDAW_IS_PLUGIN
+ #define CHURCHDAW_IS_PLUGIN 0
+#endif
+
+//==============================================================================
 // Caminhos da aplicacao, resolvidos por plataforma.
 //
 // A ARMADILHA DO MAC: no Windows o executavel fica solto numa pasta, entao
@@ -69,7 +87,14 @@ struct AppPaths
     // Pasta "onde o aplicativo esta", do ponto de vista do usuario.
     static juce::File appFolder()
     {
-       #if JUCE_ANDROID
+       #if CHURCHDAW_IS_PLUGIN
+        // Num plugin nao existe "pasta do aplicativo": o executavel e o HOST.
+        // Devolver a pasta do reaper.exe faria findLibrary procurar samples
+        // dentro da instalacao do Reaper -- nunca acha nada e nao avisa.
+        // sharedDataFolder() e o lugar onde o instalador do ChurchDAW poe as
+        // bibliotecas, e independe de quem carregou o binario.
+        return sharedDataFolder();
+       #elif JUCE_ANDROID
         // ver nota acima: derivar do "executavel" apontaria para /data/app.
         return managedDataFolder();
        #else
@@ -122,6 +147,12 @@ struct AppPaths
     // Library gravavel do sandbox, nunca na /Library global nem no bundle.
     static juce::File managedDataFolder()
     {
+        const auto qaDataDir = juce::SystemStats::getEnvironmentVariable (
+                                   "CHURCHDAW_QA_DATA_DIR", {})
+                                   .trim();
+        if (qaDataDir.isNotEmpty() && juce::File::isAbsolutePath (qaDataDir))
+            return juce::File (qaDataDir);
+
         return juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory)
                    .getChildFile ("ChurchDAW");
     }

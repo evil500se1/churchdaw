@@ -16,7 +16,8 @@ import java.security.spec.X509EncodedKeySpec;
  * uma atualizacao obrigatoria.
  */
 public final class ChurchDAWSignedPolicyVerifier {
-    public static final String KEY_ID = "churchdaw-update-2026-01";
+    public static final String KEY_ID = "churchdaw-update-2026-08";
+    public static final String KEY_ID_ANTERIOR = "churchdaw-update-2026-01";
     private static final int MAX_PAYLOAD_BYTES = 24 * 1024;
     private static final int RSA_3072_SIGNATURE_BYTES = 384;
     private static final String PUBLIC_KEY_DER_BASE64 =
@@ -30,11 +31,18 @@ public final class ChurchDAWSignedPolicyVerifier {
         + "rgJbRWvM9ZOgMknOl18+Q0F+/XWSjfMWzBzDdggmZY69MfgQXVGkW5X0RrS1o+G"
         + "A3T/949ToRXGhcRzKmXgmiQwPl8b6K2oA4tO2l9w9X/Y7xAgMBAAE=";
 
+    // Chave publicada com a rotacao 2026-08. A chave anterior permanece
+    // acima para que politicas antigas assinadas continuem verificaveis.
+    private static final String PUBLIC_KEY_DER_BASE64_2026_08 =
+        "MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEAv5ZtiPbh+xhdk9POqWX7VQcCKzOcFXfxFLYUnFkClzc3ErmIVbkY4hBsbfHUwKhEiUdbCRTzNiOn7Y6hGX6iuN5FtPPqhcecXPbxWaSyP2x6Ukk2ThKov8Y9i1eo7y7zltVOlHVcDp8kqsQNobWUS93gONE33xha0uriF6Mhge5EHXGbEfBLSDLYojm46dqwDrQpE7VPfV1hPETTWBlU3oLqs1mAhkD5tAXEVPOfmkVR35ZxPyycdvUp62x2TwNY/sflHcDls0Jtg/SrH91sUJtUkY6wnWzK7RXlLCJyQ5aC1oPBICZSVb0n07xDj1Use3Rr7hQAi91cDL2GKQN1X3MJ7Go9NgENvPB19kSZDDQt62WRMF1fQNDVWtxDc0kMy6qVWwTv/jCc9X+YMyQ/M9ebkkYSjdgpioVms1jfBN/vMHn+qLalo1zL2EHjOS+JncHZhEbvxYsOAmRdvKZpxWntvdPCqvvlJg+r6+JuluYf3p29+vp7jKCbW2TeXjD3AgMBAAE=";
+
     private ChurchDAWSignedPolicyVerifier() {}
 
     public static boolean verify(
             String payloadBase64, String signatureBase64, String keyId) {
-        if (!KEY_ID.equals(keyId)
+        final boolean isCurrentKey = KEY_ID.equals(keyId);
+        final boolean isPreviousKey = KEY_ID_ANTERIOR.equals(keyId);
+        if ((!isCurrentKey && !isPreviousKey)
                 || payloadBase64 == null
                 || signatureBase64 == null
                 || payloadBase64.length() > MAX_PAYLOAD_BYTES * 2
@@ -61,8 +69,11 @@ public final class ChurchDAWSignedPolicyVerifier {
                 return false;
             }
 
+            final String publicKeyBase64 = isCurrentKey
+                ? PUBLIC_KEY_DER_BASE64_2026_08
+                : PUBLIC_KEY_DER_BASE64;
             final byte[] publicKeyBytes =
-                Base64.decode(PUBLIC_KEY_DER_BASE64, Base64.NO_WRAP);
+                Base64.decode(publicKeyBase64, Base64.NO_WRAP);
             final PublicKey publicKey = KeyFactory.getInstance("RSA")
                 .generatePublic(new X509EncodedKeySpec(publicKeyBytes));
             final Signature verifier = Signature.getInstance("SHA256withRSA");

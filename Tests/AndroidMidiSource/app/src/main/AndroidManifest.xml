@@ -26,6 +26,7 @@
             android:exported="true">
             <intent-filter>
                 <action android:name="com.churchdaw.miditest.SEND_CC" />
+                <action android:name="com.churchdaw.miditest.EMIT_CHORDS" />
             </intent-filter>
         </receiver>
     </application>

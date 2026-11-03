@@ -150,10 +150,10 @@ namespace churchorgan
         // presets. O crossfade continua sendo processado enquanto o wet ainda
         // está descendo; depois disso o caminho fica realmente transparente e
         // sem custo de 18 taps por sample.
-        if (parameters_.mode == ScannerMode::bypass
-             && std::abs (wetMix_.current()) < 0.000001f
-             && std::abs (wetMix_.target()) < 0.000001f)
-            return;
+        const auto stableBypass =
+            parameters_.mode == ScannerMode::bypass
+            && std::abs (wetMix_.current()) < 0.000001f
+            && std::abs (wetMix_.target()) < 0.000001f;
 
         const auto stereo = right != nullptr && right != left;
         const auto sampleRate = static_cast<float> (spec_.sampleRate);
@@ -206,35 +206,38 @@ namespace churchorgan
             const auto age = age_.next();
             const auto outputGain = output_.next();
 
-            auto leftPhase = phase_ - 0.5f * spread;
-            if (leftPhase < 0.0f)
-                leftPhase += 1.0f;
-            auto rightPhase = phase_ + 0.5f * spread;
-            if (rightPhase >= 1.0f)
-                rightPhase -= 1.0f;
-
-            auto wetLeft = scannerSample (
-                leftDelay_, leftPhase, excursion);
-            auto wetRight = scannerSample (
-                rightDelay_, rightPhase, excursion);
-
-            // A very gentle odd-order phase-line colour. It is bounded and
-            // deliberately below obvious "drive" territory.
-            wetLeft -= age * 0.055f * wetLeft * wetLeft * wetLeft;
-            wetRight -= age * 0.055f * wetRight * wetRight * wetRight;
-
-            left[sample] =
-                dsp::finiteOr (
-                    ((1.0f - wet) * dryLeft + wet * wetLeft)
-                        * outputGain,
-                    0.0f);
-            if (stereo)
+            if (! stableBypass)
             {
-                right[sample] =
+                auto leftPhase = phase_ - 0.5f * spread;
+                if (leftPhase < 0.0f)
+                    leftPhase += 1.0f;
+                auto rightPhase = phase_ + 0.5f * spread;
+                if (rightPhase >= 1.0f)
+                    rightPhase -= 1.0f;
+
+                auto wetLeft = scannerSample (
+                    leftDelay_, leftPhase, excursion);
+                auto wetRight = scannerSample (
+                    rightDelay_, rightPhase, excursion);
+
+                // A very gentle odd-order phase-line colour. It is bounded and
+                // deliberately below obvious "drive" territory.
+                wetLeft -= age * 0.055f * wetLeft * wetLeft * wetLeft;
+                wetRight -= age * 0.055f * wetRight * wetRight * wetRight;
+
+                left[sample] =
                     dsp::finiteOr (
-                        ((1.0f - wet) * dryRight + wet * wetRight)
+                        ((1.0f - wet) * dryLeft + wet * wetLeft)
                             * outputGain,
                         0.0f);
+                if (stereo)
+                {
+                    right[sample] =
+                        dsp::finiteOr (
+                            ((1.0f - wet) * dryRight + wet * wetRight)
+                                * outputGain,
+                            0.0f);
+                }
             }
 
             phase_ += rate / sampleRate;

@@ -1003,8 +1003,17 @@ namespace churchorgan
 
     void PipeOrganEngine::buildPipeWaveTables() noexcept
     {
-        normalWaveTables_ = {};
-        brightWaveTables_ = {};
+        // Avoid value-initialising these large aggregates through temporary
+        // objects. On iOS the resulting stack frame exceeds the main-thread
+        // stack before the tables can be built.
+        for (auto& rankTables : normalWaveTables_)
+            for (auto& waveTable : rankTables)
+                waveTable.fill (0.0f);
+
+        for (auto& rankTables : brightWaveTables_)
+            for (auto& waveTable : rankTables)
+                waveTable.fill (0.0f);
+
         constexpr std::size_t sineStride =
             sineTableSize / pipeWaveTableSize;
 

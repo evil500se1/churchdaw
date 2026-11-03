@@ -3,6 +3,7 @@
 #include <juce_audio_processors/juce_audio_processors.h>
 #include "PluginScanDiagnostics.h"
 #include "PluginScanPolicy.h"
+#include "PluginCandidateSearch.h"
 
 #include <condition_variable>
 #include <mutex>
@@ -144,7 +145,8 @@ private:
             if (auto xml = juce::parseXML (request.descriptionXml))
                 hint.loadFromXml (*xml);
 
-            if (format->requiresUnblockedMessageThreadDuringCreation (hint))
+            if (request.phase != ScanPhase::enumeration
+                 && format->requiresUnblockedMessageThreadDuringCreation (hint))
             {
                 requestThread = std::make_unique<RequestThread> (*this, request);
 
@@ -275,6 +277,9 @@ private:
                         : juce::String{});
     }
 
+   #if JUCE_PLUGINHOST_VST3
+    // Todo o inventario por classe e exclusivo do VST3 headless do desktop.
+    // No iOS (so AUv3) estas classes nem existem no JUCE.
     std::unique_ptr<juce::XmlElement> inventoryVST3 (
         const ScanRequest& request, juce::AudioPluginFormat& format)
     {
@@ -362,6 +367,7 @@ private:
             juce::XmlElement::TextFormat().singleLine());
         return validate (validationRequest, format);
     }
+   #endif // JUCE_PLUGINHOST_VST3
 
     std::unique_ptr<juce::XmlElement> discover (
         const ScanRequest& request, juce::AudioPluginFormat& format)
@@ -512,6 +518,32 @@ private:
                     description.name);
                 instance->fillInPluginDescription (validatedDescription);
 
+                const RuntimePluginRoleEvidence roleEvidence {
+                    instance->acceptsMidi(),
+                    instance->getTotalNumInputChannels(),
+                    instance->getTotalNumOutputChannels()
+                };
+                const bool instrumentRoleBeforeNormalisation =
+                    validatedDescription.isInstrument;
+                const bool descriptionWasNormalised =
+                    normalizarPapelDoPluginValidado (
+                        description, validatedDescription, roleEvidence);
+
+                result->setAttribute (
+                    "runtimeAcceptsMidi", roleEvidence.acceptsMidi);
+                result->setAttribute (
+                    "runtimeInputChannels", roleEvidence.inputChannels);
+                result->setAttribute (
+                    "runtimeOutputChannels", roleEvidence.outputChannels);
+                result->setAttribute (
+                    "descriptionNormalised", descriptionWasNormalised);
+                result->setAttribute (
+                    "instrumentRoleNormalised",
+                    instrumentRoleBeforeNormalisation
+                        != validatedDescription.isInstrument);
+                result->setAttribute (
+                    "isInstrument", validatedDescription.isInstrument);
+
                 // Preserve exactly the identity produced during discovery.
                 // On Windows this may be the module inside the .vst3 bundle;
                 // changing it to the bundle root would change JUCE's stable
@@ -598,6 +630,41 @@ private:
         return result;
     }
 
+    std::unique_ptr<juce::XmlElement> enumerate (
+        const ScanRequest& request, juce::AudioPluginFormat& format)
+    {
+        auto result = makeBaseResult (request);
+        const auto pathsXml = juce::parseXML (request.descriptionXml);
+        if (pathsXml == nullptr || ! pathsXml->hasTagName ("SEARCH_PATHS"))
+        {
+            setFailure (*result, "host_internal_error", "enumeration",
+                        "invalid_paths", "Invalid plugin search paths");
+            return result;
+        }
+
+        juce::FileSearchPath paths;
+        for (auto* path : pathsXml->getChildWithTagNameIterator ("PATH"))
+        {
+            const auto value = path->getStringAttribute ("value");
+            if (juce::File::isAbsolutePath (value))
+            {
+                const juce::File folder (value);
+                if (folder.isDirectory()) paths.add (folder);
+            }
+        }
+        paths.removeRedundantPaths();
+
+        juce::PluginHostDiagnostics::ScopedCall search (
+            "enumeration", "AudioPluginFormat::searchPathsForPlugins", true);
+        const auto candidates = format.searchPathsForPlugins (paths, true, true);
+        search.finish (true, candidates.size());
+        auto* items = result->createNewChildElement ("CANDIDATES");
+        for (const auto& id : candidates)
+            items->createNewChildElement ("CANDIDATE")->setAttribute ("id", id);
+        result->setAttribute ("status", "enumerated");
+        return result;
+    }
+
     void executeAndSend (const ScanRequest& request)
     {
         std::unique_ptr<juce::XmlElement> result;
@@ -608,6 +675,10 @@ private:
             {
                 switch (request.phase)
                 {
+                    case ScanPhase::enumeration:
+                        result = enumerate (request, *format);
+                        break;
+
                     case ScanPhase::discovery:
                         result = discover (request, *format);
                         break;
@@ -617,11 +688,17 @@ private:
                         break;
 
                     case ScanPhase::vst3Inventory:
-                        result = inventoryVST3 (request, *format);
-                        break;
-
                     case ScanPhase::vst3ClassValidation:
-                        result = validateVST3Class (request, *format);
+                       #if JUCE_PLUGINHOST_VST3
+                        result = request.phase == ScanPhase::vst3Inventory
+                            ? inventoryVST3 (request, *format)
+                            : validateVST3Class (request, *format);
+                       #else
+                        result = makeBaseResult (request);
+                        setFailure (*result, "host_internal_error", "factory",
+                                    "vst3_unavailable",
+                                    "VST3 nao existe nesta plataforma");
+                       #endif
                         break;
                 }
             }
@@ -819,6 +896,71 @@ private:
 };
 
 //==============================================================================
+inline CandidateSearchResult searchPluginCandidates (
+    const juce::String& formatName, const juce::FileSearchPath& paths,
+    const std::atomic<bool>& cancelled, int timeoutMs = 120000)
+{
+    CandidateSearchResult result;
+    if (cancelled.load()) return result;
+
+    ScanRequest request;
+    request.phase = ScanPhase::enumeration;
+    request.token = makeScanToken();
+    request.format = formatName;
+    request.identifier = "candidate-search";
+    juce::XmlElement pathsXml ("SEARCH_PATHS");
+    for (int i = 0; i < paths.getNumPaths(); ++i)
+        pathsXml.createNewChildElement ("PATH")->setAttribute (
+            "value", paths[i].getFullPathName());
+    request.descriptionXml = pathsXml.toString();
+
+    const auto started = juce::Time::getMillisecondCounterHiRes();
+    ScannerSuperprocess process;
+    if (! process.wasLaunched()
+         || ! process.sendMessageToWorker (serialiseRequest (request)))
+        result.error = "Nao foi possivel iniciar a busca de " + formatName + ".";
+    else
+    {
+        while (! cancelled.load())
+        {
+            if (juce::Time::getMillisecondCounterHiRes() - started >= timeoutMs)
+            {
+                result.error = "A busca de " + formatName
+                             + " excedeu o tempo limite. Tente novamente.";
+                break;
+            }
+            auto response = process.getResponse();
+            if (response.state == ScannerSuperprocess::State::pollTimeout)
+                continue;
+            if (response.state == ScannerSuperprocess::State::connectionLost)
+            {
+                result.error = "O processo de busca de " + formatName + " foi interrompido.";
+                break;
+            }
+            const auto* xml = response.xml.get();
+            if (xml == nullptr || ! xml->hasTagName ("SCAN_RESULT")
+                 || xml->getIntAttribute ("protocol") != protocolVersion
+                 || xml->getStringAttribute ("token") != request.token
+                 || xml->getStringAttribute ("format") != formatName
+                 || xml->getStringAttribute ("phase") != "enumeration"
+                 || xml->getStringAttribute ("status") != "enumerated"
+                 || xml->getChildByName ("CANDIDATES") == nullptr)
+                result.error = "Resposta invalida na busca de " + formatName + ".";
+            else
+                for (auto* item : xml->getChildByName ("CANDIDATES")
+                                      ->getChildWithTagNameIterator ("CANDIDATE"))
+                    result.identifiers.addIfNotAlreadyThere (item->getStringAttribute ("id"));
+            break;
+        }
+    }
+    if (! process.stopAndReap())
+        result.error = "Nao foi possivel encerrar o processo de busca de " + formatName + ".";
+    if (result.error.isNotEmpty() || cancelled.load())
+        result.identifiers.clear();
+    result.identifiers.removeEmptyStrings();
+    return result;
+}
+
 class ChurchDAWPluginScanner final : public juce::KnownPluginList::CustomScanner
 {
 public:
@@ -837,6 +979,14 @@ public:
                              juce::OwnedArray<juce::PluginDescription>& result,
                              const juce::String& fileOrIdentifier) override
     {
+        // The GUI passes its pre-enumerated adapter through KnownPluginList.
+        // Unwrap it before detecting VST3: otherwise the adapter hides the
+        // backend type and one broken shell class aborts discovery of all of
+        // its siblings. Nested snapshots still resolve to the original format.
+        if (auto* prepared = dynamic_cast<PreparedPluginFormat*> (&format))
+            return findPluginTypesFor (prepared->getSourceFormat(), result,
+                                       fileOrIdentifier);
+
         currentFormat = format.getName();
 
         if (ehAudioUnitDeSistema (fileOrIdentifier))
@@ -862,9 +1012,11 @@ public:
             return true;   // incompatibilidade nao e crash do plugin
         }
 
+       #if JUCE_PLUGINHOST_VST3
         if (dynamic_cast<juce::VST3PluginFormatHeadless*> (&format) != nullptr)
             return findVST3PluginTypesFor (
                 format, result, fileOrIdentifier, discoveryEnvironment);
+       #endif
 
         ScanRequest discovery;
         discovery.phase = ScanPhase::discovery;
@@ -1043,6 +1195,7 @@ private:
             && juce::File (descriptionIdentifier).isAChildOf (candidate);
     }
 
+   #if JUCE_PLUGINHOST_VST3
     bool findVST3PluginTypesFor (
         juce::AudioPluginFormat& format,
         juce::OwnedArray<juce::PluginDescription>& result,
@@ -1211,6 +1364,7 @@ private:
 
         return ! deveEntrarNaBlacklistPersistente (summary);
     }
+   #endif // JUCE_PLUGINHOST_VST3
 
     void noteInconclusiveAttempt (const PhaseAttempt& attempt)
     {

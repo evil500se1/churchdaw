@@ -1,8 +1,39 @@
 # Release comercial do ChurchDAW para macOS
 
-O workflow `Release comercial macOS` e o unico fluxo deste repositorio que
-produz um candidato macOS distribuivel. O workflow de CI usa assinatura ad-hoc,
-marca o DMG como `NAO-PARA-DISTRIBUICAO` e nunca deve ser entregue a clientes.
+O workflow `Release comercial macOS` produz o candidato comercial auditado por
+commit e tag. O empacotador local `Packaging/BuildMacRelease.sh` tambem exige
+Developer ID, notarizacao aceita, tickets grampeados e Gatekeeper aprovado no
+app, no DMG e no app montado. Assinatura sozinha nao autoriza distribuicao.
+Os builds de teste do CI e o modo local `-u` marcam o DMG como
+`NAO-PARA-DISTRIBUICAO`; esses arquivos nunca devem ser entregues a clientes.
+
+## Empacotamento local
+
+```sh
+bash Packaging/BuildMacRelease.sh -b build-mac -i IDENTIDADE_DEVELOPER_ID -p churchdaw -o dist-1.6.31
+```
+
+O perfil `churchdaw` precisa existir no Keychain. Para configura-lo, o titular
+pode executar `xcrun notarytool store-credentials churchdaw` no Terminal e
+preencher os prompts interativos. Nao inclua senhas em scripts ou historico.
+
+Uma falha de notarizacao, stapler ou Gatekeeper encerra o script sem produzir
+um DMG de release nem campos de policy. Os logs de notarizacao ficam no
+diretorio de saida. O build original nao e modificado: toda assinatura ocorre
+sobre uma copia temporaria.
+
+O DMG tambem passa pela consulta `spctl --type install` usada pelos clientes
+ate 1.6.30, alem da consulta `open` com `context:primary-signature` da nova
+versao. Isso verifica a compatibilidade com o atualizador ja instalado.
+
+A saida aprovada inclui `ChurchDAW-VERSAO.dmg.verification.json`. Esse laudo
+contem o hash final (apos o stapler), tamanho, versao e os resultados de
+verificacao. `PublishLocalDesktopRelease.ps1` exige esse arquivo por
+`-MacVerificationReport` e compara o hash/tamanho antes de acessar credenciais
+ou enviar qualquer arquivo. Nao reutilize um laudo de outro DMG.
+
+Regressao local, sem acessar Apple/Keychain:
+`python3 Tests/DesktopUpdate/MacReleasePipelineTests.py`.
 
 ## Gatilho e protecao
 

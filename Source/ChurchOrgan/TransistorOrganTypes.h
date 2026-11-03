@@ -8,6 +8,11 @@ namespace churchorgan
     inline constexpr std::size_t transistorTabCount = 8;
     inline constexpr std::size_t transistorMidiNoteCount = 128;
     inline constexpr std::size_t transistorMaximumQueuedEvents = 512;
+    // The integrated Transistor path is followed by ChurchDAW's channel
+    // rotary. Keep the electronic generator vibrato available, but make it
+    // an explicit opt-in so the factory cannot stack two motion stages.
+    inline constexpr bool transistorDefaultVibratoEnabled = false;
+    inline constexpr float transistorDefaultVibratoDepth = 0.55f;
 
     enum class TransistorOrganProfile : std::uint8_t
     {
@@ -68,8 +73,8 @@ namespace churchorgan
         float outputTrim = 0.045f;
         float drive = 0.18f;
         float stereoWidth = 0.22f;
-        float vibratoDepth = 0.55f;
-        bool vibratoEnabled = true;
+        float vibratoDepth = transistorDefaultVibratoDepth;
+        bool vibratoEnabled = transistorDefaultVibratoEnabled;
     };
 
     struct TransistorOrganDiagnostics

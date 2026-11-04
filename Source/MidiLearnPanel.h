@@ -61,12 +61,21 @@ public:
 
     void showChooseTarget()
     {
+       #if CHURCHDAW_MOBILE_SHELL
+        setContent (Stage::chooseTarget,
+                    "PASSO 1",
+                    juce::String::fromUTF8 (
+                        "TOQUE no controle que voc\xc3\xaa quer comandar"),
+                    juce::String::fromUTF8 (
+                        "Fader, knob ou bot\xc3\xa3o \xe2\x80\x94 toque no painel para selecionar"));
+       #else
         setContent (Stage::chooseTarget,
                     "PASSO 1",
                     juce::String::fromUTF8 (
                         "CLIQUE no controle que voc\xc3\xaa quer comandar"),
                     juce::String::fromUTF8 (
                         "Fader, knob ou bot\xc3\xa3o \xe2\x80\x94 clique no console para selecionar"));
+       #endif
     }
 
     void showMoveHardware (const juce::String& target)
@@ -186,6 +195,74 @@ public:
                           : success                   ? NordLookAndFeel::greenOk()
                                                       : NordLookAndFeel::oledAmber();
 
+       #if CHURCHDAW_MOBILE_SHELL
+        {
+            const auto topLeft = juce::Colour (0xff1d222c).interpolatedWith (accent, 0.11f);
+            g.setGradientFill (juce::ColourGradient (
+                topLeft, bounds.getX(), bounds.getY(),
+                juce::Colour (0xff12161e), bounds.getRight(), bounds.getBottom(), false));
+            g.fillRoundedRectangle (bounds, 8.0f);
+            g.setColour (accent.withAlpha (0.34f));
+            g.drawRoundedRectangle (bounds.reduced (0.5f), 8.0f, 1.0f);
+            g.setColour (accent.withAlpha (0.92f));
+            g.fillRoundedRectangle (bounds.getX() + 1.5f, bounds.getY() + 6.0f,
+                                    2.5f, juce::jmax (4.0f, bounds.getHeight() - 12.0f), 1.25f);
+        }
+
+        if (getHeight() < 48)
+        {
+            auto line = getLocalBounds().reduced (10, 3);
+
+            // Compact right-hand telemetry pills on landscape phones/tablets
+            if (getWidth() >= 520)
+            {
+                auto mapsPill = line.removeFromRight (74).reduced (0, 2);
+                g.setColour (juce::Colour (0xff0d1017));
+                g.fillRoundedRectangle (mapsPill.toFloat(), 5.0f);
+                g.setColour (juce::Colours::white.withAlpha (0.09f));
+                g.drawRoundedRectangle (mapsPill.toFloat().reduced (0.5f), 5.0f, 1.0f);
+                g.setColour (mappingCount > 0 ? NordLookAndFeel::greenOk()
+                                              : NordLookAndFeel::txtSecondary());
+                g.setFont (juce::Font (juce::FontOptions (10.0f)).boldened());
+                g.drawText (juce::String (mappingCount) + (mappingCount == 1 ? " mapa" : " mapas"),
+                            mapsPill, juce::Justification::centred, false);
+
+                line.removeFromRight (6);
+                auto midiPill = line.removeFromRight (88).reduced (0, 2);
+                const auto devCol = connected ? NordLookAndFeel::greenOk() : NordLookAndFeel::redClip();
+                g.setColour (juce::Colour (0xff0d1017));
+                g.fillRoundedRectangle (midiPill.toFloat(), 5.0f);
+                g.setColour (devCol.withAlpha (0.28f));
+                g.drawRoundedRectangle (midiPill.toFloat().reduced (0.5f), 5.0f, 1.0f);
+                auto dot = juce::Rectangle<float> ((float) midiPill.getX() + 7.0f,
+                                                   (float) midiPill.getCentreY() - 3.0f, 6.0f, 6.0f);
+                g.setColour (devCol);
+                g.fillEllipse (dot);
+                g.setColour (connected ? juce::Colours::white.withAlpha (0.86f)
+                                       : NordLookAndFeel::txtSecondary());
+                g.setFont (juce::Font (juce::FontOptions (9.5f)).boldened());
+                g.drawText (connected ? "MIDI OK" : "SEM USB",
+                            midiPill.withTrimmedLeft (16), juce::Justification::centredLeft, false);
+
+                line.removeFromRight (8);
+            }
+
+            auto badge = line.removeFromLeft (78).reduced (0, 2);
+            g.setColour (accent.withAlpha (0.16f));
+            g.fillRoundedRectangle (badge.toFloat(), 5.0f);
+            g.setColour (accent.withAlpha (0.68f));
+            g.drawRoundedRectangle (badge.toFloat().reduced (0.5f), 5.0f, 1.0f);
+            g.setColour (accent);
+            g.setFont (NordLookAndFeel::stageLabel (9.0f));
+            g.drawText (badgeText, badge, juce::Justification::centred, false);
+
+            line.removeFromLeft (10);
+            g.setColour (NordLookAndFeel::txtPrimary());
+            g.setFont (juce::Font (juce::FontOptions (12.5f)).boldened());
+            g.drawFittedText (title, line, juce::Justification::centredLeft, 1, 0.82f);
+            return;
+        }
+       #else
         g.setColour (juce::Colour (0xff202329));
         g.fillRoundedRectangle (bounds, 7.0f);
         g.setColour (juce::Colours::white.withAlpha (0.08f));
@@ -206,6 +283,7 @@ public:
             g.drawText (title, line, juce::Justification::centredLeft, true);
             return;
         }
+       #endif
 
         auto area = getLocalBounds().reduced (13, 5);
         const bool narrow = getWidth() < 560;

@@ -139,7 +139,8 @@ public:
         for(auto* button:{&showDaw,&openLast,&record,&dawMode,&performanceMode,&cameraToggle,&refresh,&micToggle})button->getProperties().set("churchCamTouch",enabled);
         for(auto* c:settingsControls())
             if(enabled)controlsContent.addAndMakeVisible(c);else addAndMakeVisible(c);
-        controlsViewport.setScrollBarsShown(true,false);controlsViewport.setScrollBarThickness(5);
+        controlsViewport.setScrollBarsShown(true,false);controlsViewport.setScrollBarThickness(4);
+        controlsViewport.getVerticalScrollBar().setColour(juce::ScrollBar::thumbColourId,palette::muted().withAlpha(0.28f));
         controlsViewport.setScrollOnDragMode(juce::Viewport::ScrollOnDragMode::nonHover);
         for(auto* slider:{&faceSize,&dawLevel,&micLevel})slider->setViewportIgnoreDragFlag(true);
         if(enabled){addAndMakeVisible(controlsViewport);controlsViewport.setViewedComponent(&controlsContent,false);}
@@ -149,9 +150,12 @@ public:
         openLast.setButtonText(enabled?"Compartilhar":juce::String::fromUTF8("Ver vídeo"));
         dawMode.setButtonText(enabled?"DAW + rosto":"DAW + webcam");
         performanceMode.setButtonText(enabled?juce::String::fromUTF8("Rosto + teclas"):"Webcam + teclado 3D");
+        cameraToggle.setButtonText(camera?(enabled?juce::String::fromUTF8("Desligar câmera"):juce::String("Desligar webcam"))
+                                         :(enabled?juce::String::fromUTF8("Ligar câmera"):juce::String("Ligar webcam")));
         quality.changeItemText(1,enabled?juce::String("1080p"):juce::String::fromUTF8("Full HD · 1080p"));
         quality.changeItemText(2,enabled?juce::String("720p"):juce::String::fromUTF8("HD · 720p"));
         if(!busy())record.setButtonText(enabled?"Gravar":juce::String::fromUTF8("Gravar vídeo"));
+        selectComposition(visual->performanceMode.load());
         faceSize.setVisible(!visual->performanceMode.load());resized();repaint();
     }
     void setDocked(bool enabled){docked=enabled;resized();repaint();}
@@ -231,30 +235,87 @@ private:
     {
         g.fillAll(palette::background());
         if(docked)return;
-        g.drawImageWithin(brand,14,10,40,40,juce::RectanglePlacement::centred);
-        g.setColour(palette::text());g.setFont(juce::FontOptions(23,juce::Font::bold));
-        g.drawText("ChurchCam",64,8,180,28,juce::Justification::centredLeft);
-        g.setColour(palette::muted());g.setFont(juce::FontOptions(10));
-        g.drawText(juce::String::fromUTF8("Seu som. Seu jeito de aparecer."),65,35,260,17,juce::Justification::centredLeft);
+        const bool shortH=getHeight()<=420;
+        const int headH=shortH?46:54;
+        g.setGradientFill(juce::ColourGradient(juce::Colour(0xff1e1620),0,0,palette::background(),0,(float)headH,false));
+        g.fillRect(0,0,getWidth(),headH);
+        g.setColour(juce::Colours::white.withAlpha(.07f));
+        g.fillRect(12,headH-1,getWidth()-24,1);
+        const float crownW=juce::jmin(92.0f,(float)getWidth()*.18f);
+        g.setColour(palette::accent().withAlpha(.88f));
+        g.fillRoundedRectangle((float)getWidth()*.5f-crownW*.5f,.5f,crownW,2.0f,1.0f);
+
+        const float logoSide=shortH?34.0f:38.0f;
+        const float logoY=((float)headH-logoSide)*.5f;
+        const juce::Rectangle<float> logoBox(14.0f,logoY,logoSide,logoSide);
+        if(brand.isValid())
+        {
+            juce::Graphics::ScopedSaveState save(g);
+            juce::Path clip;clip.addEllipse(logoBox);g.reduceClipRegion(clip);
+            g.setOpacity(1.0f);
+            g.drawImageWithin(brand,(int)logoBox.getX(),(int)logoBox.getY(),(int)logoSide,(int)logoSide,juce::RectanglePlacement::fillDestination);
+        }
+        else
+        {
+            NordLookAndFeel::drawChurchDAWMark(g,logoBox);
+        }
+        g.setColour(juce::Colours::white.withAlpha(.16f));
+        g.drawEllipse(logoBox.reduced(.5f),1.0f);
+
+        const int textX=shortH?56:62;
+        g.setColour(palette::text());g.setFont(juce::FontOptions(shortH?19.5f:22.0f,juce::Font::bold));
+        g.drawText("ChurchCam",textX,shortH?5:7,180,24,juce::Justification::centredLeft);
+        g.setColour(palette::muted());g.setFont(juce::FontOptions(10.0f));
+        g.drawText(juce::String::fromUTF8("Seu som. Seu jeito de aparecer."),textX+1,shortH?26:33,260,15,juce::Justification::centredLeft);
+
         auto layout=TouchLayout::make(getLocalBounds());drawCard(g,layout.stage);drawCard(g,layout.settings);
+        if(!layout.dawMode.isEmpty() && !layout.performanceMode.isEmpty())
+        {
+            auto modeTray=layout.dawMode.getUnion(layout.performanceMode).toFloat().expanded(3.0f,2.5f);
+            g.setColour(juce::Colour(0xff0b0e15));g.fillRoundedRectangle(modeTray,9.5f);
+            g.setColour(juce::Colours::white.withAlpha(.07f));g.drawRoundedRectangle(modeTray.reduced(.5f),9.5f,1.0f);
+        }
+
         const bool active=busy() && recorder->isReady() && !recorder->isStopping();
-        g.setColour(active?palette::accent():palette::muted());g.setFont(juce::FontOptions(18,juce::Font::bold));
         const int seconds=recorder?(int)recorder->elapsed():0;
-        if(layout.clock.getWidth()>55)g.drawText(juce::String(seconds/60).paddedLeft('0',2)+":"+juce::String(seconds%60).paddedLeft('0',2),layout.clock,juce::Justification::centred);
-        g.setFont(juce::FontOptions(10,juce::Font::bold));
-        if(getWidth()>=540)g.drawText(active?"GRAVANDO":audioAlive?"DAW CONECTADA":"CHURCHDAW",getWidth()-166,19,150,24,juce::Justification::centredRight);
+        if(layout.clock.getWidth()>55)
+        {
+            auto clockPill=layout.clock.toFloat().withSizeKeepingCentre(juce::jmin((float)layout.clock.getWidth(),104.0f),juce::jmin((float)layout.clock.getHeight()-2.0f,34.0f));
+            g.setColour(juce::Colour(0xff0b0e15));g.fillRoundedRectangle(clockPill,8.0f);
+            g.setColour((active?palette::accent():juce::Colours::white).withAlpha(active?.42f:.08f));
+            g.drawRoundedRectangle(clockPill.reduced(.5f),8.0f,1.0f);
+            g.setColour(active?palette::accent():palette::muted().withAlpha(.55f));
+            g.fillEllipse(clockPill.getX()+10.0f,clockPill.getCentreY()-3.0f,6.0f,6.0f);
+            g.setColour(active?palette::text():palette::muted());g.setFont(juce::FontOptions(16.0f,juce::Font::bold));
+            g.drawText(juce::String(seconds/60).paddedLeft('0',2)+":"+juce::String(seconds%60).paddedLeft('0',2),
+                       clockPill.withTrimmedLeft(18.0f).toNearestInt(),juce::Justification::centred);
+        }
+        if(getWidth()>=540)
+        {
+            const juce::String badgeText=active?"GRAVANDO":audioAlive?"DAW CONECTADA":"CHURCHDAW";
+            const auto dotCol=active?palette::accent():audioAlive?palette::green():palette::muted();
+            auto badge=juce::Rectangle<float>((float)getWidth()-154.0f,((float)headH-26.0f)*.5f,142.0f,26.0f);
+            g.setColour(active?juce::Colour(0xff381926):juce::Colour(0xff0d1118));
+            g.fillRoundedRectangle(badge,13.0f);
+            g.setColour(dotCol.withAlpha(.36f));
+            g.drawRoundedRectangle(badge.reduced(.5f),13.0f,1.0f);
+            g.setColour(dotCol);
+            g.fillEllipse(badge.getX()+10.0f,badge.getCentreY()-3.2f,6.4f,6.4f);
+            g.setColour(palette::text());g.setFont(juce::FontOptions(9.5f,juce::Font::bold));
+            g.drawText(badgeText,badge.withTrimmedLeft(22.0f).withTrimmedRight(8.0f).toNearestInt(),juce::Justification::centredLeft);
+        }
     }
     void paintTouchSettings(juce::Graphics& g)
     {
         const int w=controlsContent.getWidth()-24;
-        g.setColour(palette::text());g.setFont(juce::FontOptions(14,juce::Font::bold));
-        g.drawText(juce::String::fromUTF8("Câmera"),12,10,w,26,juce::Justification::centredLeft);
-        g.drawText(juce::String::fromUTF8("Áudio do vídeo"),12,340,w,26,juce::Justification::centredLeft);
-        g.setColour(palette::muted());g.setFont(juce::FontOptions(11));
-        g.drawText(visual->performanceMode.load()?juce::String::fromUTF8("Rosto, acordes e notas ao vivo."):"Tamanho do rosto",12,242,w,24,juce::Justification::centredLeft);
-        g.drawText("MICROFONE OPCIONAL",12,480,w,24,juce::Justification::centredLeft);
-        g.drawFittedText(juce::String::fromUTF8("Sua voz vai para o vídeo. Sem retorno nas caixas."),12,702,w,40,juce::Justification::centredLeft,2);
-        g.setColour(palette::line());g.drawHorizontalLine(326,12.0f,(float)w+12);
+        g.setColour(palette::accent().withAlpha(.88f));g.setFont(juce::FontOptions(10.5f,juce::Font::bold));
+        g.drawText(juce::String::fromUTF8("CÂMERA"),12,6,w,18,juce::Justification::centredLeft);
+        g.drawText(juce::String::fromUTF8("ÁUDIO DO VÍDEO"),12,268,w,18,juce::Justification::centredLeft);
+        g.setColour(palette::muted());g.setFont(juce::FontOptions(10.5f));
+        g.drawText(visual->performanceMode.load()?juce::String::fromUTF8("Rosto, acordes e notas ao vivo."):"Tamanho do rosto",12,198,w,18,juce::Justification::centredLeft);
+        g.drawText("MICROFONE OPCIONAL",12,388,w,18,juce::Justification::centredLeft);
+        g.drawFittedText(juce::String::fromUTF8("Sua voz vai para o vídeo. Sem retorno nas caixas."),12,574,w,36,juce::Justification::centredLeft,2);
+        g.setColour(juce::Colours::white.withAlpha(.08f));g.drawHorizontalLine(258,12.0f,(float)w+12);
     }
     void resizeTouch()
     {
@@ -268,18 +329,31 @@ private:
         showDaw.setButtonText("DAW");auto layout=TouchLayout::make(getLocalBounds());
         piano.setBounds(layout.preview);dawMode.setBounds(layout.dawMode);performanceMode.setBounds(layout.performanceMode);
         showDaw.setBounds(layout.back);quality.setBounds(layout.quality);record.setBounds(layout.record);openLast.setBounds(layout.last);status.setBounds(layout.status);
-        controlsViewport.setBounds(layout.settings.reduced(2));
-        controlsContent.setSize(juce::jmax(1,controlsViewport.getWidth()-7),754);
+        controlsViewport.setBounds(layout.settings.reduced(4,5));
+        controlsContent.setSize(juce::jmax(1,controlsViewport.getWidth()-8),620);
         const int x=12,w=controlsContent.getWidth()-24;
-        cameraList.setBounds(x,44,w,44);cameraToggle.setBounds(x,98,w-82,44);refresh.setBounds(x+w-76,98,76,44);
-        mirror.setBounds(x,148,w,44);corner.setBounds(x,196,w,44);faceSize.setBounds(x,268,w,44);
-        dawStatus.setBounds(x-4,371,w+4,24);dawLevel.setBounds(x,400,w,44);dawMeterView.setBounds(x,450,w,18);
-        micList.setBounds(x,514,w,44);micChannel.setBounds(x,568,(w-8)/2,44);micToggle.setBounds(x+(w-8)/2+8,568,(w-8)/2,44);
-        micLevel.setBounds(x,622,w,44);micMeterView.setBounds(x,674,w,18);
+        cameraList.setBounds(x,28,w,38);cameraToggle.setBounds(x,72,w-82,38);refresh.setBounds(x+w-76,72,76,38);
+        mirror.setBounds(x,116,w,32);corner.setBounds(x,154,w,38);faceSize.setBounds(x,218,w,30);
+        dawStatus.setBounds(x-4,288,w+4,20);dawLevel.setBounds(x,312,w,36);dawMeterView.setBounds(x,352,w,18);
+        micList.setBounds(x,410,w,38);micChannel.setBounds(x,454,(w-8)/2,38);micToggle.setBounds(x+(w-8)/2+8,454,(w-8)/2,38);
+        micLevel.setBounds(x,498,w,36);micMeterView.setBounds(x,538,w,18);
     }
     juce::Rectangle<int> stageBounds() const{return {24,100,juce::jmax(360,getWidth()-384),getHeight()-264};}
     static void drawCard(juce::Graphics& g,juce::Rectangle<int> r)
-    {g.setColour(palette::surface());g.fillRoundedRectangle(r.toFloat(),14);g.setColour(palette::line().withAlpha(.6f));g.drawRoundedRectangle(r.toFloat().reduced(.5f),14,1);}
+    {
+       #if CHURCHDAW_MOBILE_SHELL
+        auto rf=r.toFloat();
+        g.setColour(juce::Colours::black.withAlpha(.38f));g.fillRoundedRectangle(rf.translated(0.0f,2.0f),14.0f);
+        g.setGradientFill(juce::ColourGradient(juce::Colour(0xff1d222c),rf.getX(),rf.getY(),juce::Colour(0xff12161e),rf.getX(),rf.getBottom(),false));
+        g.fillRoundedRectangle(rf,14.0f);
+        g.setColour(juce::Colours::white.withAlpha(.11f));
+        g.fillRect(rf.getX()+14.0f,rf.getY()+1.0f,juce::jmax(0.0f,rf.getWidth()-28.0f),1.0f);
+        g.setColour(juce::Colours::white.withAlpha(.085f));
+        g.drawRoundedRectangle(rf.reduced(.5f),14.0f,1.0f);
+       #else
+        g.setColour(palette::surface());g.fillRoundedRectangle(r.toFloat(),14);g.setColour(palette::line().withAlpha(.6f));g.drawRoundedRectangle(r.toFloat().reduced(.5f),14,1);
+       #endif
+    }
     void selectComposition(bool performance)
     {
         if(busy())return;
@@ -288,9 +362,11 @@ private:
         corner.setEnabled(!performance);faceSize.setVisible(!performance);
         nextCapture=0;piano.refreshStudio();repaint();
         status.setText(!connected()?juce::String("Abra o Live Cam dentro do ChurchDAW para gravar."):
-            performance && !camera?juce::String::fromUTF8("Ligue a webcam e toque: acordes e teclas acompanham seu MIDI."):
+            performance && !camera?(touchUI?juce::String::fromUTF8("Ligue a câmera e toque: acordes e teclas acompanham seu MIDI.")
+                                           :juce::String::fromUTF8("Ligue a webcam e toque: acordes e teclas acompanham seu MIDI.")):
             performance?juce::String::fromUTF8("Toque e grave. Acordes, notas e sustain aparecem no vídeo."):
-            juce::String::fromUTF8("Mesa completa pronta. A webcam é opcional neste modo."),juce::dontSendNotification);
+            (touchUI?juce::String::fromUTF8("Mesa completa pronta. A câmera frontal é opcional neste modo.")
+                    :juce::String::fromUTF8("Mesa completa pronta. A webcam é opcional neste modo.")),juce::dontSendNotification);
     }
     void savePreference(const juce::String& name,const juce::var& value){if(prefs)prefs->setValue("liveCam."+name,value);}
     static void setupSlider(juce::Slider& slider,double a,double b,double initial,const juce::String& suffix)
@@ -306,7 +382,7 @@ private:
         const auto previousCamera=cameraList.getText().isNotEmpty()?cameraList.getText():prefs?prefs->getValue("liveCam.camera"):juce::String();
         cameraList.clear(juce::dontSendNotification);int i=1,selectedCamera=1;
         for(auto name:StudioCameraDevice::getAvailableDevices()){if(name==previousCamera)selectedCamera=i;cameraList.addItem(name,i++);}
-        if(i>1)cameraList.setSelectedId(selectedCamera,juce::dontSendNotification);else cameraList.setTextWhenNothingSelected("Conecte uma webcam");
+        if(i>1)cameraList.setSelectedId(selectedCamera,juce::dontSendNotification);else cameraList.setTextWhenNothingSelected(touchUI?juce::String::fromUTF8("Selecione uma câmera"):juce::String("Conecte uma webcam"));
         auto previousMic=micList.getText().isNotEmpty()?micList.getText():prefs?prefs->getValue("liveCam.microphone"):juce::String();
         micList.clear(juce::dontSendNotification);micDevices.clear();i=1;int selectedMic=1;
         if(sharedMicControl)
@@ -324,7 +400,8 @@ private:
     void cameraOpenFinished()
     {
         cameraPending=false;cameraToggle.setEnabled(!suspended);cameraList.setEnabled(!camera && !suspended);
-        cameraToggle.setButtonText(camera?"Desligar webcam":"Ligar webcam");
+        cameraToggle.setButtonText(camera?(touchUI?juce::String::fromUTF8("Desligar câmera"):juce::String("Desligar webcam"))
+                                         :(touchUI?juce::String::fromUTF8("Ligar câmera"):juce::String("Ligar webcam")));
         cameraToggle.setToggleState(camera!=nullptr,juce::dontSendNotification);
         refresh.setEnabled(!camera && !busy() && !micPending && !suspended);
     }
@@ -332,7 +409,7 @@ private:
     {
         if(cameraPending || suspended)return;
         if(camera){stopCamera();return;}
-        if(cameraList.getSelectedId()==0){status.setText("Conecte uma webcam e clique Atualizar.",juce::dontSendNotification);return;}
+        if(cameraList.getSelectedId()==0){status.setText(touchUI?juce::String::fromUTF8("Selecione uma câmera e toque Atualizar."):juce::String("Conecte uma webcam e clique Atualizar."),juce::dontSendNotification);return;}
         const auto name=cameraList.getText();cameraPending=true;
         const auto generation=++cameraGeneration;
         cameraToggle.setEnabled(false);cameraList.setEnabled(false);refresh.setEnabled(false);cameraToggle.setButtonText("Aguardando...");
@@ -370,7 +447,7 @@ private:
         if(camera){camera->removeListener(this);camera.reset();}
         visual->cameraSequence.store(0);
         {const juce::ScopedLock lock(visual->cameraLock);visual->cameraImage={};}
-        cameraToggle.setButtonText("Ligar webcam");cameraToggle.setToggleState(false,juce::dontSendNotification);cameraToggle.setEnabled(!suspended);
+        cameraToggle.setButtonText(touchUI?juce::String::fromUTF8("Ligar câmera"):juce::String("Ligar webcam"));cameraToggle.setToggleState(false,juce::dontSendNotification);cameraToggle.setEnabled(!suspended);
         cameraList.setEnabled(!suspended);refresh.setEnabled(!busy() && !cameraPending && !micPending);piano.refreshStudio();repaint();
     }
     void imageReceived(const juce::Image& image) override
@@ -466,7 +543,7 @@ private:
         if(!connected() || !audioAlive)
         {status.setText("Abra o Studio na DAW com o dispositivo de audio ativo.",juce::dontSendNotification);return;}
         if(visual->performanceMode.load() && (!camera || visual->cameraSequence.load()==0))
-        {status.setText(juce::String::fromUTF8("Ligue a webcam antes de gravar neste modo."),juce::dontSendNotification);return;}
+        {status.setText(touchUI?juce::String::fromUTF8("Ligue a câmera antes de gravar neste modo."):juce::String::fromUTF8("Ligue a webcam antes de gravar neste modo."),juce::dontSendNotification);return;}
         if(dawLevel.getValue()==0 && (!micOn || micLevel.getValue()==0))
         {status.setText("Aumente o volume da DAW ou ligue o microfone antes de gravar.",juce::dontSendNotification);return;}
         if(cameraPending || micPending){status.setText(juce::String::fromUTF8("Conclua a permissão da câmera ou do microfone antes de gravar."),juce::dontSendNotification);return;}

@@ -16,6 +16,7 @@
 #include "MasterProcessor.h"
 #include "LevelMeter.h"
 #include "DeviceInfoBar.h"
+#include "ChurchLiveSkin.h"
 #include "AudioMidiButton.h"
 #include "PadProcessor.h"
 #include "PadPanel.h"
@@ -1024,6 +1025,14 @@ private:
     int layoutSafeBottom = 0;
     bool mobilePortraitLayout = false;
     bool mobileShortLandscapeLayout = false;
+   #if CHURCHDAW_MOBILE_SHELL
+    // Shell Church Live em paisagem: trilho de navegacao a esquerda + barra
+    // superior unica (ChurchLiveSkin.h). So camada visual/geometria.
+    bool shellSkin = false;
+    bool shellSkinWasOn = false;
+    juce::Rectangle<int> railBounds, railLogoBounds;
+    ChurchLiveSkin::Wordmark shellWordmark;
+   #endif
     bool mobileTwoRowHeader = false;
     bool compactHeaderLayout = false;
     bool narrowHeaderLayout = false;
@@ -1131,6 +1140,14 @@ private:
     void showLibraries();
     void rescanInstalledLibraries();
     juce::Rectangle<int> brandArea() const;   // area clicavel da marca no header
+   #if CHURCHDAW_MOBILE_SHELL
+    void paintShellSkin (juce::Graphics& g);
+    void layoutShellSkin (juce::Rectangle<int> headerRow, const ChurchLiveSkin::Metrics& m, bool learning, bool churchFull);
+    void clearShellSkin();
+    void placeZoomedPanel (juce::Component& panel);
+   #endif
+    // Marca no trilho a tela aberta (Audio/Bibliotecas sao paineis sobrepostos).
+    void refreshRailActive();
     void showPluginScanner();
     void showPadEditor (int sourceChannel = -1,
                         const juce::String& sourceName = {});

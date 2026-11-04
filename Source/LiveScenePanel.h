@@ -49,9 +49,34 @@ public:
             repaint();
         }
 
+        void setEstadoVisual (bool salva, bool ativa)
+        {
+            if (cenaSalva == salva && cenaAtiva == ativa)
+                return;
+
+            cenaSalva = salva;
+            cenaAtiva = ativa;
+            repaint();
+        }
+
         void paintButton (juce::Graphics& g, bool estaSobre, bool estaPressionado) override
         {
             juce::TextButton::paintButton (g, estaSobre, estaPressionado);
+
+           #if CHURCHDAW_MOBILE_SHELL
+            auto padBounds = getLocalBounds().toFloat().reduced (1.0f);
+            if (padBounds.getHeight() >= 26.0f && padBounds.getWidth() >= 32.0f)
+            {
+                const float ledW = juce::jlimit (10.0f, 18.0f, padBounds.getWidth() * 0.26f);
+                const auto ledCol = cenaAtiva              ? juce::Colours::white.withAlpha (0.86f)
+                                  : selecionadoComoDestino ? juce::Colour (0xffffc247).withAlpha (0.90f)
+                                  : cenaSalva              ? NordLookAndFeel::greenOk().withAlpha (0.68f)
+                                                           : juce::Colours::white.withAlpha (0.09f);
+                g.setColour (ledCol);
+                g.fillRoundedRectangle (padBounds.getCentreX() - ledW * 0.5f,
+                                        padBounds.getBottom() - 3.8f, ledW, 2.0f, 1.0f);
+            }
+           #endif
 
             // Vermelho continua reservado para a cena realmente no ar. A
             // borda ambar significa apenas "este e o destino que estou
@@ -127,6 +152,8 @@ public:
 
         bool segurou = false;
         bool selecionadoComoDestino = false;
+        bool cenaSalva = false;
+        bool cenaAtiva = false;
     };
 
     LiveScenePanel()
@@ -241,6 +268,7 @@ public:
                            : cena.preenchida   ? juce::Colour (0xff2f333b)
                                                : juce::Colour (0xff1d1f24);
 
+            b->setEstadoVisual (cena.preenchida, i == ativa);
             b->setColour (juce::TextButton::buttonColourId, cor);
             b->setColour (juce::TextButton::textColourOffId,
                           cena.preenchida ? juce::Colours::white
@@ -405,6 +433,46 @@ public:
 
     void paint (juce::Graphics& g) override
     {
+       #if CHURCHDAW_MOBILE_SHELL
+        {
+            auto tray = getLocalBounds().toFloat().reduced (4.0f, 1.0f);
+            if (! tray.isEmpty())
+            {
+                const bool armedRec = gravarBtn.getToggleState();
+                const bool armedClr = limparBtn.getToggleState();
+                g.setGradientFill (juce::ColourGradient (
+                    juce::Colour (0xff11151d), tray.getX(), tray.getY(),
+                    juce::Colour (0xff171c26), tray.getX(), tray.getBottom(), false));
+                g.fillRoundedRectangle (tray, 8.0f);
+
+                const auto borderCol = armedRec ? NordLookAndFeel::nordRedBright().withAlpha (0.46f)
+                                     : armedClr ? juce::Colour (0xfff59e0b).withAlpha (0.46f)
+                                                : juce::Colours::white.withAlpha (0.08f);
+                g.setColour (borderCol);
+                g.drawRoundedRectangle (tray.reduced (0.5f), 8.0f, 1.0f);
+
+                const auto edgeCol = armedClr ? juce::Colour (0xfff59e0b).withAlpha (0.85f)
+                                   : (armedRec || ativaAtual >= 0) ? NordLookAndFeel::nordRedBright().withAlpha (0.85f)
+                                                                   : NordLookAndFeel::nordRed().withAlpha (0.45f);
+                g.setColour (edgeCol);
+                g.fillRoundedRectangle (tray.getX() + 1.5f, tray.getY() + 7.0f,
+                                        2.5f, juce::jmax (6.0f, tray.getHeight() - 14.0f), 1.25f);
+
+                if (! botoes.isEmpty() && gravarBtn.isVisible())
+                {
+                    const int lastSceneRight = botoes.getLast()->getRight();
+                    const int actionsLeft = juce::jmin (gravarBtn.getX(), limparBtn.getX());
+                    if (actionsLeft > lastSceneRight + 3)
+                    {
+                        const float sepX = (float) ((lastSceneRight + actionsLeft) / 2);
+                        g.setColour (juce::Colours::white.withAlpha (0.10f));
+                        g.fillRect (sepX, tray.getY() + 6.0f, 1.0f, juce::jmax (4.0f, tray.getHeight() - 12.0f));
+                    }
+                }
+            }
+        }
+       #endif
+
         if (alturaDoRotulo <= 0)
             return;   // faixa curta: a altura toda foi para os botoes
 

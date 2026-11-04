@@ -78,6 +78,7 @@
 #include <juce_dsp/juce_dsp.h>
 
 #include "NordLookAndFeel.h"
+#include "ChurchLiveSkin.h"
 #include "LevelMeter.h"
 #include "LimiterReductionMeter.h"
 #include "MasterProcessor.h"
@@ -7123,7 +7124,8 @@ public:
             worshipReverb.setPreset (nativeReverbPreset != nullptr
                                        ? nativeReverbPreset->getIndex() : 1);
             worshipReverb.process (reverbBus);
-            addReverbReturn();
+            if (worshipReverb.isActive())
+                addReverbReturn();
         }
 
         for (int i = 0; i < numInserts; ++i)
@@ -13377,6 +13379,9 @@ private:
 
                     if (m.isNoteOn())
                     {
+                        if (lay.on == nullptr || ! (bool) *lay.on)
+                            continue;
+
                         const int inputNote = m.getNoteNumber();
                         const int outputNote = juce::jlimit (
                             0, 127, inputNote + semis);
@@ -13643,6 +13648,9 @@ private:
 
                     if (m.isNoteOn())
                     {
+                        if (lay.on == nullptr || ! (bool) *lay.on)
+                            continue;
+
                         const int inputNote = m.getNoteNumber();
                         const int outputNote = juce::jlimit (
                             0, 127, inputNote + semis);
@@ -18895,6 +18903,14 @@ public:
         return focusedMobileLayout && mobileMasterPage;
     }
 
+   #if CHURCHDAW_MOBILE_SHELL
+    // Skin Church Live: neste modo o editor ocupa tambem a faixa da barra
+    // superior (status, setas e "Editar canal" moram nela). O MainComponent
+    // estende o viewport quando isto e verdadeiro e e avisado ao mudar.
+    bool isStageSkinActive() const noexcept { return stageSkin; }
+    std::function<void()> onStageSkinChanged;
+   #endif
+
     void setOpenLibrariesCallback (std::function<void()> callback)
     {
         onOpenLibraries = std::move (callback);
@@ -19155,6 +19171,25 @@ public:
     void paint (juce::Graphics& g) override
     {
         CHURCHDAW_UI_SCOPE ("TimbresEditor::paint");
+       #if CHURCHDAW_MOBILE_SHELL
+        if (stageSkin)
+        {
+            paintStageSkin (g);
+            return;
+        }
+
+        if (chromeSkin)
+        {
+            paintStageSkin (g);
+            paintFocusedExtras (g);
+            return;
+        }
+       #endif
+        paintClassic (g);
+    }
+
+    void paintClassic (juce::Graphics& g)
+    {
         const auto clip = g.getClipBounds();
         // Fundo premium com vinheta (console no escuro do templo).
         NordLookAndFeel::fillAppBackground (g, getLocalBounds().toFloat());
@@ -19253,12 +19288,22 @@ public:
             if (! tabRail.isEmpty())
             {
                 auto rail = tabRail.toFloat().expanded (2.0f, 1.0f);
-                g.setColour (juce::Colours::black.withAlpha (0.34f));
-                g.fillRoundedRectangle (rail.translated (0.0f, 1.0f), 8.0f);
+                g.setColour (juce::Colours::black.withAlpha (0.40f));
+                g.fillRoundedRectangle (rail.translated (0.0f, 1.5f), 8.0f);
+               #if CHURCHDAW_MOBILE_SHELL
+                g.setGradientFill (juce::ColourGradient (juce::Colour (0xff0f0f13),
+                                                         rail.getX(), rail.getY(),
+                                                         juce::Colour (0xff14141a),
+                                                         rail.getX(), rail.getBottom(), false));
+                g.fillRoundedRectangle (rail, 8.0f);
+                g.setColour (juce::Colours::white.withAlpha (0.085f));
+                g.drawRoundedRectangle (rail.reduced (0.5f), 8.0f, 1.0f);
+               #else
                 g.setColour (juce::Colour (0xff15171c));
                 g.fillRoundedRectangle (rail, 8.0f);
                 g.setColour (juce::Colours::white.withAlpha (0.07f));
                 g.drawRoundedRectangle (rail.reduced (0.5f), 8.0f, 1.0f);
+               #endif
             }
 
             for (int l = 0; l < TimbresProcessor::numLayers; ++l)
@@ -19277,6 +19322,33 @@ public:
 
                 if (selected)
                 {
+                   #if CHURCHDAW_MOBILE_SHELL
+                    const auto selCol = loaded ? accent : NordLookAndFeel::nordRedBright();
+                    g.setColour (juce::Colours::black.withAlpha (0.36f));
+                    g.fillRoundedRectangle (rf.translated (0.0f, 1.0f), 6.5f);
+                    g.setGradientFill (juce::ColourGradient (juce::Colour (0xff2b2b36),
+                                                             rf.getX(), rf.getY(),
+                                                             juce::Colour (0xff1c1c24),
+                                                             rf.getX(), rf.getBottom(), false));
+                    g.fillRoundedRectangle (rf, 6.5f);
+                    g.setColour (juce::Colours::white.withAlpha (0.20f));
+                    g.drawLine (rf.getX() + 6.0f, rf.getY() + 1.0f,
+                                rf.getRight() - 6.0f, rf.getY() + 1.0f, 1.0f);
+                    g.setColour (selCol.withAlpha (0.52f));
+                    g.drawRoundedRectangle (rf.reduced (0.6f), 6.5f, 1.3f);
+
+                    g.setColour (selCol);
+                    g.fillRoundedRectangle (rf.withTrimmedTop (7.0f)
+                                              .withTrimmedBottom (7.0f)
+                                              .removeFromLeft (3.2f)
+                                              .translated (2.2f, 0.0f), 1.6f);
+                    auto activeRail = rf.reduced (8.0f, 0.0f)
+                                        .removeFromBottom (3.5f).withTrimmedBottom (1.0f);
+                    g.setColour (selCol.withAlpha (0.28f));
+                    g.fillRoundedRectangle (activeRail.expanded (1.5f, 1.0f), 2.0f);
+                    g.setColour (selCol);
+                    g.fillRoundedRectangle (activeRail, 1.5f);
+                   #else
                     // Fundo mais SOLIDO no canal ativo (pedido do dono): o
                     // gradiente sutil sumia sob luz de palco.
                     g.setGradientFill (juce::ColourGradient (juce::Colour (0xff3d434e),
@@ -19297,20 +19369,50 @@ public:
                     auto activeRail = rf.reduced (8.0f, 0.0f)
                                         .removeFromBottom (4.0f).withTrimmedBottom (1.0f);
                     g.fillRoundedRectangle (activeRail, 1.5f);
+                   #endif
                 }
                 else
                 {
+                   #if CHURCHDAW_MOBILE_SHELL
+                    if (loaded)
+                    {
+                        g.setGradientFill (juce::ColourGradient (juce::Colour (0xff1c1c24),
+                                                                 rf.getX(), rf.getY(),
+                                                                 juce::Colour (0xff14141a),
+                                                                 rf.getX(), rf.getBottom(), false));
+                        g.fillRoundedRectangle (rf, 5.5f);
+                        g.setColour (juce::Colours::white.withAlpha (0.06f));
+                        g.drawRoundedRectangle (rf.reduced (0.5f), 5.5f, 0.9f);
+                    }
+                    else
+                    {
+                        g.setColour (juce::Colours::white.withAlpha (0.022f));
+                        g.fillRoundedRectangle (rf, 5.5f);
+                    }
+                   #else
                     g.setColour (juce::Colours::white.withAlpha (0.025f));
                     g.fillRoundedRectangle (rf, 5.0f);
+                   #endif
                 }
 
                 auto text = r.reduced (7, 5);
                 auto number = r.getWidth() < 92 ? text : text.removeFromLeft (28);
                 g.setColour (selected ? juce::Colours::white
-                                      : NordLookAndFeel::dimText());
-                g.setFont (NordLookAndFeel::stageLabel (selected ? 11.5f : 10.0f));
+                                      : (loaded ? NordLookAndFeel::txtSecondary()
+                                                : NordLookAndFeel::dimText()));
+                g.setFont (NordLookAndFeel::stageLabel (selected ? 11.5f : 10.2f));
                 g.drawText ("C" + juce::String (l + 1), number,
                             juce::Justification::centred);
+
+               #if CHURCHDAW_MOBILE_SHELL
+                if (r.getWidth() < 92 && loaded)
+                {
+                    const float dotX = rf.getCentreX() - 2.5f;
+                    const float dotY = rf.getBottom() - (selected ? 10.5f : 8.5f);
+                    g.setColour (accent.withAlpha (selected ? 0.95f : 0.72f));
+                    g.fillEllipse (dotX, dotY, 5.0f, 5.0f);
+                }
+               #endif
 
                 if (mobilePageButtons[l].hasKeyboardFocus (false))
                 {
@@ -19339,7 +19441,7 @@ public:
 
                 // Um ponto pequeno diz "ha som aqui" sem transformar cada aba
                 // numa faixa colorida concorrendo com o canal ativo.
-                g.setColour (loaded ? accent.withAlpha (selected ? 1.0f : 0.72f)
+                g.setColour (loaded ? accent.withAlpha (selected ? 1.0f : 0.78f)
                                     : NordLookAndFeel::txtDisabled().withAlpha (0.35f));
                 g.fillEllipse (rf.getRight() - 9.0f, rf.getCentreY() - 2.5f, 5.0f, 5.0f);
             }
@@ -19351,6 +19453,19 @@ public:
 
                 if (mobileMasterPage)
                 {
+                   #if CHURCHDAW_MOBILE_SHELL
+                    g.setGradientFill (juce::ColourGradient (juce::Colour (0xff4d1f28),
+                                                             rf.getX(), rf.getY(),
+                                                             juce::Colour (0xff2a1319),
+                                                             rf.getX(), rf.getBottom(), false));
+                    g.fillRoundedRectangle (rf, 6.5f);
+                    g.setColour (NordLookAndFeel::nordRedBright().withAlpha (0.55f));
+                    g.drawRoundedRectangle (rf.reduced (0.6f), 6.5f, 1.2f);
+                    g.setColour (NordLookAndFeel::nordRedBright());
+                    g.fillRoundedRectangle (rf.reduced (8.0f, 0.0f)
+                                              .removeFromBottom (3.5f)
+                                              .withTrimmedBottom (1.0f), 1.5f);
+                   #else
                     g.setGradientFill (juce::ColourGradient (juce::Colour (0xff3c3136),
                                                              rf.getX(), rf.getY(),
                                                              juce::Colour (0xff292329),
@@ -19360,19 +19475,30 @@ public:
                     g.fillRoundedRectangle (rf.reduced (8.0f, 0.0f)
                                               .removeFromBottom (4.0f)
                                               .withTrimmedBottom (1.0f), 1.5f);
+                   #endif
                 }
                 else
                 {
+                   #if CHURCHDAW_MOBILE_SHELL
+                    g.setGradientFill (juce::ColourGradient (juce::Colour (0xff22191e),
+                                                             rf.getX(), rf.getY(),
+                                                             juce::Colour (0xff161216),
+                                                             rf.getX(), rf.getBottom(), false));
+                    g.fillRoundedRectangle (rf, 5.5f);
+                    g.setColour (NordLookAndFeel::nordRedBright().withAlpha (0.24f));
+                    g.drawRoundedRectangle (rf.reduced (0.5f), 5.5f, 0.9f);
+                   #else
                     g.setColour (juce::Colours::white.withAlpha (0.025f));
                     g.fillRoundedRectangle (rf, 5.0f);
+                   #endif
                 }
 
                 g.setColour (mobileMasterPage ? juce::Colours::white
-                                              : NordLookAndFeel::txtSecondary());
+                                              : NordLookAndFeel::txtPrimary().withAlpha (0.86f));
                 g.setFont (NordLookAndFeel::stageLabel (
-                    mobileMasterTabBounds.getWidth() < 92 ? 9.0f : 10.0f));
+                    mobileMasterTabBounds.getWidth() < 92 ? 9.5f : 10.5f));
                 g.drawFittedText (mobileMasterTabBounds.getWidth() < 92 ? "MST" : "MASTER",
-                                  r.reduced (5, 4), juce::Justification::centred, 1);
+                                  r.reduced (4, 4), juce::Justification::centred, 1);
 
                 if (mobileMasterPageButton.hasKeyboardFocus (false))
                 {
@@ -19419,6 +19545,17 @@ public:
             if (! premiumDesktopLayout && ! empty
                  && ! strips[l].volDb.getBounds().isEmpty())
             {
+               #if CHURCHDAW_MOBILE_SHELL
+                auto readout = focusedMobileLayout
+                                 ? strips[l].volDb.getBounds().toFloat().reduced (2.0f, 1.0f)
+                                 : strips[l].volDb.getBounds().toFloat().reduced (4.0f, 1.5f);
+                g.setColour (juce::Colours::black.withAlpha (0.38f));
+                g.fillRoundedRectangle (readout.translated (0.0f, 1.0f), 5.0f);
+                g.setColour (juce::Colour (0xff0d0d11).withAlpha (0.92f));
+                g.fillRoundedRectangle (readout, 5.0f);
+                g.setColour (juce::Colours::white.withAlpha (0.075f));
+                g.drawRoundedRectangle (readout.reduced (0.4f), 5.0f, 0.9f);
+               #else
                 auto readout = strips[l].volDb.getBounds().toFloat()
                                    .reduced (4.0f, 2.0f);
                 g.setColour (juce::Colours::black.withAlpha (0.28f));
@@ -19427,6 +19564,7 @@ public:
                 g.fillRoundedRectangle (readout, 5.0f);
                 g.setColour (juce::Colours::white.withAlpha (0.045f));
                 g.drawRoundedRectangle (readout.reduced (0.4f), 5.0f, 0.8f);
+               #endif
             }
 
             // Pill elegante de categoria no topo do strip (Estilo ChurchDAW Pro UI)
@@ -19450,6 +19588,114 @@ public:
                 drawStripModule (g, strips[l].pluginGroup, "FX / PLUGINS");
             }
 
+           #if CHURCHDAW_MOBILE_SHELL
+            if (! empty && focusedMobileLayout && shortLandscapeMobileLayout)
+            {
+                auto drawConsoleBay = [&g] (juce::Rectangle<float> bay,
+                                            const juce::String& bayTitle,
+                                            juce::Colour dotCol)
+                {
+                    if (bay.isEmpty())
+                        return;
+                    g.setColour (juce::Colours::black.withAlpha (0.28f));
+                    g.fillRoundedRectangle (bay.translated (0.0f, 1.0f), 7.5f);
+                    g.setGradientFill (juce::ColourGradient (juce::Colour (0xff14141a),
+                                                             bay.getX(), bay.getY(),
+                                                             juce::Colour (0xff0d0d11),
+                                                             bay.getX(), bay.getBottom(), false));
+                    g.fillRoundedRectangle (bay, 7.5f);
+
+                    auto head = bay.withHeight (20.0f);
+                    g.setColour (juce::Colours::white.withAlpha (0.028f));
+                    g.fillRoundedRectangle (head, 7.5f);
+                    g.setColour (juce::Colours::white.withAlpha (0.055f));
+                    g.drawLine (bay.getX() + 8.0f, bay.getY() + 20.0f,
+                                bay.getRight() - 8.0f, bay.getY() + 20.0f, 0.9f);
+
+                    g.setColour (dotCol.withAlpha (0.85f));
+                    g.fillEllipse (bay.getX() + 9.0f, bay.getY() + 7.5f, 5.0f, 5.0f);
+                    g.setFont (NordLookAndFeel::stageLabel (9.0f));
+                    g.setColour (NordLookAndFeel::txtSecondary().withAlpha (0.88f));
+                    g.drawText (bayTitle,
+                                juce::Rectangle<float> (bay.getX() + 18.0f, bay.getY() + 3.0f,
+                                                        bay.getWidth() - 24.0f, 14.0f).toNearestInt(),
+                                juce::Justification::centredLeft, false);
+
+                    g.setColour (juce::Colours::white.withAlpha (0.075f));
+                    g.drawRoundedRectangle (bay.reduced (0.5f), 7.5f, 1.0f);
+                };
+
+                const auto accentCol = categoryColourFor (l);
+
+                // Modulo AFINACAO (quando OITAVA e TRANSPOSE moram na coluna esquerda)
+                if (! strips[l].octave.getBounds().isEmpty()
+                    && ! strips[l].transp.getBounds().isEmpty()
+                    && ! strips[l].vol.getBounds().isEmpty()
+                    && strips[l].octave.getX() < strips[l].vol.getX())
+                {
+                    auto tuneUnion = strips[l].octave.getBounds()
+                                         .getUnion (strips[l].octaveLabel.getBounds())
+                                         .getUnion (strips[l].transp.getBounds())
+                                         .getUnion (strips[l].transpLabel.getBounds());
+                    const auto presetB = strips[l].combo.getBounds();
+                    const float tuneTop = presetB.isEmpty()
+                                            ? (float) tuneUnion.getY() - 22.0f
+                                            : (float) presetB.getBottom() + 6.0f;
+                    const float tuneBottom = ! strips[l].muteBtn.getBounds().isEmpty()
+                                               ? (float) strips[l].muteBtn.getBottom()
+                                               : (float) tuneUnion.getBottom() + 4.0f;
+                    juce::Rectangle<float> tuneBay (
+                        (float) (presetB.isEmpty() ? tuneUnion.getX() - 8 : presetB.getX()),
+                        tuneTop,
+                        (float) (presetB.isEmpty() ? tuneUnion.getWidth() + 16 : presetB.getWidth()),
+                        juce::jmax (40.0f, tuneBottom - tuneTop));
+                    tuneBay = tuneBay.getIntersection (strips[l].cardBounds.reduced (6, 4).toFloat());
+                    drawConsoleBay (tuneBay, juce::String::fromUTF8 ("AFINAÇÃO"), accentCol);
+                }
+
+                // Modulo NIVEL & SAIDA (fader vertical + meter + leitura dB)
+                if (! strips[l].vol.getBounds().isEmpty()
+                    && strips[l].octave.getX() < strips[l].vol.getX())
+                {
+                    auto lvlUnion = strips[l].vol.getBounds();
+                    if (strips[l].meter != nullptr && ! strips[l].meter->getBounds().isEmpty())
+                        lvlUnion = lvlUnion.getUnion (strips[l].meter->getBounds());
+                    if (! strips[l].volDb.getBounds().isEmpty())
+                        lvlUnion = lvlUnion.getUnion (strips[l].volDb.getBounds());
+
+                    const float bayLeft = (float) strips[l].muteBtn.getX();
+                    const float bayRight = (float) juce::jmax (
+                        strips[l].soloBtn.getRight(),
+                        juce::jmax (strips[l].rotaryModeBox.getRight(),
+                                    juce::jmax (strips[l].autoEqBtn.getRight(),
+                                                strips[l].pluginOpenBtn.getRight())));
+                    const float bayW = bayRight > bayLeft + 60.0f
+                                         ? (bayRight - bayLeft)
+                                         : (float) lvlUnion.getWidth() + 24.0f;
+                    const float bayX = bayRight > bayLeft + 60.0f
+                                         ? bayLeft
+                                         : (float) lvlUnion.getX() - 12.0f;
+                    juce::Rectangle<float> levelBay (
+                        bayX,
+                        (float) strips[l].fxGroup.getY(),
+                        bayW,
+                        (float) juce::jmax (60, strips[l].muteBtn.getY() - 6 - strips[l].fxGroup.getY()));
+                    drawConsoleBay (levelBay, juce::String::fromUTF8 ("NÍVEL & SAÍDA"),
+                                    NordLookAndFeel::nordRedBright());
+
+                    // Re-renderiza o visor OLED de dB por cima do bay para manter contraste maximo
+                    if (! strips[l].volDb.getBounds().isEmpty())
+                    {
+                        auto readout = strips[l].volDb.getBounds().toFloat().reduced (2.0f, 1.0f);
+                        g.setColour (juce::Colour (0xff0d0d11));
+                        g.fillRoundedRectangle (readout, 4.5f);
+                        g.setColour (juce::Colours::white.withAlpha (0.09f));
+                        g.drawRoundedRectangle (readout.reduced (0.4f), 4.5f, 0.9f);
+                    }
+                }
+            }
+           #endif
+
             // CINTA DE AGRUPAMENTO em volta dos knobs, como as molduras "B3
             // PERCUSSION" / "VIB-CHORUS" da serigrafia da Nord: uma linha fina
             // interrompida no topo pelo rotulo. E o que separa "estes 4 controles
@@ -19465,6 +19711,70 @@ public:
                 // dono, item 3).
                 if (focusedMobileLayout)
                 {
+                   #if CHURCHDAW_MOBILE_SHELL
+                    auto box = shortLandscapeMobileLayout
+                                 ? strips[l].fxGroup.toFloat()
+                                 : strips[l].fxGroup.toFloat().expanded (5.0f, 3.0f).withTrimmedBottom (2.0f);
+                    g.setColour (juce::Colours::black.withAlpha (0.28f));
+                    g.fillRoundedRectangle (box.translated (0.0f, 1.0f), 7.5f);
+                    g.setGradientFill (juce::ColourGradient (juce::Colour (0xff14141a),
+                                                             box.getX(), box.getY(),
+                                                             juce::Colour (0xff0d0d11),
+                                                             box.getX(), box.getBottom(), false));
+                    g.fillRoundedRectangle (box, 7.5f);
+
+                    auto head = box.withHeight (20.0f);
+                    g.setColour (juce::Colours::white.withAlpha (0.028f));
+                    g.fillRoundedRectangle (head, 7.5f);
+                    g.setColour (juce::Colours::white.withAlpha (0.055f));
+                    g.drawLine (box.getX() + 8.0f, box.getY() + 20.0f,
+                                box.getRight() - 8.0f, box.getY() + 20.0f, 0.9f);
+
+                    const auto fxDotCol = strips[l].eqPage ? juce::Colour (0xff38bdf8)
+                                                           : categoryColourFor (l);
+                    g.setColour (fxDotCol.withAlpha (0.90f));
+                    g.fillEllipse (box.getX() + 9.0f, box.getY() + 7.5f, 5.0f, 5.0f);
+                    g.setFont (NordLookAndFeel::stageLabel (9.0f));
+                    g.setColour (NordLookAndFeel::txtSecondary().withAlpha (0.90f));
+                    g.drawText (strips[l].eqPage ? "EQUALIZADOR 3 BANDAS" : "TIMBRE & EFEITOS",
+                                juce::Rectangle<float> (box.getX() + 18.0f, box.getY() + 3.0f,
+                                                        box.getWidth() - 24.0f, 14.0f).toNearestInt(),
+                                juce::Justification::centredLeft, false);
+
+                    // Pods individuais atras de cada encoder quando ha largura confortavel
+                    if (box.getWidth() >= 270.0f)
+                    {
+                        const std::pair<const juce::Slider*, const juce::Label*> fxPairs[] {
+                            { &strips[l].compKnob,    &strips[l].compLabel },
+                            { &strips[l].dlyKnob,     &strips[l].dlyLabel },
+                            { &strips[l].echoKnob,    &strips[l].echoLabel },
+                            { &strips[l].rotaryKnob,  &strips[l].rotaryLabel },
+                            { &strips[l].attackKnob,  &strips[l].attackLabel },
+                            { &strips[l].releaseKnob, &strips[l].releaseLabel },
+                            { &strips[l].lowKnob,     &strips[l].lowLabel },
+                            { &strips[l].midKnob,     &strips[l].midLabel },
+                            { &strips[l].highKnob,    &strips[l].highLabel }
+                        };
+                        for (const auto& pr : fxPairs)
+                        {
+                            if (! pr.first->isVisible() || pr.first->getBounds().isEmpty())
+                                continue;
+                            auto pod = pr.first->getBounds()
+                                           .getUnion (pr.second->getBounds())
+                                           .toFloat()
+                                           .expanded (6.0f, 3.0f)
+                                           .getIntersection (box.reduced (4.0f, 3.0f).withTrimmedTop (20.0f));
+                            g.setColour (juce::Colour (0xff1c1c24).withAlpha (0.76f));
+                            g.fillRoundedRectangle (pod, 6.0f);
+                            g.setColour (juce::Colours::white.withAlpha (0.045f));
+                            g.drawRoundedRectangle (pod.reduced (0.4f), 6.0f, 0.8f);
+                        }
+                    }
+
+                    g.setColour (juce::Colours::white.withAlpha (0.08f));
+                    g.drawRoundedRectangle (box.reduced (0.5f), 7.5f, 1.0f);
+                    continue;
+                   #else
                     auto box = strips[l].fxGroup.toFloat().expanded (5.0f, 3.0f)
                                    .withTrimmedBottom (2.0f);
                     g.setColour (juce::Colours::white.withAlpha (0.13f));
@@ -19476,6 +19786,7 @@ public:
                                     .removeFromTop (14),
                                 juce::Justification::centredLeft, false);
                     continue;
+                   #endif
                 }
 
                 if (premiumDesktopLayout)
@@ -19622,6 +19933,30 @@ public:
             auto sb = status.getBounds();
             if (! sb.isEmpty() && sb.expanded (24, 8).intersects (clip))
             {
+               #if CHURCHDAW_MOBILE_SHELL
+                const float tw = juce::GlyphArrangement::getStringWidth (status.getFont(), status.getText());
+                const float dot = 8.0f;
+                const float textRight = (float) sb.getRight() - 5.0f;
+                const float textLeft  = textRight - tw;
+                const float cx = textLeft - 7.5f - dot * 0.5f;
+                const float cy = (float) sb.getCentreY();
+                const float pillH = 24.0f;
+                const float pillLeft = cx - dot * 0.5f - 8.5f;
+                const float pillRight = textRight + 8.5f;
+                if (pillLeft >= (float) sb.getX() - 22.0f && tw > 1.0f)
+                {
+                    juce::Rectangle<float> pill (pillLeft, cy - pillH * 0.5f,
+                                                 pillRight - pillLeft, pillH);
+                    g.setColour (juce::Colour (0xff0e1218).withAlpha (0.90f));
+                    g.fillRoundedRectangle (pill, pillH * 0.5f);
+                    g.setColour (statusColour.withAlpha (0.28f));
+                    g.drawRoundedRectangle (pill.reduced (0.5f), pillH * 0.5f, 1.0f);
+                }
+                g.setColour (statusColour.withAlpha (0.26f));
+                g.fillEllipse (cx - dot * 0.5f - 2.5f, cy - dot * 0.5f - 2.5f, dot + 5.0f, dot + 5.0f);
+                g.setColour (statusColour);
+                g.fillEllipse (cx - dot * 0.5f, cy - dot * 0.5f, dot, dot);
+               #else
                 const float tw = juce::GlyphArrangement::getStringWidth (status.getFont(), status.getText());
                 const float dot = 9.0f;
                 const float cx = (float) sb.getRight() - tw - 12.0f;
@@ -19630,6 +19965,7 @@ public:
                 g.fillEllipse (cx - dot * 0.5f - 2.0f, cy - dot * 0.5f - 2.0f, dot + 4.0f, dot + 4.0f);
                 g.setColour (statusColour);
                 g.fillEllipse (cx - dot * 0.5f, cy - dot * 0.5f, dot, dot);
+               #endif
             }
         }
 
@@ -19679,12 +20015,16 @@ public:
                 }
             };
 
+           #if CHURCHDAW_MOBILE_SHELL
+            drawUnityMark (masterDbSlider, 0.0, 14);   // 0 dB do master fora da largura do cap
+           #else
             drawUnityMark (masterDbSlider, 0.0, 10);   // 0 dB do master
+           #endif
 
             if (focusedMobileLayout
                  && juce::isPositiveAndBelow (selectedStrip,
                                               TimbresProcessor::numLayers))
-                drawUnityMark (strips[selectedStrip].vol, 1.0, 10);  // ganho 1,0 = 0 dB
+                drawUnityMark (strips[selectedStrip].vol, 1.0, 13);  // ganho 1,0 = 0 dB
         }
     }
 
@@ -19714,6 +20054,27 @@ public:
     void paintOverChildren (juce::Graphics& g) override
     {
         const auto clip = g.getClipBounds();
+       #if CHURCHDAW_MOBILE_SHELL
+        if (chromeSkin)
+        {
+            // Canal OFF: fader e medidor apagados (o switch, o seletor e M/S
+            // seguem legiveis para religar/trocar).
+            for (int l = 0; l < TimbresProcessor::numLayers; ++l)
+            {
+                const auto& s = strips[l];
+                if (s.cardBounds.isEmpty() || s.vol.getBounds().isEmpty()
+                     || proc.layers[l].on == nullptr || (bool) *proc.layers[l].on)
+                    continue;
+
+                auto zone = s.vol.getBounds();
+                if (s.meter != nullptr)
+                    zone = zone.getUnion (s.meter->getBounds());
+                g.setColour (ChurchLiveSkin::panel().withAlpha (0.62f));
+                g.fillRoundedRectangle (zone.toFloat(), 6.0f);
+            }
+            return;
+        }
+       #endif
         // CANAL OFF = card inteiro dessaturado (spec do console: o estado nao
         // pode depender so do botao). Veu escuro DEPOIS dos filhos, com o
         // botao ON/OFF recortado para fora — e ele que religa o canal e
@@ -19802,6 +20163,16 @@ public:
         // desktop explicitamente desligada nesse ramo para o C++ continuar
         // valido em Android/iOS.
         constexpr bool referenceDesktop = false;
+        chromeSkin = (bool) getProperties().getWithDefault ("churchShell", false);
+        stageSkin = mobileStageMode && chromeSkin;
+        applyStageSkin (chromeSkin, chromeSkin);   // cards (palco e editor focado) + barra
+
+        if (chromeSkin)
+        {
+            layoutStageSkinChrome (area);
+        }
+        else
+        {
         // +15% de legibilidade no aparelho real (pedido do dono, 30/07):
         // 14->16 e 10->11,5 na paisagem curta, com a linha acompanhando.
        #if CHURCHDAW_MOBILE_SHELL
@@ -19834,7 +20205,7 @@ public:
                             ? juce::jlimit (92, 112, modeButtonW - 8)
                             : juce::jmin (modeButtonW, top.getWidth());
         editToneButton.setBounds (top.removeFromRight (modeW));
-        top.removeFromRight (juce::jmin (4, top.getWidth()));
+        top.removeFromRight (juce::jmin (8, top.getWidth()));
 
         if (mobileStageMode)
         {
@@ -19842,10 +20213,10 @@ public:
             const int arrowW = juce::jmin (40, top.getHeight());
             canalProximoBtn.setVisible (true);
             canalProximoBtn.setBounds (top.removeFromRight (arrowW));
-            top.removeFromRight (juce::jmin (2, top.getWidth()));
+            top.removeFromRight (juce::jmin (3, top.getWidth()));
             canalAnteriorBtn.setVisible (true);
             canalAnteriorBtn.setBounds (top.removeFromRight (arrowW));
-            top.removeFromRight (juce::jmin (3, top.getWidth()));
+            top.removeFromRight (juce::jmin (8, top.getWidth()));
             // No palco o status "Pronto" fica compacto a direita do titulo.
             status.setFont (juce::Font (juce::FontOptions (11.0f)));
         }
@@ -19857,7 +20228,9 @@ public:
             canalProximoBtn.setBounds ({});
         }
 
-        const int titleW = juce::jmin (mobileStageMode ? 130 : 160, top.getWidth());
+        const int titleW = juce::jmin (top.getWidth() < 185 ? 106
+                                                            : (mobileStageMode ? 126 : 156),
+                                       top.getWidth());
         title.setBounds (top.removeFromLeft (titleW));
        #else
         title.setBounds (top.removeFromLeft (
@@ -19865,8 +20238,10 @@ public:
         editToneButton.setVisible (false);
         editToneButton.setBounds ({});
        #endif
-        status.setBounds (top);
+        status.setVisible (top.getWidth() >= 44);
+        status.setBounds (top.getWidth() >= 44 ? top.withTrimmedRight (6) : juce::Rectangle<int>{});
         area.removeFromTop (shortLandscapeMobileLayout ? 2 : 4);
+        }
        #else
         // O editor recebe unidades logicas ja normalizadas pelo ScaledHolder.
         // Ao lado da sidebar, ~1000x500 ja corresponde ao desktop Full HD.
@@ -21105,6 +21480,758 @@ public:
 
 private:
    #if CHURCHDAW_MOBILE_SHELL
+    //==========================================================================
+    // SKIN CHURCH LIVE (so visual; ver ChurchLiveSkin.h). Liga o LookAndFeel e
+    // marca cada controle com o papel que o LookAndFeel sabe desenhar. Nenhum
+    // handler, attachment ou parametro muda.
+    // `chrome`: barra superior (status, setas, botao de modo) nos dois modos.
+    // `stage`: cards do palco (so no Modo Palco).
+    void applyStageSkin (bool chrome, bool stage)
+    {
+        const auto m = ChurchLiveSkin::metricsOf (*this);
+        const auto tagWhen = [&] (bool on, juce::Component& c, const char* role)
+        {
+            if (on)
+            {
+                c.getProperties().set ("churchSkin", role);
+                c.getProperties().set ("churchU", (double) m.u);
+            }
+            else
+            {
+                c.getProperties().remove ("churchSkin");
+                c.getProperties().remove ("churchU");
+            }
+        };
+        const auto tag = [&] (juce::Component& c, const char* role) { tagWhen (stage, c, role); };
+        const auto chromeTag = [&] (juce::Component& c, const char* role) { tagWhen (chrome, c, role); };
+
+        if (chrome != stageSkinApplied)
+        {
+            stageSkinApplied = chrome;
+            setLookAndFeel (chrome ? &ChurchLiveSkin::lookAndFeel() : nullptr);
+        }
+
+        for (auto& s : strips)
+        {
+            tag (s.name, "hidden");
+            tag (s.volDb, "hidden");
+            tag (s.onBtn, "switch");
+            tag (s.muteBtn, "mute");
+            tag (s.soloBtn, "solo");
+            tag (s.combo, "timbre");
+            tag (s.vol, "channelFader");
+            tag (s.addButton, "slot");
+            tag (s.tonePageBtn, "pill");
+            tag (s.pluginOpenBtn, "pill");
+            tag (s.autoEqBtn, "pill");
+
+            if (s.meter != nullptr)
+                s.meter->setSkin (stage, m.u);
+        }
+
+        chromeTag (title, "hidden");
+        chromeTag (status, "hidden");
+        tag (masterName, "hidden");
+        tag (panicButton, "panic");
+        tag (masterDbSlider, "masterFader");
+        chromeTag (canalAnteriorBtn, "arrow");
+        chromeTag (canalProximoBtn, "arrow");
+        canalAnteriorBtn.getProperties().set ("churchDir", -1);
+        canalProximoBtn.getProperties().set ("churchDir", 1);
+        chromeTag (editToneButton, "edit");
+
+        if (masterMeter != nullptr)
+            masterMeter->setSkin (stage, m.u);
+    }
+
+    // Barra superior do editor: status, setas e botao de modo (o chip MIDI, o
+    // Salvo e a marca ficam no MainComponent, na mesma geometria). `area` volta
+    // como a regiao dos cards.
+    void layoutStageSkinChrome (juce::Rectangle<int>& area)
+    {
+        const auto m = ChurchLiveSkin::metricsOf (*this);
+        const int inset = (int) getProperties().getWithDefault ("stageTopInset", 0);
+        const int barH = ChurchLiveSkin::topBarHeight (m);
+        const auto bar = ChurchLiveSkin::layoutTopBar ({ 0, 0, getWidth(), barH }, m, true);
+
+        title.setBounds ({});
+        status.setVisible (true);
+        status.setBounds (bar.status);
+
+        editToneButton.setVisible (true);
+        editToneButton.setToggleState (mobileStageMode, juce::dontSendNotification);
+        editToneButton.setButtonText (mobileStageMode ? "Editar canal" : "Modo palco");
+        editToneButton.setTooltip (mobileStageMode
+            ? "Voltar ao canal em foco para editar todos os controles"
+            : "Ver faders, meters, Mute, Solo e Master em tempo real");
+        editToneButton.setBounds (bar.edit);
+
+        // As setas de pagina so existem no palco; no editor focado elas moram
+        // na faixa de abas do proprio canal.
+        canalAnteriorBtn.setTitle ("Anterior");
+        canalProximoBtn.setTitle (juce::String::fromUTF8 ("Pr\xc3\xb3ximo"));
+        canalAnteriorBtn.setVisible (mobileStageMode);
+        canalProximoBtn.setVisible (mobileStageMode);
+        canalAnteriorBtn.setBounds (mobileStageMode ? bar.prev : juce::Rectangle<int>());
+        canalProximoBtn.setBounds (mobileStageMode ? bar.next : juce::Rectangle<int>());
+
+        const int padX = m.px (28, 8);
+        area = juce::Rectangle<int> (padX, barH + inset + m.px (24, 6),
+                                     juce::jmax (1, getWidth() - padX * 2),
+                                     juce::jmax (1, getHeight() - barH - inset - m.px (24, 6) - m.px (26, 8)));
+    }
+
+    void layoutStageSkinCards (juce::Rectangle<int> area)
+    {
+        const auto m = ChurchLiveSkin::metricsOf (*this);
+        const int gap = m.px (16, 5);
+        const int pad = m.px (16, 6);
+        const int columns = canaisNaTela;
+
+        const auto isLoaded = [this] (int layer)
+        {
+            return proc.getLayerTimbre (layer).isNotEmpty()
+                || proc.getLayerInstrument (layer) != nullptr
+                || proc.isLayerChurchOrgan (layer);
+        };
+
+        // Pesos da referencia: canal ativo 210, baia vazia 104, master 296.
+        std::array<double, TimbresProcessor::numLayers> weight {};
+        double total = 296.0;
+        for (int c = 0; c < columns; ++c)
+        {
+            const int layer = primeiroCanalVisivel + c;
+            if (! juce::isPositiveAndBelow (layer, TimbresProcessor::numLayers))
+                continue;
+            weight[(size_t) c] = isLoaded (layer) ? 210.0 : 104.0;
+            total += weight[(size_t) c];
+        }
+        const double factor = (double) juce::jmax (1, area.getWidth() - gap * columns) / total;
+
+        faixaDeCanais = area.withWidth (juce::jmax (1, area.getWidth() - juce::roundToInt (296.0 * factor) - gap));
+        const bool canPage = TimbresProcessor::numLayers > columns;
+        const int maxStart = juce::jmax (0, TimbresProcessor::numLayers - columns);
+        canalAnteriorBtn.setVisible (canPage);
+        canalProximoBtn.setVisible (canPage);
+        canalAnteriorBtn.setEnabled (primeiroCanalVisivel > 0);
+        canalProximoBtn.setEnabled (primeiroCanalVisivel < maxStart);
+        canalAnteriorBtn.setTooltip ("Pagina anterior de canais");
+        canalProximoBtn.setTooltip ("Proxima pagina de canais");
+
+        for (int c = 0; c < columns; ++c)
+        {
+            const int layer = primeiroCanalVisivel + c;
+            if (! juce::isPositiveAndBelow (layer, TimbresProcessor::numLayers))
+                continue;
+
+            auto& s = strips[layer];
+            auto cell = area.removeFromLeft (juce::roundToInt (weight[(size_t) c] * factor));
+            area.removeFromLeft (gap);
+            s.cardBounds = cell;
+            s.activity.setBounds ({});
+
+            if (! isLoaded (layer))
+            {
+                s.name.setBounds (cell.reduced (m.px (6, 2), pad).removeFromTop (m.px (44, 30)));
+                s.addButton.setBounds (cell);
+                s.addButton.setVisible (true);
+                s.addButton.toFront (false);
+                continue;
+            }
+
+            layoutSkinChannelCard (layer, cell, m);
+        }
+
+        layoutSkinMasterCard (area, m);
+    }
+
+    // Card de um canal carregado: cabecalho com ON, seletor de timbre, fader com
+    // medidor, leitura em dB e M/S. Usado no Modo Palco e no editor focado.
+    void layoutSkinChannelCard (int layer, juce::Rectangle<int> cell, const ChurchLiveSkin::Metrics& m)
+    {
+        auto& s = strips[layer];
+        const int pad = m.px (16, 6);
+        s.cardBounds = cell;
+        s.activity.setBounds ({});
+
+        auto inner = cell.reduced (pad);
+        auto header = inner.removeFromTop (m.px (44, 30));
+        auto sw = header.removeFromRight (m.px (76, 54));
+        s.onBtn.setBounds (sw.withSizeKeepingCentre (sw.getWidth(), juce::jmin (sw.getHeight(), m.px (44, 30))));
+        s.name.setBounds (header);
+        inner.removeFromTop (m.px (12, 4));
+        s.combo.setBounds (inner.removeFromTop (m.px (80, 46)));
+        inner.removeFromTop (m.px (14, 5));
+
+        auto ms = inner.removeFromBottom (m.px (56, 40));
+        inner.removeFromBottom (m.px (12, 4));
+        s.volDb.setBounds (inner.removeFromBottom (m.px (46, 28)));
+        inner.removeFromBottom (m.px (12, 4));
+        const int msGap = m.px (10, 4);
+        s.muteBtn.setBounds (ms.removeFromLeft ((ms.getWidth() - msGap) / 2));
+        ms.removeFromLeft (msGap);
+        s.soloBtn.setBounds (ms);
+
+        // Botoes so de letra precisam de nome para leitor de tela; o duplo
+        // toque no fader volta o canal a 0 dB (ganho 1,0).
+        s.muteBtn.setTitle ("Mudo canal " + juce::String (layer + 1));
+        s.soloBtn.setTitle ("Solo canal " + juce::String (layer + 1));
+        s.vol.setDoubleClickReturnValue (true, 1.0);
+
+        auto meterCol = inner.removeFromRight (m.px (26, 14));
+        inner.removeFromRight (m.px (16, 6));
+        s.vol.setSliderStyle (juce::Slider::LinearVertical);
+        s.vol.setTextBoxStyle (juce::Slider::NoTextBox, false, 0, 0);
+        s.vol.setBounds (inner);
+
+        if (s.meter != nullptr)
+        {
+            // a barra acompanha o curso do fader (do topo ao fim da calha)
+            const int top = s.vol.getY() + (int) s.vol.getPositionOfValue (s.vol.getMaximum());
+            const int bottom = s.vol.getY() + (int) s.vol.getPositionOfValue (s.vol.getMinimum());
+            s.meter->setBounds (meterCol.getX(), top, meterCol.getWidth(), juce::jmax (1, bottom - top));
+        }
+    }
+
+    // MASTER: fader com escala de dB, medidor L/R, leitura e PANIC.
+    void layoutSkinMasterCard (juce::Rectangle<int> area, const ChurchLiveSkin::Metrics& m)
+    {
+        const int pad = m.px (16, 6);
+        masterCardBounds = area;
+        auto inner = masterCardBounds.reduced (pad);
+        masterName.setBounds (inner.removeFromTop (m.px (40, 26)));
+        inner.removeFromTop (m.px (10, 3));
+        panicButton.setBounds (inner.removeFromBottom (m.px (84, 48)));
+        inner.removeFromBottom (m.px (12, 4));
+        masterReadoutBounds = inner.removeFromBottom (m.px (46, 28));
+        inner.removeFromBottom (m.px (12, 4));
+
+        masterAutoEqBtn.setBounds ({});
+        masterPunchBtn.setBounds ({});
+        masterDbSlider.setSliderStyle (juce::Slider::LinearVertical);
+        masterDbSlider.setTextBoxStyle (juce::Slider::NoTextBox, false, 0, 0);
+        masterDbSlider.getProperties().set ("churchLabelW", m.px (40, 24));
+
+        auto meterCol = inner.removeFromRight (m.px (62, 30));
+        inner.removeFromRight (m.px (14, 5));
+        masterDbSlider.setBounds (inner);
+
+        if (masterMeter != nullptr)
+        {
+            const int top = masterDbSlider.getY()
+                          + (int) masterDbSlider.getPositionOfValue (masterDbSlider.getMaximum());
+            const int bottom = masterDbSlider.getY()
+                             + (int) masterDbSlider.getPositionOfValue (masterDbSlider.getMinimum());
+            masterMeter->setBounds (meterCol.getX(), top, meterCol.getWidth(),
+                                    juce::jmax (1, bottom - top) + juce::jmax (12, m.px (20)));
+        }
+    }
+
+    //==========================================================================
+    // EDITOR FOCADO no skin Church Live: abas de canal no topo; card do canal,
+    // painel de efeitos (knobs grandes) e Master sempre visivel dividem o resto.
+    void layoutFocusedSkin (juce::Rectangle<int> area)
+    {
+        const auto m = ChurchLiveSkin::metricsOf (*this);
+        const int pad = m.px (16, 6);
+        faixaDeCanais = {};
+        mobileMasterPage = false;
+        mobileMasterTabBounds = {};
+        mobileMasterPageButton.setBounds ({});
+
+        int focus = selectedStrip;
+        if (! juce::isPositiveAndBelow (focus, TimbresProcessor::numLayers))
+        {
+            focus = 0;
+            for (int l = 0; l < TimbresProcessor::numLayers; ++l)
+                if (proc.getLayerTimbre (l).isNotEmpty() || proc.getLayerInstrument (l) != nullptr)
+                {
+                    focus = l;
+                    break;
+                }
+            selectedStrip = focus;
+            proc.setSelectedLayer (focus);
+        }
+
+        for (auto& s : strips)
+        {
+            s.cardBounds = {};
+            s.tabBounds = {};
+            s.fxGroup = {};
+            s.routingGroup = {};
+            s.pluginGroup = {};
+            for (auto* c : churchDAWStripCollapseList (s))
+                c->setBounds ({});
+            if (s.meter != nullptr)
+                s.meter->setBounds ({});
+            s.combo.setInterceptsMouseClicks (true, true);
+            s.combo.setWantsKeyboardFocus (true);
+        }
+
+        // O Master mora ao lado do canal: o resto dos controles do bloco antigo some.
+        fxTitle.setBounds ({});
+        gTranspSlider.setBounds ({});
+        gTranspLabel.setBounds ({});
+        sustainToggle.setBounds ({});
+        invPedalToggle.setBounds ({});
+        masterAutoEqBtn.setBounds ({});
+        masterPunchBtn.setBounds ({});
+        reverbTypeCombo.setBounds ({});
+        reverbTypeCombo.setVisible (false);
+        reverbReturnSlider.setBounds ({});
+        reverbReturnSlider.setVisible (false);
+        reverbReturnLabel.setBounds ({});
+        reverbReturnLabel.setVisible (false);
+        editReverbButton.setBounds ({});
+        editReverbButton.setVisible (false);
+        if (masterReductionMeter != nullptr)
+        {
+            masterReductionMeter->setBounds ({});
+            masterReductionMeter->setVisible (false);
+        }
+        for (int i = 0; i < TimbresProcessor::numInserts; ++i)
+        {
+            insertCombos[i].setBounds ({});
+            insertOpenButtons[i].setBounds ({});
+            insertRouteButtons[i].setBounds ({});
+            insertRouteButtons[i].setVisible (false);
+        }
+        bottomPanelBounds = {};
+        masterFxGroupBounds = {};
+        masterLevelGroupBounds = {};
+        masterLiveGroupBounds = {};
+        masterUtilityGroupBounds = {};
+        fxDivider = {};
+
+        // Abas de canal (pilulas) com setas de pagina nas pontas.
+        auto tabs = area.removeFromTop (m.px (56, 40));
+        area.removeFromTop (m.px (16, 5));
+        const int gap = m.px (8, 3);
+        for (int l = 0; l < TimbresProcessor::numLayers; ++l)
+        {
+            strips[l].tabBounds = {};
+            mobilePageButtons[l].setBounds ({});
+        }
+        canalAnteriorBtn.setVisible (true);
+        canalAnteriorBtn.setBounds (tabs.removeFromLeft (m.px (56, 40)));
+        tabs.removeFromLeft (gap);
+        canalProximoBtn.setVisible (true);
+        canalProximoBtn.setBounds (tabs.removeFromRight (m.px (56, 40)));
+        tabs.removeFromRight (gap);
+
+        canaisNaTela = juce::jmin (TimbresProcessor::numLayers,
+                                   ChurchDAWAndroidStageLayout::focusedChannelCountForWidth (tabs.getWidth(), gap));
+        if (focus < primeiroCanalVisivel || focus >= primeiroCanalVisivel + canaisNaTela)
+            primeiroCanalVisivel = ChurchDAWAndroidStageLayout::pageContaining (
+                focus, canaisNaTela, TimbresProcessor::numLayers);
+        limitarPrimeiroCanalVisivel();
+        canalAnteriorBtn.setEnabled (primeiroCanalVisivel > 0);
+        canalProximoBtn.setEnabled (primeiroCanalVisivel < juce::jmax (0, TimbresProcessor::numLayers - canaisNaTela));
+
+        const int tabW = juce::jmax (1, (tabs.getWidth() - gap * (canaisNaTela - 1)) / canaisNaTela);
+        for (int column = 0; column < canaisNaTela; ++column)
+        {
+            const int l = primeiroCanalVisivel + column;
+            if (! juce::isPositiveAndBelow (l, TimbresProcessor::numLayers))
+                break;
+            strips[l].tabBounds = column == canaisNaTela - 1 ? tabs : tabs.removeFromLeft (tabW);
+            mobilePageButtons[l].setBounds (strips[l].tabBounds);
+            if (column < canaisNaTela - 1)
+                tabs.removeFromLeft (gap);
+        }
+
+        // Corpo: canal | efeitos (flexivel) | master. Pesos da referencia.
+        const int colGap = m.px (16, 5);
+        const double factor = (double) juce::jmax (1, area.getWidth() - colGap * 2) / (300.0 + 820.0 + 296.0);
+        auto cardA = area.removeFromLeft (juce::roundToInt (300.0 * factor));
+        area.removeFromLeft (colGap);
+        auto cardC = area.removeFromRight (juce::roundToInt (296.0 * factor));
+        area.removeFromRight (colGap);
+        const auto cardB = area;
+
+        auto& s = strips[focus];
+        const bool loaded = proc.getLayerTimbre (focus).isNotEmpty()
+                         || proc.getLayerInstrument (focus) != nullptr
+                         || proc.isLayerChurchOrgan (focus);
+        if (loaded)
+        {
+            layoutSkinChannelCard (focus, cardA, m);
+            layoutSkinFxCard (focus, cardB, m);
+        }
+        else
+        {
+            s.cardBounds = cardA;
+            s.name.setBounds (cardA.reduced (pad).removeFromTop (m.px (44, 30)));
+            s.addButton.setBounds (cardA);
+            s.addButton.setVisible (true);
+            s.addButton.toFront (false);
+        }
+
+        layoutSkinMasterCard (cardC, m);
+    }
+
+    // Painel de efeitos do canal em foco: knobs ocupam toda a area, titulo e
+    // botao de pagina (EQ/ENV) em cima, acoes do canal embaixo.
+    void layoutSkinFxCard (int layer, juce::Rectangle<int> card, const ChurchLiveSkin::Metrics& m)
+    {
+        auto& s = strips[layer];
+        s.fxGroup = card;
+        auto inner = card.reduced (m.px (20, 8));
+        auto head = inner.removeFromTop (m.px (44, 30));
+        s.tonePageBtn.setBounds (head.removeFromRight (m.px (120, 72)));
+        inner.removeFromTop (m.px (12, 4));
+
+        const bool eq = s.eqPage;
+        const bool hasOpenAction = proc.getLayerInstrument (layer) != nullptr
+                                || proc.isLayerChurchOrgan (layer)
+                                || proc.isLayerSoundFont (layer)
+                                || proc.isLayerPadOrAmbience (layer);
+        std::vector<juce::Component*> actions;
+        if (hasOpenAction) actions.push_back (&s.pluginOpenBtn);
+        if (eq)            actions.push_back (&s.autoEqBtn);
+        if (s.rotaryModeBox.isVisible()) actions.push_back (&s.rotaryModeBox);
+
+        if (! actions.empty())
+        {
+            auto row = inner.removeFromBottom (m.px (60, 40));
+            inner.removeFromBottom (m.px (14, 5));
+            const int rowGap = m.px (12, 4);
+            const int w = (row.getWidth() - rowGap * ((int) actions.size() - 1)) / (int) actions.size();
+            for (auto* a : actions)
+            {
+                a->setVisible (true);
+                a->setBounds (row.removeFromLeft (w));
+                row.removeFromLeft (rowGap);
+            }
+        }
+
+        s.compLabel.setText ("COMP", juce::dontSendNotification);
+        s.dlyLabel.setText ("REVERB", juce::dontSendNotification);
+        s.echoLabel.setText ("DELAY", juce::dontSendNotification);
+        s.rotaryLabel.setText ("ROTARY", juce::dontSendNotification);
+        s.attackLabel.setText ("ATTACK", juce::dontSendNotification);
+        s.releaseLabel.setText ("RELEASE", juce::dontSendNotification);
+        s.lowLabel.setText ("LOW", juce::dontSendNotification);
+        s.midLabel.setText ("MID", juce::dontSendNotification);
+        s.highLabel.setText ("HI", juce::dontSendNotification);
+
+        struct Knob { juce::Slider* knob; juce::Label* label; bool valueBox; };
+        std::vector<Knob> knobs;
+        const auto add = [&] (juce::Slider& k, juce::Label& l, bool box)
+        {
+            if (k.isVisible())
+                knobs.push_back ({ &k, &l, box });
+        };
+        add (s.octave, s.octaveLabel, true);
+        add (s.transp, s.transpLabel, true);
+        add (s.compKnob, s.compLabel, false);
+        add (s.dlyKnob, s.dlyLabel, false);
+        add (s.echoKnob, s.echoLabel, false);
+        add (s.rotaryKnob, s.rotaryLabel, false);
+        add (s.attackKnob, s.attackLabel, false);
+        add (s.releaseKnob, s.releaseLabel, false);
+        add (s.lowKnob, s.lowLabel, false);
+        add (s.midKnob, s.midLabel, false);
+        add (s.highKnob, s.highLabel, false);
+
+        const int n = (int) knobs.size();
+        if (n == 0)
+            return;
+
+        const int cols = n <= 4 ? n : n <= 8 ? (n + 1) / 2 : (n + 2) / 3;
+        const int rows = (n + cols - 1) / cols;
+        const int cw = inner.getWidth() / cols, ch = inner.getHeight() / rows;
+        const int labelH = m.px (24, 14), boxH = m.px (28, 18);
+
+        for (int i = 0; i < n; ++i)
+        {
+            const auto cell = juce::Rectangle<int> (inner.getX() + (i % cols) * cw,
+                                                    inner.getY() + (i / cols) * ch, cw, ch).reduced (m.px (6, 2));
+            auto& k = knobs[(size_t) i];
+            const int extra = k.valueBox ? boxH : 0;
+            // shortcut: Oitava/Transpose ficam menores (descontam a caixa de valor); um diametro unico
+            // deixava os 4 botoes sem caixa com ~40 dp no celular, abaixo do alvo de toque de 48 dp.
+            const int d = juce::jmax (24, juce::jmin (cell.getWidth(), cell.getHeight() - labelH - extra));
+            const int y0 = cell.getCentreY() - (d + extra + labelH) / 2;
+            k.knob->setSliderStyle (juce::Slider::RotaryHorizontalVerticalDrag);
+            k.knob->setTextBoxStyle (k.valueBox ? juce::Slider::TextBoxBelow : juce::Slider::NoTextBox,
+                                     false, d, boxH);
+            k.knob->setBounds (cell.getCentreX() - d / 2, y0, d, d + extra);
+            k.label->setJustificationType (juce::Justification::centred);
+            k.label->setFont (ChurchLiveSkin::font (ChurchLiveSkin::Face::barlowSemi, m.fpx (14, 9.0f), 0.10f));
+            k.label->setColour (juce::Label::textColourId, ChurchLiveSkin::textSec());
+            k.label->setBounds (cell.getX(), y0 + d + extra, cell.getWidth(), labelH);
+        }
+    }
+
+    void paintFocusedExtras (juce::Graphics& g)
+    {
+        using namespace ChurchLiveSkin;
+        const auto m = metricsOf (*this);
+        const float radius = m.fpx (14, 6.0f);
+
+        for (int l = 0; l < TimbresProcessor::numLayers; ++l)
+        {
+            const auto r = strips[l].tabBounds.toFloat();
+            if (r.isEmpty())
+                continue;
+
+            const bool selected = l == selectedStrip;
+            const bool loaded = proc.getLayerTimbre (l).isNotEmpty()
+                             || proc.getLayerInstrument (l) != nullptr
+                             || proc.isLayerChurchOrgan (l);
+            g.setColour (selected ? railActive() : panel());
+            g.fillRoundedRectangle (r, radius);
+            g.setColour (selected ? accent() : line());
+            g.drawRoundedRectangle (r.reduced (0.5f), radius, selected ? 1.5f : 1.0f);
+            if (selected)
+            {
+                const float barH = juce::jmax (2.0f, m.fpx (3, 2.0f));
+                g.setColour (accent());
+                g.fillRoundedRectangle (r.getX() + r.getWidth() * 0.3f, r.getBottom() - barH,
+                                        r.getWidth() * 0.4f, barH, barH * 0.5f);
+            }
+
+            auto body = r.reduced (m.fpx (12, 5.0f), 0.0f);
+            const auto number = font (Face::condBold, m.fpx (20, 12.0f), 0.04f);
+            const float nw = textWidth (number, "C" + juce::String (l + 1)) + m.fpx (8, 4.0f);
+            g.setFont (number);
+            g.setColour (selected ? accentSoft() : (loaded ? ChurchLiveSkin::text() : textMute()));
+            g.drawText ("C" + juce::String (l + 1), body.removeFromLeft (nw).toNearestInt(),
+                        juce::Justification::centredLeft, false);
+            g.setFont (font (Face::barlowSemi, m.fpx (15, 9.5f)));
+            g.setColour (loaded ? (selected ? ChurchLiveSkin::text() : textSec()) : textMute());
+            g.drawFittedText (loaded ? strips[l].combo.getText() : juce::String ("Adicionar"),
+                              body.toNearestInt(), juce::Justification::centredLeft, 1, 0.8f);
+        }
+
+        // painel de efeitos do canal em foco
+        for (const auto& s : strips)
+        {
+            if (s.fxGroup.isEmpty())
+                continue;
+
+            const auto card = s.fxGroup.toFloat();
+            const float cardRadius = m.fpx (20, 8.0f);
+            g.setColour (panel());
+            g.fillRoundedRectangle (card, cardRadius);
+            g.setColour (line());
+            g.drawRoundedRectangle (card.reduced (0.5f), cardRadius, 1.0f);
+            const float pad = m.fpx (20, 8.0f);
+            g.setColour (ChurchLiveSkin::text());
+            g.setFont (font (Face::condBold, m.fpx (24, 13.0f), 0.04f));
+            g.drawText (s.eqPage ? juce::String ("EQUALIZADOR 3 BANDAS") : juce::String ("TIMBRE & EFEITOS"),
+                        juce::Rectangle<float> (card.getX() + pad, card.getY() + pad, card.getWidth() * 0.6f, m.fpx (44, 30.0f))
+                            .toNearestInt(),
+                        juce::Justification::centredLeft, false);
+        }
+    }
+
+    // Chip de status da barra superior: icone + texto, nunca so a cor. A mensagem
+    // completa fica no tooltip do rotulo.
+    void paintSkinStatusChip (juce::Graphics& g)
+    {
+        using namespace ChurchLiveSkin;
+        if (status.getBounds().isEmpty())
+            return;
+
+        const auto tone = statusColour == juce::Colour (0xff6fcf6f) ? okGreen()
+                        : statusColour == juce::Colour (0xffd83a3a) ? meterRed()
+                                                                     : meterAmber();
+        // pack ausente nao e falha: o musico precisa saber que a acao e instalar
+        const auto label = tone == okGreen() ? juce::String ("Pronto")
+                         : tone == meterRed() ? (libraryMissing ? juce::String ("Sem biblioteca") : juce::String ("Erro"))
+                         : status.getText().startsWith ("Carregando") ? juce::String ("Carregando")
+                                                                       : juce::String ("Aguarde");
+        drawStatusChip (g, status.getBounds().toFloat(), label, tone, metricsOf (*this));
+    }
+
+    void paintStageSkin (juce::Graphics& g)
+    {
+        using namespace ChurchLiveSkin;
+        const auto m = metricsOf (*this);
+        const auto clip = g.getClipBounds();
+
+        g.fillAll (bg());
+        g.setGradientFill (juce::ColourGradient (accent().withAlpha (0.07f), 0.0f, 0.0f,
+                                                 juce::Colours::transparentBlack,
+                                                 (float) getWidth() * 0.55f, (float) getHeight() * 0.55f, true));
+        g.fillRect (getLocalBounds());
+
+        paintSkinStatusChip (g);
+
+        const bool anySolo = proc.hasAnyLoadedSolo();
+        const float radius = m.fpx (20, 8.0f);
+
+        for (int l = 0; l < TimbresProcessor::numLayers; ++l)
+        {
+            const auto& s = strips[l];
+            if (s.cardBounds.isEmpty() || ! s.cardBounds.expanded (10).intersects (clip))
+                continue;
+
+            const auto card = s.cardBounds.toFloat();
+            const bool loaded = proc.getLayerTimbre (l).isNotEmpty()
+                             || proc.getLayerInstrument (l) != nullptr
+                             || proc.isLayerChurchOrgan (l);
+            const auto title = s.name.getText().toUpperCase();
+
+            if (! loaded)
+            {
+                // baia vazia: borda tracejada, "+" e a acao
+                const float stroke = juce::jmax (1.0f, m.fpx (2, 1.0f));
+                drawDashedRoundRect (g, card.reduced (stroke), radius, stroke, dashed());
+                g.setColour (textMute());
+                g.setFont (font (Face::condBold, m.fpx (22, 12.0f), 0.04f));
+                g.drawFittedText (title, s.name.getBounds(), juce::Justification::centred, 1, 0.6f);
+
+                const float r = m.fpx (32, 14.0f);
+                const float label = m.fpx (14, 9.0f);
+                const float groupH = r * 2.0f + m.fpx (16, 5.0f) + label * 2.6f;
+                const float cy = card.getCentreY() - groupH * 0.5f + r;
+                drawDashedCircle (g, { card.getCentreX(), cy }, r, stroke, dashed());
+                g.setColour (textSec());
+                drawPlus (g, { card.getCentreX(), cy }, r * 0.34f, juce::jmax (2.0f, m.fpx (3, 2.0f)));
+                g.setFont (font (Face::barlowSemi, label));
+                g.setColour (textSec());
+                const auto cta = s.addButton.getButtonText().containsIgnoreCase ("biblioteca")
+                                    ? s.addButton.getButtonText() : juce::String ("Adicionar canal");
+                // escala minima 1.0: sem isso o texto era espremido numa linha ate
+                // encostar nas bordas tracejadas em vez de quebrar em duas.
+                const float padX = m.fpx (10, 4.0f);
+                g.drawFittedText (cta, juce::Rectangle<float> (card.getX() + padX, cy + r + m.fpx (12, 4.0f),
+                                                               card.getWidth() - padX * 2.0f, label * 2.6f).toNearestInt(),
+                                  juce::Justification::centredTop, 2, 1.0f);
+                continue;
+            }
+
+            const bool selected = l == selectedStrip;
+            const bool on = proc.layers[l].on == nullptr || (bool) *proc.layers[l].on;
+
+            if (selected)
+            {
+                for (int i = 3; i >= 1; --i)
+                {
+                    g.setColour (accent().withAlpha (0.045f * (float) (4 - i)));
+                    g.drawRoundedRectangle (card.expanded ((float) i * m.fpx (2.5f, 1.0f)), radius + (float) i * 2.0f,
+                                            m.fpx (2.5f, 1.0f));
+                }
+            }
+
+            g.setColour (panel());
+            g.fillRoundedRectangle (card, radius);
+            g.setColour (selected ? accent() : line());
+            g.drawRoundedRectangle (card.reduced (0.5f), radius, 1.0f);
+
+            // barrinha de acento no topo (cinza quando o canal esta OFF)
+            const float barW = m.fpx (60, 24.0f), barH = juce::jmax (2.0f, m.fpx (4, 2.0f));
+            g.setColour (on ? accentTop() : offGrey());
+            juce::Path bar;
+            bar.addRoundedRectangle (card.getCentreX() - barW * 0.5f, card.getY(), barW, barH,
+                                     barH * 0.5f, barH * 0.5f, false, false, true, true);
+            g.fillPath (bar);
+
+            g.setColour (selected ? accentSoft() : text());
+            // Com 5+ canais o cartao tem ~108 dp e a chave ON ocupa 54: "CANAL 3" era cortado
+            // em "CANAL" e o numero sumia. Reduz ate 78% e, se ainda faltar, "C3" (como nas abas).
+            const float titlePx = m.fpx (24, 13.0f);
+            const auto titleBox = s.name.getBounds();
+            float shownPx = titlePx;
+            auto titleFont = font (Face::condBold, shownPx, 0.04f);
+            while (textWidth (titleFont, title) > (float) titleBox.getWidth() && shownPx > titlePx * 0.78f)
+                titleFont = font (Face::condBold, shownPx -= 0.5f, 0.04f);
+            const bool titleFits = textWidth (titleFont, title) <= (float) titleBox.getWidth();
+            g.setFont (titleFits ? titleFont : font (Face::condBold, titlePx, 0.04f));
+            g.drawText (titleFits ? title : "C" + juce::String (l + 1), titleBox, juce::Justification::centredLeft, false);
+
+            // seletor de timbre
+            const auto sel = s.combo.getBounds().toFloat();
+            if (! sel.isEmpty())
+            {
+                g.setColour (elevated());
+                g.fillRoundedRectangle (sel, m.fpx (16, 6.0f));
+                const float padX = m.fpx (16, 7.0f);
+                const float cap = m.fpx (11, 8.0f);
+                g.setColour (textSec());
+                NordLookAndFeel::drawDesktopNavigationIcon (g, "navInstruments",
+                    { sel.getX() + padX, sel.getY() + m.fpx (12, 4.0f), m.fpx (12, 8.0f), m.fpx (12, 8.0f) }, false);
+                g.setFont (font (Face::barlowSemi, cap, 0.10f));
+                g.drawText ("TIMBRE", juce::Rectangle<float> (sel.getX() + padX + m.fpx (18, 11.0f), sel.getY() + m.fpx (9, 3.0f),
+                                                              sel.getWidth() * 0.5f, cap * 1.5f).toNearestInt(),
+                            juce::Justification::centredLeft, false);
+                const float chev = m.fpx (11, 6.0f);
+                g.setColour (textSec());
+                drawChevron (g, { sel.getRight() - padX - chev * 2.0f, sel.getCentreY() - chev, chev * 2.0f, chev * 2.0f },
+                             0, juce::jmax (1.6f, m.fpx (2.4f, 1.6f)));
+                g.setColour (text());
+                g.setFont (font (Face::barlowSemi, m.fpx (18, 11.5f)));
+                g.drawFittedText (s.combo.getText(),
+                                  juce::Rectangle<float> (sel.getX() + padX, sel.getY() + m.fpx (28, 12.0f),
+                                                          sel.getWidth() - padX * 2.0f - chev * 2.4f,
+                                                          sel.getHeight() - m.fpx (34, 14.0f)).toNearestInt(),
+                                  juce::Justification::centredLeft, 2, 0.8f);
+            }
+
+            // leitura em dB
+            const auto readout = s.volDb.getBounds().toFloat();
+            if (! readout.isEmpty())
+            {
+                g.setColour (inset());
+                g.fillRoundedRectangle (readout, m.fpx (10, 5.0f));
+                const auto labelColour = s.volDb.findColour (juce::Label::textColourId);
+                g.setColour (labelColour == NordLookAndFeel::txtSecondary() ? text() : labelColour);
+                g.setFont (font (Face::mono, m.fpx (20, 11.5f)));
+                g.drawText (s.volDb.getText(), readout.toNearestInt(), juce::Justification::centred, false);
+            }
+
+            if (anySolo && ! proc.getLayerSolo (l) && ! proc.getLayerMute (l))
+            {
+                g.setColour (juce::Colours::black.withAlpha (0.22f));
+                g.fillRoundedRectangle (card, radius);
+            }
+        }
+
+        // MASTER
+        if (! masterCardBounds.isEmpty())
+        {
+            const auto card = masterCardBounds.toFloat();
+            g.setGradientFill (juce::ColourGradient (juce::Colour (0xff2a1118), 0.0f, card.getY(),
+                                                     juce::Colour (0xff17171d), 0.0f, card.getBottom(), false));
+            g.fillRoundedRectangle (card, radius);
+            g.setColour (accent().withAlpha (0.38f));
+            g.drawRoundedRectangle (card.reduced (0.5f), radius, 1.0f);
+
+            const auto head = masterName.getBounds().toFloat();
+            const auto f = font (Face::condExtra, m.fpx (28, 14.0f), 0.14f);
+            const float tw = juce::GlyphArrangement::getStringWidth (f, "MASTER");
+            const float iconS = m.fpx (20, 11.0f), gapW = m.fpx (10, 5.0f);
+            const float x0 = head.getCentreX() - (iconS + gapW + tw) * 0.5f;
+            g.setColour (redText());
+            const float barW = juce::jmax (2.0f, iconS * 0.16f);
+            const float hs[] = { 0.45f, 0.85f, 0.65f, 1.0f };
+            for (int i = 0; i < 4; ++i)
+            {
+                const float h = iconS * hs[i];
+                g.fillRoundedRectangle (x0 + (float) i * barW * 1.7f, head.getCentreY() - h * 0.5f, barW, h, barW * 0.5f);
+            }
+            g.setColour (text());
+            g.setFont (f);
+            g.drawText ("MASTER", juce::Rectangle<float> (x0 + iconS + gapW, head.getY(), tw + 4.0f, head.getHeight()).toNearestInt(),
+                        juce::Justification::centredLeft, false);
+
+            if (! masterReadoutBounds.isEmpty())
+            {
+                const auto readout = masterReadoutBounds.toFloat();
+                g.setColour (inset());
+                g.fillRoundedRectangle (readout, m.fpx (10, 5.0f));
+                const double db = masterDbSlider.getValue();
+                g.setColour (db > 3.0 ? juce::Colour (0xffd83a3a) : db > 0.05 ? juce::Colour (0xffe0a83a) : text());
+                g.setFont (font (Face::mono, m.fpx (20, 11.5f)));
+                g.drawText (masterDbSlider.getTextFromValue (db), readout.toNearestInt(),
+                            juce::Justification::centred, false);
+            }
+        }
+    }
+
     void layoutMobileStageMode (juce::Rectangle<int> area)
     {
         focusedMobileLayout = false;
@@ -21181,7 +22308,13 @@ private:
 
         limitarPrimeiroCanalVisivel();
 
-        constexpr int stageGap = 4;
+        if (stageSkin)
+        {
+            layoutStageSkinCards (area);
+            return;
+        }
+
+        const int stageGap = area.getWidth() >= 760 ? 8 : 4;
         const auto stageColumns =
             ChurchDAWAndroidStageLayout::calculateStageColumns (
                 area.getWidth(), canaisNaTela);
@@ -21224,22 +22357,25 @@ private:
                 continue;
 
             auto& s = strips[layer];
-            s.cardBounds = cell.reduced (1, 0);
-            s.activity.setBounds (s.cardBounds.getX() + 4,
-                                  s.cardBounds.getY() + 3,
+            s.cardBounds = cell.reduced (cell.getWidth() >= 116 ? 3 : 1, 0);
+            s.activity.setBounds (s.cardBounds.getX() + 6,
+                                  s.cardBounds.getY() + 4,
                                   juce::jmax (0,
-                                      s.cardBounds.getWidth() - 8), 2);
+                                      s.cardBounds.getWidth() - 12), 2);
 
-            auto inner = s.cardBounds.reduced (4);
+            auto inner = s.cardBounds.reduced (5, 6);
+            inner.removeFromTop (juce::jmin (3, inner.getHeight()));
             const bool loaded =
                 proc.getLayerTimbre (layer).isNotEmpty()
                 || proc.getLayerInstrument (layer) != nullptr
                 || proc.isLayerChurchOrgan (layer);
 
             auto header = inner.removeFromTop (
-                juce::jmin (44, inner.getHeight()));
+                juce::jmin (34, inner.getHeight()));
             auto power = header.removeFromRight (
-                juce::jmin (44, header.getWidth()));
+                juce::jmin (42, header.getWidth()));
+            power = power.withSizeKeepingCentre (
+                power.getWidth(), juce::jmin (28, power.getHeight()));
             header.removeFromRight (juce::jmin (3, header.getWidth()));
             s.name.setBounds (header);
             s.onBtn.setBounds (loaded ? power
@@ -21279,10 +22415,10 @@ private:
             s.combo.setInterceptsMouseClicks (true, false);
             s.combo.setWantsKeyboardFocus (false);
             s.combo.setBounds (inner.removeFromTop (
-                juce::jmin (36, inner.getHeight())));
+                juce::jmin (34, inner.getHeight())));
             inner.removeFromTop (juce::jmin (3, inner.getHeight()));
-            // Seletor de teclado compacto no modo palco.
-            if (inner.getHeight() > 160)
+            // Seletor de teclado compacto em tablets; em celulares o espaco vira curso de fader.
+            if (inner.getHeight() > 224)
             {
                 s.midiInBox.setBounds (inner.removeFromTop (
                     juce::jmin (28, inner.getHeight())));
@@ -21309,7 +22445,7 @@ private:
             }
 
             auto actions = inner.removeFromBottom (
-                juce::jmin (46, inner.getHeight()));
+                juce::jmin (40, inner.getHeight()));
             constexpr int actionGap = 4;
             const int actionW = juce::jmax (
                 1, (actions.getWidth() - actionGap) / 2);
@@ -21319,7 +22455,7 @@ private:
             s.soloBtn.setBounds (actions);
             inner.removeFromBottom (juce::jmin (4, inner.getHeight()));
 
-            if (inner.getHeight() >= 112)
+            if (inner.getHeight() >= 106)
             {
                 auto db = inner.removeFromBottom (18);
                 s.volDb.setBounds (db);
@@ -21332,12 +22468,13 @@ private:
 
             if (s.meter != nullptr)
             {
-                // Meter um pouco mais largo — legivel no palco escuro.
+                // Meter slim de console no Modo Palco: abre respiro lateral em
+                // torno do cap prateado sem perder a leitura estereo L/R.
                 const int meterW = juce::jlimit (
-                    22, 32, inner.getWidth() / 3);
+                    15, 19, inner.getWidth() / 6);
                 s.meter->setBounds (inner.removeFromRight (meterW)
                                          .reduced (0, 2));
-                inner.removeFromRight (juce::jmin (4, inner.getWidth()));
+                inner.removeFromRight (juce::jmin (5, inner.getWidth()));
             }
 
             s.vol.setBounds (inner.withSizeKeepingCentre (
@@ -21348,9 +22485,11 @@ private:
         // paginam apenas os canais. Em telas largas, EQ/PESO ocupam uma segunda
         // fileira; em telefones estreitos cedem espaco ao fader e ao PANIC.
         masterCardBounds = masterArea;
-        auto masterInner = masterCardBounds.reduced (4);
+        auto masterInner = masterCardBounds.reduced (5, 6);
+        masterInner.removeFromTop (
+            juce::jmin (3, masterInner.getHeight()));
         masterName.setBounds (masterInner.removeFromTop (
-            juce::jmin (28, masterInner.getHeight())));
+            juce::jmin (26, masterInner.getHeight())));
         masterInner.removeFromTop (
             juce::jmin (4, masterInner.getHeight()));
 
@@ -21358,7 +22497,7 @@ private:
         panicButton.setBounds (masterInner.removeFromBottom (
             juce::jmin (40, masterInner.getHeight())));
         masterInner.removeFromBottom (
-            juce::jmin (6, masterInner.getHeight()));
+            juce::jmin (5, masterInner.getHeight()));
 
         // O contrato do Modo Palco e simples e seguro: canais, faders,
         // meters, M/S, preset e PANIC. EQ/PESO/inserts continuam no editor,
@@ -21373,7 +22512,7 @@ private:
         if (masterMeter != nullptr)
         {
             const int meterW = juce::jlimit (
-                24, 34, masterInner.getWidth() / 3);
+                22, 32, masterInner.getWidth() / 3);
             masterMeter->setBounds (masterInner.removeFromRight (meterW)
                                          .reduced (0, 2));
             masterInner.removeFromRight (
@@ -21389,6 +22528,12 @@ private:
     void layoutFocusedMobile (juce::Rectangle<int> area)
     {
        #if CHURCHDAW_MOBILE_SHELL
+        if (chromeSkin)
+        {
+            layoutFocusedSkin (area);
+            return;
+        }
+
         // O Modo Palco transforma o combo em leitura. Reentrar no editor
         // detalhado restaura imediatamente toque, teclado e D-pad.
         faixaDeCanais = {};
@@ -21643,34 +22788,171 @@ private:
                 // cabecalho, preset, acoes, volume e knobs escondia todo o ENV.
                 // Aqui o card vira tres regioes horizontais:
                 // identidade | performance | controles 3x2.
-                constexpr int columnGap = 6;
+                constexpr int columnGap = 8;
                 const int identityW = juce::jlimit (
-                    190, 224, inner.getWidth() * 34 / 100);
+                    190, 226, inner.getWidth() * 28 / 100);
                 auto identity = inner.removeFromLeft (identityW);
-                inner.removeFromLeft (columnGap);
+                inner.removeFromLeft (juce::jmin (columnGap, inner.getWidth()));
                 // Quatro acoes no caso mais cheio (M, S, Orgao/Abrir e Rotary/
                 // Auto EQ) precisam de 4 x 48 dp + 3 x 4 dp de respiro. Com o piso antigo
                 // de 196, o seletor Rotary terminava em 46 dp no 640x360.
                 const int performanceW = juce::jlimit (
-                    204, 224, inner.getWidth() * 34 / 100);
+                    204, 220, inner.getWidth() * 38 / 100);
                 auto performance = inner.removeFromLeft (
                     juce::jmin (performanceW,
                                 juce::jmax (1, inner.getWidth() - 156)));
                 inner.removeFromLeft (juce::jmin (columnGap, inner.getWidth()));
                 auto controlsArea = inner;
 
+               #if CHURCHDAW_MOBILE_SHELL
+                identity.reduce (0, 2);
+                performance.reduce (0, 2);
+                controlsArea.reduce (0, 2);
+
+                constexpr int rowGap = 6;
+                const int headH = juce::jmin (36, juce::jmax (30, identity.getHeight() / 5));
+                const int presetH = juce::jmin (40, juce::jmax (34, identity.getHeight() / 5));
+                const int actionH = juce::jmin (40, juce::jmax (36, performance.getHeight() / 5));
+
+                auto identityRest = identity;
+                auto identityHead = identityRest.removeFromTop (
+                    juce::jmin (headH, identityRest.getHeight()));
+                identityRest.removeFromTop (
+                    juce::jmin (rowGap, identityRest.getHeight()));
+                auto presetRow = identityRest.removeFromTop (
+                    juce::jmin (presetH, identityRest.getHeight()));
+
+                s.onBtn.setBounds (identityHead.removeFromRight (
+                    juce::jmin (54, identityHead.getWidth())));
+                identityHead.removeFromRight (
+                    juce::jmin (4, identityHead.getWidth()));
+                s.tonePageBtn.setBounds (identityHead.removeFromRight (
+                    juce::jmin (46, identityHead.getWidth())));
+                identityHead.removeFromRight (
+                    juce::jmin (4, identityHead.getWidth()));
+                s.glyph.setBounds (identityHead.removeFromLeft (
+                    juce::jmin (32, identityHead.getWidth()))
+                    .withSizeKeepingCentre (28, 28));
+                identityHead.removeFromLeft (
+                    juce::jmin (3, identityHead.getWidth()));
+                s.name.setBounds (identityHead);
+                s.timbreName.setBounds ({});
+                s.combo.setBounds (presetRow);
+
+                const bool tuningInIdentity = identityRest.getHeight() >= 86;
+                if (tuningInIdentity)
+                {
+                    identityRest.removeFromTop (
+                        juce::jmin (6, identityRest.getHeight()));
+                    auto tuneInner = identityRest.reduced (6, 3);
+                    tuneInner.removeFromTop (
+                        juce::jmin (20, tuneInner.getHeight()));
+
+                    const int tuneColW = juce::jmax (1, (tuneInner.getWidth() - 6) / 2);
+                    auto placeTuneKnob = [] (juce::Rectangle<int> col,
+                                             juce::Slider& knob,
+                                             juce::Label& lbl,
+                                             int textW)
+                    {
+                        const int totalH = juce::jmin (col.getHeight(), 78);
+                        auto grp = col.withSizeKeepingCentre (col.getWidth(), totalH);
+                        lbl.setFont (juce::Font (juce::FontOptions (9.5f)).boldened());
+                        auto lblBounds = grp.removeFromBottom (
+                            juce::jmin (13, grp.getHeight()));
+                        lbl.setBounds (lblBounds);
+                        knob.setSliderStyle (juce::Slider::RotaryHorizontalVerticalDrag);
+                        knob.setTextBoxStyle (juce::Slider::TextBoxBelow, false, textW, 13);
+                        knob.setBounds (grp);
+                    };
+
+                    auto octCol = tuneInner.removeFromLeft (tuneColW);
+                    tuneInner.removeFromLeft (juce::jmin (6, tuneInner.getWidth()));
+                    auto trpCol = tuneInner;
+                    placeTuneKnob (octCol, s.octave, s.octaveLabel, 32);
+                    placeTuneKnob (trpCol, s.transp, s.transpLabel, 40);
+                }
+
+                auto performanceBlock = performance;
+                auto actions = performanceBlock.removeFromBottom (
+                    juce::jmin (actionH, performanceBlock.getHeight()));
+                performanceBlock.removeFromBottom (
+                    juce::jmin (rowGap, performanceBlock.getHeight()));
+                auto levelArea = performanceBlock.reduced (6, 4);
+                levelArea.removeFromTop (
+                    juce::jmin (tuningInIdentity ? 20 : 8, levelArea.getHeight()));
+
+                if (! tuningInIdentity)
+                {
+                    auto transposeColumn = levelArea.removeFromRight (
+                        juce::jmin (54, levelArea.getWidth() / 3));
+                    s.transp.setSliderStyle (
+                        juce::Slider::RotaryHorizontalVerticalDrag);
+                    s.transp.setTextBoxStyle (
+                        juce::Slider::TextBoxBelow, false, 38, 13);
+                    s.transp.setBounds (transposeColumn.removeFromTop (
+                        juce::jmin (74, transposeColumn.getHeight())));
+                    s.transpLabel.setFont (
+                        juce::Font (juce::FontOptions (9.5f)));
+                    s.transpLabel.setBounds (transposeColumn.removeFromTop (
+                        juce::jmin (12, transposeColumn.getHeight())));
+                    levelArea.removeFromRight (
+                        juce::jmin (4, levelArea.getWidth()));
+
+                    auto octaveColumn = levelArea.removeFromRight (
+                        juce::jmin (54, levelArea.getWidth() / 3));
+                    s.octave.setSliderStyle (
+                        juce::Slider::RotaryHorizontalVerticalDrag);
+                    s.octave.setTextBoxStyle (
+                        juce::Slider::TextBoxBelow, false, 30, 13);
+                    s.octave.setBounds (octaveColumn.removeFromTop (
+                        juce::jmin (74, octaveColumn.getHeight())));
+                    s.octaveLabel.setFont (
+                        juce::Font (juce::FontOptions (9.5f)));
+                    s.octaveLabel.setBounds (octaveColumn.removeFromTop (
+                        juce::jmin (12, octaveColumn.getHeight())));
+                    levelArea.removeFromRight (
+                        juce::jmin (4, levelArea.getWidth()));
+                }
+
+                s.vol.setSliderStyle (juce::Slider::LinearVertical);
+
+                auto dbRow = levelArea.removeFromBottom (
+                    juce::jmin (20, levelArea.getHeight()));
+                s.volDb.setBounds (dbRow.withSizeKeepingCentre (
+                    juce::jmin (92, dbRow.getWidth()), dbRow.getHeight()));
+                levelArea.removeFromBottom (
+                    juce::jmin (3, levelArea.getHeight()));
+
+                if (s.meter != nullptr)
+                {
+                    const int faderW = juce::jmin (58, juce::jmax (44, levelArea.getWidth() - 34));
+                    const int meterW = juce::jmin (26, juce::jmax (18, levelArea.getWidth() / 5));
+                    const int pairW = juce::jmin (levelArea.getWidth(), faderW + 8 + meterW);
+                    auto pair = levelArea.withSizeKeepingCentre (pairW, levelArea.getHeight());
+                    s.meter->setBounds (pair.removeFromRight (meterW).reduced (0, 2));
+                    pair.removeFromRight (juce::jmin (8, pair.getWidth()));
+                    s.vol.setBounds (pair);
+                }
+                else
+                {
+                    s.vol.setBounds (levelArea.withSizeKeepingCentre (
+                        juce::jmin (58, levelArea.getWidth()),
+                        levelArea.getHeight()));
+                }
+               #else
                 // As duas fileiras cresciam ate 100 dp e o resto do card
                 // virava faixa vazia acima e abaixo (medido no TANK 3:
                 // ~33 dp mortos de cada lado). Com folga, os controles
                 // engordam ate 128 dp — botao de 60 dp e alvo de palco.
                 constexpr int rowGap = 6;
                 const int twoRowHeight = juce::jlimit (
-                    100, 128, identity.getHeight() - 8);
+                    100, 134, identity.getHeight() - 8);
                 const int rowHeight = (twoRowHeight - rowGap) / 2;
-                // Ancorado no TOPO como a regua do Windows (o CANAL/ON abre
-                // o card); centrado ele flutuava com vazio acima e abaixo.
-                auto identityBlock = identity.withTrimmedTop (
-                    juce::jmin (10, identity.getHeight() / 8));
+                const int identityTopTrim =
+                    identity.getHeight() > twoRowHeight + 36
+                        ? (identity.getHeight() - twoRowHeight) / 3
+                        : juce::jmin (10, identity.getHeight() / 8);
+                auto identityBlock = identity.withTrimmedTop (identityTopTrim);
                 identityBlock = identityBlock.removeFromTop (
                     juce::jmin (twoRowHeight, identityBlock.getHeight()));
                 auto identityHead = identityBlock.removeFromTop (
@@ -21697,19 +22979,12 @@ private:
                 s.timbreName.setBounds ({});
                 s.combo.setBounds (presetRow);
 
-                // Console como no Windows (pedido do dono, 30/07 tarde):
-                // fader VERTICAL com o meter segmentado ao lado, usando a
-                // ALTURA toda da coluna — a dupla e a assinatura visual da
-                // mesa. O fader horizontal lia como player de video. Acoes
-                // continuam na base, na largura toda.
                 auto performanceBlock = performance;
                 auto actions = performanceBlock.removeFromBottom (
                     juce::jmin (rowHeight, performanceBlock.getHeight()));
                 performanceBlock.removeFromBottom (
                     juce::jmin (rowGap, performanceBlock.getHeight()));
                 auto levelArea = performanceBlock.reduced (2, 0);
-                // ar sobre o thumb: sem isto o knob do fader encostava na
-                // linha de acento do card
                 levelArea.removeFromTop (
                     juce::jmin (10, levelArea.getHeight()));
 
@@ -21721,8 +22996,6 @@ private:
                     juce::Slider::TextBoxBelow, false, 38, 13);
                 s.transp.setBounds (transposeColumn.removeFromTop (
                     juce::jmin (74, transposeColumn.getHeight())));
-                // "TRANSPOSE" escrito, como no Windows — o "0 st" sozinho
-                // nao dizia O QUE o knob afina.
                 s.transpLabel.setFont (
                     juce::Font (juce::FontOptions (9.5f)));
                 s.transpLabel.setBounds (transposeColumn.removeFromTop (
@@ -21730,7 +23003,6 @@ private:
                 levelArea.removeFromRight (
                     juce::jmin (4, levelArea.getWidth()));
 
-                // OITAVA ao lado do transpose: desloca a regiao do teclado.
                 auto octaveColumn = levelArea.removeFromRight (
                     juce::jmin (54, levelArea.getWidth() / 3));
                 s.octave.setSliderStyle (
@@ -21748,8 +23020,6 @@ private:
 
                 s.vol.setSliderStyle (juce::Slider::LinearVertical);
 
-                // Leitura de dB sob o fader (padrao de mixer do Windows):
-                // branco normal, ambar acima de 0 dB, vermelho acima de +3.
                 auto dbRow = levelArea.removeFromBottom (
                     juce::jmin (18, levelArea.getHeight()));
                 s.volDb.setBounds (dbRow);
@@ -21766,6 +23036,7 @@ private:
                 s.vol.setBounds (levelArea.withSizeKeepingCentre (
                     juce::jmin (56, levelArea.getWidth()),
                     levelArea.getHeight()));
+               #endif
 
                 constexpr int actionGap = 4;
                 const bool rotaryAction = isOrgan && ! s.eqPage;
@@ -21809,29 +23080,24 @@ private:
                 }
 
                 s.fxGroup = controlsArea;
+               #if CHURCHDAW_MOBILE_SHELL
+                controlsArea.reduce (6, 4);
+                controlsArea.removeFromTop (
+                    juce::jmin (20, controlsArea.getHeight()));
+               #endif
 
                 auto placeLandscapeKnob = [] (
                     juce::Rectangle<int> cell,
                     juce::Slider& knob, juce::Label& label)
                 {
-                    // Em 640x360 o arredondamento dos dois rows deixava
-                    // 56 px por celula. Um label de 9 px sobrava apenas
-                    // 47 px para o knob (abaixo do alvo Android de 48 dp).
-                    // Num 820x360 (TANK 3) a celula passa de 90 px: o rotulo
-                    // de 8,5 px ficava ilegivel de longe no palco. O tamanho
-                    // acompanha a folga da celula; o aparelho compacto mantem
-                    // a garantia antiga de 48 dp de knob.
-                    const bool roomy = cell.getHeight() >= 78;
+                    const bool spacious = cell.getHeight() >= 104 && cell.getWidth() >= 84;
+                    const bool roomy = cell.getHeight() >= 72;
                     label.setFont (juce::Font (juce::FontOptions (
-                        roomy ? 11.0f : 8.5f)).boldened());
+                        spacious ? 11.0f : (roomy ? 10.2f : 8.5f))).boldened());
                     label.setMinimumHorizontalScale (0.72f);
-                    // Knob e rotulo viajam JUNTOS, centrados na celula. Antes
-                    // o knob ficava no centro e o rotulo no rodape da celula
-                    // de 145 dp — um vao que desconectava nome e controle
-                    // (revisao do dono, item 4). +8% no knob quando ha folga.
-                    const int knobSide = roomy ? 52 : 48;
-                    const int labelH = roomy ? 14 : 9;
-                    const int knobGap = roomy ? 4 : 0;
+                    const int knobSide = spacious ? 56 : (roomy ? 50 : 48);
+                    const int labelH = roomy ? 13 : 9;
+                    const int knobGap = spacious ? 4 : (roomy ? 3 : 0);
                     auto group = cell.withSizeKeepingCentre (
                         cell.getWidth(),
                         juce::jmin (cell.getHeight(),
@@ -21876,7 +23142,9 @@ private:
                             &s.rotaryKnob, &s.rotaryLabel
                         };
 
-                    if (! isPlugin)
+                    if (! isPlugin
+                         && ! proc.isLayerChurchOrgan (focus)
+                         && ! proc.isLayerSoundFont (focus))
                     {
                         controls[numControls++] = {
                             &s.attackKnob, &s.attackLabel
@@ -21886,7 +23154,8 @@ private:
                         };
                     }
 
-                    const int rows = numControls > 3 ? 2 : 1;
+                    const int maxPerRow = controlsArea.getWidth() >= 280 ? 4 : 3;
+                    const int rows = numControls > maxPerRow ? 2 : 1;
                     const int controlsPerRow =
                         (numControls + rows - 1) / rows;
                     const int controlsGap = rows == 2 ? 3 : 0;
@@ -22113,7 +23382,9 @@ private:
                         rotaryInActionRail ? nullptr : &s.rotaryModeBox
                     };
 
-                if (! isPlugin)
+                if (! isPlugin
+                     && ! proc.isLayerChurchOrgan (focus)
+                     && ! proc.isLayerSoundFont (focus))
                 {
                     controls[numControls++] = {
                         &s.attackKnob, &s.attackLabel, nullptr
@@ -25263,7 +26534,9 @@ public:
        #else
         editToneButton.setEnabled (hasLoadedChannel);
        #endif
-        repaint (0, 0, getWidth(), 46);
+        // A mensagem completa fica no tooltip: o chip so mostra Pronto/Carregando/Erro.
+        status.setTooltip (status.getText());
+        repaint (0, 0, getWidth(), 140);
     }
 
     TimbresProcessor& proc;
@@ -25468,6 +26741,12 @@ public:
     bool mobileStageMode = false;
     bool mobileStageRevealSelected = false;
     int mobileStageLastChannelsOnScreen = 0;
+    // Skin Church Live (ChurchLiveSkin.h): palco em paisagem com a barra
+    // superior e os cards da referencia. So visual; liga em resized().
+    bool stageSkin = false;
+    bool chromeSkin = false;
+    bool stageSkinApplied = false;
+    juce::Rectangle<int> masterReadoutBounds;
    #endif
     bool libraryMissing = false;
     std::function<void()> onOpenLibraries;

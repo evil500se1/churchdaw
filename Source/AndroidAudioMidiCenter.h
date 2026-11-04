@@ -175,8 +175,7 @@ public:
         usbBtn.onClick = [this] { recoverUsb(); };
         addAndMakeVisible (usbBtn);
 
-        launchkeyToggle.setButtonText (juce::String::fromUTF8 (
-            "Mapeamento autom\xc3\xa1tico do Launchkey"));
+        launchkeyToggle.setButtonText ("Auto-mapear Launchkey");
         launchkeyToggle.setTooltip (juce::String::fromUTF8 (
             "Desligue para usar o Launchkey somente como entrada MIDI comum."));
         launchkeyToggle.setToggleState (host.launchkeyMappingEnabled,
@@ -246,62 +245,94 @@ public:
     {
         NordLookAndFeel::fillAppBackground (g, getLocalBounds().toFloat());
 
-        // Header glass + separador vermelho.
-        auto headFull = getLocalBounds().removeFromTop (headerH);
-        g.setGradientFill (juce::ColourGradient (juce::Colour (0xff1c222c), 0.0f, (float) headFull.getY(),
-                                                 juce::Colour (0xff12161c), 0.0f, (float) headFull.getBottom(),
+        // Header glass + separador sutil.
+        const bool compactHeader = getHeight() < 420;
+        const int curHeaderH = compactHeader ? 48 : headerH;
+        auto headFull = getLocalBounds().removeFromTop (curHeaderH);
+        g.setGradientFill (juce::ColourGradient (juce::Colour (0xff1d232e), 0.0f, (float) headFull.getY(),
+                                                 juce::Colour (0xff11151d), 0.0f, (float) headFull.getBottom(),
                                                  false));
         g.fillRect (headFull);
 
         auto head = headFull;
-        auto shadow = head.removeFromBottom (6);
+        auto shadow = head.removeFromBottom (4);
         g.setGradientFill (juce::ColourGradient (
-            juce::Colours::black.withAlpha (0.28f), 0.0f, (float) shadow.getY(),
+            juce::Colours::black.withAlpha (0.26f), 0.0f, (float) shadow.getY(),
             juce::Colours::black.withAlpha (0.0f), 0.0f, (float) shadow.getBottom(),
             false));
         g.fillRect (shadow);
 
-        g.setColour (NordLookAndFeel::nordRedBright());
-        g.fillRect (head.getX(), head.getBottom() - 2, head.getWidth(), 2);
+        g.setColour (juce::Colours::white.withAlpha (0.08f));
+        g.fillRect (head.getX(), head.getBottom() - 1, head.getWidth(), 1);
+        const float crownW = juce::jmin (96.0f, (float) head.getWidth() * 0.18f);
+        g.setColour (NordLookAndFeel::nordRedBright().withAlpha (0.88f));
+        g.fillRoundedRectangle ((float) head.getCentreX() - crownW * 0.5f,
+                                (float) head.getY() + 0.5f, crownW, 2.0f, 1.0f);
 
+        const float logoSide = compactHeader ? 32.0f : 36.0f;
+        const float logoY = ((float) head.getHeight() - logoSide) * 0.5f;
+        const juce::Rectangle<float> logoBox (14.0f, logoY, logoSide, logoSide);
         if (brand.isValid())
         {
+            juce::Graphics::ScopedSaveState state (g);
+            juce::Path clip;
+            clip.addEllipse (logoBox);
+            g.reduceClipRegion (clip);
             g.setOpacity (1.0f);
-            g.drawImageWithin (brand, 14, 12, 36, 36,
+            g.drawImageWithin (brand, logoBox.getX(), logoBox.getY(),
+                               (int) logoBox.getWidth(), (int) logoBox.getHeight(),
                                juce::RectanglePlacement::centred);
         }
         else
         {
-            NordLookAndFeel::drawChurchDAWMark (
-                g, { 12.0f, 10.0f, 40.0f, 40.0f });
+            NordLookAndFeel::drawChurchDAWMark (g, logoBox);
         }
+        g.setColour (juce::Colours::white.withAlpha (0.16f));
+        g.drawEllipse (logoBox.reduced (0.5f), 1.0f);
+
+        // Status badge + bounded title/subtitle so narrow portrait never collides.
+        const auto badge = statusBadgeBounds();
+        const int textLeft = compactHeader ? 54 : 58;
+        const int textMaxW = juce::jmax (64, badge.getX() - textLeft - 10);
 
         g.setColour (NordLookAndFeel::txtPrimary());
-        g.setFont (juce::Font (juce::FontOptions (17.0f)).boldened());
-        g.drawText (juce::String::fromUTF8 (u8"Áudio / MIDI"),
-                    58, 10, getWidth() - 160, 24,
-                    juce::Justification::centredLeft);
+        g.setFont (juce::Font (juce::FontOptions (compactHeader ? 15.5f : 17.0f)).boldened());
+        g.drawFittedText (juce::String::fromUTF8 (u8"Áudio / MIDI"),
+                          textLeft, compactHeader ? 6 : 9, textMaxW, 20,
+                          juce::Justification::centredLeft, 1, 0.88f);
 
         g.setColour (NordLookAndFeel::txtSecondary());
-        g.setFont (juce::Font (juce::FontOptions (11.5f)));
-        g.drawText (juce::String::fromUTF8 (u8"Dispositivos, latência e controladores"),
-                    58, 32, getWidth() - 160, 18,
+        g.setFont (juce::Font (juce::FontOptions (compactHeader ? 10.5f : 11.5f)));
+        g.drawFittedText (juce::String::fromUTF8 (u8"Dispositivos, latência e controladores"),
+                          textLeft, compactHeader ? 24 : 30, textMaxW, 16,
+                          juce::Justification::centredLeft, 1, 0.85f);
+
+        g.setColour (juce::Colour (0xff0d0d11));
+        g.fillRoundedRectangle (badge.toFloat(), 13.0f);
+        g.setColour (statusColour().withAlpha (0.38f));
+        g.drawRoundedRectangle (badge.toFloat().reduced (0.5f), 13.0f, 1.0f);
+        g.setColour (statusColour().withAlpha (0.22f));
+        g.fillEllipse ((float) badge.getX() + 8.5f,
+                       (float) badge.getCentreY() - 5.5f, 11.0f, 11.0f);
+        g.setColour (statusColour());
+        g.fillEllipse ((float) badge.getX() + 10.5f,
+                       (float) badge.getCentreY() - 3.5f, 7.0f, 7.0f);
+        g.setColour (NordLookAndFeel::txtPrimary());
+        g.setFont (juce::Font (juce::FontOptions (11.0f)).boldened());
+        g.drawText (statusText,
+                    badge.withTrimmedLeft (24).withTrimmedRight (10),
                     juce::Justification::centredLeft);
 
-        // Status badge.
-        const auto badge = statusBadgeBounds();
-        g.setColour (statusColour().withAlpha (0.15f));
-        g.fillRoundedRectangle (badge.toFloat(), 14.0f);
-        g.setColour (NordLookAndFeel::borderDefault());
-        g.drawRoundedRectangle (badge.toFloat().reduced (0.5f), 14.0f, 1.0f);
-        g.setColour (statusColour());
-        g.fillEllipse ((float) badge.getX() + 10.0f,
-                       (float) badge.getCentreY() - 4.0f, 8.0f, 8.0f);
-        g.setColour (NordLookAndFeel::txtPrimary());
-        g.setFont (juce::Font (juce::FontOptions (11.5f)).boldened());
-        g.drawText (statusText,
-                    badge.withTrimmedLeft (26).withTrimmedRight (10),
-                    juce::Justification::centredLeft);
+        // Recessed segmented control tray behind tabs.
+        if (tabs.size() >= 3 && tabs[0]->isVisible())
+        {
+            auto tray = tabs[0]->getBounds().getUnion (tabs[tabs.size() - 1]->getBounds())
+                            .toFloat().expanded (3.0f, 2.5f);
+            g.setColour (juce::Colour (0xff0b0e15));
+            g.fillRoundedRectangle (tray, 9.0f);
+            g.setColour (juce::Colours::white.withAlpha (0.07f));
+            g.drawRoundedRectangle (tray.reduced (0.5f), 9.0f, 1.0f);
+        }
 
         // Cards de seção.
         drawCard (g, cardAudioSummary);
@@ -317,8 +348,10 @@ public:
         // Barra de latência (desenhada dentro do card de total).
         if (! latBarBounds.isEmpty())
         {
-            g.setColour (NordLookAndFeel::bgControl());
-            g.fillRoundedRectangle (latBarBounds.toFloat(), 6.0f);
+            g.setColour (juce::Colour (0xff0d0d11));
+            g.fillRoundedRectangle (latBarBounds.toFloat(), 4.0f);
+            g.setColour (juce::Colours::white.withAlpha (0.07f));
+            g.drawRoundedRectangle (latBarBounds.toFloat().reduced (0.5f), 4.0f, 1.0f);
 
             const float norm = juce::jlimit (0.0f, 1.0f, latBarFraction);
             if (norm > 0.0f)
@@ -326,7 +359,7 @@ public:
                 auto fill = latBarBounds.toFloat();
                 fill.setWidth (fill.getWidth() * norm);
                 g.setColour (latBarColour);
-                g.fillRoundedRectangle (fill, 6.0f);
+                g.fillRoundedRectangle (fill, 4.0f);
             }
         }
     }
@@ -334,17 +367,21 @@ public:
     void resized() override
     {
         auto r = getLocalBounds();
+        const bool compactHeader = r.getHeight() < 420;
 
-        auto headerArea = r.removeFromTop (headerH);
-        closeBtn.setBounds (headerArea.getRight() - 56, headerArea.getY() + 9, 42, 40);
+        auto headerArea = r.removeFromTop (compactHeader ? 48 : headerH);
+        const int closeSideH = compactHeader ? 34 : 40;
+        closeBtn.setBounds (headerArea.getRight() - 54,
+                            headerArea.getY() + (headerArea.getHeight() - closeSideH - 4) / 2,
+                            40, closeSideH);
 
         // Abas tipo segmented control.
-        auto tabRow = r.removeFromTop (52).reduced (14, 6);
+        auto tabRow = r.removeFromTop (compactHeader ? 42 : 52).reduced (14, compactHeader ? 4 : 6);
         const int tw = juce::jmax (1, tabRow.getWidth() / 3);
         for (int i = 0; i < tabs.size(); ++i)
-            tabs[i]->setBounds (tabRow.removeFromLeft (tw).reduced (i == 1 ? 4 : 3, 0));
+            tabs[i]->setBounds (tabRow.removeFromLeft (tw).reduced (i == 1 ? 4 : 2, 0));
 
-        content = r.reduced (14, 8);
+        content = r.reduced (14, compactHeader ? 5 : 8);
         layoutCurrentTab();
     }
 
@@ -471,8 +508,11 @@ private:
 
     juce::Rectangle<int> statusBadgeBounds() const
     {
+        const bool compactHeader = getHeight() < 420;
         const int w = juce::jlimit (120, 172, getWidth() / 3);
-        return { getWidth() - 56 - 10 - w, 15, w, 28 };
+        const int h = compactHeader ? 26 : 28;
+        const int y = ((compactHeader ? 48 : headerH) - 4 - h) / 2;
+        return { getWidth() - 56 - 10 - w, y, w, h };
     }
 
     void setTab (int index)
@@ -517,12 +557,13 @@ private:
         hideAllPageWidgets();
         auto r = content;
         const bool shortH = r.getHeight() < 420;
-        const bool wide = r.getWidth() >= 660 && r.getWidth() > r.getHeight();
+        const bool ultraShortH = r.getHeight() < 275;
+        const bool wide = r.getWidth() >= 520 && r.getWidth() > r.getHeight();
         const int gap = shortH ? 8 : 12;
-        const int fieldH = shortH ? 40 : 46;
-        const int btnH = shortH ? 42 : 48;
+        const int fieldH = ultraShortH ? 34 : (shortH ? 40 : 46);
+        const int btnH = ultraShortH ? 36 : (shortH ? 42 : 48);
         const int cardPadX = 14;
-        const int cardPadY = shortH ? 9 : 12;
+        const int cardPadY = ultraShortH ? 7 : (shortH ? 9 : 12);
         const int sectionTitleGap = 4;
 
         // Cria um card de altura fixa na área e devolve o retângulo interno
@@ -551,8 +592,8 @@ private:
 
         auto placeMidiSection = [&] (juce::Rectangle<int>& area)
         {
-            const int bodyH = shortH ? 64 : 80;
-            const int toggleH = shortH ? 34 : 38;
+            const int bodyH = ultraShortH ? 48 : (shortH ? 64 : 80);
+            const int toggleH = ultraShortH ? 30 : (shortH ? 34 : 38);
             const int cardHeight = cardPadY * 2 + titleH + sectionTitleGap
                                  + bodyH + 8 + toggleH;
             auto inner = makeCard (area, cardHeight, cardMidi);
@@ -577,8 +618,9 @@ private:
                 {
                     const bool showDriverType = driverTypeBox.getNumItems() > 1;
                     const int driverBoxH = showDriverType ? (fieldH + 6) : 0;
+                    const int hintH = ultraShortH ? 18 : (shortH ? 28 : 40);
                     const int cardHeight = cardPadY * 2 + titleH + sectionTitleGap
-                                           + driverBoxH + fieldH + 6 + btnH + 6 + (shortH ? 28 : 40);
+                                           + driverBoxH + fieldH + 6 + btnH + 6 + hintH;
                     auto inner = makeCard (left, cardHeight, cardOutput);
                     outTitle.setVisible (true);
                     outTitle.setBounds (inner.removeFromTop (titleH));
@@ -604,27 +646,36 @@ private:
                     refreshDevicesBtn.setBounds (row.reduced (0, 1).withTrimmedLeft (5));
                     inner.removeFromTop (6);
                     outHint.setVisible (true);
-                    outHint.setBounds (inner.removeFromTop (shortH ? 28 : 40));
+                    outHint.setBounds (inner.removeFromTop (hintH));
                 }
 
                 // ---- Card de resumo (direita, topo) ----
                 {
+                    const int summaryH = ultraShortH ? 54 : (shortH ? 80 : 96);
                     const int cardHeight = cardPadY * 2 + titleH + sectionTitleGap
-                                           + (shortH ? 80 : 96);
+                                           + summaryH;
                     auto inner = makeCard (right, cardHeight, cardAudioSummary);
                     audioSummaryTitle.setVisible (true);
                     audioSummaryTitle.setBounds (inner.removeFromTop (titleH));
                     inner.removeFromTop (sectionTitleGap);
                     audioSummaryBody.setVisible (true);
-                    audioSummaryBody.setBounds (inner.removeFromTop (shortH ? 80 : 96));
+                    audioSummaryBody.setBounds (inner.removeFromTop (summaryH));
                 }
 
-                // ---- Card de entrada (esquerda, restante) ----
-                if (left.getHeight() > 64)
+                // ---- Card de entrada (coluna com mais respiro vertical) ----
+                auto& inputCol = right.getHeight() > left.getHeight() ? right : left;
+                if (inputCol.getHeight() > 56)
                     placeSection (inTitle, inHint,
-                                  juce::jmin (left.getHeight() - 28,
-                                              shortH ? 48 : 56),
-                                  left, cardInput);
+                                  juce::jmin (inputCol.getHeight() - 24,
+                                              ultraShortH ? 42 : (shortH ? 48 : 56)),
+                                  inputCol, cardInput);
+
+                // Preenche 100% da altura: o ultimo card de cada coluna estica
+                // ate a base da area (o conteudo continua no topo do card).
+                auto& leftLast = &inputCol == &left ? cardInput : cardOutput;
+                auto& rightLast = &inputCol == &right ? cardInput : cardAudioSummary;
+                leftLast.setBottom (content.getBottom() - 1);
+                rightLast.setBottom (content.getBottom() - 1);
             }
             else
             {
@@ -1019,8 +1070,13 @@ private:
         }
         else if (dev == nullptr)
         {
+           #if defined (CHURCHDAW_MOBILE_UI_PREVIEW) && CHURCHDAW_MOBILE_UI_PREVIEW
+            statusText = juce::String::fromUTF8 (u8"Áudio ativo");
+            statusColourValue = NordLookAndFeel::greenOk();
+           #else
             statusText = juce::String::fromUTF8 (u8"Erro de áudio");
             statusColourValue = NordLookAndFeel::redClip();
+           #endif
         }
         else
         {
@@ -1047,6 +1103,10 @@ private:
         juce::String outName = setup.outputDeviceName;
         if (outName.isEmpty() && dev != nullptr)
             outName = dev->getName();
+       #if defined (CHURCHDAW_MOBILE_UI_PREVIEW) && CHURCHDAW_MOBILE_UI_PREVIEW
+        if (outName.isEmpty())
+            outName = juce::String::fromUTF8 (u8"Saída USB-C / Alto-falante");
+       #endif
         if (outName.isEmpty())
             outName = juce::String::fromUTF8 (u8"Nenhuma saída");
 
@@ -1072,10 +1132,17 @@ private:
             outHint.setText ({}, juce::dontSendNotification);
         }
 
+       #if defined (CHURCHDAW_MOBILE_UI_PREVIEW) && CHURCHDAW_MOBILE_UI_PREVIEW
+        const double sr = dev != nullptr ? dev->getCurrentSampleRate()
+                        : setup.sampleRate > 0.0 ? setup.sampleRate : 48000.0;
+        const int buf = dev != nullptr ? dev->getCurrentBufferSizeSamples()
+                      : setup.bufferSize > 0 ? setup.bufferSize : 128;
+       #else
         const double sr = dev != nullptr ? dev->getCurrentSampleRate()
                                          : setup.sampleRate;
         const int buf = dev != nullptr ? dev->getCurrentBufferSizeSamples()
                                        : setup.bufferSize;
+       #endif
         const double blockMs = (sr > 0.0 && buf > 0)
                                    ? (1000.0 * (double) buf / sr)
                                    : 0.0;
@@ -1313,7 +1380,13 @@ private:
         }
 
         if (outDeviceBox.getNumItems() == 0)
+        {
+           #if defined (CHURCHDAW_MOBILE_UI_PREVIEW) && CHURCHDAW_MOBILE_UI_PREVIEW
+            outDeviceBox.addItem (juce::String::fromUTF8 (u8"Saída USB-C / Alto-falante"), 1);
+           #else
             outDeviceBox.addItem (juce::String::fromUTF8 (u8"Nenhuma saída encontrada"), 1);
+           #endif
+        }
 
         if (selected > 0)
             outDeviceBox.setSelectedId (selected, juce::dontSendNotification);
@@ -1601,6 +1674,7 @@ private:
                 }
             }
 
+           #if JUCE_ANDROID
             auto* env = juce::getEnv();
             // LocalRef deve viver por TODA a sequência JNI abaixo.
             juce::LocalRef<jobject> activity (juce::getMainActivity());
@@ -1673,6 +1747,12 @@ private:
             }
 
             env->DeleteLocalRef (clazz);
+           #else
+            safe->bleBody.setText (
+                juce::String::fromUTF8 (
+                    u8"Pareamento MIDI Bluetooth dispon\u00edvel no dispositivo Android."),
+                juce::dontSendNotification);
+           #endif
 
             if (safe->host.refreshMidiInputs)
                 safe->host.refreshMidiInputs();

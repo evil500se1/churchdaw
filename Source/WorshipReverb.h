@@ -154,6 +154,11 @@ public:
         return desiredPreset.load (std::memory_order_relaxed);
     }
 
+    bool isActive() const noexcept
+    {
+        return tailActive;
+    }
+
     double getTailLengthSeconds() const noexcept
     {
         const auto& p = preset (getPreset());
@@ -197,7 +202,8 @@ public:
         }
         else if (! tailActive)
         {
-            buffer.clear();
+            if (inputPeakForBlock > 0.0f)
+                buffer.clear();
             return;
         }
 

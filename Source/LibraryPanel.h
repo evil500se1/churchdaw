@@ -92,13 +92,13 @@ public:
             }
             else if (updateAvailable)
             {
-                status = "ATUALIZACAO DISPONIVEL";
+                status = juce::String::fromUTF8 ("ATUALIZA\xc3\x87\xc3\x83O DISPON\xc3\x8dVEL");
                 statusColour = juce::Colour (0xffe2ad54);
                 action.setButtonText ("Atualizar");
             }
             else
             {
-                status = "INCLUIDA";
+                status = juce::String::fromUTF8 ("INCLU\xc3\x8d" "DA");
                 statusColour = NordLookAndFeel::nordRedBright();
                 action.setButtonText ("Baixar");
             }
@@ -109,7 +109,7 @@ public:
         {
             status = "EM BREVE";
             statusColour = juce::Colours::white.withAlpha (0.42f);
-            action.setButtonText ("Indisponivel");
+            action.setButtonText (juce::String::fromUTF8 ("Indispon\xc3\xadvel"));
             action.setEnabled (false);
         }
 
@@ -117,9 +117,18 @@ public:
         {
             action.setButtonText (catalogUnavailableText.isNotEmpty()
                                       ? catalogUnavailableText
-                                      : juce::String ("Sem conexao"));
+                                      : juce::String::fromUTF8 ("Sem conex\xc3\xa3o"));
             action.setEnabled (false);
         }
+
+       #if CHURCHDAW_MOBILE_SHELL
+        action.setColour (juce::TextButton::buttonColourId,
+                          action.isEnabled() ? NordLookAndFeel::nordRed()
+                                             : juce::Colour (0xff232833));
+        action.setColour (juce::TextButton::textColourOffId,
+                          action.isEnabled() ? juce::Colours::white
+                                             : NordLookAndFeel::txtSecondary());
+       #endif
 
         repaint();
     }
@@ -156,23 +165,60 @@ public:
         const bool dense = getHeight() <= 100;
         const bool compact = dense || getHeight() <= 118;
         auto card = getLocalBounds().toFloat().reduced (1.0f);
-        g.setColour (desktop ? juce::Colour (0xff22262d) : NordLookAndFeel::bgCardHi());
-        g.fillRoundedRectangle (card, dense ? 8.0f : 10.0f);
-        g.setColour (desktop ? juce::Colours::white.withAlpha (0.055f) : NordLookAndFeel::borderSoft());
-        g.drawRoundedRectangle (card.reduced (0.5f), dense ? 8.0f : 10.0f, 1.0f);
+        const float cardRad = dense ? 8.0f : 10.0f;
+        if (desktop)
+        {
+            g.setColour (juce::Colour (0xff22262d));
+            g.fillRoundedRectangle (card, cardRad);
+            g.setColour (juce::Colours::white.withAlpha (0.055f));
+            g.drawRoundedRectangle (card.reduced (0.5f), cardRad, 1.0f);
+        }
+        else
+        {
+            g.setGradientFill (juce::ColourGradient (
+                juce::Colour (0xff212733), card.getX(), card.getY(),
+                juce::Colour (0xff151922), card.getX(), card.getBottom(), false));
+            g.fillRoundedRectangle (card, cardRad);
+            g.setColour (juce::Colours::white.withAlpha (0.10f));
+            g.fillRect (card.getX() + cardRad, card.getY() + 1.0f,
+                        juce::jmax (0.0f, card.getWidth() - cardRad * 2.0f), 1.0f);
+            g.setColour (juce::Colours::white.withAlpha (0.08f));
+            g.drawRoundedRectangle (card.reduced (0.5f), cardRad, 1.0f);
+            g.setColour (statusColour.withAlpha (0.72f));
+            g.fillRoundedRectangle (card.getX() + 1.5f, card.getY() + 8.0f,
+                                    2.5f, juce::jmax (6.0f, card.getHeight() - 16.0f), 1.25f);
+        }
 
-        const int marginX = dense ? 10 : compact ? 14 : 18;
+        const int marginX = dense ? 12 : compact ? 14 : 18;
         const int marginY = dense ? 8 : compact ? 10 : 13;
         const int buttonWidth = dense ? 112 : compact ? 150 : 136;
         auto area = getLocalBounds().reduced (marginX, marginY);
         const auto buttonSpace = area.removeFromRight (buttonWidth);
         area.removeFromRight (dense ? 8 : compact ? 12 : 18);
 
-        auto statusArea = area.removeFromTop (dense ? 14 : compact ? 17 : 20);
-        g.setColour (statusColour);
-        g.setFont (juce::Font (juce::FontOptions (dense ? 9.5f : compact ? 11.5f : 11.0f)).boldened()
-                       .withExtraKerningFactor (desktop ? 0.025f : 0.08f));
-        g.drawText (status, statusArea, juce::Justification::centredLeft);
+        auto statusArea = area.removeFromTop (dense ? 16 : compact ? 18 : 20);
+        if (desktop)
+        {
+            g.setColour (statusColour);
+            g.setFont (juce::Font (juce::FontOptions (dense ? 9.5f : compact ? 11.5f : 11.0f)).boldened()
+                           .withExtraKerningFactor (0.025f));
+            g.drawText (status, statusArea, juce::Justification::centredLeft);
+        }
+        else
+        {
+            const auto statusFont = juce::Font (juce::FontOptions (dense ? 8.5f : 9.5f)).boldened()
+                                        .withExtraKerningFactor (0.07f);
+            const int pillW = juce::jlimit (56, juce::jmax (60, statusArea.getWidth()),
+                                            juce::roundToInt (juce::GlyphArrangement::getStringWidth (statusFont, status)) + 16);
+            auto pill = statusArea.removeFromLeft (pillW).toFloat().reduced (0.0f, 0.5f);
+            g.setColour (statusColour.withAlpha (0.15f));
+            g.fillRoundedRectangle (pill, 4.0f);
+            g.setColour (statusColour.withAlpha (0.48f));
+            g.drawRoundedRectangle (pill.reduced (0.5f), 4.0f, 1.0f);
+            g.setColour (statusColour);
+            g.setFont (statusFont);
+            g.drawText (status, pill.toNearestInt(), juce::Justification::centred, false);
+        }
 
         auto titleArea = area.removeFromTop (dense ? 22 : compact ? 27 : 35);
         g.setColour (juce::Colours::white);
@@ -316,7 +362,7 @@ public:
         setSize (900, 590);
 
         closeButton.setButtonText ("Fechar");
-        refreshButton.setButtonText ("Atualizar catalogo");
+        refreshButton.setButtonText (juce::String::fromUTF8 ("Atualizar cat\xc3\xa1logo"));
         legacyAccessButton.setButtonText ("Liberar acervo antigo");
         legacyAccessButton.setColour (juce::TextButton::buttonColourId,
                                       juce::Colour (0xff312125));
@@ -336,7 +382,7 @@ public:
         }
         allFilter.setButtonText ("Todas");
         installedFilter.setButtonText ("Instaladas");
-        availableFilter.setButtonText ("Disponiveis");
+        availableFilter.setButtonText (juce::String::fromUTF8 ("Dispon\xc3\xadveis"));
         allFilter.setToggleState (true, juce::dontSendNotification);
         allFilter.onClick = [this] { setLibraryFilter (0); };
         installedFilter.onClick = [this] { setLibraryFilter (1); };
@@ -345,6 +391,9 @@ public:
         addAndMakeVisible (viewport);
         viewport.setViewedComponent (&content, false);
         viewport.setScrollBarsShown (true, false);
+       #if CHURCHDAW_MOBILE_SHELL
+        viewport.setScrollBarThickness (7);
+       #endif
         viewport.setScrollOnDragMode (juce::Viewport::ScrollOnDragMode::all);
         content.addAndMakeVisible (emptyState);
         emptyState.setJustificationType (juce::Justification::centred);
@@ -362,7 +411,7 @@ public:
                     cancelRequested = true;
                     closeButton.setButtonText ("Cancelando...");
                     closeButton.setEnabled (false);
-                    statusText = "Cancelando com seguranca. Partes validas serao preservadas...";
+                    statusText = juce::String::fromUTF8 ("Cancelando com seguran\xc3\xa7" "a. Partes v\xc3\xa1lidas ser\xc3\xa3o preservadas...");
                     installer->cancel();
                     repaint();
                 }
@@ -381,7 +430,7 @@ public:
                 refreshButton.setEnabled (false);
                 catalogActionsAllowed = false;
                 catalogUnavailableText = "Verificando...";
-                statusText = "Buscando o catalogo seguro...";
+                statusText = juce::String::fromUTF8 ("Buscando o cat\xc3\xa1logo seguro...");
                 updateCardsCatalogAvailability();
                 repaint();
                 startThread();
@@ -399,9 +448,9 @@ public:
         catalogUnavailableText = "Verificando...";
         statusText = manifest.valid
             ? (ChurchDAWServices::cacheIsFresh()
-                  ? juce::String ("Catalogo salvo. Validando a conexao...")
-                  : juce::String ("Catalogo salvo expirado. Conecte para atualizar."))
-            : juce::String ("Buscando o catalogo...");
+                  ? juce::String::fromUTF8 ("Cat\xc3\xa1logo salvo. Validando a conex\xc3\xa3o...")
+                  : juce::String::fromUTF8 ("Cat\xc3\xa1logo salvo expirado. Conecte para atualizar."))
+            : juce::String::fromUTF8 ("Buscando o cat\xc3\xa1logo...");
         rebuildCards();
 
         // A abertura do painel tambem tenta atualizar. O cache faz a tela nascer
@@ -457,8 +506,8 @@ public:
                     self->manifest = std::move (check.manifest);
                     self->catalogActionsAllowed = true;
                     self->catalogUnavailableText.clear();
-                    self->statusText = "Catalogo atualizado e pronto";
-                    self->catalogEmptyText = "Nenhum pack publicado.\nAs bibliotecas instaladas continuam disponiveis.";
+                    self->statusText = juce::String::fromUTF8 ("Cat\xc3\xa1logo atualizado e pronto");
+                    self->catalogEmptyText = juce::String::fromUTF8 ("Nenhum pack publicado.\nAs bibliotecas instaladas continuam dispon\xc3\xadveis.");
                 }
                 else
                 {
@@ -504,10 +553,40 @@ public:
         const bool compact = dense || isCompact();
         auto bounds = surfaceBounds().toFloat();
         const float corner = desktop ? 14.0f : dense ? 12.0f : compact ? 14.0f : 20.0f;
-        g.setColour (desktop ? juce::Colour (0xff1b1f26) : NordLookAndFeel::bgCard());
-        g.fillRoundedRectangle (bounds, corner);
-        g.setColour (desktop ? juce::Colour (0xff3b414b) : NordLookAndFeel::borderDefault());
-        g.drawRoundedRectangle (bounds.reduced (0.5f), corner, 1.0f);
+        if (desktop)
+        {
+            g.setColour (juce::Colour (0xff1b1f26));
+            g.fillRoundedRectangle (bounds, corner);
+            g.setColour (juce::Colour (0xff3b414b));
+            g.drawRoundedRectangle (bounds.reduced (0.5f), corner, 1.0f);
+        }
+        else
+        {
+            g.setColour (juce::Colours::black.withAlpha (0.48f));
+            g.fillRoundedRectangle (bounds.translated (0.0f, 3.0f), corner);
+            g.setGradientFill (juce::ColourGradient (
+                juce::Colour (0xff1d222c), bounds.getX(), bounds.getY(),
+                juce::Colour (0xff11151d), bounds.getX(), bounds.getBottom(), false));
+            g.fillRoundedRectangle (bounds, corner);
+            g.setColour (juce::Colours::white.withAlpha (0.12f));
+            g.fillRect (bounds.getX() + corner, bounds.getY() + 1.0f,
+                        juce::jmax (0.0f, bounds.getWidth() - corner * 2.0f), 1.0f);
+            g.setColour (juce::Colours::white.withAlpha (0.09f));
+            g.drawRoundedRectangle (bounds.reduced (0.5f), corner, 1.0f);
+            const float crownW = juce::jmin (92.0f, bounds.getWidth() * 0.20f);
+            g.setColour (NordLookAndFeel::nordRedBright().withAlpha (0.88f));
+            g.fillRoundedRectangle (bounds.getCentreX() - crownW * 0.5f, bounds.getY() + 0.5f,
+                                    crownW, 2.0f, 1.0f);
+            if (allFilter.isVisible() && availableFilter.isVisible())
+            {
+                auto filterTray = allFilter.getBounds().getUnion (availableFilter.getBounds())
+                                      .toFloat().expanded (3.0f, 2.5f);
+                g.setColour (juce::Colour (0xff0c0f16));
+                g.fillRoundedRectangle (filterTray, 8.0f);
+                g.setColour (juce::Colours::white.withAlpha (0.07f));
+                g.drawRoundedRectangle (filterTray.reduced (0.5f), 8.0f, 1.0f);
+            }
+        }
 
         const int margin = dense ? 8 : compact ? 12 : 26;
         const int headerHeight = dense ? 44 : compact ? 64 : 82;
@@ -896,7 +975,7 @@ private:
         if (cards.isEmpty())
         {
             if (manifest.valid && catalogActionsAllowed)
-                statusText = "Nenhum pack publicado. As bibliotecas instaladas continuam disponiveis.";
+                statusText = juce::String::fromUTF8 ("Nenhum pack publicado. As bibliotecas instaladas continuam dispon\xc3\xadveis.");
         }
 
         applyLibraryFilter();
@@ -1056,8 +1135,8 @@ private:
     juce::Label emptyState;
     juce::OwnedArray<LibraryPackCard> cards;
     int libraryFilter = 0;
-    juce::String statusText { "Buscando o catalogo..." };
-    juce::String catalogEmptyText { "Buscando o catalogo..." };
+    juce::String statusText { juce::String::fromUTF8 ("Buscando o cat\xc3\xa1logo...") };
+    juce::String catalogEmptyText { juce::String::fromUTF8 ("Buscando o cat\xc3\xa1logo...") };
     bool catalogActionsAllowed = false;
     juce::String catalogUnavailableText { "Verificando..." };
     juce::String activePackId;

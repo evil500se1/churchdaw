@@ -1,8 +1,9 @@
-﻿#pragma once
+#pragma once
 
 #include <juce_gui_basics/juce_gui_basics.h>
 #include <functional>
 #include "NordLookAndFeel.h"
+#include "ChurchLiveSkin.h"
 
 //==============================================================================
 // Device names remain complete in the tooltip. The desktop rack presents them
@@ -101,12 +102,65 @@ public:
         }
     }
 
+    // Chip MIDI da barra superior Church Live: teclado, ponto de estado, rotulo
+    // e valor. O nome completo (e a interface de audio) seguem no tooltip.
+    void paintSkinChip (juce::Graphics& g, juce::Rectangle<float> r)
+    {
+        using namespace ChurchLiveSkin;
+        Metrics m;
+        m.u = (float) (double) getProperties().getWithDefault ("churchU", 1.0);
+        const float radius = m.fpx (14, 6.0f);
+        g.setColour (panel());
+        g.fillRoundedRectangle (r, radius);
+        g.setColour (line());
+        g.drawRoundedRectangle (r.reduced (0.5f), radius, 1.0f);
+
+        const float padX = m.fpx (14, 6.0f);
+        const float iconS = m.fpx (24, 14.0f);
+        const auto icon = juce::Rectangle<float> (r.getX() + padX, r.getCentreY() - iconS * 0.5f, iconS, iconS);
+        g.setColour (textSec());
+        NordLookAndFeel::drawDesktopNavigationIcon (g, "navInstruments", icon, false);
+
+        const float dot = m.fpx (10, 6.0f);
+        const float dotX = icon.getRight() + m.fpx (10, 4.0f);
+        const auto tone = ctrlOn ? okGreen() : juce::Colour (0xff5b5b66);
+        g.setColour (tone.withAlpha (0.28f));
+        g.fillEllipse (dotX - dot * 0.5f, r.getCentreY() - dot, dot * 2.0f, dot * 2.0f);
+        g.setColour (tone);
+        g.fillEllipse (dotX, r.getCentreY() - dot * 0.5f, dot, dot);
+
+        const float chev = m.fpx (9, 5.0f);
+        const float textX = dotX + dot + m.fpx (10, 4.0f);
+        const float textR = r.getRight() - padX - chev * 2.0f - m.fpx (6, 3.0f);
+        const auto caption = juce::Rectangle<float> (textX, r.getCentreY() - m.fpx (19, 11.0f),
+                                                     juce::jmax (1.0f, textR - textX), m.fpx (14, 9.0f));
+        g.setColour (textSec());
+        g.setFont (font (Face::barlowSemi, m.fpx (11, 7.5f), 0.14f));
+        g.drawText ("MIDI", caption.toNearestInt(), juce::Justification::centredLeft, false);
+        g.setColour (ctrlOn ? text() : textSec());
+        g.setFont (font (Face::barlowSemi, m.fpx (17, 10.5f)));
+        g.drawFittedText (controller.isNotEmpty() ? controller : juce::String ("Nenhum"),
+                          juce::Rectangle<float> (textX, r.getCentreY() - m.fpx (4, 2.0f),
+                                                  juce::jmax (1.0f, textR - textX), m.fpx (22, 13.0f)).toNearestInt(),
+                          juce::Justification::centredLeft, 1, 0.8f);
+
+        g.setColour (textSec());
+        drawChevron (g, { r.getRight() - padX - chev * 2.0f, r.getCentreY() - chev, chev * 2.0f, chev * 2.0f },
+                     0, juce::jmax (1.5f, m.fpx (2.2f, 1.5f)));
+    }
+
     void paint (juce::Graphics& g) override
     {
         auto area = getLocalBounds();
 
         if (area.isEmpty())
             return;
+
+        if (getProperties().getWithDefault ("churchSkin", juce::var()).toString() == "midiChip")
+        {
+            paintSkinChip (g, area.toFloat());
+            return;
+        }
 
         if (integratedRack && ! compact)
         {
@@ -358,11 +412,21 @@ private:
         // chapa, borda e brilho iguais aos dos botoes e competiam com eles no
         // topo. Agora sao quase transparentes -- so uma sombra de contorno.
         juce::ignoreUnused (integrated);
-        chip = chip.reduced (0.5f, 1.0f);
+        chip = chip.reduced (0.5f, 1.5f);
+       #if CHURCHDAW_MOBILE_SHELL
+        g.setGradientFill (juce::ColourGradient (
+            juce::Colour (0xff0e1219), chip.getX(), chip.getY(),
+            juce::Colour (0xff151a24), chip.getX(), chip.getBottom(), false));
+        g.fillRoundedRectangle (chip, 7.5f);
+        g.setColour (connected ? juce::Colour (0xff5fd08a).withAlpha (0.28f)
+                               : juce::Colours::white.withAlpha (0.08f));
+        g.drawRoundedRectangle (chip, 7.5f, 1.0f);
+       #else
         g.setColour (NordLookAndFeel::bgCard());
         g.fillRoundedRectangle (chip, 7.0f);
         g.setColour (NordLookAndFeel::borderSoft());
         g.drawRoundedRectangle (chip, 7.0f, 1.0f);
+       #endif
 
         auto inner = chip.reduced (8.0f, 5.0f);
 

@@ -47,15 +47,13 @@ public:
        #if CHURCHDAW_UI_BISECT
         // experimento: medidores congelados, para medir quanto eles custam
        #elif JUCE_ANDROID
-        // 6 Hz no Android: o perfil no TANK 3 mostrou a rasterizacao vetorial
-        // dos meters disputando CPU com o callback de 256 samples. A balistica
-        // abaixo e calculada em dB/segundo, portanto ataque, queda e peak-hold
-        // conservam o mesmo TEMPO; muda apenas a cadencia visual. Nenhuma voz,
-        // filtro, efeito ou sample do caminho sonoro e reduzido.
-        timerHzUsado = 6;
+        // 24 Hz no Android: fluido para leitura de palco e ainda leve na UI
+        // porque canais em silencio saem em fast-path (zero dB math/repaint) e
+        // mudancas apenas de nivel repintam somente a regiao interna das barras.
+        timerHzUsado = 24;
         startTimerHz (timerHzUsado);
        #elif JUCE_IOS
-        timerHzUsado = 10;
+        timerHzUsado = 24;
         startTimerHz (timerHzUsado);
        #else
         // 45 Hz no desktop: ataque e queda deixam de revelar degraus de frame
@@ -124,13 +122,99 @@ public:
         repaint();
     }
 
+    // Skin Church Live: barras de segmentos 7 px / 3 px (verde ate 60% da altura,
+    // ambar ate 82%, vermelho acima), apagados a ~12%. `unit` e a escala da
+    // referencia 1600x900. O alerta de clip travado continua pela moldura.
+    void setSkin (bool enabled, float unit)
+    {
+        if (skinOn == enabled && skinUnit == unit)
+            return;
+
+        skinOn = enabled;
+        skinUnit = unit;
+        repaint();
+    }
+
     // avisa o nivel exibido (0..1) a cada quadro. Serve pra acender o card do
     // canal sem criar um segundo timer nem um segundo leitor do nivel (o
     // readAndResetLayerLevel do processador ZERA a cada leitura: so pode ter um).
     std::function<void (float)> onLevel;
 
+    void paintSkin (juce::Graphics& g)
+    {
+        auto bounds = getLocalBounds().toFloat();
+        const float u = skinUnit;
+        const bool alerta = clipSticky && clipRole != ClipRole::limiterWorking;
+
+        juce::Rectangle<float> labelRow;
+        if (channelLabels && channels == 2)
+            labelRow = bounds.removeFromBottom (juce::jmax (12.0f, 20.0f * u));
+
+        const float gap = channels == 2 ? juce::jmax (2.0f, 6.0f * u) : 0.0f;
+        const float barW = (bounds.getWidth() - gap * (float) (channels - 1)) / (float) channels;
+        const float segH = juce::jmax (3.0f, 7.0f * u);
+        const float segGap = juce::jmax (1.5f, 3.0f * u);
+        const float step = segH + segGap;
+
+        for (int ch = 0; ch < channels; ++ch)
+        {
+            const auto bar = juce::Rectangle<float> (bounds.getX() + (float) ch * (barW + gap),
+                                                     bounds.getY(), barW, bounds.getHeight());
+            const int numSeg = juce::jmax (1, (int) ((bar.getHeight() + segGap) / step));
+            const float ladderTop = bar.getBottom() - ((float) numSeg * step - segGap);
+            const float lvl = displayDb[ch];
+            const float peak = peakDb[ch];
+            const float radius = juce::jmax (1.0f, segH * 0.18f);
+
+            for (int i = 0; i < numSeg; ++i)
+            {
+                const auto seg = juce::Rectangle<float> (bar.getX(), ladderTop + (float) i * step, barW, segH);
+                const float pEntry = 1.0f - (seg.getBottom() - bar.getY()) / bar.getHeight();
+                const float pColour = 1.0f - (seg.getCentreY() - bar.getY()) / bar.getHeight();
+                const float dbEntry = proportionToDb (pEntry);
+                const bool active = lvl > minDb + 0.05f && dbEntry <= lvl + 0.01f;
+                const float p = dbToProportion (proportionToDb (pColour));
+                const auto tone = p >= 0.82f ? juce::Colour (0xfff2495c)
+                                : p >= 0.60f ? juce::Colour (0xfff4b73b)
+                                             : juce::Colour (0xff2fcb74);
+                g.setColour (active ? tone : tone.withAlpha (0.12f));
+                g.fillRoundedRectangle (seg, radius);
+            }
+
+            if (peak > minDb + 0.5f)
+            {
+                const float py = bar.getBottom() - bar.getHeight() * dbToProportion (peak);
+                g.setColour (peak >= -0.05f ? juce::Colour (0xfff2495c) : juce::Colours::white.withAlpha (0.85f));
+                g.fillRect (juce::Rectangle<float> (bar.getX(), py - 1.0f, barW, 2.0f).getIntersection (bar));
+            }
+        }
+
+        if (alerta)
+        {
+            g.setColour (NordLookAndFeel::redClip().withAlpha (0.9f));
+            g.drawRoundedRectangle (getLocalBounds().toFloat().reduced (0.75f), 3.0f, 1.5f);
+        }
+
+        if (! labelRow.isEmpty())
+        {
+            g.setFont (juce::Font (juce::FontOptions (juce::jmax (9.0f, 14.0f * u))).boldened());
+            g.setColour (juce::Colour (0xffa3a1ad));
+            const char* names[] = { "L", "R" };
+            for (int ch = 0; ch < channels; ++ch)
+                g.drawText (names[ch], juce::Rectangle<float> (labelRow.getX() + (float) ch * (barW + gap),
+                                                               labelRow.getY(), barW, labelRow.getHeight()),
+                            juce::Justification::centred);
+        }
+    }
+
     void paint (juce::Graphics& g) override
     {
+        if (skinOn)
+        {
+            paintSkin (g);
+            return;
+        }
+
         auto bounds = getLocalBounds().toFloat();
 
         const bool temChip = clipFn != nullptr || limiterFn != nullptr;
@@ -231,34 +315,40 @@ public:
 
         // luz de clip DENTRO da moldura, como tampa do medidor: flutuando acima
         // com um vao ela lia como um elemento vermelho perdido/cortado
+        const bool slimMeter = getWidth() <= 30;
         if (clipFn || limiterFn)
         {
-            auto clipArea = bounds.removeFromTop (12.0f).reduced (4.0f, 2.5f);
+            auto clipArea = bounds.removeFromTop (slimMeter ? 9.0f : 12.0f)
+                                  .reduced (slimMeter ? 2.5f : 4.0f, slimMeter ? 2.0f : 2.5f);
 
             const auto onColour  = chipDeAlerta ? alertaColour               // vermelho: alerta
                                                 : juce::Colour (0xffffb020);  // ambar: informativo
             const auto offColour = falaDeLimiter ? juce::Colour (0xff2e2718)
                                                  : juce::Colour (0xff3a2226);
-            const char* const rotulo = chipDeAlerta ? "CLIP"
+            const char* const rotulo = slimMeter ? ""
+                                      : chipDeAlerta ? "CLIP"
                                       : falaDeLimiter ? "LIM"
                                       : getWidth() < 50 ? "CL" : "CLIP";
 
             g.setColour (aceso ? onColour : offColour);
-            g.fillRoundedRectangle (clipArea, 3.0f);
+            g.fillRoundedRectangle (clipArea, slimMeter ? 2.2f : 3.0f);
 
             if (aceso)
             {
                 g.setColour (onColour.withAlpha (0.38f));
-                g.drawRoundedRectangle (clipArea.expanded (1.5f), 4.0f, 1.5f);
+                g.drawRoundedRectangle (clipArea.expanded (1.2f), slimMeter ? 3.0f : 4.0f, 1.3f);
             }
 
-            // Texto escuro sobre o ambar (o branco sumia); branco sobre o vermelho.
-            g.setColour (aceso ? (chipDeAlerta ? juce::Colours::white : juce::Colour (0xff1a1207))
-                               : juce::Colours::white.withAlpha (0.34f));
-            g.setFont (juce::Font (juce::FontOptions (7.5f, juce::Font::bold))
-                           .withExtraKerningFactor (0.08f));
-            g.drawText (rotulo, clipArea.toNearestInt(),
-                        juce::Justification::centred, false);
+            if (rotulo[0] != '\0')
+            {
+                // Texto escuro sobre o ambar (o branco sumia); branco sobre o vermelho.
+                g.setColour (aceso ? (chipDeAlerta ? juce::Colours::white : juce::Colour (0xff1a1207))
+                                   : juce::Colours::white.withAlpha (0.34f));
+                g.setFont (juce::Font (juce::FontOptions (7.5f, juce::Font::bold))
+                               .withExtraKerningFactor (0.08f));
+                g.drawText (rotulo, clipArea.toNearestInt(),
+                            juce::Justification::centred, false);
+            }
 
             bounds.removeFromTop (1.0f);
         }
@@ -267,7 +357,7 @@ public:
         if (scaleLabels && bounds.getWidth() >= 34.0f)
             scaleArea = bounds.removeFromLeft (14.0f);
 
-        auto meterArea = bounds.reduced (channels == 1 ? 2.0f : 2.5f);
+        auto meterArea = bounds.reduced (slimMeter ? 1.5f : channels == 1 ? 2.0f : 2.5f);
 
         // Um VU estereo de console e uma dupla de colunas finas, nao um painel
         // vermelho largo. O componente conserva sua area de clique/leitura e
@@ -630,7 +720,8 @@ private:
             return;
         }
 
-        bool changed = false;
+        bool chromeChanged = false;
+        bool barsChanged = false;
 
         if (clipFn)
         {
@@ -638,38 +729,27 @@ private:
 
             if (clipRole == ClipRole::limiterWorking)
             {
-                // Informativo: acompanha o momento em vez de travar. Num louvor
-                // forte o limiter trabalha o tempo todo -- luz travada nao diria
-                // nada. Aceso = esta segurando AGORA.
                 if (agora != clipSticky)
                 {
                     clipSticky = agora;
-                    changed = true;
+                    chromeChanged = true;
                 }
             }
             else if (clipClearFn != nullptr)
             {
-                // A trava mora no MOTOR (ver MasterProcessor::getClipLatched):
-                // aqui a luz so ESPELHA a fonte. Assim, se outro medidor da
-                // mesma fonte for clicado, esta luz apaga junto em vez de ficar
-                // acesa por conta propria com a trava ja limpa.
                 if (agora != clipSticky)
                 {
                     clipSticky = agora;
-                    changed = true;
+                    chromeChanged = true;
                 }
             }
             else if (agora && ! clipSticky)
             {
-                // Alerta: trava ate o musico clicar (senao um clip de 20 ms
-                // entre duas musicas passaria despercebido).
                 clipSticky = true;
-                changed = true;
+                chromeChanged = true;
             }
         }
 
-        // Atividade do limiter: informativa e NAO destrutiva, entao pode existir
-        // em paralelo com o alerta e ser lida por quantos medidores houver.
         if (limiterFn)
         {
             const bool segurando = limiterFn();
@@ -677,25 +757,33 @@ private:
             if (segurando != limiterActive)
             {
                 limiterActive = segurando;
-                changed = true;
+                chromeChanged = true;
             }
         }
 
+        bool allRestingAtFloor = true;
         for (int ch = 0; ch < channels; ++ch)
         {
             const float raw = levelFn ? levelFn (ch) : 0.0f;
 
-            // Abaixo do epsilon nao ha sinal nenhum: vai direto pro piso, sem
-            // passar pela conversao (que satura no MESMO -60 de um sinal real de
-            // -60 dBFS e apagava a diferenca). Ver silenceGain.
+            // Fast-path: canal ja em repouso no piso e sem sinal novo -> zero math.
+            if (raw <= silenceGain
+                && displayDb[ch] <= minDb
+                && peakDb[ch] <= minDb
+                && lastShownDb[ch] <= minDb
+                && lastShownPeak[ch] <= minDb)
+            {
+                peakHoldFrames[ch] = 0;
+                continue;
+            }
+
+            allRestingAtFloor = false;
             const float newDb = raw > silenceGain
                                   ? juce::Decibels::gainToDecibels (raw, minDb)
                                   : minDb;
 
             if (newDb > displayDb[ch])
             {
-                // O peak continua instantaneo (logo abaixo), enquanto o corpo
-                // da escada recebe um ataque curto de cerca de dois frames.
                 const float attackBlend = timerHzUsado >= 40 ? 0.86f : 1.0f;
                 displayDb[ch] += (newDb - displayDb[ch]) * attackBlend;
 
@@ -730,13 +818,32 @@ private:
             {
                 lastShownDb[ch] = displayDb[ch];
                 lastShownPeak[ch] = peakDb[ch];
-                changed = true;
+                barsChanged = true;
             }
         }
 
-        // so repinta quando algo mudou de verdade (economiza CPU de interface)
-        if (changed)
+        // Repinta moldura+chip apenas quando alerta/limiter mudou; quando so o
+        // nivel mudou, invalida somente o miolo das barras (poupando borda e chip).
+        if (chromeChanged || (skinOn && barsChanged))
+        {
             repaint();
+        }
+        else if (barsChanged)
+        {
+            const int topInset = (clipFn || limiterFn) ? (getWidth() <= 30 ? 10 : 13) : 1;
+            const int bottomInset = (channelLabels && channels == 2 && ! peakReadout) ? 13 : 1;
+            auto dirty = getLocalBounds()
+                             .withTrimmedTop (topInset)
+                             .withTrimmedBottom (bottomInset)
+                             .reduced (1, 0);
+            if (! dirty.isEmpty())
+                repaint (dirty);
+            else
+                repaint();
+        }
+
+        if (allRestingAtFloor && lastOnLevel == 0.0f)
+            return;
 
         if (onLevel != nullptr)
         {
@@ -770,6 +877,8 @@ private:
     bool channelLabels = false;
     bool scaleLabels = false;
     bool peakReadout = false;
+    bool skinOn = false;
+    float skinUnit = 1.0f;
 
     // Balistica do medidor derivada da TAXA REAL do timer, nao de constantes
     // por quadro. Antes a queda e o peak-hold eram contados em QUADROS fixos

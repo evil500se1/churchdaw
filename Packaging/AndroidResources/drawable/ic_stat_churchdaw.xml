@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Icone pequeno da notificacao do servico de audio: o Android usa so o canal alfa. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="80"
+    android:viewportHeight="80">
+    <group android:translateX="-14" android:translateY="-9">
+        <path
+            android:fillColor="#FFFFFFFF"
+            android:pathData="M51,12h6v8h8v6h-8v8h-6v-8h-8v-6h8z M54,29L25,51l5,7l24,-19l24,19l5,-7z M34,56L54,40l20,16v10h-7V55L54,45L41,55v11h-7z M34,71h6v15h-6z M44,71h6v15h-6z M54,71h6v15h-6z M64,71h6v15h-6z M74,71h2v15h-2z M17,53h4v6h-4z M24,49h4v14h-4z M80,49h4v14h-4z M87,53h4v6h-4z" />
+    </group>
+</vector>

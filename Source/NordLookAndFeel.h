@@ -2,6 +2,9 @@
 
 #include <juce_gui_basics/juce_gui_basics.h>
 #include "MobileShellConfig.h"
+#if CHURCHDAW_MOBILE_SHELL
+ #include "ChurchLiveFonts.h"
+#endif
 #include <cmath>
 
 //==============================================================================
@@ -17,31 +20,31 @@ public:
     //==============================================================================
 
     // ---- superficies (grafite quente, OLED premium) ----
-    static juce::Colour bgApp()          { return juce::Colour (0xff101216); }   // preto grafite neutro
-    static juce::Colour bgAppLift()      { return juce::Colour (0xff191c22); }   // luz ambiente da console
-    static juce::Colour bgCard()         { return juce::Colour (0xff191c22); }   // painel/card
-    static juce::Colour bgCardHi()       { return juce::Colour (0xff22262d); }   // topo do glass
-    static juce::Colour bgCardSel()      { return juce::Colour (0xff252a32); }   // card selecionado
-    static juce::Colour bgControl()      { return juce::Colour (0xff22262e); }   // campos/controles
-    static juce::Colour bgControlHi()    { return juce::Colour (0xff2b3039); }
-    static juce::Colour borderDefault()  { return juce::Colour (0xff383e48); }
-    static juce::Colour borderSoft()     { return juce::Colour (0xff292e36); }
+    static juce::Colour bgApp()          { return juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xff0a0a0d : 0xff101216); }   // preto grafite neutro
+    static juce::Colour bgAppLift()      { return juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xff14141a : 0xff191c22); }   // luz ambiente da console
+    static juce::Colour bgCard()         { return juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xff14141a : 0xff191c22); }   // painel/card
+    static juce::Colour bgCardHi()       { return juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xff1c1c24 : 0xff22262d); }   // topo do glass
+    static juce::Colour bgCardSel()      { return juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xff1c1c24 : 0xff252a32); }   // card selecionado
+    static juce::Colour bgControl()      { return juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xff1c1c24 : 0xff22262e); }   // campos/controles
+    static juce::Colour bgControlHi()    { return juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xff23232c : 0xff2b3039); }
+    static juce::Colour borderDefault()  { return juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xff2b2b36 : 0xff383e48); }
+    static juce::Colour borderSoft()     { return juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xff22222b : 0xff292e36); }
     static juce::Colour hairline()       { return juce::Colours::white.withAlpha (0.050f); }
-    static juce::Colour bgFloating()     { return juce::Colour (0xff22262d); }
-    static juce::Colour bgFloatingHover() { return juce::Colour (0xff36303a); }
-    static juce::Colour focusOutline()   { return juce::Colour (0xffeb7184); }
+    static juce::Colour bgFloating()     { return juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xff1c1c24 : 0xff22262d); }
+    static juce::Colour bgFloatingHover() { return juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xff23232c : 0xff36303a); }
+    static juce::Colour focusOutline()   { return juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xffff6b7d : 0xffeb7184); }
 
     // ---- texto ----
-    static juce::Colour txtPrimary()     { return juce::Colour (0xfff2f2f3); }
-    static juce::Colour txtSecondary()   { return juce::Colour (0xffb2bac7); }
-    static juce::Colour txtDisabled()    { return juce::Colour (0xff7f8998); }
+    static juce::Colour txtPrimary()     { return juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xfff5f3f4 : 0xfff2f2f3); }
+    static juce::Colour txtSecondary()   { return juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xffa3a1ad : 0xffb2bac7); }
+    static juce::Colour txtDisabled()    { return juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xff7d7b88 : 0xff7f8998); }
 
     // ---- acento e status ----
-    static juce::Colour nordRed()        { return juce::Colour (0xffdc3f57); }   // acento global
-    static juce::Colour nordRedBright()  { return juce::Colour (0xfff15b70); }   // hover/destaque
-    static juce::Colour nordRedDark()    { return juce::Colour (0xff6d1220); }
-    static juce::Colour amberSolo()      { return juce::Colour (0xffffb020); }   // solo/atencao
-    static juce::Colour greenOk()        { return juce::Colour (0xff46d37c); }   // status normal
+    static juce::Colour nordRed()        { return juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xffd92b40 : 0xffdc3f57); }   // acento global
+    static juce::Colour nordRedBright()  { return juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xffff5a6e : 0xfff15b70); }   // hover/destaque
+    static juce::Colour nordRedDark()    { return juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xff5a1420 : 0xff6d1220); }
+    static juce::Colour amberSolo()      { return juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xfff4b73b : 0xffffb020); }   // solo/atencao
+    static juce::Colour greenOk()        { return juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xff3ddc84 : 0xff46d37c); }   // status normal
     static juce::Colour redClip()        { return juce::Colour (0xffff1744); }   // erro/clip
 
     // Fundo do app com estetica matte dark minimalista:
@@ -89,23 +92,61 @@ public:
         }
         return;
        #else
-        const float corner = integratedStrip ? 7.0f : radius;
+        const float corner = integratedStrip ? 8.0f : radius;
         const auto cue = accent.isTransparent() ? nordRed() : accent;
-        const auto surface = empty ? juce::Colour (0xff15171b)
-                                   : selected ? juce::Colour (0xff252a31) : bgCard();
+        const auto topCol = empty ? juce::Colour (0xff15181e)
+                          : selected ? juce::Colour (0xff272d38)
+                          : master ? juce::Colour (0xff20252f)
+                                   : juce::Colour (0xff1e232c);
+        const auto botCol = empty ? juce::Colour (0xff101318)
+                          : selected ? juce::Colour (0xff181c24)
+                          : master ? juce::Colour (0xff13171e)
+                                   : juce::Colour (0xff13161d);
+
+        if (! empty && card.getHeight() >= 48.0f)
+        {
+            g.setColour (juce::Colours::black.withAlpha (selected ? 0.34f : 0.22f));
+            g.fillRoundedRectangle (card.translated (0.0f, 1.5f), corner);
+        }
+
         g.setGradientFill (juce::ColourGradient (
-            empty ? surface : surface.brighter (0.035f), card.getX(), card.getY(),
-            surface, card.getX(), card.getY() + juce::jmin (140.0f, card.getHeight()), false));
+            topCol, card.getX(), card.getY(),
+            botCol, card.getX(), card.getBottom(), false));
         g.fillRoundedRectangle (card, corner);
-        g.setColour (selected ? cue.withAlpha (0.38f)
-                              : juce::Colours::white.withAlpha (empty ? 0.035f : 0.065f));
-        g.drawRoundedRectangle (card.reduced (0.5f), corner, 1.0f);
+
         if (! empty)
         {
-            g.setColour (cue.withAlpha (selected || master ? 0.90f : 0.55f));
-            g.fillRoundedRectangle (card.getX() + 12.0f, card.getY() + 5.0f,
-                                    selected ? juce::jmax (18.0f, card.getWidth() - 24.0f)
-                                             : 18.0f, 2.0f, 1.0f);
+            auto topRim = card.reduced (corner * 0.45f, 1.0f).removeFromTop (1.0f);
+            if (topRim.getWidth() > 4.0f)
+            {
+                g.setColour (juce::Colours::white.withAlpha (selected ? 0.10f : 0.06f));
+                g.fillRect (topRim);
+            }
+        }
+
+        g.setColour (selected ? cue.withAlpha (0.50f)
+                              : juce::Colours::white.withAlpha (empty ? 0.045f : master ? 0.095f : 0.075f));
+        g.drawRoundedRectangle (card.reduced (0.5f), corner, selected ? 1.2f : 1.0f);
+
+        if (! empty && (selected || master || ! accent.isTransparent()))
+        {
+            const float crownW = selected
+                ? juce::jmax (20.0f, juce::jmin (card.getWidth() - 24.0f, 52.0f))
+                : master ? juce::jmin (card.getWidth() - 24.0f, 32.0f)
+                         : 22.0f;
+            if (crownW > 4.0f && card.getWidth() >= 36.0f)
+            {
+                auto crown = juce::Rectangle<float> (
+                    card.getCentreX() - crownW * 0.5f,
+                    card.getY() + 2.5f, crownW, 2.2f);
+                if (selected || master)
+                {
+                    g.setColour (cue.withAlpha (0.22f));
+                    g.fillRoundedRectangle (crown.expanded (2.0f, 1.2f), 2.0f);
+                }
+                g.setColour (cue.withAlpha (selected || master ? 0.92f : 0.68f));
+                g.fillRoundedRectangle (crown, 1.1f);
+            }
         }
        #endif
     }
@@ -246,7 +287,7 @@ public:
     // ---- raio de canto: TRES escalas, nao cinco ----
     // Premium: um pouco mais generoso no card/painel (vidro, nao tijolo).
     static constexpr float radiusControl = 6.0f;   // botoes, combos, chips
-    static constexpr float radiusCard    = 10.0f;  // cards de canal
+    static constexpr float radiusCard    = CHURCHDAW_MOBILE_SHELL ? 18.0f : 10.0f;  // cards de canal
     static constexpr float radiusPanel   = 14.0f;  // paineis e visores
 
     // LEDs do painel. Nas fotos: VERDE nas escadas de nivel dos faders, VERMELHO
@@ -360,6 +401,17 @@ public:
         setColour (juce::TooltipWindow::textColourId, txtPrimary());
         setColour (juce::ComboBox::textColourId, txtPrimary());
         setColour (juce::ComboBox::arrowColourId, txtSecondary());
+       #else
+        setColour (juce::PopupMenu::backgroundColourId, juce::Colour (0xff181c24));
+        setColour (juce::PopupMenu::highlightedBackgroundColourId, juce::Colour (0xff4d1826));
+        setColour (juce::PopupMenu::headerTextColourId, txtSecondary());
+        setColour (juce::TextEditor::backgroundColourId, juce::Colour (0xff141820));
+        setColour (juce::TextEditor::textColourId, txtPrimary());
+        setColour (juce::TextEditor::outlineColourId, juce::Colour (0xff2f3643));
+        setColour (juce::TextEditor::focusedOutlineColourId, nordRedBright());
+        setColour (juce::TextEditor::highlightColourId, nordRed().withAlpha (0.34f));
+        setColour (juce::TextEditor::highlightedTextColourId, juce::Colours::white);
+        setColour (juce::CaretComponent::caretColourId, nordRedBright());
        #endif
     }
 
@@ -702,6 +754,60 @@ public:
         g.drawFittedText (text, textArea, juce::Justification::centredLeft, 1, 0.84f);
     }
 
+    // Pilula unica da barra de navegacao mobile (tambem usada pelo botao Audio).
+    static void drawTouchNavPill (juce::Graphics& g, juce::Rectangle<float> bounds, bool selected,
+                                  bool accentRim, bool hover, bool down, float alpha)
+    {
+        auto pill = bounds.reduced (0.0f, 2.0f);
+        if (pill.isEmpty()) return;
+        const float radius = juce::jmin (8.0f, pill.getHeight() * 0.22f);
+
+        if (selected)
+        {
+            const auto top = juce::Colour (0xff4a1b28), bottom = juce::Colour (0xff2a0f17);
+            g.setGradientFill (juce::ColourGradient (
+                (down ? top.darker (0.12f) : top).withMultipliedAlpha (alpha), pill.getX(), pill.getY(),
+                (down ? bottom.darker (0.12f) : bottom).withMultipliedAlpha (alpha), pill.getX(), pill.getBottom(), false));
+            g.fillRoundedRectangle (pill, radius);
+            g.setColour (nordRedBright().withAlpha (0.55f * alpha));
+            g.drawRoundedRectangle (pill.reduced (0.5f), radius, 1.0f);
+            const float barW = juce::jlimit (16.0f, 26.0f, pill.getWidth() * 0.34f);
+            g.setColour (nordRedBright().withAlpha (0.95f * alpha));
+            g.fillRoundedRectangle (pill.getCentreX() - barW * 0.5f, pill.getBottom() - 3.0f, barW, 2.0f, 1.0f);
+            return;
+        }
+
+        g.setColour ((accentRim ? nordRed().withAlpha (down ? 0.20f : hover ? 0.16f : 0.11f)
+                                : juce::Colours::white.withAlpha (down ? 0.085f : hover ? 0.060f : 0.035f))
+                         .withMultipliedAlpha (alpha));
+        g.fillRoundedRectangle (pill, radius);
+        g.setColour ((accentRim ? nordRedBright().withAlpha (0.50f)
+                                : juce::Colours::white.withAlpha (hover ? 0.12f : 0.065f))
+                         .withMultipliedAlpha (alpha));
+        g.drawRoundedRectangle (pill.reduced (0.5f), radius, 1.0f);
+    }
+
+   #if CHURCHDAW_MOBILE_SHELL
+    // Fonte padrao do app mobile: Barlow empacotada (nao a do sistema). Troca
+    // so as fontes "padrao" (sans e monoespacada); nomes explicitos seguem.
+    juce::Typeface::Ptr getTypefaceForFont (const juce::Font& font) override
+    {
+        if (font.getTypefaceName() == juce::Font::getDefaultSansSerifFontName())
+        {
+            if (auto face = ChurchLiveSkin::typefaceFor (font.isBold() ? ChurchLiveSkin::Face::barlowBold
+                                                                       : ChurchLiveSkin::Face::barlow))
+                return face;
+        }
+        else if (font.getTypefaceName() == juce::Font::getDefaultMonospacedFontName())
+        {
+            if (auto face = ChurchLiveSkin::typefaceFor (ChurchLiveSkin::Face::mono))
+                return face;
+        }
+
+        return juce::LookAndFeel_V4::getTypefaceForFont (font);
+    }
+   #endif
+
     void drawButtonBackground (juce::Graphics& g, juce::Button& button, const juce::Colour& backgroundColour,
                                bool shouldDrawButtonAsHighlighted, bool shouldDrawButtonAsDown) override
     {
@@ -710,7 +816,8 @@ public:
         const bool desktopNavigation = nav && usesDesktopShell (button);
         // Semantic channel overlays stay transparent. Desktop navigation still
         // needs hover/focus feedback when its resting surface is transparent.
-        if (backgroundColour.isTransparent() && ! desktopNavigation) return;
+        const bool touchNavPill = nav && (bool) button.getProperties()["churchTouchNav"];
+        if (backgroundColour.isTransparent() && ! desktopNavigation && ! touchNavPill) return;
         auto bounds = button.getLocalBounds().toFloat().reduced (1.0f);
         if (bounds.isEmpty()) return;
         // Dark graphite can be saturated blue; only semantic accent colours
@@ -785,32 +892,209 @@ public:
         const bool danger = id == "panicOutline";
         const bool emptyAdd = id == "emptyChannelAdd";
         const bool solo = id == "consoleSolo";
-        const auto accent = solo ? amberSolo()
-                          : backgroundColour.getHue() > 0.20f && backgroundColour.getHue() < 0.48f
-                                && backgroundColour.getSaturation() > 0.3f ? greenOk() : nordRed();
-        auto fill = emptyAdd ? juce::Colours::white.withAlpha (0.025f)
-                       : nav ? (active ? nordRed().withAlpha (0.13f) : juce::Colours::transparentBlack)
-                       : danger ? nordRed().withAlpha (0.13f)
-                       : active ? accent.withAlpha (0.18f) : bgControl();
-        if (shouldDrawButtonAsDown) fill = active ? accent.withAlpha (0.30f) : bgControlHi();
-        else if (shouldDrawButtonAsHighlighted) fill = active ? accent.withAlpha (0.23f) : bgControlHi();
-        if (! button.isEnabled()) fill = fill.withMultipliedAlpha (0.45f);
-        const float radius = juce::jmin (8.0f, bounds.getHeight() * 0.25f);
-        g.setColour (fill);
+        const bool amberAccent = backgroundColour.getHue() >= 0.07f
+                                  && backgroundColour.getHue() <= 0.18f
+                                  && backgroundColour.getSaturation() > 0.24f
+                                  && backgroundColour.getBrightness() > 0.18f;
+        const auto accent = solo || amberAccent ? amberSolo()
+                          : greenAccent ? greenOk() : nordRed();
+        const bool activeOrAmber = active || amberAccent;
+        const bool primaryCta = redAccent && backgroundColour.getBrightness() >= 0.52f && ! emptyAdd;
+        const float alpha = button.isEnabled() ? 1.0f : 0.42f;
+        const float radius = juce::jmin (8.0f, bounds.getHeight() * 0.24f);
+
+        if (nav && touchNavPill)
+        {
+            // Barra mobile: TODOS os destinos usam a mesma pilula, mesma altura.
+            // Selecionado = estado real (toggle), nao a cor; o atalho Timbres
+            // (CTA vermelho fixo) vira so um aro carmim, sem competir com a aba ativa.
+            const bool selected = button.getToggleState() && id != "navSave";
+            drawTouchNavPill (g, bounds, selected, ! selected && primaryCta,
+                              shouldDrawButtonAsHighlighted, shouldDrawButtonAsDown, alpha);
+            return;
+        }
+
+        if (nav)
+        {
+            const bool saved = id == "navSave";
+            const bool selectedNav = active && ! saved;
+            const bool touchNav = (bool) button.getProperties()["churchTouchNav"];
+            if (selectedNav)
+            {
+                const auto topCol = primaryCta ? juce::Colour (0xffad1e35) : juce::Colour (0xff461a26);
+                const auto botCol = primaryCta ? juce::Colour (0xff7d1324) : juce::Colour (0xff2b1018);
+                g.setGradientFill (juce::ColourGradient (
+                    (shouldDrawButtonAsDown ? topCol.darker (0.12f) : topCol).withMultipliedAlpha (alpha),
+                    bounds.getX(), bounds.getY(),
+                    (shouldDrawButtonAsDown ? botCol.darker (0.12f) : botCol).withMultipliedAlpha (alpha),
+                    bounds.getX(), bounds.getBottom(), false));
+                g.fillRoundedRectangle (bounds, radius);
+                g.setColour (nordRedBright().withAlpha ((primaryCta ? 0.72f : 0.46f) * alpha));
+                g.drawRoundedRectangle (bounds.reduced (0.5f), radius, 1.0f);
+                if (! primaryCta)
+                {
+                    const float barW = juce::jlimit (16.0f, 26.0f, bounds.getWidth() * 0.34f);
+                    g.setColour (nordRedBright().withAlpha (0.92f * alpha));
+                    g.fillRoundedRectangle (bounds.getCentreX() - barW * 0.5f,
+                                            bounds.getBottom() - 2.5f, barW, 2.0f, 1.0f);
+                }
+            }
+            else if (touchNav || shouldDrawButtonAsHighlighted || shouldDrawButtonAsDown)
+            {
+                const float surfAlpha = shouldDrawButtonAsDown ? 0.085f
+                                      : shouldDrawButtonAsHighlighted ? 0.060f : 0.028f;
+                g.setColour (juce::Colours::white.withAlpha (surfAlpha * alpha));
+                g.fillRoundedRectangle (bounds.reduced (0.0f, 2.0f), radius);
+                g.setColour (juce::Colours::white.withAlpha (
+                    (shouldDrawButtonAsHighlighted ? 0.11f : 0.055f) * alpha));
+                g.drawRoundedRectangle (bounds.reduced (0.5f, 2.5f), radius, 1.0f);
+            }
+            return;
+        }
+
+        if (emptyAdd)
+        {
+            const auto fill = shouldDrawButtonAsDown ? juce::Colour (0xff222731)
+                            : shouldDrawButtonAsHighlighted ? juce::Colour (0xff1f242d)
+                                                            : juce::Colour (0xff191d25);
+            g.setColour (fill.withMultipliedAlpha (alpha));
+            g.fillRoundedRectangle (bounds, radius);
+            g.setColour (juce::Colours::white.withAlpha (0.08f * alpha));
+            g.drawRoundedRectangle (bounds.reduced (0.5f), radius, 1.0f);
+            return;
+        }
+
+        juce::Colour topCol, botCol, rimCol;
+        if (danger)
+        {
+            topCol = juce::Colour (0xff3c1b23);
+            botCol = juce::Colour (0xff261117);
+            rimCol = nordRedBright().withAlpha (0.58f);
+        }
+        else if (primaryCta)
+        {
+            topCol = juce::Colour (0xffc41f3a);
+            botCol = juce::Colour (0xff8c1327);
+            rimCol = juce::Colour (0xffff6b81).withAlpha (0.62f);
+        }
+        else if (activeOrAmber)
+        {
+            if (solo || amberAccent)
+            {
+                topCol = button.getToggleState() ? juce::Colour (0xff785216) : juce::Colour (0xff40321d);
+                botCol = button.getToggleState() ? juce::Colour (0xff4e340d) : juce::Colour (0xff2c2214);
+                rimCol = amberSolo().withAlpha (button.getToggleState() ? 0.78f : 0.48f);
+            }
+            else if (greenAccent)
+            {
+                topCol = juce::Colour (0xff1e593f);
+                botCol = juce::Colour (0xff133b29);
+                rimCol = greenOk().withAlpha (0.68f);
+            }
+            else
+            {
+                topCol = juce::Colour (0xff6e1b2b);
+                botCol = juce::Colour (0xff46101b);
+                rimCol = nordRedBright().withAlpha (0.68f);
+            }
+        }
+        else
+        {
+            // Keep neutral R <= G <= B (cool studio gunmetal) so inactive controls
+            // never read as warm/selected.
+            topCol = juce::Colour (0xff252b35);
+            botCol = juce::Colour (0xff1a1f27);
+            rimCol = juce::Colour (0xff363e4c).withAlpha (0.78f);
+        }
+
+       #if CHURCHDAW_MOBILE_SHELL
+        // Skin Church Live: superficies chapadas nos tokens novos (sem sombra
+        // projetada nem filete especular). So a paleta e o raio mudam; a logica
+        // que decide primario/ativo/perigo continua a de cima.
+        {
+            const float mobileRadius = juce::jmin (14.0f, bounds.getHeight() * 0.30f);
+            if (danger)
+            {
+                topCol = juce::Colour (0xff3a1520);
+                botCol = juce::Colour (0xff2a1018);
+                rimCol = juce::Colour (0xffff5a6e).withAlpha (0.70f);
+            }
+            else if (primaryCta)
+            {
+                topCol = juce::Colour (0xffe8384f);
+                botCol = juce::Colour (0xffb01b2e);
+                rimCol = juce::Colour (0xffff7a8a).withAlpha (0.60f);
+            }
+            else if (activeOrAmber)
+            {
+                const auto tone = (solo || amberAccent) ? amberSolo() : greenAccent ? greenOk() : juce::Colour (0xffff5a6e);
+                topCol = botCol = juce::Colour (0xff1c1c24).interpolatedWith (tone, 0.16f);
+                rimCol = tone.withAlpha (0.70f);
+            }
+            else
+            {
+                topCol = botCol = juce::Colour (0xff1c1c24);
+                rimCol = juce::Colour (0xff2b2b36);
+            }
+
+            if (shouldDrawButtonAsDown)
+            {
+                topCol = topCol.darker (0.12f);
+                botCol = botCol.darker (0.12f);
+            }
+            else if (shouldDrawButtonAsHighlighted)
+            {
+                topCol = topCol.brighter (0.08f);
+                botCol = botCol.brighter (0.08f);
+            }
+
+            if (primaryCta || danger)
+                g.setGradientFill (juce::ColourGradient (topCol.withMultipliedAlpha (alpha), 0.0f, bounds.getY(),
+                                                         botCol.withMultipliedAlpha (alpha), 0.0f, bounds.getBottom(), false));
+            else
+                g.setColour (topCol.withMultipliedAlpha (alpha));
+            g.fillRoundedRectangle (bounds, mobileRadius);
+            g.setColour ((button.hasKeyboardFocus (true) ? nordRedBright() : rimCol).withMultipliedAlpha (alpha));
+            g.drawRoundedRectangle (bounds.reduced (0.5f), mobileRadius, button.hasKeyboardFocus (true) ? 1.5f : 1.0f);
+            return;
+        }
+       #endif
+
+        if (shouldDrawButtonAsDown)
+        {
+            topCol = topCol.darker (0.14f);
+            botCol = botCol.darker (0.06f);
+        }
+        else if (shouldDrawButtonAsHighlighted)
+        {
+            topCol = topCol.brighter (0.08f);
+            botCol = botCol.brighter (0.05f);
+        }
+
+        if (button.isEnabled() && bounds.getHeight() >= 26.0f && ! shouldDrawButtonAsDown)
+        {
+            g.setColour (juce::Colours::black.withAlpha (primaryCta ? 0.36f : 0.24f));
+            g.fillRoundedRectangle (bounds.translated (0.0f, 1.2f), radius);
+        }
+
+        g.setGradientFill (juce::ColourGradient (
+            topCol.withMultipliedAlpha (alpha), bounds.getX(), bounds.getY(),
+            botCol.withMultipliedAlpha (alpha), bounds.getX(), bounds.getBottom(), false));
         g.fillRoundedRectangle (bounds, radius);
-        if (! nav)
+
+        if (bounds.getWidth() > 14.0f && bounds.getHeight() >= 22.0f && ! shouldDrawButtonAsDown)
         {
-            g.setColour (button.hasKeyboardFocus (true) ? nordRedBright()
-                         : danger ? nordRed().withAlpha (0.70f)
-                         : active ? accent.withAlpha (0.38f) : borderDefault().withAlpha (0.72f));
-            g.drawRoundedRectangle (bounds, radius, button.hasKeyboardFocus (true) ? 1.5f : 1.0f);
+            auto spec = bounds.reduced (radius * 0.55f, 1.0f).removeFromTop (1.0f);
+            if (spec.getWidth() > 4.0f)
+            {
+                g.setColour (juce::Colours::white.withAlpha ((primaryCta ? 0.18f : 0.075f) * alpha));
+                g.fillRect (spec);
+            }
         }
-        else if (active)
-        {
-            g.setColour (nordRedBright());
-            g.fillRoundedRectangle (bounds.getCentreX() - 11.0f, bounds.getBottom() - 3.0f,
-                                    22.0f, 2.0f, 1.0f);
-        }
+
+        const bool focus = button.hasKeyboardFocus (true);
+        g.setColour ((focus ? nordRedBright() : rimCol).withMultipliedAlpha (alpha));
+        g.drawRoundedRectangle (bounds.reduced (0.5f), radius, focus ? 1.5f : 1.0f);
     }
 
     //==============================================================================
@@ -921,37 +1205,88 @@ public:
         const float radius = juce::jmin (bounds.getWidth(), bounds.getHeight()) * 0.5f;
         const auto centre = bounds.getCentre();
         const float angle = rotaryStartAngle + sliderPos * (rotaryEndAngle - rotaryStartAngle);
-        const float arcRadius = radius * 0.93f;
+        const float alpha = slider.isEnabled() ? 1.0f : 0.35f;
+        const float arcRadius = radius * 0.90f;
         const auto accent = slider.findColour (juce::Slider::rotarySliderFillColourId);
-        const auto stroke = juce::PathStrokeType (2.0f, juce::PathStrokeType::curved,
-                                                       juce::PathStrokeType::rounded);
+        const auto trackStroke = juce::PathStrokeType (2.6f, juce::PathStrokeType::curved,
+                                                             juce::PathStrokeType::rounded);
+
+        if (radius >= 20.0f)
+        {
+            g.setColour (juce::Colours::white.withAlpha (0.12f * alpha));
+            for (int i = 0; i <= 6; ++i)
+            {
+                const float ta = rotaryStartAngle + ((float) i / 6.0f) * (rotaryEndAngle - rotaryStartAngle);
+                const float tr = radius * 0.985f;
+                g.fillEllipse (centre.x + std::sin (ta) * tr - 0.9f,
+                               centre.y - std::cos (ta) * tr - 0.9f, 1.8f, 1.8f);
+            }
+        }
+
         juce::Path track;
-        track.addCentredArc (centre.x, centre.y, arcRadius, arcRadius, 0,
+        track.addCentredArc (centre.x, centre.y, arcRadius, arcRadius, 0.0f,
                              rotaryStartAngle, rotaryEndAngle, true);
-        g.setColour (juce::Colour (0xff393e46));
-        g.strokePath (track, stroke);
-        if (sliderPos > 0.001f)
+        g.setColour (juce::Colour (0xff12151c).withAlpha (alpha));
+        g.strokePath (track, juce::PathStrokeType (3.8f, juce::PathStrokeType::curved,
+                                                         juce::PathStrokeType::rounded));
+        g.setColour (juce::Colour (0xff2f3542).withAlpha (alpha));
+        g.strokePath (track, trackStroke);
+
+        const bool bipolar = slider.getMinimum() < 0.0 && slider.getMaximum() > 0.0;
+        const float origin = bipolar
+            ? rotaryStartAngle + (float) slider.valueToProportionOfLength (0.0)
+                                     * (rotaryEndAngle - rotaryStartAngle)
+            : rotaryStartAngle;
+
+        if (bipolar)
+        {
+            const auto p0 = centre + juce::Point<float> (std::sin (origin) * (arcRadius + 2.2f),
+                                                         -std::cos (origin) * (arcRadius + 2.2f));
+            const auto p1 = centre + juce::Point<float> (std::sin (origin) * (arcRadius - 2.2f),
+                                                         -std::cos (origin) * (arcRadius - 2.2f));
+            g.setColour (juce::Colours::white.withAlpha (0.34f * alpha));
+            g.drawLine ({ p0, p1 }, 1.4f);
+        }
+
+        if (std::abs (angle - origin) > 0.003f)
         {
             juce::Path value;
-            value.addCentredArc (centre.x, centre.y, arcRadius, arcRadius, 0,
-                                 rotaryStartAngle, angle, true);
-            g.setColour (accent.withAlpha (slider.isEnabled() ? 0.95f : 0.35f));
-            g.strokePath (value, stroke);
+            value.addCentredArc (centre.x, centre.y, arcRadius, arcRadius, 0.0f,
+                                 juce::jmin (origin, angle), juce::jmax (origin, angle), true);
+            g.setColour (accent.withAlpha (0.22f * alpha));
+            g.strokePath (value, juce::PathStrokeType (5.2f, juce::PathStrokeType::curved,
+                                                             juce::PathStrokeType::rounded));
+            g.setColour (accent.withAlpha (0.96f * alpha));
+            g.strokePath (value, juce::PathStrokeType (2.8f, juce::PathStrokeType::curved,
+                                                             juce::PathStrokeType::rounded));
         }
-        const float bodyRadius = radius * 0.70f;
-        auto body = juce::Rectangle<float> (bodyRadius * 2, bodyRadius * 2)
+
+        const float bodyRadius = radius * 0.68f;
+        auto body = juce::Rectangle<float> (bodyRadius * 2.0f, bodyRadius * 2.0f)
                         .withCentre (centre);
-        const auto bodyTop = slider.isMouseOverOrDragging() ? juce::Colour (0xff434b57)
-                                                           : juce::Colour (0xff353d47);
-        g.setGradientFill (juce::ColourGradient (bodyTop, body.getX(), body.getY(),
-                                                juce::Colour (0xff1f252d), body.getX(), body.getBottom(), false));
+        g.setColour (juce::Colours::black.withAlpha (0.48f * alpha));
+        g.fillEllipse (body.translated (0.0f, 1.8f).expanded (0.5f));
+
+        const auto bodyTop = slider.isMouseOverOrDragging() ? juce::Colour (0xff444d5c)
+                                                            : juce::Colour (0xff333a47);
+        g.setGradientFill (juce::ColourGradient (
+            bodyTop.withMultipliedAlpha (alpha), body.getX(), body.getY(),
+            juce::Colour (0xff191d25).withMultipliedAlpha (alpha), body.getX(), body.getBottom(), false));
         g.fillEllipse (body);
-        g.setColour (juce::Colours::white.withAlpha (0.12f));
-        g.drawEllipse (body, 1.0f);
+
+        auto capTop = body.reduced (bodyRadius * 0.16f);
+        g.setGradientFill (juce::ColourGradient (
+            juce::Colour (0xff262c37).withMultipliedAlpha (alpha), capTop.getX(), capTop.getY(),
+            juce::Colour (0xff1d222b).withMultipliedAlpha (alpha), capTop.getX(), capTop.getBottom(), false));
+        g.fillEllipse (capTop);
+
+        g.setColour (juce::Colours::white.withAlpha (0.14f * alpha));
+        g.drawEllipse (body.reduced (0.5f), 1.0f);
+
         const auto pointAt = [&] (float r)
         { return centre + juce::Point<float> (std::sin (angle) * r, -std::cos (angle) * r); };
-        g.setColour (txtPrimary().withAlpha (slider.isEnabled() ? 0.95f : 0.35f));
-        g.drawLine ({ pointAt (bodyRadius * 0.24f), pointAt (bodyRadius * 0.83f) }, 2.0f);
+        g.setColour (juce::Colour (0xfff6f4f0).withAlpha (0.96f * alpha));
+        g.drawLine ({ pointAt (bodyRadius * 0.28f), pointAt (bodyRadius * 0.80f) }, 2.1f);
     }
 
     //==============================================================================
@@ -1161,7 +1496,7 @@ public:
         // tela. O ID "masterFader" liga o mesmo desenho ja provado no celular,
         // sem tocar em NENHUM outro slider horizontal do app.
        #if CHURCHDAW_MOBILE_SHELL
-        const bool consoleHorizontal = true;
+        const bool consoleHorizontal = slider.getComponentID() != "auditionVolumeSlider" && height >= 32;
        #else
         const bool consoleHorizontal = slider.getComponentID() == "masterFader";
        #endif
@@ -1177,7 +1512,7 @@ public:
 
             // trilha com mais PRESENCA: o fader e o controle principal do canal
             // e com 8 px lia como um risco; 10-14 px da corpo sem virar barra
-            const float trackH = juce::jlimit (10.0f, 14.0f, (float) height * 0.38f);
+            const float trackH = juce::jlimit (8.0f, 12.0f, (float) height * 0.30f);
             auto track = juce::Rectangle<float> ((float) x + inset,
                                                  (float) y + (float) height * 0.5f - trackH * 0.5f,
                                                  juce::jmax (1.0f, (float) width - inset * 2.0f),
@@ -1233,13 +1568,8 @@ public:
                 }
             }
 
-            const float capW = juce::jlimit (24.0f, 34.0f, (float) height * 0.92f);
-            // Piso 14 e folga de 2 px (era 16 e 4): no desktop a pista do master
-            // pode ficar com ~15 px de altura quando a janela e baixa, e o cap de
-            // 16 px transbordava por cima da caixa de dB. Em altura de celular
-            // (30 px pra cima) o resultado continua sendo os mesmos 22 px de
-            // antes, entao o toque nao muda.
-            const float capH = juce::jlimit (14.0f, 22.0f, (float) height - 2.0f);
+            const float capW = juce::jlimit (22.0f, 30.0f, (float) height * 0.84f);
+            const float capH = juce::jlimit (14.0f, 20.0f, (float) height - 4.0f);
             auto cap = juce::Rectangle<float> (pos - capW * 0.5f,
                                                track.getCentreY() - capH * 0.5f,
                                                capW, capH);
@@ -1247,9 +1577,9 @@ public:
             g.setColour (juce::Colours::black.withAlpha (0.42f));
             g.fillRoundedRectangle (cap.translated (0.0f, 2.0f), 4.0f);
 
-            g.setGradientFill (juce::ColourGradient (juce::Colour (0xff555a64),
+            g.setGradientFill (juce::ColourGradient (juce::Colour (0xff4a515d),
                                                      cap.getX(), cap.getY(),
-                                                     juce::Colour (0xff282b32),
+                                                     juce::Colour (0xff232730),
                                                      cap.getX(), cap.getBottom(), false));
             g.fillRoundedRectangle (cap, 4.0f);
             g.setGradientFill (juce::ColourGradient (
@@ -1258,17 +1588,50 @@ public:
             g.fillRoundedRectangle (cap.reduced (1.0f), 3.2f);
             g.setColour (juce::Colours::white.withAlpha (0.18f));
             g.drawRoundedRectangle (cap.reduced (0.5f), 4.0f, 1.0f);
-            g.setColour (juce::Colours::white.withAlpha (0.16f));
-            g.drawLine (cap.getX() + 4.0f, cap.getY() + 1.2f,
-                        cap.getRight() - 4.0f, cap.getY() + 1.2f, 1.0f);
-            g.setColour (juce::Colours::black.withAlpha (0.42f));
-            g.drawLine (cap.getX() + 4.0f, cap.getBottom() - 1.2f,
-                        cap.getRight() - 4.0f, cap.getBottom() - 1.2f, 1.0f);
-            g.setColour (juce::Colour (0xffe2e4e8));
-            g.fillRect (cap.getCentreX() - 1.1f, cap.getY() + 3.0f,
-                        2.2f, juce::jmax (1.0f, cap.getHeight() - 6.0f));
+            g.setColour (juce::Colour (0xfff2f4f7));
+            g.fillRect (cap.getCentreX() - 1.0f, cap.getY() + 3.0f,
+                        2.0f, juce::jmax (1.0f, cap.getHeight() - 6.0f));
             return;
         }
+
+       #if CHURCHDAW_MOBILE_SHELL
+        if (style == juce::Slider::LinearHorizontal)
+        {
+            juce::ignoreUnused (minSliderPos, maxSliderPos);
+            const float alpha = slider.isEnabled() ? 1.0f : 0.36f;
+            const float trackH = 5.0f;
+            const float cy = (float) y + (float) height * 0.5f;
+            auto track = juce::Rectangle<float> ((float) x + 7.0f, cy - trackH * 0.5f,
+                                                 juce::jmax (4.0f, (float) width - 14.0f), trackH);
+            const float pos = juce::jlimit (track.getX(), track.getRight(), sliderPos);
+
+            g.setColour (juce::Colour (0xff10131a).withAlpha (alpha));
+            g.fillRoundedRectangle (track, 2.5f);
+            g.setColour (juce::Colours::white.withAlpha (0.075f * alpha));
+            g.drawRoundedRectangle (track.reduced (0.4f), 2.5f, 0.8f);
+
+            auto fill = track.withRight (pos);
+            if (fill.getWidth() > 1.5f)
+            {
+                g.setGradientFill (juce::ColourGradient (
+                    nordRed().withAlpha (alpha), fill.getX(), cy,
+                    nordRedBright().withAlpha (alpha), fill.getRight(), cy, false));
+                g.fillRoundedRectangle (fill, 2.5f);
+            }
+
+            const float thumbD = 15.0f;
+            auto thumb = juce::Rectangle<float> (thumbD, thumbD).withCentre ({ pos, cy });
+            g.setColour (juce::Colours::black.withAlpha (0.45f * alpha));
+            g.fillEllipse (thumb.translated (0.0f, 1.5f));
+            g.setGradientFill (juce::ColourGradient (
+                juce::Colour (0xffebeff5).withAlpha (alpha), thumb.getX(), thumb.getY(),
+                juce::Colour (0xffaeb7c4).withAlpha (alpha), thumb.getX(), thumb.getBottom(), false));
+            g.fillEllipse (thumb);
+            g.setColour (juce::Colour (0xff1a1f28).withAlpha (alpha));
+            g.fillEllipse (thumb.reduced (4.8f));
+            return;
+        }
+       #endif
 
         if (style != juce::Slider::LinearVertical)
         {
@@ -1280,6 +1643,104 @@ public:
         const bool master = slider.getComponentID() == "masterFader";
         const bool channel = slider.getComponentID() == "channelFader";
         if (width <= 0 || height <= 0) return;
+
+       #if CHURCHDAW_MOBILE_SHELL
+        const float alpha = slider.isEnabled() ? 1.0f : 0.40f;
+        const float capW = juce::jmin ((float) width, juce::jlimit (22.0f, master ? 34.0f : 29.0f, (float) width * 0.72f));
+        const float capH = juce::jmin ((float) height * 0.42f, master ? 38.0f : 34.0f);
+        const float slotPadY = juce::jmax (4.0f, capH * 0.28f);
+        const float slotW = master ? 7.0f : 6.0f;
+        auto track = juce::Rectangle<float> ((float) x + (float) width * 0.5f - slotW * 0.5f,
+                                             (float) y + slotPadY,
+                                             slotW,
+                                             juce::jmax (12.0f, (float) height - slotPadY * 2.0f));
+
+        // Laser-etched console graduation ticks along the fader slot.
+        if (width >= 30 && track.getHeight() >= 48.0f)
+        {
+            const float tickFracs[] = { 0.08f, 0.22f, 0.38f, 0.56f, 0.74f, 0.90f };
+            for (int ti = 0; ti < 6; ++ti)
+            {
+                const float ty = track.getY() + track.getHeight() * tickFracs[ti];
+                const bool major = (ti == 1 || ti == 3);
+                const float tw = major ? 5.0f : 3.2f;
+                g.setColour (juce::Colours::white.withAlpha ((major ? 0.22f : 0.10f) * alpha));
+                g.drawLine (track.getX() - 3.0f - tw, ty, track.getX() - 3.0f, ty, major ? 1.1f : 0.85f);
+                g.drawLine (track.getRight() + 3.0f, ty, track.getRight() + 3.0f + tw, ty, major ? 1.1f : 0.85f);
+            }
+            if (slider.getMinimum() < 0.0 && slider.getMaximum() > 0.0)
+            {
+                const float zy = juce::jlimit (track.getY(), track.getBottom(),
+                                               slider.getPositionOfValue (0.0));
+                g.setColour (nordRedBright().withAlpha (0.55f * alpha));
+                g.drawLine (track.getX() - 9.0f, zy, track.getX() - 2.5f, zy, 1.35f);
+                g.drawLine (track.getRight() + 2.5f, zy, track.getRight() + 9.0f, zy, 1.35f);
+            }
+        }
+
+        // Deep recessed console slot + subtle active crimson core.
+        g.setColour (juce::Colour (0xff07090d).withAlpha (alpha));
+        g.fillRoundedRectangle (track.expanded (1.2f, 1.0f), slotW * 0.5f + 1.0f);
+        g.setGradientFill (juce::ColourGradient (
+            juce::Colour (0xff090b10).withAlpha (alpha), track.getX(), track.getY(),
+            juce::Colour (0xff131720).withAlpha (alpha), track.getRight(), track.getY(), false));
+        g.fillRoundedRectangle (track, slotW * 0.5f);
+        g.setColour (juce::Colours::white.withAlpha (0.065f * alpha));
+        g.drawRoundedRectangle (track.reduced (0.35f), slotW * 0.5f, 0.8f);
+
+        const float cy = juce::jlimit ((float) y + capH * 0.5f + 1.0f,
+                                       (float) (y + height) - capH * 0.5f - 1.0f, sliderPos);
+        const float levelTop = juce::jlimit (track.getY(), track.getBottom(), cy);
+        if (track.getBottom() - levelTop > 2.0f)
+        {
+            auto core = track.withTop (levelTop).reduced (1.4f, 1.0f);
+            g.setGradientFill (juce::ColourGradient (
+                nordRedBright().withAlpha (0.88f * alpha), core.getCentreX(), core.getY(),
+                nordRedDark().withAlpha (0.55f * alpha), core.getCentreX(), core.getBottom(), false));
+            g.fillRoundedRectangle (core, core.getWidth() * 0.5f);
+        }
+
+        // Sculpted anodized concave studio fader cap.
+        auto cap = juce::Rectangle<float> (track.getCentreX() - capW * 0.5f,
+                                           cy - capH * 0.5f, capW, capH);
+        g.setColour (juce::Colours::black.withAlpha (0.52f * alpha));
+        g.fillRoundedRectangle (cap.translated (0.0f, 2.5f).expanded (0.5f, 0.0f), 4.5f);
+
+        juce::ColourGradient bodyGrad (juce::Colour (0xff3c4452).withAlpha (alpha), cap.getX(), cap.getY(),
+                                       juce::Colour (0xff232832).withAlpha (alpha), cap.getX(), cap.getBottom(), false);
+        bodyGrad.addColour (0.20, juce::Colour (0xff545e70).withAlpha (alpha));
+        bodyGrad.addColour (0.44, juce::Colour (0xff262b36).withAlpha (alpha));
+        bodyGrad.addColour (0.56, juce::Colour (0xff222731).withAlpha (alpha));
+        bodyGrad.addColour (0.80, juce::Colour (0xff454e5e).withAlpha (alpha));
+        g.setGradientFill (bodyGrad);
+        g.fillRoundedRectangle (cap, 4.2f);
+
+        // Concave saddle ridges above and below the center index line.
+        if (capH >= 24.0f)
+        {
+            const float ridgeInset = 4.0f;
+            g.setColour (juce::Colours::white.withAlpha (0.16f * alpha));
+            g.drawLine (cap.getX() + ridgeInset, cap.getY() + capH * 0.22f,
+                        cap.getRight() - ridgeInset, cap.getY() + capH * 0.22f, 0.9f);
+            g.drawLine (cap.getX() + ridgeInset, cap.getY() + capH * 0.78f,
+                        cap.getRight() - ridgeInset, cap.getY() + capH * 0.78f, 0.9f);
+        }
+
+        g.setColour ((slider.hasKeyboardFocus (false) ? nordRedBright()
+                                                      : juce::Colours::white.withAlpha (0.20f))
+                         .withMultipliedAlpha (alpha));
+        g.drawRoundedRectangle (cap.reduced (0.5f), 4.2f, 1.0f);
+
+        // High-contrast precision center index line.
+        auto indexLine = juce::Rectangle<float> (cap.getX() + 3.5f, cy - 1.0f,
+                                                 juce::jmax (2.0f, capW - 7.0f), 2.0f);
+        g.setColour (juce::Colours::black.withAlpha (0.55f * alpha));
+        g.fillRoundedRectangle (indexLine.expanded (0.5f, 0.8f), 1.0f);
+        g.setColour ((slider.isMouseOverOrDragging() ? juce::Colours::white
+                                                     : juce::Colour (0xfff2f5f9)).withAlpha (alpha));
+        g.fillRoundedRectangle (indexLine, 1.0f);
+        return;
+       #else
         const float trackW = master ? 10.0f : 7.0f;
         auto track = juce::Rectangle<float> ((float) x + width * 0.5f - trackW * 0.5f,
                                              (float) y, trackW, (float) height);
@@ -1293,13 +1754,8 @@ public:
             g.setColour (slider.isEnabled() ? nordRed() : txtDisabled());
             g.fillRoundedRectangle (track.withTop (level), trackW * 0.5f);
         }
-       #if CHURCHDAW_MOBILE_SHELL
-        const float desiredWidth = juce::jlimit (28.0f, 46.0f, width * 0.88f);
-        const float desiredHeight = 26.0f;
-       #else
         const float desiredWidth = master ? 46.0f : channel ? 34.0f : 42.0f;
         const float desiredHeight = channel ? 20.0f : 24.0f;
-       #endif
         const float capW = juce::jmin ((float) width, desiredWidth);
         const float capH = juce::jmin ((float) height, desiredHeight);
         // Keep the complete handle visible at both ends of the travel.
@@ -1327,6 +1783,7 @@ public:
         g.setColour (nordRedDark());
         g.fillRoundedRectangle (cap.reduced (5.0f, 0.0f).withSizeKeepingCentre (
                                     juce::jmax (1.0f, capW - 10.0f), 2.0f), 1.0f);
+       #endif
     }
 
     //==============================================================================
@@ -1367,26 +1824,39 @@ public:
             return;
         }
        #if CHURCHDAW_MOBILE_SHELL
-        const float h = juce::jlimit (20.0f, 26.0f, bounds.getHeight() - 6.0f);
+        const float h = juce::jlimit (18.0f, 21.0f, bounds.getHeight() - 8.0f);
        #else
         const float h = juce::jlimit (14.0f, 20.0f, bounds.getHeight() - 2.0f);
        #endif
-        const float w = h * 1.9f;
+        const float w = h * 1.86f;
         const float alpha = button.isEnabled() ? 1.0f : 0.4f;
         auto sw = juce::Rectangle<float> (1.0f, bounds.getCentreY() - h * 0.5f, w, h);
-        g.setColour ((on ? nordRed() : bgControlHi()).withMultipliedAlpha (alpha));
+        if (on)
+        {
+            g.setGradientFill (juce::ColourGradient (
+                juce::Colour (0xffc21f3a).withMultipliedAlpha (alpha), sw.getX(), sw.getY(),
+                juce::Colour (0xff8a1427).withMultipliedAlpha (alpha), sw.getX(), sw.getBottom(), false));
+        }
+        else
+        {
+            g.setColour (juce::Colour (0xff191e27).withMultipliedAlpha (alpha));
+        }
         g.fillRoundedRectangle (sw, h * 0.5f);
         g.setColour ((button.hasKeyboardFocus (true) ? nordRedBright()
-                      : shouldDrawButtonAsHighlighted ? txtSecondary() : borderDefault()).withMultipliedAlpha (alpha));
+                      : on ? nordRedBright().withAlpha (0.55f)
+                      : shouldDrawButtonAsHighlighted ? txtSecondary()
+                                                      : juce::Colour (0xff343c4a)).withMultipliedAlpha (alpha));
         g.drawRoundedRectangle (sw.reduced (0.5f), h * 0.5f, 1.0f);
-        const float d = h - 6.0f;
-        const float kx = on ? sw.getRight() - d - 3.0f : sw.getX() + 3.0f;
-        g.setColour (txtPrimary().withMultipliedAlpha (alpha));
+        const float d = h - 5.0f;
+        const float kx = on ? sw.getRight() - d - 2.5f : sw.getX() + 2.5f;
+        g.setColour (juce::Colours::black.withAlpha (0.35f * alpha));
+        g.fillEllipse (kx, sw.getCentreY() - d * 0.5f + 1.0f, d, d);
+        g.setColour ((on ? juce::Colours::white : juce::Colour (0xffb6bfcc)).withMultipliedAlpha (alpha));
         g.fillEllipse (kx, sw.getCentreY() - d * 0.5f, d, d);
-        auto textArea = bounds.withTrimmedLeft (w + 10.0f);
+        auto textArea = bounds.withTrimmedLeft (w + 9.0f);
         g.setColour (button.findColour (juce::ToggleButton::textColourId).withMultipliedAlpha (alpha));
-        g.setFont (juce::Font (juce::FontOptions (juce::jlimit (11.0f, 14.0f, h * 0.78f))));
-        g.drawText (button.getButtonText(), textArea.toNearestInt(), juce::Justification::centredLeft, true);
+        g.setFont (juce::Font (juce::FontOptions (juce::jlimit (11.5f, 13.0f, h * 0.62f))));
+        g.drawFittedText (button.getButtonText(), textArea.toNearestInt(), juce::Justification::centredLeft, 1, 0.86f);
     }
 
     //==============================================================================
@@ -1721,7 +2191,7 @@ public:
 
         const bool stackedTouch = (bool) button.getProperties()["churchTouchNav"]
                                && button.getWidth() < 120 && button.getHeight() >= 44;
-        auto text = id == "navSave" ? saveStatusLabel (button).toUpperCase()
+        auto text = id == "navSave" ? (stackedTouch ? saveStatusLabel (button) : saveStatusLabel (button).toUpperCase())
                     : stackedTouch ? button.getButtonText() : button.getButtonText().toUpperCase();
         const auto font = getTextButtonFont (button, button.getHeight());
         auto area = button.getLocalBounds().reduced (6, 2);
@@ -1885,7 +2355,16 @@ public:
 
         // Presets e slots de FX precisam caber completos na mesa de oito
         // canais. No editor focado, onde ha largura, a fonte volta ao teto.
-       #if ! CHURCHDAW_MOBILE_SHELL
+       #if CHURCHDAW_MOBILE_SHELL
+        if (box.getWidth() < 72)
+            height = juce::jmin (height, 9.5f);
+        else if (box.getWidth() < 96)
+            height = juce::jmin (height, 11.0f);
+        else if (box.getWidth() < 130)
+            height = juce::jmin (height, 13.0f);
+        else if (box.getWidth() < 156)
+            height = juce::jmin (height, 14.2f);
+       #else
         if (box.getWidth() < 96)
             height = juce::jmin (height, 10.5f);
         else if (box.getWidth() < 126)
@@ -1899,7 +2378,16 @@ public:
     {
         if (! usesDesktopControls (box))
         {
-            juce::LookAndFeel_V4::positionComboBoxText (box, label);
+            const bool ultraCompact = box.getWidth() < 72;
+            const int inset = ultraCompact ? 4 : box.getWidth() < 116 ? 6 : 9;
+            const int arrowLane = ultraCompact ? 12 : juce::jmin (22, box.getHeight());
+            label.setBorderSize (ultraCompact ? juce::BorderSize<int> (0, 1, 0, 1)
+                                              : juce::BorderSize<int> (1, 5, 1, 5));
+            label.setBounds (inset, 1,
+                             juce::jmax (0, box.getWidth() - arrowLane - inset - (ultraCompact ? 1 : 2)),
+                             juce::jmax (0, box.getHeight() - 2));
+            label.setFont (getComboBoxFont (box));
+            label.setMinimumHorizontalScale (ultraCompact ? 0.68f : 0.78f);
             return;
         }
         const int inset = box.getWidth() < 96 ? 5 : 9;
@@ -1966,29 +2454,38 @@ public:
                                                             juce::PathStrokeType::rounded));
             return;
         }
-        g.setColour (box.isMouseOver (true) ? bgControlHi() : bgControl());
+        const float alpha = box.isEnabled() ? 1.0f : 0.42f;
+        const bool activePopup = down || box.isPopupActive();
+        g.setGradientFill (juce::ColourGradient (
+            (activePopup ? juce::Colour (0xff26202a) : box.isMouseOver (true) ? juce::Colour (0xff202631) : juce::Colour (0xff151922)).withMultipliedAlpha (alpha),
+            bounds.getX(), bounds.getY(),
+            (activePopup ? juce::Colour (0xff1e1821) : juce::Colour (0xff1c212c)).withMultipliedAlpha (alpha),
+            bounds.getX(), bounds.getBottom(), false));
         g.fillRoundedRectangle (bounds, radius);
-        g.setColour (focus ? nordRedBright() : borderDefault().withAlpha (0.70f));
+        g.setColour ((focus || activePopup ? nordRedBright().withAlpha (0.80f)
+                                           : juce::Colour (0xff343c4a).withAlpha (0.85f)).withMultipliedAlpha (alpha));
         g.drawRoundedRectangle (bounds, radius, focus ? 1.5f : 1.0f);
-        const float cx = width - juce::jmax (12.0f, height * 0.42f);
+        const float cx = width - (width < 72 ? 8.0f : juce::jmax (13.0f, height * 0.40f));
         const float cy = height * 0.5f;
-        const float arm = juce::jlimit (3.0f, 5.0f, height * 0.13f);
+        const float arm = width < 72 ? 2.6f : juce::jlimit (3.2f, 4.4f, height * 0.11f);
         juce::Path caret;
         caret.startNewSubPath (cx - arm, cy - 1.5f);
         caret.lineTo (cx, cy + 2.0f);
         caret.lineTo (cx + arm, cy - 1.5f);
-        g.setColour (box.isEnabled() ? txtSecondary() : txtDisabled());
+        g.setColour ((activePopup || focus ? nordRedBright() : txtSecondary()).withMultipliedAlpha (alpha));
         g.strokePath (caret, juce::PathStrokeType (1.5f, juce::PathStrokeType::curved,
                                                         juce::PathStrokeType::rounded));
     }
 
     void fillTextEditorBackground (juce::Graphics& g, int width, int height, juce::TextEditor& editor) override
     {
+       #if ! CHURCHDAW_MOBILE_SHELL
         if (! usesDesktopControls (editor))
         {
             juce::LookAndFeel_V4::fillTextEditorBackground (g, width, height, editor);
             return;
         }
+       #endif
         const auto colour = editor.findColour (juce::TextEditor::backgroundColourId);
         if (colour.isTransparent()) return;
         const auto bounds = juce::Rectangle<float> ((float) width, (float) height);
@@ -2001,11 +2498,13 @@ public:
 
     void drawTextEditorOutline (juce::Graphics& g, int width, int height, juce::TextEditor& editor) override
     {
+       #if ! CHURCHDAW_MOBILE_SHELL
         if (! usesDesktopControls (editor))
         {
             juce::LookAndFeel_V4::drawTextEditorOutline (g, width, height, editor);
             return;
         }
+       #endif
         const bool focused = editor.hasKeyboardFocus (true) && ! editor.isReadOnly() && editor.isEnabled();
         auto colour = editor.findColour (focused ? juce::TextEditor::focusedOutlineColourId
                                                  : juce::TextEditor::outlineColourId);
@@ -2080,6 +2579,20 @@ public:
             g.fillRoundedRectangle (thumb.getIntersection (track).reduced (0.5f), thickness * 0.5f);
             return;
         }
+       #if CHURCHDAW_MOBILE_SHELL
+        if (thumbSize <= 0 || track.isEmpty())
+            return;
+        const float thickness = juce::jmin (isScrollbarVertical ? track.getWidth() : track.getHeight(),
+                                            isMouseOver || isMouseDown ? 6.0f : 4.5f);
+        auto thumb = isScrollbarVertical
+            ? juce::Rectangle<float> (track.getCentreX() - thickness * 0.5f, (float) thumbStartPosition,
+                                       thickness, (float) thumbSize)
+            : juce::Rectangle<float> ((float) thumbStartPosition, track.getCentreY() - thickness * 0.5f,
+                                       (float) thumbSize, thickness);
+        const float alpha = isMouseDown ? 0.44f : isMouseOver ? 0.32f : 0.22f;
+        g.setColour (juce::Colours::white.withAlpha (alpha * (bar.isEnabled() ? 1.0f : 0.4f)));
+        g.fillRoundedRectangle (thumb.getIntersection (track).reduced (0.5f), thickness * 0.5f);
+       #else
         g.setColour (bar.findColour (juce::ScrollBar::trackColourId));
         g.fillRoundedRectangle (track.reduced (isScrollbarVertical ? 2.0f : 0.0f,
                                                isScrollbarVertical ? 0.0f : 2.0f), 4.0f);
@@ -2099,5 +2612,6 @@ public:
             col = col.brighter (0.08f);
         g.setColour (col);
         g.fillRoundedRectangle (thumb.reduced (0.5f), 4.0f);
+       #endif
     }
 };

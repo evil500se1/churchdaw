@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- O launcher pode recortar o icone em circulo, quadrado ou squircle.
-         Este fundo opaco evita que a cor do launcher apareca nos cantos. -->
-    <color name="ic_launcher_background">#180509</color>
+    <!-- Vermelho medio da propria arte (mesma do icone de iPad/Windows/Mac). Aparece so
+         onde o launcher recorta alem da arte (animacoes); a arte ocupa a area visivel. -->
+    <color name="ic_launcher_background">#B2131D</color>
 </resources>

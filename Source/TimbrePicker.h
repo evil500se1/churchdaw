@@ -102,25 +102,21 @@ public:
                 g.fillRoundedRectangle (bounds.getX(), bounds.getCentreY() - cueHeight * 0.5f,
                                         desktop ? 2.0f : 3.0f, cueHeight, 1.0f);
             }
-            auto text = bounds.toNearestInt().reduced (14, 3);
-            auto icon = text.removeFromLeft (24).toFloat().withSizeKeepingCentre (18, 18);
+            const bool tight = bounds.getWidth() < 136.0f;
+            auto text = bounds.toNearestInt().reduced (tight ? 7 : 14, 3);
+            const float iconSide = tight ? 15.0f : 18.0f;
+            auto icon = text.removeFromLeft (tight ? 18 : 24).toFloat().withSizeKeepingCentre (iconSide, iconSide);
             auto ink = (active ? NordLookAndFeel::txtPrimary() : NordLookAndFeel::txtSecondary())
                            .withMultipliedAlpha (alpha);
-            if (index >= 3) paintCategoryIcon (g, icon, index, ink);
-            else
-            {
-                g.setColour (active ? NordLookAndFeel::nordRedBright().withMultipliedAlpha (alpha) : ink);
-                g.setFont (juce::Font (juce::FontOptions (15.0f)));
-                g.drawText (index == 0 ? juce::String::fromUTF8 ("≡")
-                           : index == 1 ? juce::String::fromUTF8 ("☆")
-                                        : juce::String::fromUTF8 ("↶"),
-                            icon, juce::Justification::centred);
-            }
-            text.removeFromLeft (8);
+            // as tres abas largas eram glifos de fonte minusculos ao lado de icones
+            // vetoriais de 18 px: agora todos os filtros desenham do mesmo jeito.
+            paintCategoryIcon (g, icon, index,
+                               index < 3 && active ? NordLookAndFeel::nordRedBright().withMultipliedAlpha (alpha) : ink);
+            text.removeFromLeft (tight ? 5 : 8);
             g.setColour (ink);
-            g.setFont (juce::Font (juce::FontOptions (juce::jlimit (11.5f, 14.0f, bounds.getHeight() * 0.37f),
+            g.setFont (juce::Font (juce::FontOptions (juce::jlimit (11.5f, tight ? 13.0f : 14.0f, bounds.getHeight() * 0.37f),
                                                     active ? juce::Font::bold : juce::Font::plain)));
-            g.drawFittedText (getButtonText(), text, juce::Justification::centredLeft, 1, 0.9f);
+            g.drawFittedText (getButtonText(), text, juce::Justification::centredLeft, 1, tight ? 0.82f : 0.9f);
     }
 
     private:
@@ -131,6 +127,34 @@ public:
         {
             g.setColour (colour.withMultipliedAlpha (0.92f));
             r = r.reduced (1.0f);
+
+            if (category == 0) // todos: lista
+            {
+                for (int i = 0; i < 3; ++i)
+                    g.fillRoundedRectangle (r.getX() + 1.0f,
+                                            r.getY() + r.getHeight() * (0.2f + 0.3f * (float) i) - 0.8f,
+                                            r.getWidth() - 2.0f, 1.6f, 0.8f);
+                return;
+            }
+
+            if (category == 1) // favoritos: estrela
+            {
+                juce::Path star;
+                star.addStar (r.getCentre().translated (0.0f, 0.5f), 5,
+                              r.getWidth() * 0.22f, r.getWidth() * 0.52f, 0.0f);
+                g.strokePath (star, juce::PathStrokeType (1.3f, juce::PathStrokeType::curved));
+                return;
+            }
+
+            if (category == 2) // recentes: relogio
+            {
+                const auto c = r.getCentre();
+                const float rad = r.getWidth() * 0.5f - 0.5f;
+                g.drawEllipse (c.x - rad, c.y - rad, rad * 2.0f, rad * 2.0f, 1.3f);
+                g.drawLine (c.x, c.y, c.x, c.y - rad * 0.55f, 1.3f);
+                g.drawLine (c.x, c.y, c.x + rad * 0.4f, c.y + rad * 0.25f, 1.3f);
+                return;
+            }
 
             if (category == 3 || category == 4) // piano / orgao
             {
@@ -282,7 +306,7 @@ public:
         {
             auto* chip = new FilterButton (categoryLabel (i), i);
             chip->setClickingTogglesState (false);
-            chip->setColour (juce::TextButton::buttonColourId, juce::Colour (0xff20252d));
+            chip->setColour (juce::TextButton::buttonColourId, juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xff1c1c24 : 0xff20252d));
             chip->setColour (juce::TextButton::buttonOnColourId, NordLookAndFeel::nordRed().withAlpha (0.85f));
             chip->setColour (juce::TextButton::textColourOffId, NordLookAndFeel::txtSecondary());
             chip->setColour (juce::TextButton::textColourOnId, juce::Colours::white);
@@ -319,7 +343,7 @@ public:
         closeBtn.setButtonText (juce::String::fromUTF8 ("\xc3\x97"));   // ×
         closeBtn.setComponentID ("timbrePickerClose");
         closeBtn.setTooltip ("Fechar seletor de instrumento");
-        closeBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff2a2d34));
+        closeBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xff2b2b36 : 0xff2a2d34));
         closeBtn.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
         closeBtn.onClick = [this] { if (onCancel != nullptr) onCancel(); };
         addAndMakeVisible (closeBtn);
@@ -328,7 +352,7 @@ public:
         // "Canal vazio / remover instrumento" que dominava a lista.
         removeBtn.setButtonText ("Remover instrumento");
         removeBtn.setComponentID ("timbrePickerRemove");
-        removeBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff1c2027));
+        removeBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xff1c1c24 : 0xff1c2027));
         removeBtn.setColour (juce::TextButton::textColourOffId,
                              NordLookAndFeel::nordRedBright().withAlpha (0.85f));
         removeBtn.onClick = [this] { if (onPick != nullptr) onPick (1); };
@@ -352,10 +376,11 @@ public:
         loadButton.setButtonText ("Carregar timbre");
         loadButton.onClick = [this] { pickRow (list.getSelectedRow()); };
         addAndMakeVisible (loadButton);
+        previewLevel.setComponentID ("auditionVolumeSlider");
         previewLevel.setRange (-48.0, -12.0, 1.0);
         previewLevel.setValue (-24.0, juce::dontSendNotification);
         previewLevel.setSliderStyle (juce::Slider::LinearHorizontal);
-        previewLevel.setTextBoxStyle (juce::Slider::TextBoxRight, false, 55, 24);
+        previewLevel.setTextBoxStyle (juce::Slider::TextBoxRight, false, 52, 22);
         previewLevel.setTextValueSuffix (" dB");
         previewLevel.setTitle ("Volume da pre-escuta");
         previewLevel.setTooltip ("Volume independente da amostra. Nao altera o canal.");
@@ -373,11 +398,9 @@ public:
     void useTouchLayout (bool shouldUseTouch)
     {
         touchLayout = shouldUseTouch;
-        // 64 dp: nome e subtitulo em zonas proprias com respiro — com 58 os
-        // descendentes do nome encostavam no subtitulo (apontado pelo dono).
-        list.setRowHeight (touchLayout ? 64 : 72);
+        list.setRowHeight (touchLayout ? 54 : 72);
         list.setWantsKeyboardFocus (true);
-        search.setFont (juce::Font (juce::FontOptions (touchLayout ? 17.0f : 15.0f)));
+        search.setFont (juce::Font (juce::FontOptions (touchLayout ? 15.5f : 15.0f)));
         resized();
         repaint();
     }
@@ -487,16 +510,50 @@ public:
         // Overlay real: cobre a tela anfitria inteira e deixa o browser como
         // unica superficie ativa, em vez de parecer um popup pequeno do combo.
         const bool desktop = ! touchLayout && NordLookAndFeel::usesDesktopControls (*this);
-        g.setColour (juce::Colours::black.withAlpha (desktop ? 0.58f : 0.72f));
+        g.setColour (juce::Colours::black.withAlpha (desktop ? 0.58f : 0.78f));
         g.fillRect (getLocalBounds());
 
         auto card = modalCardBounds().toFloat();
-        const float rad = 14.0f;
+        const float rad = touchLayout ? 12.0f : 14.0f;
 
-        g.setColour (desktop ? juce::Colour (0xff1b1f26) : NordLookAndFeel::bgCard());
-        g.fillRoundedRectangle (card, rad);
-        g.setColour (desktop ? juce::Colour (0xff3b414b) : NordLookAndFeel::borderDefault());
-        g.drawRoundedRectangle (card.reduced (0.5f), rad, 1.0f);
+        if (desktop)
+        {
+            g.setColour (juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xff1c1c24 : 0xff1b1f26));
+            g.fillRoundedRectangle (card, rad);
+            g.setColour (juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xff34343f : 0xff3b414b));
+            g.drawRoundedRectangle (card.reduced (0.5f), rad, 1.0f);
+        }
+        else
+        {
+            g.setColour (juce::Colours::black.withAlpha (0.55f));
+            g.fillRoundedRectangle (card.translated (0.0f, 4.0f).expanded (1.5f), rad + 1.5f);
+            g.setGradientFill (juce::ColourGradient (juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xff1c1c24 : 0xff1e232d),
+                                                     card.getX(), card.getY(),
+                                                     juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xff0d0d11 : 0xff12161e),
+                                                     card.getX(), card.getBottom(), false));
+            g.fillRoundedRectangle (card, rad);
+
+            // Top specular rim + centered Nord crimson crown accent
+            g.setColour (juce::Colours::white.withAlpha (0.11f));
+            g.drawLine (card.getX() + rad, card.getY() + 1.0f,
+                        card.getRight() - rad, card.getY() + 1.0f, 1.0f);
+            const float crownW = juce::jlimit (64.0f, 160.0f, card.getWidth() * 0.18f);
+            g.setColour (NordLookAndFeel::nordRedBright().withAlpha (0.88f));
+            g.fillRoundedRectangle (card.getCentreX() - crownW * 0.5f,
+                                    card.getY() + 1.0f, crownW, 2.5f, 1.25f);
+
+            g.setColour (juce::Colours::white.withAlpha (0.095f));
+            g.drawRoundedRectangle (card.reduced (0.5f), rad, 1.0f);
+
+            // Header divider separating top bar from category rail & search
+            if (touchLayout)
+            {
+                g.setColour (juce::Colours::white.withAlpha (0.065f));
+                g.drawLine (card.getX() + 14.0f, card.getY() + 45.0f,
+                            card.getRight() - 14.0f, card.getY() + 45.0f, 1.0f);
+            }
+        }
+
         if (! touchLayout)
         {
             auto rail = card.reduced (16.0f, 16.0f).withTrimmedTop (68.0f)
@@ -513,10 +570,24 @@ public:
                 g.fillRoundedRectangle (rail, 9.0f);
             }
         }
+        else if (! chips.isEmpty() && ! chips[0]->getBounds().isEmpty())
+        {
+            juce::Rectangle<int> railUnion = chips[0]->getBounds();
+            for (auto* c : chips)
+                if (! c->getBounds().isEmpty())
+                    railUnion = railUnion.getUnion (c->getBounds());
+            if (removeBtn.isVisible() && ! removeBtn.getBounds().isEmpty())
+                railUnion = railUnion.getUnion (removeBtn.getBounds());
+            auto railBox = railUnion.toFloat().expanded (5.0f, 5.0f);
+            g.setColour (juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xff0d0d11 : 0xff0e1118).withAlpha (0.78f));
+            g.fillRoundedRectangle (railBox, 8.5f);
+            g.setColour (juce::Colours::white.withAlpha (0.06f));
+            g.drawRoundedRectangle (railBox.reduced (0.5f), 8.5f, 0.9f);
+        }
 
         // ---- header: titulo + badge do canal + timbre atual ----
-        auto head = card.toNearestInt().reduced (touchLayout ? 20 : 22, 0)
-                        .withTop (card.toNearestInt().getY() + (touchLayout ? 14 : 14))
+        auto head = card.toNearestInt().reduced (touchLayout ? 18 : 22, 0)
+                        .withTop (card.toNearestInt().getY() + (touchLayout ? 10 : 14))
                         .withHeight (touchLayout ? 26 : 36);
         g.setColour (juce::Colours::white);
         g.setFont (juce::Font (juce::FontOptions (touchLayout ? 16.0f : 22.0f,
@@ -528,19 +599,20 @@ public:
         {
             const float titleW = juce::GlyphArrangement::getStringWidth (g.getCurrentFont(), title);
             auto badgeFont = juce::Font (juce::FontOptions (
-                touchLayout ? 11.0f : 12.0f, juce::Font::bold));
-            const float badgeH = touchLayout ? 20.0f : 30.0f;
+                touchLayout ? 10.8f : 12.0f, juce::Font::bold));
+            const float badgeH = touchLayout ? 21.0f : 30.0f;
             const float badgeW = juce::GlyphArrangement::getStringWidth (badgeFont, channelBadge)
                                  + (touchLayout ? 18.0f : 22.0f);
             auto badge = juce::Rectangle<float> ((float) head.getX() + titleW
-                                                     + (touchLayout ? 14.0f : 14.0f),
+                                                     + (touchLayout ? 12.0f : 14.0f),
                                                  (float) head.getCentreY() - badgeH * 0.5f,
                                                  badgeW, badgeH);
-            g.setColour (desktop ? juce::Colour (0xff2a2e37) : NordLookAndFeel::bgControlHi());
+            g.setColour (desktop ? juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xff2b2b36 : 0xff2a2e37)
+                                 : NordLookAndFeel::nordRed().withAlpha (0.22f));
             g.fillRoundedRectangle (badge, desktop ? 6.0f : badgeH * 0.5f);
             if (! desktop)
             {
-                g.setColour (juce::Colours::white.withAlpha (0.16f));
+                g.setColour (NordLookAndFeel::nordRedBright().withAlpha (0.48f));
                 g.drawRoundedRectangle (badge.reduced (0.5f), badgeH * 0.5f, 1.0f);
             }
             g.setColour (juce::Colours::white);
@@ -550,43 +622,46 @@ public:
             const juce::String shownName = currentName.isNotEmpty()
                                                ? currentName : juce::String ("Canal vazio");
             auto currentFont = juce::Font (juce::FontOptions (
-                touchLayout ? 13.0f : 13.5f, juce::Font::plain));
+                touchLayout ? 12.5f : 13.5f, juce::Font::plain));
             const juce::String prefix ("Atual: ");
             const float prefixW = juce::GlyphArrangement::getStringWidth (currentFont, prefix);
-            auto currentArea = juce::Rectangle<int> (
-                (int) badge.getRight() + (touchLayout ? 10 : 12), head.getY(),
-                juce::jmax (10, (int) card.getRight() - (touchLayout ? 76 : 212)
-                                 - ((int) badge.getRight() + (touchLayout ? 10 : 12))),
-                head.getHeight());
-            g.setColour (NordLookAndFeel::txtSecondary());
-            g.setFont (currentFont);
-            g.drawText (prefix, currentArea, juce::Justification::centredLeft, false);
-            currentArea.removeFromLeft (juce::roundToInt (prefixW));
-            g.setColour (NordLookAndFeel::txtPrimary());
-            g.setFont (currentFont.boldened());
-            g.drawFittedText (shownName, currentArea,
-                              juce::Justification::centredLeft, 1, 0.75f);
+            const int curLeft = (int) badge.getRight() + (touchLayout ? 10 : 12);
+            const int curRight = (int) card.getRight() - (touchLayout ? 164 : 212);
+            const int availCurrentW = curRight - curLeft;
+            if (availCurrentW >= 88)
+            {
+                auto currentArea = juce::Rectangle<int> (
+                    curLeft, head.getY(), availCurrentW, head.getHeight());
+                g.setColour (NordLookAndFeel::txtSecondary());
+                g.setFont (currentFont);
+                g.drawText (prefix, currentArea, juce::Justification::centredLeft, false);
+                currentArea.removeFromLeft (juce::roundToInt (prefixW));
+                g.setColour (NordLookAndFeel::txtPrimary());
+                g.setFont (currentFont.boldened());
+                g.drawFittedText (shownName, currentArea,
+                                  juce::Justification::centredLeft, 1, 0.75f);
+            }
         }
 
         // A busca transparente recebe daqui o vidro, o contorno e o glow.
         if (! search.getBounds().isEmpty())
         {
             auto sb = search.getBounds().toFloat();
-            g.setColour (desktop ? juce::Colour (0xff151920) : NordLookAndFeel::bgControl());
+            g.setColour (desktop ? juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xff14141a : 0xff151920) : juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xff0d0d11 : 0xff0d1016));
             g.fillRoundedRectangle (sb, 8.0f);
             g.setColour (search.hasKeyboardFocus (true) ? (desktop ? NordLookAndFeel::focusOutline()
                                                                     : NordLookAndFeel::nordRedBright())
-                                                       : NordLookAndFeel::borderDefault());
+                                                       : juce::Colours::white.withAlpha (0.10f));
             g.drawRoundedRectangle (sb.reduced (0.5f), 8.0f, 1.0f);
         }
 
         if (! desktop && ! list.getBounds().isEmpty())
         {
             auto lb = list.getBounds().toFloat();
-            g.setColour (NordLookAndFeel::bgCard());
-            g.fillRoundedRectangle (lb, 6.0f);
-            g.setColour (juce::Colours::white.withAlpha (0.065f));
-            g.drawRoundedRectangle (lb.reduced (0.5f), 6.0f, 0.9f);
+            g.setColour (juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xff0d0d11 : 0xff0e1219));
+            g.fillRoundedRectangle (lb, 7.5f);
+            g.setColour (juce::Colours::white.withAlpha (0.075f));
+            g.drawRoundedRectangle (lb.reduced (0.5f), 7.5f, 1.0f);
         }
 
         // ---- estado vazio elegante ----
@@ -618,23 +693,36 @@ public:
                         juce::Justification::centredTop);
         }
 
-        // ---- rodape ----
-        auto foot = card.toNearestInt().reduced (touchLayout ? 20 : 22, 0)
-                        .withHeight (touchLayout ? 18 : 34);
-        foot.setY (card.toNearestInt().getBottom() - (touchLayout ? 28 : 42));
-        g.setColour (NordLookAndFeel::dimText().withAlpha (0.86f));
-        g.setFont (juce::Font (juce::FontOptions (touchLayout ? 11.0f : 11.5f)));
-
-        if (! touchLayout)
-            foot = juce::Rectangle<int> (card.getRight() - 204, card.getY() + 22, 128, 26);
-
+        // ---- contador de timbres (no topo em ambos os modos, poupando altura da lista no touch) ----
         const auto countLabel = activeTab == 1 ? " favoritos"
                               : activeTab == 2 ? " recentes"
                                                : " timbres";
-        g.setColour (NordLookAndFeel::txtSecondary());
         const int shownCount = getVisibleInstrumentCount();
-        g.drawText (juce::String (shownCount) + countLabel,
-                    foot, juce::Justification::centredRight);
+        const juce::String countText = juce::String (shownCount) + countLabel;
+
+        if (touchLayout)
+        {
+            auto countFont = juce::Font (juce::FontOptions (11.0f, juce::Font::bold));
+            const float cw = juce::GlyphArrangement::getStringWidth (countFont, countText) + 18.0f;
+            juce::Rectangle<float> countPill ((float) closeBtn.getX() - cw - 8.0f,
+                                              (float) head.getCentreY() - 11.0f,
+                                              cw, 22.0f);
+            g.setColour (juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xff0d0d11 : 0xff0e1218));
+            g.fillRoundedRectangle (countPill, 11.0f);
+            g.setColour (juce::Colours::white.withAlpha (0.08f));
+            g.drawRoundedRectangle (countPill.reduced (0.5f), 11.0f, 0.9f);
+            g.setColour (NordLookAndFeel::txtSecondary());
+            g.setFont (countFont);
+            g.drawText (countText, countPill.toNearestInt(), juce::Justification::centred, false);
+        }
+        else
+        {
+            juce::Rectangle<int> foot (card.toNearestInt().getRight() - 204,
+                                       card.toNearestInt().getY() + 22, 128, 26);
+            g.setColour (NordLookAndFeel::txtSecondary());
+            g.setFont (juce::Font (juce::FontOptions (11.5f)));
+            g.drawText (countText, foot, juce::Justification::centredRight);
+        }
     }
 
     void paintOverChildren (juce::Graphics& g) override
@@ -644,10 +732,10 @@ public:
         if (! search.getBounds().isEmpty())
         {
             auto sb = search.getBounds().toFloat();
-            const float side = touchLayout ? 11.0f : 16.0f;
+            const float side = touchLayout ? 12.0f : 16.0f;
             auto lens = juce::Rectangle<float> (
-                sb.getX() + (touchLayout ? 10.0f : 16.0f),
-                sb.getCentreY() - side * 0.58f, side, side);
+                sb.getX() + (touchLayout ? 12.0f : 16.0f),
+                sb.getCentreY() - side * 0.56f, side, side);
             g.setColour (NordLookAndFeel::txtSecondary());
             g.drawEllipse (lens, desktop ? 1.4f : touchLayout ? 1.6f : 2.2f);
             g.drawLine (lens.getRight() - 1.0f, lens.getBottom() - 1.0f,
@@ -660,41 +748,59 @@ public:
     void resized() override
     {
         auto card = modalCardBounds();
-        closeBtn.setBounds (card.getRight() - (touchLayout ? 58 : 54),
-                            card.getY() + (touchLayout ? 10 : 18),
-                            touchLayout ? 48 : 40,
-                            touchLayout ? 44 : 40);
+        closeBtn.setBounds (card.getRight() - (touchLayout ? 52 : 54),
+                            card.getY() + (touchLayout ? 6 : 18),
+                            touchLayout ? 38 : 40,
+                            touchLayout ? 34 : 40);
+
+        if (auto* viewport = list.getViewport())
+        {
+            viewport->setScrollBarThickness (touchLayout ? 7 : 9);
+
+            auto& scrollBar = viewport->getVerticalScrollBar();
+            scrollBar.setColour (juce::ScrollBar::backgroundColourId,
+                                 juce::Colours::transparentBlack);
+            scrollBar.setColour (juce::ScrollBar::trackColourId,
+                                 touchLayout ? juce::Colours::transparentBlack
+                                             : juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xff14141a : 0xff171b22));
+            scrollBar.setColour (juce::ScrollBar::thumbColourId,
+                                 NordLookAndFeel::txtDisabled().withAlpha (0.80f));
+        }
 
         if (touchLayout)
         {
             // ---- BIBLIOTECA em duas colunas (spec do dono): categorias na
-            //      lateral esquerda, busca + lista na direita. Estrutura de
-            //      biblioteca premium e o fim da rolagem infinita num card
-            //      baixo.
+            //      lateral esquerda, busca + lista na direita.
             auto area = card.reduced (14, 10);
-            area.removeFromTop (44);                       // titulo + contexto
+            area.removeFromTop (44);                       // header + divisoria
 
-            const bool twoColRail = (area.getHeight() - 42) < 310 && area.getWidth() >= 480;
+            const bool twoColRail = (area.getHeight() - 38) < 310 && area.getWidth() >= 480;
             auto rail = area.removeFromLeft (twoColRail
-                ? juce::jmin (216, area.getWidth() * 36 / 100)
-                : juce::jmin (172, area.getWidth() / 4));
+                ? juce::jmin (232, area.getWidth() * 36 / 100)
+                : juce::jlimit (juce::jmin (100, area.getWidth() / 3), 172,
+                                area.getWidth() * 30 / 100));
+            rail.reduce (4, 4);
             area.removeFromLeft (10);
 
-            // remover discreto ANTES: reservar a base evita o trilho de
-            // categorias estourar por cima dele (aconteceu no TANK 3 —
-            // "Strings" e "Remover" sobrepostos, "Leads" invisivel).
-            removeBtn.setBounds (rail.removeFromBottom (38).withTrimmedTop (4));
-            rail.removeFromBottom (4);
+            if (removeBtn.isVisible())
+            {
+                removeBtn.setBounds (rail.removeFromBottom (34));
+                rail.removeFromBottom (5);
+            }
+            else
+            {
+                removeBtn.setBounds ({});
+            }
 
             if (twoColRail)
             {
                 constexpr int cols = 2;
-                const int rows = (numCategories + cols - 1) / cols;
+                const int rowsCount = (numCategories + cols - 1) / cols;
                 const int colGap = 4;
                 const int rowGap = 4;
                 const int colW = juce::jmax (48, (rail.getWidth() - colGap) / cols);
-                const int chipH = juce::jlimit (24, 44,
-                    (rail.getHeight() - rowGap * (rows - 1)) / rows);
+                const int chipH = juce::jlimit (24, 38,
+                    (rail.getHeight() - rowGap * (rowsCount - 1)) / rowsCount);
 
                 for (int i = 0; i < numCategories; ++i)
                 {
@@ -709,8 +815,7 @@ public:
             }
             else
             {
-                // chips empilhados dividindo o que sobrou; piso de 28 dp
-                const int catH = juce::jlimit (28, 42,
+                const int catH = juce::jlimit (28, 40,
                     rail.getHeight() / numCategories - 3);
                 for (int i = 0; i < numCategories; ++i)
                 {
@@ -720,16 +825,29 @@ public:
                 }
             }
 
-            auto searchRow = area.removeFromTop (46);
+            auto searchRow = area.removeFromTop (38);
             search.setBounds (searchRow);
-            clearBtn.setBounds (searchRow.removeFromRight (searchRow.getHeight()).reduced (6));
-            area.removeFromTop (8);
-            area.removeFromBottom (22);                    // rodape (contagem)
-            auto auditionRow = area.removeFromBottom (44);
-            loadButton.setBounds (auditionRow.removeFromRight (116));
-            auditionRow.removeFromRight (6);
-            previewButton.setBounds (auditionRow.removeFromLeft (80));
-            previewLevel.setBounds (auditionRow);
+            search.setIndents (34, 8);
+            clearBtn.setBounds (searchRow.removeFromRight (searchRow.getHeight()).reduced (4));
+            area.removeFromTop (6);
+
+            auto auditionRow = area.removeFromBottom (38);
+            if (auditionRow.getWidth() >= 310)
+            {
+                loadButton.setBounds (auditionRow.removeFromRight (128));
+                auditionRow.removeFromRight (8);
+                previewButton.setBounds (auditionRow.removeFromLeft (78));
+                auditionRow.removeFromLeft (6);
+                previewLevel.setBounds (auditionRow);
+            }
+            else
+            {
+                previewLevel.setBounds ({});
+                const int prevW = juce::jmin (84, auditionRow.getWidth() * 38 / 100);
+                previewButton.setBounds (auditionRow.removeFromLeft (prevW));
+                auditionRow.removeFromLeft (8);
+                loadButton.setBounds (auditionRow);
+            }
             previewLabel.setBounds ({});
             area.removeFromBottom (6);
             list.setBounds (area);
@@ -765,19 +883,6 @@ public:
         area.removeFromTop (16);
         list.setBounds (area);
         removeBtn.setBounds (footer.removeFromLeft (188));
-
-        if (auto* viewport = list.getViewport())
-        {
-            viewport->setScrollBarThickness (9);
-
-            auto& scrollBar = viewport->getVerticalScrollBar();
-            scrollBar.setColour (juce::ScrollBar::backgroundColourId,
-                                 juce::Colours::transparentBlack);
-            scrollBar.setColour (juce::ScrollBar::trackColourId,
-                                 juce::Colour (0xff171b22));
-            scrollBar.setColour (juce::ScrollBar::thumbColourId,
-                                 NordLookAndFeel::txtDisabled().withAlpha (0.80f));
-        }
     }
 
     void parentSizeChanged() override
@@ -903,7 +1008,7 @@ private:
     {
         auto available = getLocalBounds();
         if (touchLayout)
-            return available.reduced (margin);
+            return available.reduced (12, 8);
 
         const int cardH = juce::jmin (900, juce::jmax (280, available.getHeight() - 28));
         const int cardW = juce::jmin (
@@ -1139,9 +1244,21 @@ private:
 
         if (r.header)
         {
+            if (touchLayout)
+            {
+                g.setColour (NordLookAndFeel::nordRedBright().withAlpha (0.85f));
+                g.fillEllipse (12.0f, (float) height * 0.5f - 2.5f, 5.0f, 5.0f);
+                g.setColour (NordLookAndFeel::txtSecondary().withAlpha (0.92f));
+                g.setFont (NordLookAndFeel::stageLabel (10.5f));
+                g.drawText (r.text.toUpperCase(), 23, 0, width - 36, height,
+                            juce::Justification::centredLeft);
+                g.setColour (juce::Colours::white.withAlpha (0.06f));
+                g.fillRect (12, height - 1, juce::jmax (1, width - 24), 1);
+                return;
+            }
             // secao em cinza discreto: o vermelho fica para estados
             g.setColour (desktop ? NordLookAndFeel::txtSecondary() : juce::Colours::white.withAlpha (0.50f));
-            g.setFont (juce::Font (juce::FontOptions (touchLayout ? 11.5f : desktop ? 11.0f : 10.0f))
+            g.setFont (juce::Font (juce::FontOptions (desktop ? 11.0f : 10.0f))
                                    .boldened().withExtraKerningFactor (desktop ? 0.025f : 0.16f));
             g.drawText (r.text, 8, 0, width - 16, height, juce::Justification::centredLeft);
             g.setColour (juce::Colours::white.withAlpha (0.08f));
@@ -1153,32 +1270,38 @@ private:
         const auto accent = colourForKind != nullptr ? colourForKind (r.kind)
                                                      : NordLookAndFeel::txtSecondary();
 
-        auto rowArea = juce::Rectangle<float> (3.0f, 2.0f, (float) width - 6.0f, (float) height - 4.0f);
+        auto rowArea = juce::Rectangle<float> (4.0f, 2.0f, (float) width - 8.0f, (float) height - 4.0f);
         if (rowIsSelected || isCurrent)
         {
             g.setColour (rowIsSelected ? (desktop ? juce::Colour (0xff332730)
-                                                  : NordLookAndFeel::nordRed().withAlpha (0.12f))
-                                      : NordLookAndFeel::bgControl());
+                                                  : NordLookAndFeel::nordRed().withAlpha (0.16f))
+                                      : juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xff14141a : 0xff171c26));
             g.fillRoundedRectangle (rowArea, 7.0f);
+            if (! desktop)
+            {
+                g.setColour ((rowIsSelected ? NordLookAndFeel::nordRedBright()
+                                            : NordLookAndFeel::greenOk()).withAlpha (0.30f));
+                g.drawRoundedRectangle (rowArea.reduced (0.5f), 7.0f, 0.9f);
+            }
             g.setColour (rowIsSelected ? NordLookAndFeel::nordRedBright()
                                       : NordLookAndFeel::greenOk());
             const float cueHeight = desktop ? juce::jmin (20.0f, rowArea.getHeight() - 8.0f)
-                                            : juce::jmax (1.0f, rowArea.getHeight() - 20);
-            g.fillRoundedRectangle (rowArea.getX(), rowArea.getCentreY() - cueHeight * 0.5f,
-                                    2.0f, cueHeight, 1.0f);
+                                            : juce::jmax (1.0f, rowArea.getHeight() - 16.0f);
+            g.fillRoundedRectangle (rowArea.getX() + 1.5f, rowArea.getCentreY() - cueHeight * 0.5f,
+                                    2.5f, cueHeight, 1.25f);
         }
         else
         {
             g.setColour (desktop ? juce::Colours::white.withAlpha (0.035f)
-                                  : NordLookAndFeel::borderSoft().withAlpha (0.55f));
+                                  : juce::Colours::white.withAlpha (0.045f));
             g.fillRect (14, height - 1, juce::jmax (1, width - 28), 1);
         }
-        const float tile = juce::jmin (56.0f, height - 14.0f);
-        auto tileArea = juce::Rectangle<float> (12.0f, (height - tile) * 0.5f, tile, tile);
+        const float tile = juce::jmin (56.0f, (float) height - (touchLayout ? 12.0f : 14.0f));
+        auto tileArea = juce::Rectangle<float> (12.0f, ((float) height - tile) * 0.5f, tile, tile);
         if (! desktop || drawArtwork == nullptr)
         {
-            g.setColour (accent.withAlpha (desktop ? 0.075f : 0.12f));
-            g.fillRoundedRectangle (tileArea, 8.0f);
+            g.setColour (accent.withAlpha (desktop ? 0.075f : 0.14f));
+            g.fillRoundedRectangle (tileArea, 7.5f);
         }
 
         if (r.importAction)
@@ -1228,17 +1351,29 @@ private:
 
         if (height >= 50 && r.subtitle.isNotEmpty())
         {
-            // duas linhas em ZONAS FIXAS com folga real entre elas: nome
-            // forte (sempre bold — biblioteca le pelo nome) e contexto
-            // discreto embaixo, sem os descendentes de um tocarem o outro.
-            g.setFont (juce::Font (juce::FontOptions (15.0f, juce::Font::bold)));
-            g.drawText (r.text, textX, (height - 44) / 2, textW, 24,
-                        juce::Justification::centredLeft, true);
-            g.setColour (rowIsSelected ? juce::Colours::white.withAlpha (0.72f)
-                                       : NordLookAndFeel::txtSecondary());
-            g.setFont (juce::Font (juce::FontOptions (12.0f)));
-            g.drawText (r.subtitle, textX, (height - 44) / 2 + 26, textW, 18,
-                        juce::Justification::centredLeft, true);
+            if (touchLayout)
+            {
+                const int blockTop = juce::jmax (4, (height - 40) / 2);
+                g.setFont (juce::Font (juce::FontOptions (14.5f, juce::Font::bold)));
+                g.drawText (r.text, textX, blockTop, textW, 20,
+                            juce::Justification::centredLeft, true);
+                g.setColour (rowIsSelected ? juce::Colours::white.withAlpha (0.76f)
+                                           : NordLookAndFeel::txtSecondary());
+                g.setFont (juce::Font (juce::FontOptions (11.5f)));
+                g.drawText (r.subtitle, textX, blockTop + 21, textW, 17,
+                            juce::Justification::centredLeft, true);
+            }
+            else
+            {
+                g.setFont (juce::Font (juce::FontOptions (15.0f, juce::Font::bold)));
+                g.drawText (r.text, textX, (height - 44) / 2, textW, 24,
+                            juce::Justification::centredLeft, true);
+                g.setColour (rowIsSelected ? juce::Colours::white.withAlpha (0.72f)
+                                           : NordLookAndFeel::txtSecondary());
+                g.setFont (juce::Font (juce::FontOptions (12.0f)));
+                g.drawText (r.subtitle, textX, (height - 44) / 2 + 26, textW, 18,
+                            juce::Justification::centredLeft, true);
+            }
         }
         else
         {
@@ -1274,7 +1409,7 @@ private:
 
             const auto fill = r.actionEnabled
                                   ? NordLookAndFeel::nordRed().withAlpha (0.88f)
-                                  : juce::Colour (0xff2a2f38);
+                                  : juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xff2b2b36 : 0xff2a2f38);
             g.setColour (fill);
             g.fillRoundedRectangle (tagArea, 11.0f);
             g.setColour (juce::Colours::white.withAlpha (r.actionEnabled ? 1.0f : 0.55f));
@@ -1330,8 +1465,8 @@ private:
             if (! desktop && isCurrent)
             {
                 g.setGradientFill (juce::ColourGradient (
-                    juce::Colour (0xff20252d), starArea.getX(), starArea.getY(),
-                    juce::Colour (0xff0c0f14), starArea.getX(), starArea.getBottom(), false));
+                    juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xff1c1c24 : 0xff20252d), starArea.getX(), starArea.getY(),
+                    juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xff0d0d11 : 0xff0c0f14), starArea.getX(), starArea.getBottom(), false));
                 g.fillEllipse (starArea);
                 g.setColour (juce::Colours::white.withAlpha (0.13f));
                 g.drawEllipse (starArea.reduced (0.5f), 1.0f);
@@ -1403,9 +1538,16 @@ private:
         previewButton.setTitle (playing ? juce::String::fromUTF8 ("Parar pr\xc3\xa9-escuta") : "Ouvir amostra do timbre");
         previewLevel.setEnabled (canHear || playing);
         const bool download = valid && rows.getReference (row).downloadable;
-        loadButton.setEnabled (valid && id != currentSelectedId && (! download || rows.getReference (row).actionEnabled));
+        const bool canLoad = valid && id != currentSelectedId && (! download || rows.getReference (row).actionEnabled);
+        loadButton.setEnabled (canLoad);
         loadButton.setButtonText (importing ? "Importar arquivo" : download ? "Baixar"
                                  : id == currentSelectedId ? "No canal" : "Carregar timbre");
+        if (touchLayout)
+        {
+            loadButton.setColour (juce::TextButton::buttonColourId,
+                                  canLoad ? NordLookAndFeel::nordRed() : juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xff1c1c24 : 0xff232730));
+            loadButton.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
+        }
         previewLabel.setText (importing ? "Escolha um arquivo SoundFont (.sf2)."
             : canHear && previewStatus != nullptr ? previewStatus()
             : download ? "Instale a biblioteca para ouvir suas amostras"

@@ -614,6 +614,8 @@ private:
                  + "\nPerformanceMode = " + getOboeString (oboe::PerformanceMode::LowLatency));
 
             openResult = builder.openStream (stream);
+            if (stream != nullptr && direction == oboe::Direction::Output && newCallback != nullptr)
+                stream->setPerformanceHintEnabled (true);
             JUCE_OBOE_LOG ("Building Oboe stream with result: " + getOboeString (openResult)
                  + "\nStream state = " + (stream != nullptr ? getOboeString (stream->getState()) : String ("?")));
 

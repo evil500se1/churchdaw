@@ -59,6 +59,16 @@ public:
         if (bounds.isEmpty())
             return;
 
+        // Skin Church Live: o item do trilho e desenhado pelo LookAndFeel de skin.
+        if (getProperties().getWithDefault ("churchSkin", juce::var()).toString() == "rail")
+        {
+            auto& lf = getLookAndFeel();
+            lf.drawButtonBackground (g, *this, findColour (juce::TextButton::buttonColourId),
+                                     shouldDrawButtonAsHighlighted, shouldDrawButtonAsDown);
+            lf.drawButtonText (g, *this, shouldDrawButtonAsHighlighted, shouldDrawButtonAsDown);
+            return;
+        }
+
         if (getComponentID() == "headerNav" && NordLookAndFeel::usesDesktopShell (*this))
         {
             // Reuse the shell's surfaces and glyphs. The audio panel supplies
@@ -77,6 +87,58 @@ public:
         // elevado e quebrava a continuidade visual exatamente no ultimo item.
         if (getComponentID() == "headerNav")
         {
+           #if CHURCHDAW_MOBILE_SHELL
+            if (getHeight() >= 44)
+            {
+                NordLookAndFeel::drawTouchNavPill (g, bounds.reduced (1.0f), active, false,
+                                                   shouldDrawButtonAsHighlighted, shouldDrawButtonAsDown,
+                                                   isEnabled() ? 1.0f : 0.42f);
+                auto area = getLocalBounds().reduced (6, 2);
+                const float side = juce::jmin (14.0f, (float) area.getHeight() - 4.0f);
+                const auto icon = juce::Rectangle<float> ((float) area.getCentreX() - side * 0.5f,
+                                                          (float) area.getY() + 3.0f, side, side);
+                g.setColour (active ? NordLookAndFeel::nordRedBright()
+                                    : findColour (juce::TextButton::textColourOffId));
+                juce::Path speaker;
+                speaker.startNewSubPath (icon.getX(), icon.getCentreY() - 2.5f);
+                speaker.lineTo (icon.getX() + 4.0f, icon.getCentreY() - 2.5f);
+                speaker.lineTo (icon.getX() + 8.0f, icon.getY() + 2.0f);
+                speaker.lineTo (icon.getX() + 8.0f, icon.getBottom() - 2.0f);
+                speaker.lineTo (icon.getX() + 4.0f, icon.getCentreY() + 2.5f);
+                speaker.lineTo (icon.getX(), icon.getCentreY() + 2.5f);
+                speaker.closeSubPath();
+                g.fillPath (speaker);
+                g.drawLine (icon.getX() + 10.5f, icon.getY() + 4.0f, icon.getX() + 10.5f, icon.getBottom() - 4.0f, 1.2f);
+                g.drawLine (icon.getX() + 13.0f, icon.getY() + 2.0f, icon.getX() + 13.0f, icon.getBottom() - 2.0f, 1.2f);
+                g.setFont (getLookAndFeel().getTextButtonFont (*this, getHeight()));
+                g.drawFittedText (buttonText, area.withTrimmedTop (20).reduced (0, 1),
+                                  juce::Justification::centred, 1, 0.72f);
+                return;
+            }
+            {
+                auto pill = bounds.reduced (1.5f, 3.0f);
+                const float rad = juce::jmin (8.0f, pill.getHeight() * 0.24f);
+                if (active)
+                {
+                    g.setGradientFill (juce::ColourGradient (
+                        juce::Colour (0xff461a26), pill.getX(), pill.getY(),
+                        juce::Colour (0xff2b1018), pill.getX(), pill.getBottom(), false));
+                    g.fillRoundedRectangle (pill, rad);
+                    g.setColour (NordLookAndFeel::nordRedBright().withAlpha (0.48f));
+                    g.drawRoundedRectangle (pill.reduced (0.5f), rad, 1.0f);
+                }
+                else
+                {
+                    const float surfAlpha = shouldDrawButtonAsDown ? 0.085f
+                                          : shouldDrawButtonAsHighlighted ? 0.060f : 0.028f;
+                    g.setColour (juce::Colours::white.withAlpha (surfAlpha));
+                    g.fillRoundedRectangle (pill, rad);
+                    g.setColour (juce::Colours::white.withAlpha (
+                        shouldDrawButtonAsHighlighted ? 0.11f : 0.055f));
+                    g.drawRoundedRectangle (pill.reduced (0.5f), rad, 1.0f);
+                }
+            }
+           #else
             if (shouldDrawButtonAsHighlighted || shouldDrawButtonAsDown)
             {
                 g.setColour (juce::Colours::white.withAlpha (
@@ -87,6 +149,7 @@ public:
             g.setColour (juce::Colours::white.withAlpha (0.055f));
             g.drawVerticalLine (juce::roundToInt (bounds.getRight()),
                                 bounds.getY() + 8.0f, bounds.getBottom() - 8.0f);
+           #endif
 
             const auto label = buttonText.toUpperCase();
             const auto font = juce::Font (juce::FontOptions (11.0f,

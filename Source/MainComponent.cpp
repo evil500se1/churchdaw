@@ -22,12 +22,14 @@ static constexpr bool churchstudioMobileHeader = false;
 #include "LibraryPanel.h"
 #include "MidiMappingSafety.h"
 #include "AndroidCultoConnectivity.h"
-#if JUCE_ANDROID
+#if JUCE_ANDROID || CHURCHDAW_MOBILE_UI_PREVIEW
  #include "AndroidAudioMidiCenter.h"
+#endif
+#if JUCE_ANDROID
  #include "AndroidPerformance.h"
  #include <unistd.h>
 #endif
-#if JUCE_ANDROID || JUCE_IOS
+#if JUCE_ANDROID || JUCE_IOS || CHURCHDAW_MOBILE_UI_PREVIEW
  #include "MobileAudioBufferPolicy.h"
 #endif
 #include "UiProfiler.h"
@@ -1781,6 +1783,8 @@ MainComponent::MainComponent (
    #if CHURCHDAW_MOBILE_SHELL
     for (auto* button : std::initializer_list<juce::Button*> { &instrumentsButton, &liveButton, &mapButton, &saveButton, &padButton, &scanButton, &librariesButton, &liveCamButton })
         button->getProperties().set ("churchTouchNav", true);
+    addChildComponent (shellWordmark);   // marca da barra superior (so no skin Church Live)
+    shellWordmark.onClick = [this] { showAbout(); };
    #endif
 
     // Clique de mouse nao leva o foco do teclado para a navegacao. O anel de
@@ -2760,6 +2764,13 @@ bool MainComponent::ownerTeardownIsReady() const noexcept
 void MainComponent::paint (juce::Graphics& g)
 {
     CHURCHDAW_UI_SCOPE ("MainComponent::paint");
+   #if CHURCHDAW_MOBILE_SHELL
+    if (shellSkin)
+    {
+        paintShellSkin (g);
+        return;
+    }
+   #endif
     g.fillAll (NordLookAndFeel::background());
 
     // ---- header GRAFITE com acento vermelho ----
@@ -2842,7 +2853,7 @@ void MainComponent::paint (juce::Graphics& g)
         g.drawRoundedRectangle (brandArea().toFloat().reduced (0.5f), 9.0f, 1.0f);
     }
 
-   #if JUCE_ANDROID
+   #if CHURCHDAW_MOBILE_SHELL
     {
         const float iconSize = mobileShortLandscapeLayout ? 34.0f
                                                           : compactHeader ? 46.0f : 82.0f;
@@ -3023,7 +3034,7 @@ void MainComponent::paint (juce::Graphics& g)
                 g.drawText ("MASTER", masterHeader, juce::Justification::centredLeft);
             }
         }
-        else
+        else if (programBand.getHeight() >= 14)
         {
             g.setColour (juce::Colours::white.withAlpha (0.72f));
             g.setFont (NordLookAndFeel::stageLabel (10.0f));
@@ -3850,6 +3861,30 @@ void MainComponent::resized()
     performanceDock.setVisible (desktopReferenceLayout);
     performanceDock.setBounds (desktopBottomBarBounds);
 
+   #if CHURCHDAW_MOBILE_SHELL
+    // Shell Church Live (paisagem): o trilho de navegacao sai da esquerda e a
+    // barra superior vira uma fileira so. Todo o resto do layout continua
+    // calculado sobre `area`, agora mais estreita.
+    shellSkin = ChurchLiveSkin::wantsShell (getWidth(), getHeight());
+    const auto shellMetrics = ChurchLiveSkin::metricsFor (getWidth(), getHeight());
+    if (shellSkin)
+    {
+        const int railW = ChurchLiveSkin::railWidth (shellMetrics);
+        railBounds = { 0, 0, layoutContentBounds.getX() + railW, getHeight() };
+        layoutContentBounds = layoutContentBounds.withTrimmedLeft (railW);
+    }
+    else
+    {
+        railBounds = {};
+        railLogoBounds = {};
+
+        if (shellSkinWasOn)
+            clearShellSkin();
+    }
+    shellSkinWasOn = shellSkin;
+    shellWordmark.setVisible (shellSkin);
+   #endif
+
     auto area = layoutContentBounds;
 
     // 720 dp e uma largura comum em aparelhos 20:9. Tratar exatamente 720 como
@@ -3893,15 +3928,22 @@ void MainComponent::resized()
     // So cresce quando as cenas estao na tela: fora do Live Mode a faixa
     // continua exatamente como era, e o resto do layout nao muda.
     const bool cenasNaFaixa = liveScenePanel.isVisible();
+    const bool learningBand = mapButton.getToggleState() || midiLearnActive.load();
 
     layoutProgramBandHeight = mobilePortraitLayout ? (cenasNaFaixa ? 104 : 52)
-                                                   : mobileShortLandscapeLayout ? (cenasNaFaixa ? 56 : 32)
+                                                   : mobileShortLandscapeLayout ? (cenasNaFaixa ? 56 : learningBand ? 44 : 32)
                                                                                 : mobileProgramBandHeight;
+    // As faixas de Cenas e Mapear nasceram em dp de celular (u ~ 0.44): em tablet
+    // o texto de 12 px e os alvos ficavam pequenos. Zoom proporcional a escala do shell.
+    const float bandZoom = shellSkin ? juce::jlimit (1.0f, 2.2f, shellMetrics.u / 0.44f) : 1.0f;
+    if (shellSkin)
+        layoutProgramBandHeight = juce::roundToInt ((float) layoutProgramBandHeight * bandZoom);
     layoutBrandWidth = mobileTwoRowHeader ? (narrowPhone ? 58 : 166)
                      : safeContentWidth < 900 ? 48
                      : wideMobileTablet ? 214 : 158;
     desktopHeaderTwoRows = false;
    #else
+    const bool learningBand = mapButton.getToggleState() || midiLearnActive.load();
     desktopHeaderTwoRows = desktopReferenceLayout || safeContentWidth < 1160;
     layoutHeaderHeight = desktopReferenceLayout ? DesktopHeaderLayout::height
                        : compact ? (desktopHeaderTwoRows ? 82 : 46)
@@ -3918,21 +3960,32 @@ void MainComponent::resized()
    #endif
     compactHeaderLayout = compact;
 
-    const int headerH = layoutHeaderHeight;
    #if CHURCHDAW_MOBILE_SHELL
-    compactProgramBand = false;
-   #else
-    // Com a mesa Church Live aberta, o visor grande repete o canal/timbre que
-    // as reguas ja mostram. Conservamos uma faixa curta para contexto, mas
-    // devolvemos a maior parte dessa altura ao mixer.
-    compactProgramBand = churchFull
-                      && ! liveScenePanel.isVisible()
-                      && ! midiLearnPanel.isVisible();
+    if (shellSkin)
+    {
+        mobileTwoRowHeader = false;
+        layoutHeaderHeight = ChurchLiveSkin::topBarHeight (shellMetrics);
+        layoutBrandWidth = 0;
+    }
    #endif
 
+    const int headerH = layoutHeaderHeight;
+    // Com a mesa Church Live aberta, o visor grande repete o canal/timbre que
+    // as reguas ja mostram. No mobile colapsamos a faixa para um separador fino
+    // de 2 dp fora de Cenas Live e Mapear MIDI, devolvendo ~32-50 dp aos faders.
+    compactProgramBand = churchFull
+                      && ! liveScenePanel.isVisible()
+                      && ! learningBand;
+
     if (compactProgramBand)
+    {
+       #if CHURCHDAW_MOBILE_SHELL
+        layoutProgramBandHeight = 2;
+       #else
         layoutProgramBandHeight = desktopReferenceLayout ? 34
                                                          : compactProgramBandHeight;
+       #endif
+    }
 
     const int bandH = layoutProgramBandHeight;
 
@@ -4063,6 +4116,21 @@ void MainComponent::resized()
                                                 mobileShortLandscapeLayout ? 2 : 3)
                                           : programBand.withSizeKeepingCentre (juce::jmin (960, programBand.getWidth() - 48),
                                                                                programBand.getHeight() - 22));
+
+       #if CHURCHDAW_MOBILE_SHELL
+        // A transformacao age sobre os limites no sistema do pai: posicao e tamanho
+        // sao divididos pelo fator para o painel cair de volta na faixa.
+        for (juce::Component* panel : { (juce::Component*) &midiLearnPanel, (juce::Component*) &liveScenePanel })
+        {
+            panel->setTransform (bandZoom > 1.001f ? juce::AffineTransform::scale (bandZoom) : juce::AffineTransform());
+            if (bandZoom > 1.001f)
+            {
+                const auto b = panel->getBounds();
+                panel->setBounds (juce::roundToInt ((float) b.getX() / bandZoom), juce::roundToInt ((float) b.getY() / bandZoom),
+                                  juce::roundToInt ((float) b.getWidth() / bandZoom), juce::roundToInt ((float) b.getHeight() / bandZoom));
+            }
+        }
+       #endif
     }
     const bool learning = mapButton.getToggleState() || midiLearnActive.load();
 
@@ -4150,7 +4218,11 @@ void MainComponent::resized()
    #endif
 
    #if CHURCHDAW_MOBILE_SHELL
-    if (mobileTwoRowHeader)
+    if (shellSkin)
+    {
+        layoutShellSkin (headerRow, shellMetrics, learning, churchFull);
+    }
+    else if (mobileTwoRowHeader)
     {
         // Retrato/freeform: primeira linha conserva marca, dispositivos e o
         // estado de salvamento; segunda linha e uma barra de acoes de 48 dp.
@@ -4375,7 +4447,7 @@ void MainComponent::resized()
         headerControls.removeFromLeft (
             juce::jmin (layoutBrandWidth + (narrowHeaderLayout ? 8 : 12),
                         headerControls.getWidth()));
-        headerControls.removeFromRight (juce::jmin (4, headerControls.getWidth()));
+        headerControls.removeFromRight (juce::jmin (10, headerControls.getWidth()));
 
         juce::Array<juce::Button*> navButtons;
         juce::Array<int> navWeights;
@@ -4395,10 +4467,10 @@ void MainComponent::resized()
         }
         else
         {
-            addMobileNav (liveButton, 52);
+            addMobileNav (liveButton, 60);
             addMobileNav (mapButton, wideMobileTablet ? 96 : 68);
             addMobileNav (saveButton, 60);
-            addMobileNav (padButton, 50);
+            addMobileNav (padButton, 60);
            #if JUCE_IOS || CHURCHDAW_HOSTS_PLUGINS
             addMobileNav (scanButton, 68);
            #endif
@@ -4587,7 +4659,59 @@ void MainComponent::resized()
             dockTitle.setBounds (dockHeader.reduced (14, 0));
         }
 
+       #if CHURCHDAW_MOBILE_SHELL
+        // No palco com o skin Church Live o editor ocupa tambem a faixa da barra
+        // superior (status, setas e "Editar canal" moram nela). Chip MIDI, Salvo,
+        // marca e a faixa de programa ficam POR CIMA do viewport.
+        bool editorOwnsBar = false;
+        if (dockedNative)
+        {
+            if (auto* te = dynamic_cast<TimbresEditor*> (dockedEditor.get()))
+            {
+                const auto& props = te->getProperties();
+                const bool shellChanged = (bool) props.getWithDefault ("churchShell", false) != shellSkin
+                                       || std::abs ((double) props.getWithDefault ("churchU", 0.0)
+                                                    - (double) shellMetrics.u) > 1.0e-4;
+                te->getProperties().set ("churchShell", shellSkin);
+                te->getProperties().set ("churchU", (double) shellMetrics.u);
+                editorOwnsBar = shellSkin;   // palco e editor focado dividem a mesma barra
+                const int stageInset = editorOwnsBar && ! compactProgramBand ? programBand.getHeight() : 0;
+                // A faixa de Cenas/Mapear muda a altura sem mudar os limites do viewport:
+                // sem relayout o editor seguia com os cards por baixo da faixa.
+                const bool insetChanged = (int) props.getWithDefault ("stageTopInset", 0) != stageInset;
+                te->getProperties().set ("stageTopInset", stageInset);
+                te->onStageSkinChanged = [this] { resized(); repaint(); };
+
+                if (shellChanged || insetChanged)
+                    te->resized();
+            }
+        }
+
+        if (editorOwnsBar)
+            area = area.withTop (headerRow.getY());
+       #endif
+
         dockViewport.setBounds (area);
+
+       #if CHURCHDAW_MOBILE_SHELL
+        if (shellSkin)
+        {
+            shellWordmark.toFront (false);
+            deviceBar.toFront (false);
+            saveButton.toFront (false);
+            clearMapButton.toFront (false);
+
+            if (editorOwnsBar && ! compactProgramBand)
+            {
+                oled.toFront (false);
+                midiLearnPanel.toFront (false);
+                liveScenePanel.toFront (false);
+            }
+
+            if (librariesPanel != nullptr && librariesPanel->isVisible())
+                librariesPanel->toFront (false);
+        }
+       #endif
 
         // o Church Live nativo preenche a area visivel; se a janela ficar
         // pequena demais (< 1120), o editor mantem um tamanho minimo confortavel
@@ -4673,8 +4797,7 @@ void MainComponent::resized()
     if (audioPanel != nullptr)
     {
        #if CHURCHDAW_MOBILE_SHELL
-        audioPanel->setBounds (layoutContentBounds.isEmpty() ? getLocalBounds()
-                                                             : layoutContentBounds);
+        placeZoomedPanel (*audioPanel);
        #else
         audioPanel->setBounds (getLocalBounds());
        #endif
@@ -4684,8 +4807,7 @@ void MainComponent::resized()
     if (librariesPanel != nullptr)
     {
        #if CHURCHDAW_MOBILE_SHELL
-        librariesPanel->setBounds (layoutContentBounds.isEmpty() ? getLocalBounds()
-                                                                 : layoutContentBounds);
+        placeZoomedPanel (*librariesPanel);
        #else
         librariesPanel->setBounds (getLocalBounds());
        #endif
@@ -16854,8 +16976,12 @@ struct AudioSettingsHolder : public juce::Component,
          addAndMakeVisible (mc.inputToggle);
        #endif
 
+        #if CHURCHDAW_MOBILE_SHELL
+         launchkeyToggle.setButtonText ("Auto-mapear Launchkey");
+        #else
          launchkeyToggle.setButtonText (juce::String::fromUTF8 (
              "Mapeamento autom\xc3\xa1tico do Launchkey"));
+        #endif
          launchkeyToggle.setTooltip (juce::String::fromUTF8 (
              "Quando desligado, o Launchkey funciona apenas como entrada MIDI comum; "
              "faders, knobs e pads deixam de controlar o ChurchDAW automaticamente."));
@@ -17227,32 +17353,42 @@ struct AudioSettingsHolder : public juce::Component,
             juce::Colour (0xff1c2028), col.getX(), col.getY(),
             juce::Colour (0xff12151a), col.getX(), col.getBottom(), false));
         g.fillRoundedRectangle (col, rad);
-        g.setColour (juce::Colours::white.withAlpha (0.07f));
+        g.setColour (juce::Colours::white.withAlpha (0.12f));
+        g.fillRect (col.getX() + rad, col.getY() + 1.0f,
+                    juce::jmax (0.0f, col.getWidth() - rad * 2.0f), 1.0f);
+        g.setColour (juce::Colours::white.withAlpha (0.09f));
         g.drawRoundedRectangle (col.reduced (0.5f), rad, 1.0f);
-        g.setColour (NordLookAndFeel::nordRed().withAlpha (0.70f));
-        g.drawRoundedRectangle (col, rad, 1.4f);
 
-        // Barra vermelha no topo do card
-        g.setColour (NordLookAndFeel::nordRed());
-        g.fillRoundedRectangle (col.getX() + 20.0f, col.getY() + 1.0f,
-                                col.getWidth() - 40.0f, 3.0f, 1.5f);
+        // Barra vermelha centralizada no topo do card
+        const float crownW = juce::jmin (92.0f, col.getWidth() * 0.22f);
+        g.setColour (NordLookAndFeel::nordRedBright().withAlpha (0.88f));
+        g.fillRoundedRectangle (col.getCentreX() - crownW * 0.5f, col.getY() + 0.5f,
+                                crownW, 2.0f, 1.0f);
 
         const bool shortMobile = col.getHeight() < 480.0f && col.getWidth() >= 540.0f;
         const int mobileHeadH = shortMobile ? 52 : headerH;
         auto head = col.toNearestInt().removeFromTop (mobileHeadH);
+        const float logoSide = shortMobile ? 32.0f : 34.0f;
+        const juce::Rectangle<float> logoBox ((float) head.getX() + 18.0f,
+                                              (float) head.getY() + (shortMobile ? 10.0f : 14.0f),
+                                              logoSide, logoSide);
         if (brandIcon.isValid())
         {
+            juce::Graphics::ScopedSaveState state (g);
+            juce::Path clip;
+            clip.addEllipse (logoBox);
+            g.reduceClipRegion (clip);
             g.setOpacity (1.0f);
-            g.drawImageWithin (brandIcon, head.getX() + 18, head.getY() + (shortMobile ? 10 : 14),
-                               shortMobile ? 32 : 34, shortMobile ? 32 : 34,
+            g.drawImageWithin (brandIcon, (int) logoBox.getX(), (int) logoBox.getY(),
+                               (int) logoSide, (int) logoSide,
                                juce::RectanglePlacement::centred);
         }
         else
         {
-            NordLookAndFeel::drawChurchDAWMark (
-                g, { (float) head.getX() + 16.0f, (float) head.getY() + (shortMobile ? 8.0f : 12.0f),
-                     shortMobile ? 34.0f : 38.0f, shortMobile ? 34.0f : 38.0f });
+            NordLookAndFeel::drawChurchDAWMark (g, logoBox);
         }
+        g.setColour (juce::Colours::white.withAlpha (0.16f));
+        g.drawEllipse (logoBox.reduced (0.5f), 1.0f);
 
         g.setColour (NordLookAndFeel::txtPrimary());
         g.setFont (juce::Font (juce::FontOptions (shortMobile ? 15.5f : 17.0f)).boldened()
@@ -18037,10 +18173,11 @@ void MainComponent::showAudioSettings()
     {
         audioPanel.reset();
         audioSettingsButton.repaint();
+        refreshRailActive();
         return;
     }
 
-   #if JUCE_ANDROID
+   #if JUCE_ANDROID || CHURCHDAW_MOBILE_UI_PREVIEW
     // Central full-screen com abas (AUDIO / LATENCIA / MIDI-USB).
     AndroidAudioMidiCenter::Host host {
         deviceManager,
@@ -18051,6 +18188,7 @@ void MainComponent::showAudioSettings()
             {
                 c->audioPanel.reset();
                 c->audioSettingsButton.repaint();
+                c->refreshRailActive();
             }
         },
         [safe = juce::Component::SafePointer<MainComponent> (this)]
@@ -18065,11 +18203,15 @@ void MainComponent::showAudioSettings()
         },
         [safe = juce::Component::SafePointer<MainComponent> (this)]
         {
+           #if JUCE_ANDROID
             if (auto* c = safe.getComponent())
             {
                 c->androidForceAudioReconcile = true;
                 c->reconcileAndroidAudioTopology();
             }
+           #else
+            juce::ignoreUnused (safe);
+           #endif
         },
         [safe = juce::Component::SafePointer<MainComponent> (this)]() -> TimbresProcessor*
         {
@@ -18095,9 +18237,9 @@ void MainComponent::showAudioSettings()
     audioPanel.reset (center);
     audioSettingsButton.repaint();
     addAndMakeVisible (center);
+    refreshRailActive();
     // Respeita safeAreaInsets para nao entrar sob camera/barra gestual.
-    center->setBounds (layoutContentBounds.isEmpty() ? getLocalBounds()
-                                                     : layoutContentBounds);
+    placeZoomedPanel (*center);
     center->toFront (true);
     center->grabKeyboardFocus();
    #else
@@ -18120,8 +18262,175 @@ void MainComponent::showAudioSettings()
 //==============================================================================
 // Marca do header = botao de "Sobre". Nao gasta espaco na fileira de botoes e
 // e o lugar onde todo mundo procura os creditos.
+#if CHURCHDAW_MOBILE_SHELL
+// Shell Church Live: trilho de navegacao + barra superior unica.
+void MainComponent::paintShellSkin (juce::Graphics& g)
+{
+    using namespace ChurchLiveSkin;
+    g.fillAll (bg());
+    g.setGradientFill (juce::ColourGradient (accent().withAlpha (0.07f), (float) railBounds.getRight(), 0.0f,
+                                             juce::Colours::transparentBlack,
+                                             (float) getWidth() * 0.55f, (float) getHeight() * 0.55f, true));
+    g.fillRect (getLocalBounds());
+
+    g.setColour (railBg());
+    g.fillRect (railBounds);
+    g.setColour (railLine());
+    g.fillRect (railBounds.getRight() - 1, 0, 1, getHeight());
+
+    if (! railLogoBounds.isEmpty())
+        NordLookAndFeel::drawChurchDAWMark (g, railLogoBounds.toFloat());
+}
+
+// Paineis de tela cheia (Audio/MIDI, Bibliotecas) foram desenhados para ~900 dp
+// de largura. Em telas maiores o layout interno dele nao estica; entao o painel
+// recebe um tamanho logico de ~900 dp e e ampliado para cobrir 100% da area.
+void MainComponent::placeZoomedPanel (juce::Component& panel)
+{
+    const auto r = layoutContentBounds.isEmpty() ? getLocalBounds() : layoutContentBounds;
+    // O limite e a menor dimensao: assim o conteudo cobre largura E altura.
+    const float z = shellSkin ? juce::jlimit (1.0f, 2.2f, juce::jmin ((float) r.getWidth() / 700.0f,
+                                                                      (float) r.getHeight() / 440.0f))
+                              : 1.0f;
+    panel.setTransform (z > 1.001f ? juce::AffineTransform::scale (z) : juce::AffineTransform());
+    // A transformacao do JUCE age sobre os limites no sistema do pai: o retangulo
+    // inteiro (posicao incluida) e dividido pelo fator para cair em `r` depois.
+    panel.setBounds (juce::roundToInt ((float) r.getX() / z), juce::roundToInt ((float) r.getY() / z),
+                     juce::roundToInt ((float) r.getWidth() / z), juce::roundToInt ((float) r.getHeight() / z));
+}
+
+void MainComponent::layoutShellSkin (juce::Rectangle<int> headerRow, const ChurchLiveSkin::Metrics& m,
+                                     bool learning, bool churchFull)
+{
+    using namespace ChurchLiveSkin;
+
+    for (juce::Button* button : std::initializer_list<juce::Button*> { &instrumentsButton, &liveButton, &mapButton, &clearMapButton,
+                                  &saveButton, &sabrinaButton, &padButton, &scanButton,
+                                  &liveCamButton, &librariesButton, &audioSettingsButton })
+        button->setBounds ({});
+
+    instrumentsButton.setButtonText ("Timbres");
+    liveButton.setButtonText ("Live");
+    mapButton.setButtonText (learning ? "Concluir" : "Mapear");
+    padButton.setButtonText ("Pad");
+    liveCamButton.setButtonText ("ChurchCam");
+    librariesButton.setButtonText ("Biblioteca");
+    audioSettingsButton.setButtonText (juce::String::fromUTF8 ("\xc3\x81udio"));
+
+    // Trilho: logo e sete destinos em posicoes fixas (um destino oculto nao
+    // desloca os outros).
+    const int railW = railWidth (m);
+    const juce::Rectangle<int> rail (layoutContentBounds.getX() - railW, layoutContentBounds.getY(),
+                                     railW, layoutContentBounds.getHeight());
+    const int padTop = m.px (18, 4);
+    // O icone da igreja saiu do trilho: a marca e o wordmark da barra, que abre "Sobre".
+    railLogoBounds = {};
+    auto items = rail.withTrimmedTop (padTop).withTrimmedBottom (m.px (12, 2));
+    const int gap = m.px (8, 3);
+    // Piso de 50 dp (>= 48 de toque): sem o logo sobra altura e os destinos podem crescer.
+    const int itemH = juce::jlimit (34, m.px (84, 50), (items.getHeight() - gap * 6) / 7);
+    // Em telas altas a pilha de destinos fica centralizada, nao colada no topo.
+    items.removeFromTop (juce::jmax (0, (items.getHeight() - (itemH * 7 + gap * 6)) / 2));
+
+    juce::Button* order[] = { &instrumentsButton, &liveButton, &mapButton, &padButton,
+                              &liveCamButton, &librariesButton, &audioSettingsButton };
+    const bool active[] = { churchFull && ! learning && ! padEditorVisible && ! liveButton.getToggleState(),
+                            liveButton.getToggleState(), learning, padEditorVisible,
+                            false, false, false };
+
+    for (int i = 0; i < 7; ++i)
+    {
+        const auto slot = items.removeFromTop (itemH);
+        items.removeFromTop (gap);
+        auto* button = order[i];
+        button->getProperties().set ("churchSkin", "rail");
+        button->getProperties().set ("churchU", (double) m.u);
+        button->getProperties().set ("churchActiveBase", active[i]);
+        button->setLookAndFeel (&ChurchLiveSkin::lookAndFeel());
+        if (button != &instrumentsButton || churchFull)
+            button->setBounds (slot);
+    }
+
+    refreshRailActive();
+
+    // Barra superior: o MainComponent posiciona o chip MIDI e o Salvo; o editor
+    // posiciona status, setas e "Editar canal" na mesma geometria.
+    const auto bar = layoutTopBar (headerRow, m, true);
+    deviceBar.getProperties().set ("churchSkin", "midiChip");
+    deviceBar.getProperties().set ("churchU", (double) m.u);
+    deviceBar.setCompact (true);
+    deviceBar.setIntegratedRack (false);
+    deviceBar.setVisible (true);
+    deviceBar.setBounds (bar.midi);
+    statusInfo.setBounds ({});
+
+    saveButton.getProperties().set ("churchSkin", "chip");
+    saveButton.getProperties().set ("churchU", (double) m.u);
+    saveButton.setLookAndFeel (&ChurchLiveSkin::lookAndFeel());
+    saveButton.setBounds (learning ? juce::Rectangle<int>() : bar.save);
+
+    // Durante o Mapear MIDI o botao de limpar ocupa o lugar do "Editar canal".
+    clearMapButton.setBounds (learning ? bar.edit : juce::Rectangle<int>());
+
+    shellWordmark.getProperties().set ("churchU", (double) m.u);
+    shellWordmark.setBounds (bar.wordmark);
+}
+
+// Fora do skin os componentes voltam a ser desenhados pelo look and feel padrao.
+void MainComponent::clearShellSkin()
+{
+    for (juce::Button* button : std::initializer_list<juce::Button*> { &instrumentsButton, &liveButton, &mapButton, &padButton,
+                                  &liveCamButton, &librariesButton, &audioSettingsButton, &saveButton })
+    {
+        button->getProperties().remove ("churchSkin");
+        button->getProperties().remove ("churchU");
+        button->getProperties().remove ("churchActive");
+        button->getProperties().remove ("churchActiveBase");
+        button->setLookAndFeel (nullptr);
+    }
+
+    deviceBar.getProperties().remove ("churchSkin");
+    deviceBar.repaint();
+}
+#endif
+
+// Audio e Bibliotecas abrem POR CIMA do palco: sem isto o trilho seguia marcando
+// "Timbres" debaixo deles. O estado base (palco/live/mapear/pad) vem do layout.
+void MainComponent::refreshRailActive()
+{
+   #if CHURCHDAW_MOBILE_SHELL
+    if (! shellSkin)
+        return;
+
+    const bool libs  = librariesPanel != nullptr && librariesPanel->isVisible();
+    const bool audio = audioPanel != nullptr && audioPanel->isVisible();
+
+    for (juce::Button* button : std::initializer_list<juce::Button*> { &instrumentsButton, &liveButton, &mapButton, &padButton,
+                                  &liveCamButton, &librariesButton, &audioSettingsButton })
+    {
+        bool on = (bool) button->getProperties().getWithDefault ("churchActiveBase", false) && ! libs && ! audio;
+
+        if (button == &librariesButton)
+            on = libs;
+        else if (button == &audioSettingsButton)
+            on = audio;
+
+        if ((bool) button->getProperties().getWithDefault ("churchActive", false) != on)
+        {
+            button->getProperties().set ("churchActive", on);
+            button->repaint();
+        }
+    }
+   #endif
+}
+
 juce::Rectangle<int> MainComponent::brandArea() const
 {
+   #if CHURCHDAW_MOBILE_SHELL
+    if (shellSkin)
+        return railLogoBounds;
+   #endif
+
     if (desktopReferenceLayout)
         return DesktopHeaderLayout::calculate (layoutContentBounds).brand;
 
@@ -18493,7 +18802,10 @@ void MainComponent::showLibraries()
         juce::MessageManager::callAsync ([safe]
         {
             if (auto* component = safe.getComponent())
+            {
                 component->librariesPanel.reset();
+                component->refreshRailActive();
+            }
         });
     };
 
@@ -18504,9 +18816,9 @@ void MainComponent::showLibraries()
     };
 
     addAndMakeVisible (panel);
+    refreshRailActive();
    #if CHURCHDAW_MOBILE_SHELL
-    panel->setBounds (layoutContentBounds.isEmpty() ? getLocalBounds()
-                                                    : layoutContentBounds);
+    placeZoomedPanel (*panel);
    #else
     panel->setBounds (getLocalBounds());
    #endif

@@ -39,8 +39,8 @@ namespace ChurchDAWServices
     // gate em runtime, mas estes valores alimentam a tela inicial, logs,
     // fixtures e fallbacks offline; divergir fazia um APK 1.6.24 se anunciar
     // como 1.6.10 e quebrava a verificacao oficial de release.
-    inline constexpr int currentVersionCode = 10642;
-    inline constexpr const char* currentVersionName = "1.6.35";
+    inline constexpr int currentVersionCode = 10643;
+    inline constexpr const char* currentVersionName = "1.6.36";
     inline constexpr const char* packageId = "com.churchdaw.app";
     inline constexpr const char* updatePolicyUrl =
         "https://churchdaw.com/app/android/update-policy-v3.json";

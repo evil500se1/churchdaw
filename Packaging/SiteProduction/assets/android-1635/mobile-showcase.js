@@ -5,8 +5,8 @@
     palco: [
       'Palco ao vivo com faders de curso longo.',
       'Até 6 camadas simultâneas visíveis com medidores individuais, Mute/Solo, Master Limiter e Panic instantâneo.',
-      'Palco ao vivo do ChurchDAW no Android com Black Upright, Pad Lp, Pad Worship e Pad2',
-      'CAPTURA REAL · REDMI NOTE 14 PRO+ 5G'
+      'Palco ao vivo do ChurchDAW no Android com Tonewheel Organ, Worship Hybrid, Pipe Organ e Master',
+      'DESIGNER PREVIEW · SHELL ANDROID'
     ],
     canal: [
       'Edição dedicada por canal, feita para o toque.',
@@ -71,7 +71,7 @@
         const key = btn.dataset.androidScreen;
         const info = androidScreens[key];
         if (!info) return;
-        const src = `assets/android-1635/${key}.webp`;
+        const src = `assets/android-1635/${key}.webp?v=20261104`;
         imgEl.src = src;
         imgEl.alt = info[2];
         linkEl.href = src;

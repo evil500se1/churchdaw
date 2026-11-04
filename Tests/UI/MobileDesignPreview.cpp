@@ -388,7 +388,7 @@ class MobileDesignPreview final : public juce::JUCEApplication,
 {
 public:
     const juce::String getApplicationName() override { return "ChurchDAW Mobile Preview"; }
-    const juce::String getApplicationVersion() override { return "1.6.35"; }
+    const juce::String getApplicationVersion() override { return "1.6.36"; }
     bool moreThanOneInstanceAllowed() override { return false; }
 
     void initialise (const juce::String& arguments) override
@@ -500,7 +500,7 @@ private:
         Window (juce::Point<int> contentSize,
                 ChurchDAWMidiMapping::DeferredOwnerTeardownGate& gate,
                 bool topLeftPlacement)
-            : DocumentWindow ("ChurchDAW Android Designer Preview (1.6.35)",
+            : DocumentWindow ("ChurchDAW Android Designer Preview (1.6.36)",
                               NordLookAndFeel::background(),
                               juce::DocumentWindow::allButtons),
               holder (gate)

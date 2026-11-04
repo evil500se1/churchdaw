@@ -583,10 +583,49 @@ public:
         auto card = getLocalBounds().toFloat().reduced (compacto ? 8.0f : 12.0f);
         const float rad = 14.0f;
 
-        g.setColour (desktop ? juce::Colour (0xff1b1f26) : NordLookAndFeel::bgCard());
-        g.fillRoundedRectangle (card, rad);
-        g.setColour (desktop ? juce::Colour (0xff3b414b) : NordLookAndFeel::borderDefault());
-        g.drawRoundedRectangle (card.reduced (0.5f), rad, 1.0f);
+        if (desktop)
+        {
+            g.setColour (juce::Colour (0xff1b1f26));
+            g.fillRoundedRectangle (card, rad);
+            g.setColour (juce::Colour (0xff3b414b));
+            g.drawRoundedRectangle (card.reduced (0.5f), rad, 1.0f);
+        }
+        else
+        {
+            g.setColour (juce::Colours::black.withAlpha (0.46f));
+            g.fillRoundedRectangle (card.translated (0.0f, 3.0f), rad);
+
+            g.setGradientFill (juce::ColourGradient (
+                juce::Colour (0xff1e232d), card.getX(), card.getY(),
+                juce::Colour (0xff12161e), card.getX(), card.getBottom(), false));
+            g.fillRoundedRectangle (card, rad);
+
+            g.setColour (juce::Colours::white.withAlpha (0.13f));
+            g.fillRect (card.getX() + rad, card.getY() + 1.0f,
+                        juce::jmax (0.0f, card.getWidth() - rad * 2.0f), 1.0f);
+
+            g.setColour (juce::Colours::white.withAlpha (0.09f));
+            g.drawRoundedRectangle (card.reduced (0.5f), rad, 1.0f);
+
+            const float crownW = juce::jmin (88.0f, card.getWidth() * 0.22f);
+            g.setColour (NordLookAndFeel::nordRedBright().withAlpha (0.88f));
+            g.fillRoundedRectangle (card.getCentreX() - crownW * 0.5f, card.getY() + 0.5f,
+                                    crownW, 2.0f, 1.0f);
+
+            if (vol.isVisible() && corte.isVisible())
+            {
+                auto bay = vol.getBounds().getUnion (volLbl.getBounds())
+                              .getUnion (corte.getBounds()).getUnion (corteLbl.getBounds())
+                              .toFloat().expanded (4.0f, 2.5f);
+                g.setColour (juce::Colour (0xff0e1219).withAlpha (0.82f));
+                g.fillRoundedRectangle (bay, 8.0f);
+                g.setColour (juce::Colours::white.withAlpha (0.065f));
+                g.drawRoundedRectangle (bay.reduced (0.5f), 8.0f, 1.0f);
+                const float sepX = (float) corteLbl.getX();
+                g.setColour (juce::Colours::white.withAlpha (0.06f));
+                g.fillRect (sepX, bay.getY() + 5.0f, 1.0f, juce::jmax (4.0f, bay.getHeight() - 10.0f));
+            }
+        }
 
         // titulo
         g.setColour (NordLookAndFeel::txtPrimary());
@@ -633,15 +672,16 @@ public:
         auto bottom = area.removeFromBottom (compacto ? 48 : 54);
         area.removeFromBottom (compacto ? 8 : 12);
 
-        auto volArea = bottom.removeFromLeft (compacto ? 66 : 82);
+        const int knobSide = (! NordLookAndFeel::usesDesktopControls (*this) && compacto) ? 38 : 44;
+        auto volArea = bottom.removeFromLeft (compacto ? 68 : 82);
         volLbl.setBounds (volArea.removeFromBottom (12));
-        vol.setBounds (volArea.withSizeKeepingCentre (44, 44));
+        vol.setBounds (volArea.withSizeKeepingCentre (knobSide, knobSide));
 
         // O corte fica ao lado do volume: sao os dois controles continuos do
         // pad, e o musico procura os dois no mesmo canto.
-        auto corteArea = bottom.removeFromLeft (compacto ? 76 : 92);
+        auto corteArea = bottom.removeFromLeft (compacto ? 78 : 92);
         corteLbl.setBounds (corteArea.removeFromBottom (12));
-        corte.setBounds (corteArea.withSizeKeepingCentre (44, 44));
+        corte.setBounds (corteArea.withSizeKeepingCentre (knobSide, knobSide));
 
         // Parar encostado na direita (fim da linha = acao final), Editar logo a
         // esquerda dele. Os jmax evitam largura negativa numa janela minuscula.
@@ -1374,11 +1414,14 @@ private:
         juce::Colour topo, base;
 
         if (pressionado)     { topo = padAccentBright();          base = padAccent(); }
-        else if (sustentado) { topo = padAccent().darker (0.34f); base = padAccent().darker (0.60f); }
+        else if (sustentado) { topo = desktop ? padAccent().darker (0.34f) : padAccent().darker (0.14f);
+                               base = desktop ? padAccent().darker (0.60f) : padAccent().darker (0.54f); }
         else if (sobMouse)   { topo = sustenido ? padHoverAlt() : padHover();
                                base = sustenido ? padHoverAlt().darker (0.22f) : padHover().darker (0.20f); }
-        else if (sustenido)  { topo = padSurfaceAlt();            base = padSurfaceDeep(); }
-        else                 { topo = padSurface();               base = padSurface().darker (0.22f); }
+        else if (sustenido)  { topo = desktop ? padSurfaceAlt()  : juce::Colour (0xff151821);
+                               base = desktop ? padSurfaceDeep() : juce::Colour (0xff0d1016); }
+        else                 { topo = desktop ? padSurface()               : juce::Colour (0xff242a36);
+                               base = desktop ? padSurface().darker (0.22f) : juce::Colour (0xff181c25); }
 
         if (desktop)
             g.setColour (topo.interpolatedWith (base, 0.35f));
@@ -1386,6 +1429,12 @@ private:
             g.setGradientFill (juce::ColourGradient (topo, r.getX(), r.getY(),
                                                      base, r.getX(), r.getBottom(), false));
         g.fillRoundedRectangle (r, rad);
+
+        if (! desktop && ! pressionado && ! sustentado && ! sustenido && r.getWidth() > rad * 2.5f)
+        {
+            g.setColour (juce::Colours::white.withAlpha (0.11f));
+            g.fillRect (r.getX() + rad, r.getY() + 1.0f, r.getWidth() - rad * 2.0f, 1.0f);
+        }
 
         // ---- contorno por estado ----
         if (pressionado)

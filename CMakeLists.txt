@@ -849,7 +849,17 @@ juce_add_binary_data(ChurchAssets SOURCES
         Assets/Premium/premium_bells.png
     Assets/Premium/premium_graphite.png
     Assets/Premium/premium_bigsky.png
-    Assets/Premium/premium_pianoteq.png)
+    Assets/Premium/premium_pianoteq.png
+    # Barlow / Barlow Condensed / JetBrains Mono (SIL OFL 1.1, licencas em
+    # Assets/Fonts): tipografia do shell Church Live, empacotada para nao
+    # depender de fonte do sistema nem de rede.
+    Assets/Fonts/Barlow-Regular.ttf
+    Assets/Fonts/Barlow-SemiBold.ttf
+    Assets/Fonts/Barlow-Bold.ttf
+    Assets/Fonts/BarlowCondensed-Bold.ttf
+    Assets/Fonts/BarlowCondensed-ExtraBold.ttf
+    Assets/Fonts/BarlowCondensed-ExtraBoldItalic.ttf
+    Assets/Fonts/JetBrainsMono-SemiBold.ttf)
 
 if(IOS)
     # Archive relocates installable targets. This static resource library must

@@ -123,7 +123,7 @@ public:
         editBtn.setClickingTogglesState (true);
         editBtn.setColour (juce::TextButton::buttonColourId, padHover());
         editBtn.setColour (juce::TextButton::buttonOnColourId, juce::Colour (0xfff59e0b));
-       #if JUCE_ANDROID || JUCE_IOS
+       #if CHURCHDAW_MOBILE_SHELL
         editBtn.setColour (juce::TextButton::textColourOnId, juce::Colour (0xff1a1206));
        #else
         editBtn.setColour (juce::TextButton::textColourOnId, juce::Colour (0xffffce80));
@@ -409,7 +409,7 @@ public:
         if (getWantsKeyboardFocus() && ! hasKeyboardFocus (true))
             grabKeyboardFocus();
 
-       #if ! JUCE_IOS && ! JUCE_ANDROID
+       #if ! CHURCHDAW_MOBILE_SHELL
         // arrastar o card pela faixa do topo (titulo) — reposiciona onde quiser
         auto card = getLocalBounds().reduced (compacto ? 8 : 12);
         if (pt.y < (float) (card.getY() + (compacto ? 40 : 46)))

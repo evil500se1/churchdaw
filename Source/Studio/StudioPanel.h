@@ -20,7 +20,7 @@ using StudioCameraDevice=AndroidCamera;
 static constexpr bool mobileStudio=true;
 #else
 using StudioCameraDevice=juce::CameraDevice;
-static constexpr bool mobileStudio=false;
+static constexpr bool mobileStudio=CHURCHDAW_MOBILE_SHELL;
 #endif
 class Panel final : public juce::Component, private juce::Timer,
                     private StudioCameraDevice::Listener,private juce::AudioIODeviceCallback

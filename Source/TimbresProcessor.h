@@ -17333,7 +17333,7 @@ public:
         newLevel = juce::jlimit (0.0f, 1.0f, newLevel);
 
         // Limiar maior no touch: menos repaint, mesma leitura de "esta tocando".
-       #if JUCE_ANDROID || JUCE_IOS
+       #if CHURCHDAW_MOBILE_SHELL
         const float thresh = 0.06f;
        #else
         const float thresh = 0.03f;
@@ -17353,7 +17353,7 @@ public:
 
         auto r = getLocalBounds().toFloat();
 
-       #if JUCE_ANDROID || JUCE_IOS
+       #if CHURCHDAW_MOBILE_SHELL
         // Sem glow expandido (caro no software renderer) — barra solida basta.
         g.setColour (NordLookAndFeel::nordRed().withAlpha (
             juce::jmin (1.0f, 0.30f + level * 1.2f)));
@@ -17385,7 +17385,7 @@ public:
           plugin (p), closedCallback (std::move (onClosed))
     {
         setUsingNativeTitleBar (false);
-       #if JUCE_IOS || JUCE_ANDROID
+       #if CHURCHDAW_MOBILE_SHELL
         setTitleBarHeight (44);
        #else
         setTitleBarHeight (30);
@@ -17415,7 +17415,7 @@ public:
             setResizeLimits (200, 150, 2560, 1600);
         }
 
-       #if JUCE_IOS || JUCE_ANDROID
+       #if CHURCHDAW_MOBILE_SHELL
         if (const auto* display = juce::Desktop::getInstance().getDisplays().getPrimaryDisplay())
         {
             const auto safe = display->safeAreaInsets.subtractedFrom (display->userArea).reduced (6);
@@ -17530,7 +17530,7 @@ public:
     void resized() override
     {
         auto card = getLocalBounds().reduced (margin);
-       #if JUCE_IOS || JUCE_ANDROID
+       #if CHURCHDAW_MOBILE_SHELL
         closeBtn.setBounds (card.getRight() - 44, card.getY() + 6, 38, 32);
        #else
         closeBtn.setBounds (card.getRight() - 36, card.getY() + 9, 26, 22);
@@ -17571,7 +17571,7 @@ private:
         resizingSelf = false;
     }
 
-   #if JUCE_IOS || JUCE_ANDROID
+   #if CHURCHDAW_MOBILE_SHELL
     static constexpr int margin = 8, headerH = 44;
    #else
     static constexpr int margin = 12, headerH = 36;
@@ -17649,7 +17649,7 @@ public:
                                   NordLookAndFeel::txtPrimary());
         editToneButton.onClick = [this]
         {
-           #if JUCE_ANDROID || JUCE_IOS
+           #if CHURCHDAW_MOBILE_SHELL
             // No touch, o editor focado continua sendo a mesa de edicao. O
             // Modo Palco abre as reguas compactas com fader, meter, M/S e
             // master atualizando juntas, como no Windows/macOS. A troca e so
@@ -17761,7 +17761,7 @@ public:
             // gritava em 17px negrito e competia com o nome do som logo abaixo.
             // Agora ela e rotulo de apoio; o heroi e o seletor de preset.
             s.timbreName.setJustificationType (juce::Justification::centredLeft);
-           #if JUCE_ANDROID || JUCE_IOS
+           #if CHURCHDAW_MOBILE_SHELL
             s.timbreName.setFont (NordLookAndFeel::stageLabel (11.0f));
            #else
             // Categoria precisa caber entre o icone e o ON inclusive em
@@ -18034,7 +18034,7 @@ public:
             // No Android, D-pad/teclado precisa alcancar o seletor. No desktop
             // ele segue fora da ordem de foco para uma seta acidental nao trocar
             // o timbre durante o culto.
-           #if JUCE_ANDROID || JUCE_IOS
+           #if CHURCHDAW_MOBILE_SHELL
             s.combo.setWantsKeyboardFocus (true);
            #else
             s.combo.setWantsKeyboardFocus (false);
@@ -18296,7 +18296,7 @@ public:
                 // para o clique.
                 knob->setSliderSnapsToMousePosition (false);
                 knob->setViewportIgnoreDragFlag (true);
-               #if JUCE_ANDROID || JUCE_IOS
+               #if CHURCHDAW_MOBILE_SHELL
                 // D-pad/teclado em tablet precisa alcançar os controles de
                 // edição. Transpose continua sem foco para não mudar o tom por
                 // acidente ao vivo; aqui o foco é explícito e seguro.
@@ -18419,7 +18419,7 @@ public:
             s.rotaryModeBox.addItem ("Stop", 2);
             s.rotaryModeBox.addItem ("Fast", 3);
             s.rotaryModeBox.setTooltip ("Velocidade do Leslie: Slow, Stop ou Fast");
-           #if JUCE_ANDROID || JUCE_IOS
+           #if CHURCHDAW_MOBILE_SHELL
             s.rotaryModeBox.setWantsKeyboardFocus (true);
            #else
             s.rotaryModeBox.setWantsKeyboardFocus (false);
@@ -19770,7 +19770,7 @@ public:
             strip.pluginMenuBtn.setBounds ({});
         }
 
-       #if JUCE_ANDROID || JUCE_IOS
+       #if CHURCHDAW_MOBILE_SHELL
         // Tablets start with several playable channels in view. Re-evaluate
         // provisional constructor bounds until the musician chooses a mode;
         // resizing after that must never undo their choice.
@@ -19804,7 +19804,7 @@ public:
         constexpr bool referenceDesktop = false;
         // +15% de legibilidade no aparelho real (pedido do dono, 30/07):
         // 14->16 e 10->11,5 na paisagem curta, com a linha acompanhando.
-       #if JUCE_ANDROID || JUCE_IOS
+       #if CHURCHDAW_MOBILE_SHELL
         // O seletor de modo e uma acao de palco, nao um link miudo. Reserva um
         // alvo touch de 44/48 dp e deixa o restante do editor refluindo abaixo.
         auto top = area.removeFromTop (shortLandscapeMobileLayout ? 44 : 48);
@@ -19814,7 +19814,7 @@ public:
         title.setFont (juce::Font (juce::FontOptions (16.0f)).boldened());
         status.setFont (juce::Font (juce::FontOptions (
                              shortLandscapeMobileLayout ? 11.5f : 12.0f)));
-       #if JUCE_ANDROID || JUCE_IOS
+       #if CHURCHDAW_MOBILE_SHELL
         // Remove primeiro os alvos touch e entrega ao titulo apenas o que
         // realmente sobrou. Na largura de 320/360 dp, reservar o titulo antes
         // das setas fazia a segunda seta nascer com largura negativa.
@@ -19907,7 +19907,7 @@ public:
         masterLiveGroupBounds = {};
         masterUtilityGroupBounds = {};
 
-       #if JUCE_ANDROID || JUCE_IOS
+       #if CHURCHDAW_MOBILE_SHELL
         // O touch abre no editor focado (14 abas + Master). Android e iOS
         // compartilham o Modo Palco explicito: duas, quatro ou seis reguas por
         // pagina, meters simultaneos e Master sempre ao lado.
@@ -19934,7 +19934,7 @@ public:
         if (! focusedMobileLayout)
             mobileMasterPageButton.setBounds ({});
 
-       #if JUCE_ANDROID || JUCE_IOS
+       #if CHURCHDAW_MOBILE_SHELL
         if (mobileStageMode)
         {
             layoutMobileStageMode (area);
@@ -20813,7 +20813,7 @@ public:
             return;
         }
 
-       #if JUCE_ANDROID || JUCE_IOS
+       #if CHURCHDAW_MOBILE_SHELL
         const bool referenceMaster = false;
        #else
         const bool referenceMaster = referenceDesktop;
@@ -21104,7 +21104,7 @@ public:
     }
 
 private:
-   #if JUCE_ANDROID || JUCE_IOS
+   #if CHURCHDAW_MOBILE_SHELL
     void layoutMobileStageMode (juce::Rectangle<int> area)
     {
         focusedMobileLayout = false;
@@ -21388,7 +21388,7 @@ private:
 
     void layoutFocusedMobile (juce::Rectangle<int> area)
     {
-       #if JUCE_ANDROID || JUCE_IOS
+       #if CHURCHDAW_MOBILE_SHELL
         // O Modo Palco transforma o combo em leitura. Reentrar no editor
         // detalhado restaura imediatamente toque, teclado e D-pad.
         faixaDeCanais = {};
@@ -21458,7 +21458,7 @@ private:
         auto tabs = area.removeFromTop (tabsH);
         const int gap = shortLandscapeMobileLayout ? 2 : 3;
 
-       #if JUCE_ANDROID || JUCE_IOS
+       #if CHURCHDAW_MOBILE_SHELL
         for (int l = 0; l < TimbresProcessor::numLayers; ++l)
         {
             strips[l].tabBounds = {};
@@ -21977,7 +21977,7 @@ private:
             s.highLabel.setText ("HIGH", juce::dontSendNotification);
             s.autoEqBtn.setButtonText ("AUTO EQ");
 
-           #if JUCE_ANDROID || JUCE_IOS
+           #if CHURCHDAW_MOBILE_SHELL
             const bool rotaryInActionRail = isOrgan && ! s.eqPage;
            #else
             const bool rotaryInActionRail = false;
@@ -22756,7 +22756,7 @@ private:
 
         applyPickerDownloadState();
 
-       #if JUCE_ANDROID || JUCE_IOS
+       #if CHURCHDAW_MOBILE_SHELL
         // TELA CHEIA de verdade: dentro do editor o card tinha ~207 dp de
         // altura no TANK 3 e a lista virava uma fresta com rolagem infinita
         // ("tem que rolar muito pra ver" — dono, 30/07). O seletor sobe para
@@ -23153,7 +23153,7 @@ private:
 
     void refreshMasterUtilityLabels()
     {
-       #if JUCE_ANDROID || JUCE_IOS
+       #if CHURCHDAW_MOBILE_SHELL
         // O touch usa abreviacoes proprias definidas no layout responsivo.
         return;
        #else
@@ -23554,7 +23554,7 @@ public:
             return true;
         }
 
-       #if JUCE_ANDROID || JUCE_IOS
+       #if CHURCHDAW_MOBILE_SHELL
         if (mobileStageMode)
         {
             mobileModeChosen = true;
@@ -24885,7 +24885,7 @@ public:
                           : isSoundFont ? libName
                           : (loaded ? categoryTitleFor (timbre)
                                     : juce::String());
-           #if ! JUCE_ANDROID && ! JUCE_IOS
+           #if ! CHURCHDAW_MOBILE_SHELL
             category = isPlugin ? juce::String ("PLUGIN") : category.toUpperCase();
            #endif
             s.timbreName.setText (category, juce::dontSendNotification);
@@ -25176,10 +25176,10 @@ public:
         }
         else
         {
-           #if JUCE_ANDROID || JUCE_IOS
+           #if CHURCHDAW_MOBILE_SHELL
             // Status bar + molduras leves: meters/activity se atualizam sozinhos.
             repaint (0, 0, getWidth(), 52);
-           #if JUCE_ANDROID || JUCE_IOS
+           #if CHURCHDAW_MOBILE_SHELL
             if (mobileStageMode)
             {
                 for (int l = 0; l < TimbresProcessor::numLayers; ++l)
@@ -25253,7 +25253,7 @@ public:
                             || proc.getLayerTimbre (l).isNotEmpty()
                             || proc.getLayerInstrument (l) != nullptr;
 
-       #if JUCE_ANDROID || JUCE_IOS
+       #if CHURCHDAW_MOBILE_SHELL
         // O Modo Palco tambem e o caminho mais rapido para montar uma sessao
         // vazia: cada regua sem timbre ja oferece o alvo "Adicionar". Manter o
         // botao habilitado evita que ele pareca ter sumido no primeiro uso ou
@@ -25358,7 +25358,7 @@ public:
 
     void rolarCanais (int passos)
     {
-       #if JUCE_ANDROID || JUCE_IOS
+       #if CHURCHDAW_MOBILE_SHELL
         if (mobileStageMode || focusedMobileLayout)
         {
             const int antes = primeiroCanalVisivel;
@@ -25463,7 +25463,7 @@ public:
     bool premiumDesktopLayout = false;
     bool shortLandscapeMobileLayout = false;
     bool mobileMasterPage = false;
-   #if JUCE_ANDROID || JUCE_IOS
+   #if CHURCHDAW_MOBILE_SHELL
     bool mobileModeChosen = false;
     bool mobileStageMode = false;
     bool mobileStageRevealSelected = false;

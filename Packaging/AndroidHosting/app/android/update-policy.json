@@ -1,9 +1,9 @@
 {
     "schema_version":  1,
     "package_id":  "com.churchdaw.app",
-    "latest_version_code":  10642,
+    "latest_version_code":  10643,
     "minimum_version_code":  10623,
-    "latest_version_name":  "1.6.35",
-    "update_message":  "Atualize para o ChurchDAW 1.6.35: novo motor de audio Oboe anti-travamento, menor uso de RAM e interface touch otimizada.",
-    "play_store_url":  "https://churchdaw.com/app/android/ChurchDAW-1.6.35-signed.apk"
+    "latest_version_name":  "1.6.36",
+    "update_message":  "Atualize para o ChurchDAW 1.6.36: novo visual Church Live em todas as telas, icone oficial e audio protegido ao trocar de app.",
+    "play_store_url":  "https://churchdaw.com/app/android/ChurchDAW-1.6.36-signed.apk"
 }

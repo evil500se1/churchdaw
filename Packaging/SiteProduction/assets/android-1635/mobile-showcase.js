@@ -71,7 +71,7 @@
         const key = btn.dataset.androidScreen;
         const info = androidScreens[key];
         if (!info) return;
-        const src = `assets/android-1635/${key}.webp?v=20261104`;
+        const src = `assets/android-1635/${key}.webp?v=20261104b`;
         imgEl.src = src;
         imgEl.alt = info[2];
         linkEl.href = src;

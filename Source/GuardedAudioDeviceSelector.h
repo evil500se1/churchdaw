@@ -1,5 +1,6 @@
 #pragma once
 #include <juce_audio_utils/juce_audio_utils.h>
+#include "MobileShellConfig.h"
 #include <functional>
 
 namespace ChurchDAWAudioUI
@@ -33,7 +34,7 @@ public:
         : AudioDeviceSelectorComponent (
               manager,
               0,
-             #if JUCE_ANDROID || JUCE_IOS
+             #if CHURCHDAW_MOBILE_SHELL
               0,
              #else
               2,

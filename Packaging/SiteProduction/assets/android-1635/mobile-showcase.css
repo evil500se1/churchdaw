@@ -1,0 +1,255 @@
+.android-showcase {
+  position: relative;
+  background:
+    radial-gradient(900px 460px at 50% 8%, rgba(201, 47, 80, 0.16), transparent 72%),
+    linear-gradient(180deg, #090a0d 0%, #100c12 46%, #090a0d 100%);
+  border-bottom: 1px solid var(--line);
+}
+
+.android-film {
+  border-color: #633546;
+  box-shadow: 0 34px 90px rgba(0, 0, 0, 0.62), 0 0 0 1px rgba(255, 108, 136, 0.06);
+}
+
+.android-gallery-block {
+  margin-top: 68px;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.android-gallery-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  gap: 28px;
+  margin-bottom: 22px;
+}
+
+.android-gallery-header h3 {
+  font-size: clamp(24px, 2.5vw, 32px);
+  letter-spacing: -0.035em;
+}
+
+.android-gallery-header p {
+  font-size: 14px;
+  color: var(--muted);
+  max-width: 440px;
+}
+
+.android-tabs {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding-bottom: 22px;
+  max-width: 100%;
+}
+
+.android-tabs button {
+  border: 1px solid #262933;
+  border-radius: 999px;
+  padding: 10px 16px;
+  min-height: 42px;
+  background: #14161c;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 600;
+  transition: border-color 0.18s, background 0.18s, color 0.18s, transform 0.18s;
+}
+
+.android-tabs button:hover {
+  color: #ffffff;
+  border-color: #69384a;
+  transform: translateY(-1px);
+}
+
+.android-tabs button[aria-pressed="true"] {
+  color: #ffe4eb;
+  background: linear-gradient(135deg, #552133 0%, #3a1825 100%);
+  border-color: #a94764;
+  box-shadow: 0 8px 24px rgba(201, 47, 80, 0.22);
+}
+
+.android-stage-card {
+  border: 1px solid #3c2a34;
+  border-radius: 16px;
+  background:
+    radial-gradient(760px 320px at 50% 45%, rgba(201, 47, 80, 0.14), transparent 74%),
+    #0d0f14;
+  overflow: hidden;
+  box-shadow: 0 28px 75px rgba(0, 0, 0, 0.55);
+}
+
+.android-phone-wrap {
+  padding: clamp(18px, 3.2vw, 42px) clamp(14px, 3.6vw, 52px);
+  display: grid;
+  place-items: center;
+}
+
+.android-phone-bezel {
+  position: relative;
+  display: block;
+  width: 100%;
+  max-width: 1120px;
+  padding: clamp(8px, 1.1vw, 14px);
+  border-radius: clamp(20px, 2.6vw, 34px);
+  background: linear-gradient(145deg, #342933 0%, #171820 42%, #111218 72%, #472533 100%);
+  border: 1px solid #6f3d4f;
+  box-shadow:
+    0 26px 64px rgba(0, 0, 0, 0.72),
+    inset 0 1px 0 rgba(255, 255, 255, 0.12);
+  cursor: zoom-in;
+  transition: transform 0.22s ease, border-color 0.22s ease;
+}
+
+.android-phone-bezel:hover {
+  transform: translateY(-2px);
+  border-color: #9e506b;
+}
+
+.android-phone-bezel::before {
+  content: "";
+  position: absolute;
+  left: clamp(14px, 1.8vw, 24px);
+  top: 50%;
+  transform: translateY(-50%);
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #050608;
+  box-shadow: 0 0 0 1.5px #2a2d3a, inset 0 0 0 2px #162230;
+  z-index: 2;
+  pointer-events: none;
+}
+
+.android-phone-bezel img {
+  width: 100%;
+  aspect-ratio: 1920 / 848;
+  object-fit: cover;
+  border-radius: clamp(14px, 1.9vw, 24px);
+  background: #090a0d;
+  transition: opacity 0.16s ease;
+}
+
+.android-stage-card figcaption {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 24px;
+  border-top: 1px solid var(--line);
+  padding: 22px 28px;
+  background: #111319;
+}
+
+.android-stage-card figcaption strong {
+  display: block;
+  font-size: 18px;
+  letter-spacing: -0.02em;
+}
+
+.android-stage-card figcaption div > span {
+  display: block;
+  color: var(--muted);
+  font-size: 14px;
+  margin-top: 4px;
+}
+
+.android-pillars {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 22px;
+  margin-top: 48px;
+}
+
+.android-pillar {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 24px 22px;
+  background: linear-gradient(180deg, #14151c 0%, #101116 100%);
+}
+
+.android-pillar h3 {
+  font-size: 20px;
+  margin-bottom: 10px;
+}
+
+.android-pillar p {
+  font-size: 14px;
+  line-height: 1.75;
+}
+
+.android-cta-bar {
+  margin-top: 38px;
+  padding: 24px 28px;
+  border: 1px solid #593242;
+  border-radius: 12px;
+  background: linear-gradient(115deg, #25151e 0%, #15131a 60%, #111318 100%);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  flex-wrap: wrap;
+}
+
+.android-cta-copy strong {
+  display: block;
+  font-size: 18px;
+  letter-spacing: -0.02em;
+}
+
+.android-cta-copy span {
+  display: block;
+  font-size: 13px;
+  color: var(--muted);
+  margin-top: 3px;
+}
+
+.android-cta-actions {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  flex-wrap: wrap;
+}
+
+@media (max-width: 1100px) {
+  .android-pillars {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 760px) {
+  .android-gallery-header {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 10px;
+  }
+  .android-tabs {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    padding-bottom: 14px;
+    margin-inline: -4px;
+    padding-inline: 4px;
+    scrollbar-width: thin;
+  }
+  .android-tabs button {
+    flex: none;
+    font-size: 12px;
+    padding: 8px 14px;
+    min-height: 38px;
+  }
+  .android-phone-bezel::before {
+    display: none;
+  }
+  .android-stage-card figcaption {
+    flex-direction: column;
+    align-items: flex-start;
+    padding: 18px;
+    gap: 12px;
+  }
+  .android-pillars {
+    grid-template-columns: 1fr;
+    gap: 14px;
+  }
+  .android-cta-bar {
+    padding: 20px;
+  }
+}

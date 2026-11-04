@@ -2131,4 +2131,63 @@ if(CHURCHDAW_BUILD_AUDIO_TESTS AND NOT ANDROID AND NOT IOS)
         target_compile_options(ChurchDAWDesktopDesignPreview PRIVATE /utf-8 /bigobj)
         target_link_options(ChurchDAWDesktopDesignPreview PRIVATE /STACK:33554432)
     endif()
+
+    juce_add_gui_app(ChurchDAWMobileDesignPreview
+        PRODUCT_NAME "ChurchDAW Mobile Preview"
+        BUNDLE_ID "com.churchdaw.mobile-preview")
+    set_target_properties(ChurchDAWMobileDesignPreview PROPERTIES
+        EXCLUDE_FROM_ALL TRUE)
+    target_sources(ChurchDAWMobileDesignPreview PRIVATE
+        Tests/UI/MobileDesignPreview.cpp
+        Source/MainComponent.cpp
+        ${CHURCHDAW_ORGAN_SOURCES}
+        ${CHURCHDAW_SF2_SOURCES}
+        ${CHURCHDAW_SABRINA_SOURCES})
+    target_include_directories(ChurchDAWMobileDesignPreview PRIVATE Source)
+    target_compile_definitions(ChurchDAWMobileDesignPreview PRIVATE
+        CHURCHDAW_UI_PREVIEW=1
+        CHURCHDAW_MOBILE_UI_PREVIEW=1
+        CHURCHDAW_REMOTE_CONTROL_ENABLED=0
+        CHURCHDAW_HOSTS_PLUGINS=0
+        CHURCHDAW_APP_VERSION="${PROJECT_VERSION}"
+        JUCE_PLUGINHOST_VST=0
+        JUCE_PLUGINHOST_VST3=0
+        JUCE_USE_CAMERA=1
+        JUCE_WEB_BROWSER=0
+        JUCE_PUSH_NOTIFICATIONS=0
+        JUCE_USE_CURL=0)
+    target_link_libraries(ChurchDAWMobileDesignPreview PRIVATE
+        ChurchAssets
+        juce::juce_opengl
+        juce::juce_video
+        juce::juce_cryptography
+        juce::juce_dsp
+        juce::juce_audio_utils
+        juce::juce_audio_processors
+        juce::juce_audio_devices
+        juce::juce_gui_extra
+        juce::juce_recommended_config_flags)
+    if(APPLE)
+        target_sources(ChurchDAWMobileDesignPreview PRIVATE
+            Source/Studio/StudioMovieWriter_mac.mm)
+        target_compile_definitions(ChurchDAWMobileDesignPreview PRIVATE
+            JUCE_USE_VDSP_FRAMEWORK=1)
+        target_link_libraries(ChurchDAWMobileDesignPreview PRIVATE
+            "-framework AudioUnit" "-framework AudioToolbox"
+            "-framework CoreAudioKit" "-framework Accelerate"
+            "-framework AVFoundation" "-framework CoreVideo"
+            "-framework CoreMedia" "-framework Security")
+    elseif(WIN32)
+        target_sources(ChurchDAWMobileDesignPreview PRIVATE
+            Source/Studio/StudioMovieWriter_windows.cpp)
+        target_link_libraries(ChurchDAWMobileDesignPreview PRIVATE
+            mfplat mfreadwrite mfuuid ole32 bcrypt crypt32)
+    else()
+        target_sources(ChurchDAWMobileDesignPreview PRIVATE
+            Source/Studio/StudioMovieWriter_stub.cpp)
+    endif()
+    if(MSVC)
+        target_compile_options(ChurchDAWMobileDesignPreview PRIVATE /utf-8 /bigobj)
+        target_link_options(ChurchDAWMobileDesignPreview PRIVATE /STACK:33554432)
+    endif()
 endif()

@@ -704,7 +704,7 @@ private:
 
     bool isShortLandscape() const noexcept
     {
-       #if JUCE_ANDROID || JUCE_IOS
+       #if CHURCHDAW_MOBILE_SHELL
         const auto surface = surfaceBounds();
 
         if (surface.getWidth() < 700

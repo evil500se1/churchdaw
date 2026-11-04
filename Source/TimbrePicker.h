@@ -228,7 +228,7 @@ public:
     static juce::Rectangle<int> safeTouchBoundsFor (juce::Component& parent)
     {
         auto safe = parent.getLocalBounds();
-       #if JUCE_IOS || JUCE_ANDROID
+       #if CHURCHDAW_MOBILE_SHELL
         if (const auto* display = juce::Desktop::getInstance().getDisplays()
                                       .getDisplayForRect (parent.getScreenBounds()))
         {

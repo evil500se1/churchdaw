@@ -25,7 +25,7 @@ inline void cameraIcon(juce::Graphics& g,juce::Rectangle<float> r)
 
 // Share desktop menus, text fields and tooltips with the main workspace while
 // keeping Live Cam's camera/record controls and mobile touch presentation.
-#if JUCE_ANDROID || JUCE_IOS
+#if CHURCHDAW_MOBILE_SHELL
 using LiveCamBaseLookAndFeel = juce::LookAndFeel_V4;
 #else
 using LiveCamBaseLookAndFeel = NordLookAndFeel;

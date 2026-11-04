@@ -1,6 +1,6 @@
 #include "MainComponent.h"
 #include "Studio/StudioPanel.h"
-#if JUCE_IOS || JUCE_ANDROID
+#if CHURCHDAW_MOBILE_SHELL
 static constexpr bool churchstudioMobileHeader = true;
 #else
 static constexpr bool churchstudioMobileHeader = false;
@@ -1013,7 +1013,7 @@ MainComponent::MainComponent (
     {
         const bool aberto = liveButton.getToggleState();
 
-       #if ! JUCE_ANDROID && ! JUCE_IOS
+       #if ! CHURCHDAW_MOBILE_SHELL
         // No shell desktop da referencia, LIVE e uma pagina principal (com
         // MIXER / PERFORMANCE / SESSAO logo abaixo), nao o painel legado de
         // dez botoes que ocupava a faixa de programa. As cenas ja vivem na
@@ -1259,7 +1259,7 @@ MainComponent::MainComponent (
 
     // ---- cabecalho ----
     addAndMakeVisible (liveCamButton);
-   #if JUCE_IOS || JUCE_ANDROID
+   #if CHURCHDAW_MOBILE_SHELL
     liveCamButton.setButtonText ("ChurchCam");
    #endif
     liveCamButton.setComponentID ("navLiveCam");
@@ -1559,13 +1559,13 @@ MainComponent::MainComponent (
     // vira um indicador de confianca: verde "Salvo" = autosave ligado, seu setup
     // esta guardado. Clicar forca salvar tudo e pisca "Salvo!"
     // Guardado para poder VOLTAR ao verde depois de um "FALHOU" vermelho.
-   #if JUCE_ANDROID || JUCE_IOS
+   #if CHURCHDAW_MOBILE_SHELL
     corDoSalvoNormal = juce::Colour (0xff5fd08a).withAlpha (0.82f);
    #else
     corDoSalvoNormal = juce::Colour (0xff5fd08a);
    #endif
 
-   #if JUCE_ANDROID || JUCE_IOS
+   #if CHURCHDAW_MOBILE_SHELL
     saveButton.setButtonText ("Salvo");
     saveButton.setColour (juce::TextButton::buttonColourId, juce::Colours::transparentBlack);
     saveButton.setColour (juce::TextButton::textColourOffId, corDoSalvoNormal);
@@ -1579,7 +1579,7 @@ MainComponent::MainComponent (
    #endif
     if (midiMapPersistenceError.load (std::memory_order_acquire))
     {
-       #if JUCE_ANDROID || JUCE_IOS
+       #if CHURCHDAW_MOBILE_SHELL
         saveButton.setButtonText ("FALHOU");
        #else
         saveButton.setButtonText (
@@ -1668,7 +1668,7 @@ MainComponent::MainComponent (
         // timer must never turn a failed/recovery-blocked project green.
         midiMapPersistenceError.store (! tudoOk, std::memory_order_release);
 
-       #if JUCE_ANDROID || JUCE_IOS
+       #if CHURCHDAW_MOBILE_SHELL
         saveButton.setButtonText (tudoOk ? "Salvo!" : "FALHOU");
        #else
         saveButton.setButtonText (tudoOk ? juce::String::fromUTF8 ("\xe2\x9c\x93 Salvo!")
@@ -1732,7 +1732,7 @@ MainComponent::MainComponent (
                         std::memory_order_acquire))
                     return;
 
-               #if JUCE_ANDROID || JUCE_IOS
+               #if CHURCHDAW_MOBILE_SHELL
                 c->saveButton.setButtonText ("Salvo");
                #else
                 c->saveButton.setButtonText (juce::String::fromUTF8 ("\xe2\x9c\x93 Salvo"));
@@ -1778,7 +1778,7 @@ MainComponent::MainComponent (
     scanButton.setComponentID ("navPlugins");
     librariesButton.setComponentID ("navLibraries");
     audioSettingsButton.setComponentID ("headerNav");
-   #if JUCE_IOS || JUCE_ANDROID
+   #if CHURCHDAW_MOBILE_SHELL
     for (auto* button : std::initializer_list<juce::Button*> { &instrumentsButton, &liveButton, &mapButton, &saveButton, &padButton, &scanButton, &librariesButton, &liveCamButton })
         button->getProperties().set ("churchTouchNav", true);
    #endif
@@ -2204,7 +2204,7 @@ MainComponent::MainComponent (
             }
         }
 
-       #if ! JUCE_ANDROID && ! JUCE_IOS
+       #if ! CHURCHDAW_MOBILE_SHELL
         if (desktopReferenceLayout)
         {
             const auto mainPt = getLocalPoint (nullptr, screenPos);
@@ -2258,7 +2258,7 @@ MainComponent::MainComponent (
                                                  BinaryData::logo_round_pngSize);
    #endif
 
-   #if ! JUCE_ANDROID && ! JUCE_IOS
+   #if ! CHURCHDAW_MOBILE_SHELL
     // A arte oficial veio em JPG/PNG com fundo preto incorporado. Para a
     // sidebar atmosferica esse retangulo denunciava o arquivo. Criamos uma
     // copia com alpha derivado da luminosidade e preservamos vermelho/branco;
@@ -2480,7 +2480,7 @@ MainComponent::MainComponent (
     addChildComponent (dockTitle);
     addChildComponent (dockViewport);
     dockViewport.setViewedComponent (&dockHolder, false);
-   #if ! JUCE_ANDROID && ! JUCE_IOS
+   #if ! CHURCHDAW_MOBILE_SHELL
     dockViewport.setScrollBarThickness (8);
    #endif
     addChildComponent (dockFloatButton);
@@ -3691,7 +3691,7 @@ void MainComponent::resized()
     // ja mudava para a mesa movel, mas este conteiner tratava 600 dp como desktop
     // e lhe impunha o minimo de 1120x400: resultado, barras de rolagem nos dois
     // eixos e o master cortado. Os dois niveis agora tomam a mesma decisao.
-   #if JUCE_ANDROID || JUCE_IOS
+   #if CHURCHDAW_MOBILE_SHELL
     const bool compact = true;
 
     // JUCE permite desenhar atras das barras e recortes do sistema no mobile.
@@ -3729,7 +3729,7 @@ void MainComponent::resized()
     // O fundo continua full bleed, mas nenhum controle interativo entra em
     // notch, recorte, barra de status ou barra gestual. Aplicar apenas esquerda
     // e direita (como antes) ainda deixava o mixer sob a alca de gesto inferior.
-   #if JUCE_ANDROID || JUCE_IOS
+   #if CHURCHDAW_MOBILE_SHELL
     // Perfil horizontal baixo medido no TANK3. Mantemos todos os safe insets:
     // o topo de 24 dp faz parte da area protegida do aparelho, enquanto o
     // conteudo visual abaixo dele e compactado de verdade.
@@ -3757,7 +3757,7 @@ void MainComponent::resized()
     if (layoutContentBounds.getWidth() < 1 || layoutContentBounds.getHeight() < 1)
         layoutContentBounds = getLocalBounds();
 
-   #if ! JUCE_ANDROID && ! JUCE_IOS
+   #if ! CHURCHDAW_MOBILE_SHELL
     // A referencia desktop usa uma moldura de console completa: a marca e as
     // cenas vivem numa coluna fixa, enquanto header, mixer e rodape ocupam a
     // area principal. Em janelas menores voltamos ao layout responsivo atual.
@@ -3856,13 +3856,13 @@ void MainComponent::resized()
     // layout largo deixava a wordmark ocupar o espaco do chip MIDI.
     const int safeContentWidth = juce::jmax (1, layoutContentBounds.getWidth());
     const int safeContentHeight = juce::jmax (1, layoutContentBounds.getHeight());
-   #if JUCE_ANDROID || JUCE_IOS
+   #if CHURCHDAW_MOBILE_SHELL
     mobilePortraitLayout = safeContentWidth < safeContentHeight;
    #else
     mobilePortraitLayout = false;
    #endif
     const bool narrowPhone = compact && safeContentWidth <= 760;
-   #if JUCE_ANDROID || JUCE_IOS
+   #if CHURCHDAW_MOBILE_SHELL
     // Tablets em paisagem tem largura suficiente para marca e destinos por
     // extenso. Telefones em paisagem (>=680 dp livres) e tablets em paisagem
     // usam uma unica fileira de 52 dp para devolver +56 dp de altura a mesa;
@@ -3879,7 +3879,7 @@ void MainComponent::resized()
     narrowHeaderLayout = narrowPhone;
    #endif
 
-   #if JUCE_ANDROID || JUCE_IOS
+   #if CHURCHDAW_MOBILE_SHELL
     layoutHeaderHeight = mobileTwoRowHeader ? 108 : 52;
     // A FAIXA CRESCE PARA AS CENAS.
     //
@@ -3919,7 +3919,7 @@ void MainComponent::resized()
     compactHeaderLayout = compact;
 
     const int headerH = layoutHeaderHeight;
-   #if JUCE_ANDROID || JUCE_IOS
+   #if CHURCHDAW_MOBILE_SHELL
     compactProgramBand = false;
    #else
     // Com a mesa Church Live aberta, o visor grande repete o canal/timbre que
@@ -4076,7 +4076,7 @@ void MainComponent::resized()
         oled.setVisible (true);
     const int gap = compact ? 4 : 7;
 
-   #if JUCE_ANDROID || JUCE_IOS
+   #if CHURCHDAW_MOBILE_SHELL
     // Orcamento de largura do header mobile (800 dp, Church Live aberto):
     // 166 marca + 112 dispositivo + 474 acoes/gaps + 22 margens = 774.
     // Em 720 dp entra o ramo narrow (58 + 112 + 420 + 22 = 612).
@@ -4136,7 +4136,7 @@ void MainComponent::resized()
     audioSettingsButton.setVisible (! learning);
     librariesButton.setVisible (! learning);
     saveButton.setVisible (! learning);
-   #if JUCE_IOS || JUCE_ANDROID
+   #if CHURCHDAW_MOBILE_SHELL
     liveCamButton.setVisible (! learning);
    #endif
    #if JUCE_IOS
@@ -4149,7 +4149,7 @@ void MainComponent::resized()
     scanButton.setVisible (! learning);
    #endif
 
-   #if JUCE_ANDROID || JUCE_IOS
+   #if CHURCHDAW_MOBILE_SHELL
     if (mobileTwoRowHeader)
     {
         // Retrato/freeform: primeira linha conserva marca, dispositivos e o
@@ -4198,7 +4198,7 @@ void MainComponent::resized()
            #if JUCE_IOS
             actions.add (&scanButton);
            #endif
-           #if JUCE_IOS || JUCE_ANDROID
+           #if CHURCHDAW_MOBILE_SHELL
             actions.add (&liveCamButton);
            #endif
             actions.add (&librariesButton);
@@ -4225,7 +4225,7 @@ void MainComponent::resized()
     else
    #endif
     {
-       #if ! JUCE_ANDROID && ! JUCE_IOS
+       #if ! CHURCHDAW_MOBILE_SHELL
         // Desktop premium: quatro grupos com orcamentos independentes. A versao
         // anterior removia todos os botoes da direita com larguras fixas e so
         // depois entregava o que sobrasse aos cards de dispositivo; em 1280 px
@@ -4603,7 +4603,7 @@ void MainComponent::resized()
         }
         else if (dockedNative && compact)
         {
-           #if JUCE_ANDROID || JUCE_IOS
+           #if CHURCHDAW_MOBILE_SHELL
             if (mobileShortLandscapeLayout)
                 dockViewport.setViewPosition (0, 0);
 
@@ -4639,7 +4639,7 @@ void MainComponent::resized()
             // tem um piso de 520 dp. Isso atende portrait/freeform sem esmagar
             // componentes; em paisagem baixa a pagina rola, mantendo todos os
             // comandos acessiveis e nenhum mixer sob a barra gestual.
-           #if JUCE_ANDROID || JUCE_IOS
+           #if CHURCHDAW_MOBILE_SHELL
             dockedEditor->setSize (
                 compact ? area.getWidth() : juce::jmax (1120, area.getWidth()),
                 compact ? (mobileShortLandscapeLayout
@@ -4672,7 +4672,7 @@ void MainComponent::resized()
     // Audio/MIDI overlay follows the window and keeps the controls centered.
     if (audioPanel != nullptr)
     {
-       #if JUCE_IOS || JUCE_ANDROID
+       #if CHURCHDAW_MOBILE_SHELL
         audioPanel->setBounds (layoutContentBounds.isEmpty() ? getLocalBounds()
                                                              : layoutContentBounds);
        #else
@@ -4683,7 +4683,7 @@ void MainComponent::resized()
 
     if (librariesPanel != nullptr)
     {
-       #if JUCE_IOS || JUCE_ANDROID
+       #if CHURCHDAW_MOBILE_SHELL
         librariesPanel->setBounds (layoutContentBounds.isEmpty() ? getLocalBounds()
                                                                  : layoutContentBounds);
        #else
@@ -6193,7 +6193,7 @@ void MainComponent::dockNodeNow (juce::AudioProcessorGraph::NodeID nodeID)
         dockedNative = (dynamic_cast<TimbresProcessor*> (proc) != nullptr);
         dockTitle.setText (proc->getName(), juce::dontSendNotification);
 
-       #if ! JUCE_ANDROID && ! JUCE_IOS
+       #if ! CHURCHDAW_MOBILE_SHELL
         if (dockedNative && desktopReferenceLayout)
         {
             // O destaque do header acompanha a pagina realmente aberta. A
@@ -6248,7 +6248,7 @@ void MainComponent::undockEditor()
     dockFloatButton.setVisible (false);
     dockCloseButton.setVisible (false);
 
-   #if ! JUCE_ANDROID && ! JUCE_IOS
+   #if ! CHURCHDAW_MOBILE_SHELL
     if (wasNative && desktopReferenceLayout)
         liveButton.setToggleState (false, juce::dontSendNotification);
    #endif
@@ -12548,7 +12548,7 @@ void MainComponent::setMidiLearningFromPage (bool enabled)
 
 void MainComponent::beginQuickMidiMapping()
 {
-   #if JUCE_ANDROID || JUCE_IOS
+   #if CHURCHDAW_MOBILE_SHELL
     // A tela compacta ja usa o fluxo direto historico; a central desktop e a
     // unica origem deste comando.
     return;
@@ -16771,7 +16771,7 @@ bool MainComponent::reconcileAudioInputPolicy()
 struct AudioSettingsHolder : public juce::Component,
                              private juce::Timer
 {
-   #if JUCE_ANDROID || JUCE_IOS
+   #if CHURCHDAW_MOBILE_SHELL
     static constexpr int margin = 0, headerH = 64, footerPad = 14;
    #else
     static constexpr int margin = 12, headerH = 82;
@@ -16790,7 +16790,7 @@ struct AudioSettingsHolder : public juce::Component,
         brandIcon = juce::ImageCache::getFromMemory (BinaryData::logo_round_png,
                                                      BinaryData::logo_round_pngSize);
 
-       #if JUCE_ANDROID || JUCE_IOS
+       #if CHURCHDAW_MOBILE_SHELL
         selector.setItemHeight (44);
         selectorViewport.setViewedComponent (&selector, false);
         selectorViewport.setScrollBarsShown (true, false);
@@ -16841,7 +16841,7 @@ struct AudioSettingsHolder : public juce::Component,
         // No Android/iOS o motor abre com ZERO entradas: o app e instrumento,
         // nao gravador, e por isso nao pede acesso ao microfone. Mostrar ali um
         // toggle que nunca poderia funcionar era uma promessa falsa.
-       #if JUCE_ANDROID || JUCE_IOS
+       #if CHURCHDAW_MOBILE_SHELL
         audioInputNote.setText (juce::String::fromUTF8 (
                                     "\xe2\x9c\x93 Sem microfone \xc2\xb7 s\xc3\xb3 instrumento"),
                                 juce::dontSendNotification);
@@ -16872,7 +16872,7 @@ struct AudioSettingsHolder : public juce::Component,
         // pra mesma forca. Fica aqui, e nao na regua master, porque e do mesmo
         // assunto da entrada MIDI logo acima -- calibragem do equipamento, se
         // ajusta uma vez por teclado.
-       #if JUCE_ANDROID || JUCE_IOS
+       #if CHURCHDAW_MOBILE_SHELL
         velLabel.setText (juce::String::fromUTF8 ("Resposta do teclado"),
                           juce::dontSendNotification);
         velLabel.setJustificationType (juce::Justification::centredLeft);
@@ -16908,7 +16908,7 @@ struct AudioSettingsHolder : public juce::Component,
             "de martelo). Pesada = exige mais for\xc3\xa7""a (teclado leve que manda "
             "velocity alta em qualquer toque). Fixa = ignora a din\xc3\xa2mica, bom "
             "para \xc3\xb3rg\xc3\xa3o e pad."));
-       #if JUCE_ANDROID || JUCE_IOS
+       #if CHURCHDAW_MOBILE_SHELL
         velCombo.setColour (juce::ComboBox::backgroundColourId, NordLookAndFeel::bgControl());
         velCombo.setColour (juce::ComboBox::outlineColourId, NordLookAndFeel::borderDefault());
         velCombo.setColour (juce::ComboBox::textColourId, NordLookAndFeel::txtPrimary());
@@ -16919,7 +16919,7 @@ struct AudioSettingsHolder : public juce::Component,
         // fecha o card (o destrutor salva a config)
         closeBtn.setComponentID ("timbrePickerClose");
         closeBtn.setButtonText (juce::String::fromUTF8 ("\xc3\x97"));   // ×
-       #if JUCE_ANDROID || JUCE_IOS
+       #if CHURCHDAW_MOBILE_SHELL
         closeBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff2a3038));
         closeBtn.setColour (juce::TextButton::textColourOffId, NordLookAndFeel::txtPrimary());
        #else
@@ -16942,7 +16942,7 @@ struct AudioSettingsHolder : public juce::Component,
 
         // recupera o driver de "pipocos" SEM desplugar o cabo (e sem travar o app).
         // No Android o texto deixa claro o caso USB class-compliant.
-       #if JUCE_ANDROID
+       #if JUCE_ANDROID || CHURCHDAW_MOBILE_UI_PREVIEW
         const auto restartLabel = juce::String::fromUTF8 ("Recuperar USB");
        #else
         const auto restartLabel = juce::String::fromUTF8 (
@@ -16992,7 +16992,7 @@ struct AudioSettingsHolder : public juce::Component,
         };
         addAndMakeVisible (restartBtn);
 
-       #if JUCE_ANDROID || JUCE_IOS
+       #if CHURCHDAW_MOBILE_SHELL
         // MIDI BLE: permissoes + atalho para Ajustes de Bluetooth (pareamento).
         bleMidiBtn.setButtonText (juce::String::fromUTF8 ("MIDI Bluetooth"));
         bleMidiBtn.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff252a32));
@@ -17009,7 +17009,7 @@ struct AudioSettingsHolder : public juce::Component,
                 if (auto* mc2 = owner.getComponent())
                     mc2->refreshMidiInputs();
             }
-           #else
+           #elif JUCE_ANDROID
             // Manter LocalRef vivo: getMainActivity().get() em temporário
             // invalida o jobject e causa SIGSEGV em openBluetoothSettings.
             auto launch = [safeOwner = owner]
@@ -17070,7 +17070,7 @@ struct AudioSettingsHolder : public juce::Component,
         addAndMakeVisible (bleMidiBtn);
        #endif
 
-       #if JUCE_ANDROID || JUCE_IOS
+       #if CHURCHDAW_MOBILE_SHELL
         // O tamanho final vem de showAudioSettings(), usando a janela real.
         setSize (360, 640);
        #else
@@ -17093,7 +17093,7 @@ struct AudioSettingsHolder : public juce::Component,
 
     void timerCallback() override
     {
-       #if ! JUCE_ANDROID && ! JUCE_IOS
+       #if ! CHURCHDAW_MOBILE_SHELL
         // Snapshot SOMENTE LEITURA do estado de audio enquanto o painel esta
         // aberto (a cada 700 ms). Quando o processo morre ao trocar de driver
         // (ASIO4ALL), a ultima linha do log mostra o que estava selecionado ANTES
@@ -17126,7 +17126,7 @@ struct AudioSettingsHolder : public juce::Component,
     // pior caso volta o visual padrao: nada quebra.
     static void restyleSelector (juce::Component& parent)
     {
-       #if JUCE_ANDROID || JUCE_IOS
+       #if CHURCHDAW_MOBILE_SHELL
         const float labelPt = 12.5f;
         const juce::uint32 comboBg = 0xff22272f;
        #else
@@ -17194,7 +17194,7 @@ struct AudioSettingsHolder : public juce::Component,
     juce::Rectangle<int> contentColumn() const
     {
         auto full = getLocalBounds();
-       #if JUCE_ANDROID || JUCE_IOS
+       #if CHURCHDAW_MOBILE_SHELL
         const bool shortMobile = full.getHeight() < 480 && full.getWidth() >= 540;
         const int maxW = juce::jmin (shortMobile ? 820 : 680,
                                      juce::jmax (320, full.getWidth() - (shortMobile ? 24 : 48)));
@@ -17209,7 +17209,7 @@ struct AudioSettingsHolder : public juce::Component,
 
     void paint (juce::Graphics& g) override
     {
-       #if JUCE_ANDROID || JUCE_IOS
+       #if CHURCHDAW_MOBILE_SHELL
         // Scrim escuro sobre o mixer + card central premium.
         g.setColour (juce::Colours::black.withAlpha (0.72f));
         g.fillRect (getLocalBounds());
@@ -17347,7 +17347,7 @@ struct AudioSettingsHolder : public juce::Component,
 
     void resized() override
     {
-       #if JUCE_ANDROID || JUCE_IOS
+       #if CHURCHDAW_MOBILE_SHELL
         auto col = contentColumn();
         const bool shortMobile = col.getHeight() < 480 && col.getWidth() >= 540;
         const int mobileHeadH = shortMobile ? 52 : headerH;
@@ -17492,7 +17492,7 @@ struct AudioSettingsHolder : public juce::Component,
 
     void mouseDrag (const juce::MouseEvent& e) override
     {
-       #if JUCE_ANDROID || JUCE_IOS
+       #if CHURCHDAW_MOBILE_SHELL
         juce::ignoreUnused (e);
        #else
         if (dragging)
@@ -17505,13 +17505,13 @@ struct AudioSettingsHolder : public juce::Component,
     juce::Component::SafePointer<MainComponent> owner;
     GuardedAudioDeviceSelector selector;
     juce::Viewport selectorViewport;
-   #if JUCE_ANDROID || JUCE_IOS
+   #if CHURCHDAW_MOBILE_SHELL
     juce::Label sectionDevice, sectionMidi, statusChip;
     juce::Rectangle<int> footerBand;
    #endif
      juce::TextButton restartBtn, closeBtn;
      juce::ToggleButton launchkeyToggle;
-   #if JUCE_ANDROID || JUCE_IOS
+   #if CHURCHDAW_MOBILE_SHELL
     juce::TextButton bleMidiBtn;
    #endif
     juce::Label velLabel, audioInputNote;
@@ -18504,7 +18504,7 @@ void MainComponent::showLibraries()
     };
 
     addAndMakeVisible (panel);
-   #if JUCE_IOS || JUCE_ANDROID
+   #if CHURCHDAW_MOBILE_SHELL
     panel->setBounds (layoutContentBounds.isEmpty() ? getLocalBounds()
                                                     : layoutContentBounds);
    #else
@@ -21396,7 +21396,7 @@ void MainComponent::showDesktopWorkspace (DesktopWorkspace workspace)
 
 void MainComponent::openSidebarTimbreCategory (int categoryIndex)
 {
-   #if JUCE_ANDROID || JUCE_IOS
+   #if CHURCHDAW_MOBILE_SHELL
     juce::ignoreUnused (categoryIndex);
    #else
     int layer = 0;
@@ -21692,7 +21692,7 @@ void MainComponent::showPadWindow()
     {
         padButton.setToggleState (padEditorVisible, juce::dontSendNotification);
 
-       #if JUCE_ANDROID || JUCE_IOS
+       #if CHURCHDAW_MOBILE_SHELL
         const auto help = juce::String::fromUTF8 (
             "Pad Cont\xc3\xadnuo n\xc3\xa3o instalado.\n\n"
             "Instale ou repare o pack Pad Cont\xc3\xadnuo em Bibliotecas "

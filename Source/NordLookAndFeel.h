@@ -1,6 +1,7 @@
 #pragma once
 
 #include <juce_gui_basics/juce_gui_basics.h>
+#include "MobileShellConfig.h"
 #include <cmath>
 
 //==============================================================================
@@ -63,7 +64,7 @@ public:
         if (card.isEmpty())
             return;
 
-       #if ! JUCE_ANDROID && ! JUCE_IOS
+       #if ! CHURCHDAW_MOBILE_SHELL
         // Matte surfaces keep the hierarchy in spacing and luminance rather
         // than stacking shiny frames around every section of the console.
         const float corner = integratedStrip ? 9.0f : radius;
@@ -340,7 +341,7 @@ public:
         setColour (juce::ResizableWindow::backgroundColourId, background());
         setColour (juce::DocumentWindow::textColourId, textColour());
 
-       #if ! JUCE_ANDROID && ! JUCE_IOS
+       #if ! CHURCHDAW_MOBILE_SHELL
         // Detached menus and dialogs use the application's shared look and feel,
         // but have no shell ancestor. Keep their palette in this same layer.
         // A translucent window flag allows genuinely rounded menu corners.
@@ -520,7 +521,7 @@ public:
     // existing measurements and rendering, including dialogs outside the shell.
     static bool usesDesktopShell (const juce::Component& component)
     {
-       #if JUCE_ANDROID || JUCE_IOS
+       #if CHURCHDAW_MOBILE_SHELL
         juce::ignoreUnused (component);
         return false;
        #else
@@ -536,7 +537,7 @@ public:
     // have no MainComponent ancestor. An explicit compact-shell opt-out wins.
     static bool usesDesktopControls (const juce::Component& component)
     {
-       #if JUCE_ANDROID || JUCE_IOS
+       #if CHURCHDAW_MOBILE_SHELL
         juce::ignoreUnused (component);
         return false;
        #else
@@ -1159,7 +1160,7 @@ public:
         // + bolinha, a unica peca grande do card do master sem o vocabulario da
         // tela. O ID "masterFader" liga o mesmo desenho ja provado no celular,
         // sem tocar em NENHUM outro slider horizontal do app.
-       #if JUCE_ANDROID || JUCE_IOS
+       #if CHURCHDAW_MOBILE_SHELL
         const bool consoleHorizontal = true;
        #else
         const bool consoleHorizontal = slider.getComponentID() == "masterFader";
@@ -1292,7 +1293,7 @@ public:
             g.setColour (slider.isEnabled() ? nordRed() : txtDisabled());
             g.fillRoundedRectangle (track.withTop (level), trackW * 0.5f);
         }
-       #if JUCE_ANDROID || JUCE_IOS
+       #if CHURCHDAW_MOBILE_SHELL
         const float desiredWidth = juce::jlimit (28.0f, 46.0f, width * 0.88f);
         const float desiredHeight = 26.0f;
        #else
@@ -1365,7 +1366,7 @@ public:
                               juce::Justification::centredLeft, 1, 0.88f);
             return;
         }
-       #if JUCE_ANDROID || JUCE_IOS
+       #if CHURCHDAW_MOBILE_SHELL
         const float h = juce::jlimit (20.0f, 26.0f, bounds.getHeight() - 6.0f);
        #else
         const float h = juce::jlimit (14.0f, 20.0f, bounds.getHeight() - 2.0f);
@@ -1394,7 +1395,7 @@ public:
     // mais tempo escolhendo timbre — parecia de outro programa.
     void drawPopupMenuBackground (juce::Graphics& g, int width, int height) override
     {
-       #if JUCE_ANDROID || JUCE_IOS
+       #if CHURCHDAW_MOBILE_SHELL
         g.fillAll (bgCardHi());
         g.setColour (borderDefault());
         g.drawRoundedRectangle (juce::Rectangle<float> (0.5f, 0.5f, width - 1.0f, height - 1.0f), 8.0f, 1.0f);
@@ -1415,7 +1416,7 @@ public:
     // rotulo curto em caixa alta e um filete que corre ate a borda.
     juce::Font getPopupMenuFont() override
     {
-       #if JUCE_ANDROID || JUCE_IOS
+       #if CHURCHDAW_MOBILE_SHELL
         return juce::Font (juce::FontOptions (14.0f));
        #else
         return juce::Font (juce::FontOptions (13.5f));
@@ -1429,12 +1430,12 @@ public:
     {
        #if JUCE_IOS
         height = separator ? 10 : juce::jmax (44, standardHeight);
-       #elif JUCE_ANDROID
+       #elif JUCE_ANDROID || CHURCHDAW_MOBILE_UI_PREVIEW
         height = separator ? 10 : juce::jmax (32, standardHeight);
        #else
         height = separator ? 9 : juce::jmax (34, standardHeight);
        #endif
-       #if JUCE_ANDROID || JUCE_IOS
+       #if CHURCHDAW_MOBILE_SHELL
         constexpr int horizontalSpace = 72;
        #else
         // Check, optional icon and submenu arrow may all be present together.
@@ -1448,7 +1449,7 @@ public:
                             bool submenu, const juce::String& text, const juce::String& shortcut,
                             const juce::Drawable* icon, const juce::Colour* customText) override
     {
-       #if ! JUCE_ANDROID && ! JUCE_IOS
+       #if ! CHURCHDAW_MOBILE_SHELL
         auto row = area.reduced (2, 1);
         if (row.isEmpty()) return;
         if (separator)
@@ -1562,7 +1563,7 @@ public:
     void drawPopupMenuSectionHeader (juce::Graphics& g, const juce::Rectangle<int>& area,
                                      const juce::String& sectionName) override
     {
-       #if ! JUCE_ANDROID && ! JUCE_IOS
+       #if ! CHURCHDAW_MOBILE_SHELL
         g.setColour (findColour (juce::PopupMenu::headerTextColourId));
         g.setFont (juce::Font (juce::FontOptions (11.0f, juce::Font::bold)));
         g.drawText (sectionName, area.reduced (12, 0).withTrimmedTop (4),
@@ -1590,7 +1591,7 @@ public:
                                                         int& width, int& height,
                                                         const juce::PopupMenu::Options& options) override
     {
-       #if JUCE_ANDROID || JUCE_IOS
+       #if CHURCHDAW_MOBILE_SHELL
         juce::LookAndFeel_V4::getIdealPopupMenuSectionHeaderSizeWithOptions (text, standardHeight, width, height, options);
        #else
         juce::ignoreUnused (options);
@@ -1601,7 +1602,7 @@ public:
 
     void drawPopupMenuUpDownArrow (juce::Graphics& g, int width, int height, bool up) override
     {
-       #if JUCE_ANDROID || JUCE_IOS
+       #if CHURCHDAW_MOBILE_SHELL
         juce::LookAndFeel_V4::drawPopupMenuUpDownArrow (g, width, height, up);
        #else
         const float cx = width * 0.5f, cy = height * 0.5f;
@@ -1859,7 +1860,7 @@ public:
 
         // As tres acoes no rodape de cada strip tem ~32 px. A fonte padrao
         // desktop era grande demais e transformava LOOP/ORGAO em reticencias.
-       #if ! JUCE_ANDROID && ! JUCE_IOS
+       #if ! CHURCHDAW_MOBILE_SHELL
         if (button.getWidth() < 44)
             height = juce::jmin (height, 9.5f);
         else if (button.getWidth() < 64)
@@ -1884,7 +1885,7 @@ public:
 
         // Presets e slots de FX precisam caber completos na mesa de oito
         // canais. No editor focado, onde ha largura, a fonte volta ao teto.
-       #if ! JUCE_ANDROID && ! JUCE_IOS
+       #if ! CHURCHDAW_MOBILE_SHELL
         if (box.getWidth() < 96)
             height = juce::jmin (height, 10.5f);
         else if (box.getWidth() < 126)
@@ -2030,7 +2031,7 @@ public:
     juce::Rectangle<int> getTooltipBounds (const juce::String& text, juce::Point<int> screenPos,
                                           juce::Rectangle<int> parentArea) override
     {
-       #if JUCE_ANDROID || JUCE_IOS
+       #if CHURCHDAW_MOBILE_SHELL
         return juce::LookAndFeel_V4::getTooltipBounds (text, screenPos, parentArea);
        #else
         const auto layout = desktopTooltipLayout (text, (float) juce::jmin (340, juce::jmax (1, parentArea.getWidth() - 24)));
@@ -2044,7 +2045,7 @@ public:
 
     void drawTooltip (juce::Graphics& g, const juce::String& text, int width, int height) override
     {
-       #if JUCE_ANDROID || JUCE_IOS
+       #if CHURCHDAW_MOBILE_SHELL
         juce::LookAndFeel_V4::drawTooltip (g, text, width, height);
        #else
         const auto bounds = juce::Rectangle<float> ((float) width, (float) height);

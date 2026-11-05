@@ -714,6 +714,24 @@ public:
             path.startNewSubPath (point (0.78f, 0.15f));
             path.lineTo (point (0.95f, 0.84f));
         }
+        else if (id == "navClear")
+        {
+            // Lixeira: tampa com alca, corpo afunilado e duas ranhuras.
+            path.startNewSubPath (point (0.14f, 0.24f));
+            path.lineTo (point (0.86f, 0.24f));
+            path.startNewSubPath (point (0.38f, 0.24f));
+            path.lineTo (point (0.38f, 0.12f));
+            path.lineTo (point (0.62f, 0.12f));
+            path.lineTo (point (0.62f, 0.24f));
+            path.startNewSubPath (point (0.24f, 0.24f));
+            path.lineTo (point (0.29f, 0.88f));
+            path.lineTo (point (0.71f, 0.88f));
+            path.lineTo (point (0.76f, 0.24f));
+            path.startNewSubPath (point (0.42f, 0.42f));
+            path.lineTo (point (0.42f, 0.7f));
+            path.startNewSubPath (point (0.58f, 0.42f));
+            path.lineTo (point (0.58f, 0.7f));
+        }
         else if (id == "headerNav" || id == "navAudio")
         {
             for (int lane = 0; lane < 3; ++lane)

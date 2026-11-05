@@ -489,7 +489,8 @@ public:
             const float y0 = area.getCentreY() - blockH * 0.5f;
             const auto icon = juce::Rectangle<float> (area.getCentreX() - iconS * 0.5f, y0, iconS, iconS);
             g.setColour ((on ? accentSoft() : textSec()).withMultipliedAlpha (alpha));
-            NordLookAndFeel::drawDesktopNavigationIcon (g, b.getComponentID(), icon, false);
+            NordLookAndFeel::drawDesktopNavigationIcon (
+                g, b.getProperties().getWithDefault ("churchIcon", b.getComponentID()).toString(), icon, false);
             g.setColour ((on ? juce::Colours::white : textSec()).withMultipliedAlpha (alpha));
             g.setFont (font (Face::barlowSemi, labelPx));
             g.drawFittedText (label, juce::Rectangle<float> (area.getX(), icon.getBottom() + m.fpx (4, 1.0f),

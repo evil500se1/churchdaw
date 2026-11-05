@@ -394,6 +394,7 @@ if(CHURCHDAW_BUILD_AUDIO_TESTS AND NOT ANDROID AND NOT IOS)
 
     target_link_libraries(ChurchDAWMixerStripCollapseTests
         PRIVATE
+            ChurchAssets   # NordLookAndFeel.h inclui ChurchLiveFonts.h (BinaryData) com o visual Church Live ligado
             juce::juce_dsp
             juce::juce_audio_basics
             juce::juce_audio_processors

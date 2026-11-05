@@ -18489,6 +18489,8 @@ void MainComponent::layoutDesktopRail (bool learning)
         button->getProperties().set ("churchSkin", "rail");
         button->getProperties().set ("churchU", (double) m.u);
         button->getProperties().set ("churchActiveFromToggle", true);
+        if (button == &clearMapButton)   // nao tem ID "nav*": esse prefixo muda o desenho fora do trilho
+            button->getProperties().set ("churchIcon", "navClear");
         button->setLookAndFeel (&ChurchLiveSkin::lookAndFeel());
         button->setBounds (area.removeFromTop (itemH));
         area.removeFromTop (gap);
@@ -18506,6 +18508,7 @@ void MainComponent::clearDesktopRail()
         button->getProperties().remove ("churchSkin");
         button->getProperties().remove ("churchU");
         button->getProperties().remove ("churchActiveFromToggle");
+        button->getProperties().remove ("churchIcon");
         button->setLookAndFeel (nullptr);
     }
 }

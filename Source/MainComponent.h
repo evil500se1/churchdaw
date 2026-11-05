@@ -29,6 +29,7 @@
 #include "OledDisplay.h"
 #include "LiveScenes.h"
 #include "LiveScenePanel.h"
+#include "ScenesPage.h"
 #include "ChurchDAWRemoteServer.h"
 #include "ChurchDAWPlaybackEngine.h"
 #include "FinalOutputGuard.h"
@@ -405,6 +406,9 @@ private:
     std::unique_ptr<PadPanel> padPanel;     // card embutido (nao e janela separada)
     std::unique_ptr<PadEditorPanel> padEditorPanel; // pagina premium do sintetizador de pads
     std::unique_ptr<PerformanceSessionPanel> performanceSessionPanel;
+    // Pagina CENAS do desktop (botao do trilho que substituiu "Instrumentos").
+    std::unique_ptr<ScenesPage> scenesPage;
+    bool scenesPageVisible = false;
     bool padEditorVisible = false;
     // ultima posicao do card do Pad setada por codigo: se a atual difere, o
     // usuario arrastou e o resized() nao pode re-centralizar
@@ -1158,6 +1162,8 @@ private:
     void showPadEditor (int sourceChannel = -1,
                         const juce::String& sourceName = {});
     void closePadEditor();
+    void showScenesPage();
+    void closeScenesPage();
     void showDesktopWorkspace (DesktopWorkspace workspace);
     void refreshPerformanceSessionPanel();
     // true = o ARQUIVO foi gravado. Plugin que se recusou a serializar nao

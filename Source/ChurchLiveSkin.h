@@ -334,7 +334,7 @@ public:
                 g.drawRoundedRectangle (bounds.reduced (0.5f), radius, 1.0f);
             }
         }
-        else if (r == "panic" || r == "edit")
+        else if (r == "panic" || r == "edit" || r == "primary")
         {
             const float radius = m.fpx (r == "panic" ? 18.0f : 16.0f, 8.0f);
             const auto top = r == "panic" ? juce::Colour (0xffe8384f) : juce::Colour (0xffe03048);
@@ -443,6 +443,14 @@ public:
                                                        juce::jmax (1.0f, bounds.getRight() - (x0 + iconS + gapW)), bounds.getHeight())
                                    .toNearestInt(),
                         juce::Justification::centredLeft, false);
+        }
+        else if (r == "primary")
+        {
+            // Acao principal da pagina (ex.: CARREGAR AGORA): fundo vermelho do
+            // "edit", texto centrado sem icone.
+            g.setFont (font (Face::barlowBold, m.fpx (19, 11.5f), 0.08f));
+            g.setColour (juce::Colours::white.withMultipliedAlpha (alpha));
+            g.drawFittedText (label, bounds.reduced (m.fpx (10, 4.0f), 0.0f).toNearestInt(), juce::Justification::centred, 1, 0.7f);
         }
         else if (r == "pill")
         {

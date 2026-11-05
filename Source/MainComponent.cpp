@@ -999,6 +999,33 @@ MainComponent::MainComponent (
     liveScenePanel.atualizar (cenas, cenaAtiva);
     addChildComponent (liveScenePanel);
 
+   #if ! CHURCHDAW_MOBILE_SHELL
+    // Pagina CENAS (desktop): mesmas operacoes do painel Live, numa lista de
+    // musicas com detalhes. Toda mudanca de cena chega a ela por aoAtualizar.
+    scenesPage = std::make_unique<ScenesPage>();
+    scenesPage->onCarregar = [this] (int i)
+    {
+        const auto r = aplicarCena (i);
+        liveScenePanel.atualizar (cenas, cenaAtiva);
+        return r;
+    };
+    scenesPage->onGravar = [this] (int i)
+    {
+        const auto r = capturarCena (i);
+        liveScenePanel.atualizar (cenas, cenaAtiva);
+        return r;
+    };
+    scenesPage->onDetalhes = [this] (int i, const ChurchDAWLive::Cena& nova) { atualizarMetadadosDaCena (i, nova); };
+    scenesPage->onApagar = [this] (int i) { apagarCena (i); };
+    liveScenePanel.aoAtualizar = [this] (const ChurchDAWLive::Cena* origem, int ativa)
+    {
+        if (scenesPage != nullptr)
+            scenesPage->atualizar (origem, ativa);
+    };
+    scenesPage->atualizar (cenas, cenaAtiva);
+    addChildComponent (*scenesPage);
+   #endif
+
     avisarSobreArquivosDeVersaoFutura();
 
     liveButton.setWantsKeyboardFocus (false);
@@ -1025,6 +1052,7 @@ MainComponent::MainComponent (
         if (desktopReferenceLayout)
         {
             liveScenePanel.setVisible (false);
+            closeScenesPage();
 
             if (mapButton.getToggleState() || midiLearnActive.load())
                 finishMidiLearn (true);
@@ -1750,6 +1778,14 @@ MainComponent::MainComponent (
     instrumentsButton.setButtonText (juce::String::fromUTF8 ("\xe2\x97\x89 Instrumentos"));   // ◉
     instrumentsButton.setColour (juce::TextButton::buttonColourId, juce::Colour (0xffc4112e));
     instrumentsButton.setColour (juce::TextButton::textColourOffId, juce::Colours::white);
+   #if ! CHURCHDAW_MOBILE_SHELL
+    // No desktop este botao virou CENAS: "Instrumentos" so voltava da tela cheia
+    // do Church Live para a cadeia e nao guardava nada. O membro conserva o nome
+    // porque o trilho, o layout e o mobile o compartilham.
+    instrumentsButton.setButtonText ("Cenas");
+    instrumentsButton.setTooltip (juce::String::fromUTF8 (u8"Cenas: guarde o som completo de cada música do culto"));
+    instrumentsButton.onClick = [this] { showScenesPage(); };
+   #else
     instrumentsButton.onClick = [this]
     {
         // Instrumentos e Mapear MIDI sao destinos exclusivos no shell desktop.
@@ -1771,8 +1807,13 @@ MainComponent::MainComponent (
         resized();
         repaint();
     };
+   #endif
 
+   #if ! CHURCHDAW_MOBILE_SHELL
+    instrumentsButton.setComponentID ("navScenes");
+   #else
     instrumentsButton.setComponentID ("navInstruments");
+   #endif
     liveButton.setComponentID ("navLive");
     mapButton.setComponentID ("navMidi");
     saveButton.setComponentID ("navSave");
@@ -3833,13 +3874,18 @@ void MainComponent::resized()
         // visiveis. O destaque segue a pagina que realmente esta na frente:
         // Mapear MIDI e PAD nao podem deixar Instrumentos parecendo ativo so
         // porque a cadeia continua montada por baixo.
+        // No desktop o botao do trilho e CENAS: so fica aceso com a pagina aberta.
+       #if ! CHURCHDAW_MOBILE_SHELL
+        const bool instrumentsActive = scenesPageVisible;
+       #else
         const bool instrumentsActive = ! churchFull
                                     && (! mapButton.getToggleState()
                                          || quickMidiMappingMode)
                                     && ! padEditorVisible;
+       #endif
         instrumentsButton.setVisible (true);
         instrumentsButton.setToggleState (instrumentsActive, juce::dontSendNotification);
-        liveButton.setToggleState (churchFull && ! padEditorVisible
+        liveButton.setToggleState (churchFull && ! padEditorVisible && ! scenesPageVisible
                                     && (! mapButton.getToggleState() || quickMidiMappingMode),
                                    juce::dontSendNotification);
         instrumentsButton.setColour (juce::TextButton::buttonColourId,
@@ -3849,7 +3895,11 @@ void MainComponent::resized()
                               NordLookAndFeel::bgControl());
         liveButton.setColour (juce::TextButton::buttonOnColourId,
                               NordLookAndFeel::nordRed());
+       #if ! CHURCHDAW_MOBILE_SHELL
+        instrumentsButton.setButtonText ("Cenas");
+       #else
         instrumentsButton.setButtonText ("Instrumentos");
+       #endif
         liveButton.setButtonText ("Live");
         const bool learnModeActive = mapButton.getToggleState() || midiLearnActive.load() || quickMidiMappingMode;
         mapButton.setButtonText (learnModeActive ? "Concluir MIDI" : "Mapear MIDI");
@@ -4223,9 +4273,13 @@ void MainComponent::resized()
     librariesButton.setButtonText (desktopReferenceLayout ? "Bibliotecas"
                                      : mobileShortLandscapeLayout ? "Biblioteca"
                                      : "Bibliotecas");
+   #if ! CHURCHDAW_MOBILE_SHELL
+    instrumentsButton.setButtonText ("Cenas");
+   #else
     instrumentsButton.setButtonText (desktopReferenceLayout ? "Instrumentos"
                                          : (narrowPhone || mobileShortLandscapeLayout) ? "Timbres"
                                          : "Instrumentos");
+   #endif
     liveButton.setButtonText (desktopReferenceLayout ? "Live" : "Live");
     mapButton.setButtonText (desktopReferenceLayout
                                      ? learning ? "Concluir MIDI"
@@ -4934,6 +4988,24 @@ void MainComponent::resized()
         performanceSessionPanel->setBounds ({});
         performanceSessionPanel->setVisible (false);
     }
+
+   #if ! CHURCHDAW_MOBILE_SHELL
+    if (scenesPage != nullptr)
+    {
+        // Mesma area do editor do Pad: tudo entre o cabecalho e o rodape.
+        scenesPage->getProperties().set (
+            "churchU", desktopRail ? (double) desktopRailBounds.getWidth() / 104.0
+                                   : (double) ChurchLiveSkin::metricsFor (getWidth(), getHeight()).u);
+        scenesPage->setBounds (layoutContentBounds.getX(), programBand.getY(),
+                               layoutContentBounds.getWidth(),
+                               juce::jmax (1, layoutContentBounds.getBottom() - programBand.getY()));
+        scenesPage->setVisible (scenesPageVisible);
+
+        if (scenesPageVisible)
+            scenesPage->toFront (false);
+    }
+   #endif
+
     auto editActions = programBand.reduced (18, 7).withTrimmedLeft (118);
     undoMixButton.setBounds (editActions.removeFromLeft (78)); editActions.removeFromLeft (5);
     redoMixButton.setBounds (editActions.removeFromLeft (74));
@@ -18173,6 +18245,12 @@ bool MainComponent::handleBackButton()
         return true;
     }
 
+    if (scenesPageVisible)
+    {
+        closeScenesPage();
+        return true;
+    }
+
     if (padEditorVisible)
     {
         closePadEditor();
@@ -21759,6 +21837,7 @@ void MainComponent::showPadEditor (int sourceChannel,
     if (desktopWorkspace != DesktopWorkspace::mixer)
         showDesktopWorkspace (DesktopWorkspace::mixer);
 
+    closeScenesPage();
     if (mapButton.getToggleState() || midiLearnActive.load())
         finishMidiLearn (true);
     if (liveButton.getToggleState())
@@ -21780,6 +21859,50 @@ void MainComponent::showPadEditor (int sourceChannel,
     padEditorPanel->toFront (false);
     if (quickMidiMappingMode)
         midiLearnPanel.toFront (false);
+    repaint();
+}
+
+void MainComponent::showScenesPage()
+{
+    if (scenesPage == nullptr)
+        return;
+
+    if (mapButton.getToggleState() || midiLearnActive.load())
+        finishMidiLearn (true);
+
+    if (padEditorVisible)
+        closePadEditor();
+
+    if (desktopWorkspace != DesktopWorkspace::mixer)
+        showDesktopWorkspace (DesktopWorkspace::mixer);
+
+    liveScenePanel.setVisible (false);
+    scenesPageVisible = true;
+    scenesPage->atualizar (cenas, cenaAtiva);
+    oled.setVisible (false);
+    resized();
+    scenesPage->toFront (false);
+
+    // Audio e Bibliotecas abrem POR CIMA do palco: a pagina nao pode cobri-los.
+    for (auto* overlay : { audioPanel.get(), aboutPanel.get(), librariesPanel.get() })
+        if (overlay != nullptr && overlay->isVisible())
+            overlay->toFront (false);
+
+    repaint();
+}
+
+void MainComponent::closeScenesPage()
+{
+    if (! scenesPageVisible)
+        return;
+
+    scenesPageVisible = false;
+
+    if (scenesPage != nullptr)
+        scenesPage->setVisible (false);
+
+    oled.setVisible (! mapButton.getToggleState() && ! liveScenePanel.isVisible());
+    resized();
     repaint();
 }
 
@@ -21981,6 +22104,7 @@ void MainComponent::startMidiLearn()
         showDesktopWorkspace (DesktopWorkspace::mixer);
     if (padEditorVisible)
         closePadEditor();
+    closeScenesPage();
     liveModeBeforeMidiLearn = liveButton.getToggleState();
     quickMidiMappingMode = false;
     resetMidiLearnTargetUnderCallbackBarrier (true);

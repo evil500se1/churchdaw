@@ -231,8 +231,15 @@ public:
     std::function<void (int, juce::String)> onRenomearCena;
     std::function<void (int)> onApagarCena;
 
+    // Toda mudanca de cena passa por atualizar(); a pagina Cenas do desktop
+    // pega carona aqui para nunca mostrar uma lista desatualizada.
+    std::function<void (const ChurchDAWLive::Cena*, int)> aoAtualizar;
+
     void atualizar (const ChurchDAWLive::Cena* cenas, int ativa)
     {
+        if (aoAtualizar != nullptr)
+            aoAtualizar (cenas, ativa);
+
         const int selecionadaAntes = interacao.selecionada;
         ativaAtual = ativa;
 

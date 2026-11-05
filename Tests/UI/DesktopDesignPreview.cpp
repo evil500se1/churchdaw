@@ -316,13 +316,15 @@ public:
         if (surface.isNotEmpty()
             && surface != "audio" && surface != "plugins" && surface != "libraries"
             && surface != "midi" && surface != "pad" && surface != "picker"
-            && surface != "master-menu")
+            && surface != "master-menu" && surface != "scenes")
         {
-            std::cerr << "Unknown --surface; use audio, plugins, libraries, midi, pad, picker or master-menu.\n";
+            std::cerr << "Unknown --surface; use audio, plugins, libraries, midi, pad, picker, scenes or master-menu.\n";
             setApplicationReturnValue (2);
             quit();
             return;
         }
+        if (surface == "scenes")
+            writeDemoScenes();
         if (tokens.contains ("--test-shell"))
         {
             const int result = runDesktopShellTests();
@@ -392,12 +394,84 @@ public:
     {
         stopTimer();
         window.reset();
+        if (surface == "scenes")
+        {
+            // o fixture volta a nao ter cenas
+            demoScenesFile().deleteFile();
+            demoScenesFile().getSiblingFile ("live-scene-pages").deleteRecursively();
+        }
         juce::LookAndFeel::setDefaultLookAndFeel (nullptr);
         if (juce::Logger::getCurrentLogger() == &logger)
             juce::Logger::setCurrentLogger (nullptr);
     }
 
 private:
+    static ScenesPage* findScenesPage (juce::Component& root)
+    {
+        for (auto* child : root.getChildren())
+        {
+            if (auto* page = dynamic_cast<ScenesPage*> (child))
+                return page;
+            if (auto* found = findScenesPage (*child))
+                return found;
+        }
+        return nullptr;
+    }
+
+    static juce::File demoScenesFile()
+    {
+        return juce::File (juce::SystemStats::getEnvironmentVariable ("CHURCHDAW_QA_SETTINGS_DIR", {}).trim())
+                   .getChildFile ("live-scenes.xml");
+    }
+
+    // Cenas de exemplo SO para a captura --surface scenes (o fixture nao tem cenas).
+    static void writeDemoScenes()
+    {
+        struct Canal { const char* timbre; float volume; };
+        struct Demo
+        {
+            const char* musica; const char* secao; const char* tom; double bpm; int pad;
+            std::vector<Canal> canais;
+        };
+        const std::vector<Demo> demos {
+            { "Aleluia", "Refr\xc3\xa3o", "G", 72.0, 7, { { "Pearl Upright", 0.667f }, { "Pad2", 0.60f }, { "Prophetic Ambience", 0.45f } } },
+            { "Santo", "Verso", "D", 68.0, 2, { { "Pearl Upright", 0.667f }, { "Pad Lp", 0.52f } } },
+            { "Grande \xc3\xa9 o Senhor", "Intro", "A", 84.0, 9, { { "Pearl Upright", 0.60f }, { "Pad2", 0.55f }, { "Pad Lp", 0.40f }, { "Prophetic Ambience", 0.35f }, { "String Ensemble", 0.50f } } },
+            { "Ao Deus que Adoro", "Cena", "E", 76.0, 4, { { "Pearl Upright", 0.667f } } },
+            { "Tua Gra\xc3\xa7\x61 me Basta", "Ponte", "C", 64.0, -1, { { "Pearl Upright", 0.667f }, { "Pad2", 0.50f } } },
+        };
+
+        juce::XmlElement xml ("LIVESCENES");
+        xml.setAttribute ("schema", 3);
+        xml.setAttribute ("active", 0);
+
+        for (int i = 0; i < ChurchDAWLive::numeroDeCenas; ++i)
+        {
+            ChurchDAWLive::Cena cena;
+            if (i < (int) demos.size())
+            {
+                const auto& d = demos[(size_t) i];
+                cena.preenchida = true;
+                cena.musica = juce::String::fromUTF8 (d.musica);
+                cena.secao = juce::String::fromUTF8 (d.secao);
+                cena.tonalidade = d.tom;
+                cena.bpm = d.bpm;
+                cena.padTom = d.pad;
+                cena.gravadaEm = "2026-11-05T10:00:00";
+                for (size_t c = 0; c < d.canais.size(); ++c)
+                {
+                    cena.canais[c].rotuloDoTimbre = d.canais[c].timbre;
+                    cena.canais[c].volume = d.canais[c].volume;
+                }
+            }
+            ChurchDAWLive::escreverCena (xml, cena, i);
+        }
+
+        ChurchDAWLive::Setlist setlist;
+        ChurchDAWLive::escreverSetlist (xml, setlist);
+        (void) xml.writeTo (demoScenesFile());
+    }
+
     struct StdoutLogger final : juce::Logger
     {
         void logMessage (const juce::String& message) override
@@ -542,11 +616,26 @@ private:
                              : surface == "plugins" ? juce::String ("Plugins")
                              : surface == "libraries" ? juce::String ("Bibliotecas")
                              : surface == "midi" ? juce::String ("Mapear MIDI")
+                             : surface == "scenes" ? juce::String ("Cenas")
                              : surface == "pad" ? juce::String ("Pad") : juce::String ("Adicionar");
             if (auto* button = findVisibleButton (window->holder.inner, label))
             {
                 button->triggerClick();
                 surfaceOpened = true;
+                if (surface == "scenes")
+                    if (auto* page = findScenesPage (window->holder.inner))
+                    {
+                        const auto args = juce::JUCEApplication::getCommandLineParameters();
+                        // --load-scene=N passa pelo MESMO callback do toque na lista (motor real).
+                        if (optionValue (args, "--load-scene").isNotEmpty())
+                        {
+                            const int n = optionValue (args, "--load-scene").getIntValue();
+                            const auto r = page->onCarregar != nullptr ? page->onCarregar (n) : ChurchDAWLive::Resultado::indisponivel;
+                            std::cout << "DESIGN_PREVIEW: load-scene " << n << " resultado=" << (int) r << '\n';
+                        }
+                        if (optionValue (args, "--select-scene").isNotEmpty())
+                            page->selecionar (optionValue (args, "--select-scene").getIntValue());
+                    }
                 // These use the same callbacks as the UI, with the ordinary
                 // async open/resize allowed to finish before the snapshot.
                 startTimer (700);

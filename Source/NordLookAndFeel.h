@@ -634,6 +634,18 @@ public:
                 path.lineTo (point ((float) key * 0.25f, 0.88f));
             }
         }
+        else if (id == "navScenes")
+        {
+            // Setlist: tres linhas, cada uma com o seu marcador.
+            for (int row = 0; row < 3; ++row)
+            {
+                const float fy = 0.22f + 0.28f * (float) row;
+                const auto dot = point (0.14f, fy);
+                g.fillEllipse (dot.x - 1.2f, dot.y - 1.2f, 2.4f, 2.4f);
+                path.startNewSubPath (point (0.36f, fy));
+                path.lineTo (point (0.92f, fy));
+            }
+        }
         else if (id == "navLive")
         {
             for (int bar = 0; bar < 5; ++bar)
@@ -2257,6 +2269,15 @@ public:
                 const float x = icon.getX() + icon.getWidth() * (float) key / 4.0f;
                 g.drawVerticalLine (juce::roundToInt (x),
                                     icon.getY() + 1.5f, icon.getBottom() - 1.5f);
+            }
+        }
+        else if (id == "navScenes")
+        {
+            for (int row = 0; row < 3; ++row)
+            {
+                const float yy = icon.getY() + iconSide * (0.22f + 0.28f * (float) row);
+                g.fillEllipse (icon.getX() + iconSide * 0.14f - 1.0f, yy - 1.0f, 2.0f, 2.0f);
+                g.drawLine (icon.getX() + iconSide * 0.36f, yy, icon.getRight() - 1.0f, yy, 1.1f);
             }
         }
         else if (id == "navLive")

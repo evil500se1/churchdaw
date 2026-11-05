@@ -240,7 +240,7 @@ workflows:
           mkdir "$FIX/settings" "$FIX/data"
           printf 'churchdaw-design-preview-v1' > "$FIX/.churchdaw-design-preview"
           export CHURCHDAW_QA_SETTINGS_DIR="$FIX/settings" CHURCHDAW_QA_DATA_DIR="$FIX/data"
-          for SZ in 1366x1024 1180x820 926x428; do
+          for SZ in 1366x1024 1080x810 1180x820 926x428; do
             mkdir "$FIX/mobile-$SZ"
             perl -e 'alarm shift; exec @ARGV' 300 "$APPBIN" --size="$SZ" --capture-all --capture-dir "$FIX/mobile-$SZ" || true
             cp -R "$FIX/mobile-$SZ" "dist-mac/medicao/mobile-$SZ" || true

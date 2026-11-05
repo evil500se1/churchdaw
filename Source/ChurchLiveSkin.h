@@ -87,10 +87,11 @@ inline Metrics metricsOf (const juce::Component& component)
 inline int railWidth (const Metrics& m)  { return m.px (104, 56); }
 inline int topBarHeight (const Metrics& m) { return m.px (84, 52); }
 
-// So o layout paisagem usa o shell novo (trilho + barra unica).
+// So o layout paisagem usa o shell novo (trilho + barra unica). O limite e 1,3:1
+// para incluir os iPads 4:3 (1,33): iPad 9a geracao, Pro 12,9" e Air antigo.
 inline bool wantsShell (int width, int height) noexcept
 {
-    return width >= 640 && height >= 300 && width * 10 >= height * 14;
+    return width >= 640 && height >= 300 && width * 10 >= height * 13;
 }
 
 //==============================================================================

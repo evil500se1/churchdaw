@@ -48,6 +48,15 @@ int runScenesPageTests()
         if (! ok) { ++failures; std::cerr << "FAIL: " << message << '\n'; }
     };
 
+    // Shell Church Live: paisagem >= 1,3:1, o que inclui os iPads 4:3 (1,33).
+    for (const auto tamanho : { juce::Point<int> (1366, 1024), juce::Point<int> (1180, 820),
+                                juce::Point<int> (1080, 810), juce::Point<int> (1024, 768),
+                                juce::Point<int> (884, 390) })
+        expect (ChurchLiveSkin::wantsShell (tamanho.x, tamanho.y), "paisagem de iPad/celular deve usar o shell");
+    expect (! ChurchLiveSkin::wantsShell (820, 1180), "retrato nao usa o shell");
+    expect (! ChurchLiveSkin::wantsShell (1000, 900), "quase quadrado nao usa o shell");
+    expect (! ChurchLiveSkin::wantsShell (600, 400), "abaixo de 640 dp nao usa o shell");
+
     ChurchDAWLive::Cena cenas[ChurchDAWLive::numeroDeCenas];
     const char* musicas[] { "Aleluia", "Santo", "Grande e o Senhor" };
     for (int i = 0; i < 3; ++i)

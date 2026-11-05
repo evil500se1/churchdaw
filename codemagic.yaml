@@ -152,3 +152,76 @@ workflows:
           rm -rf dmg-stage
     artifacts:
       - dist-mac/*.dmg
+
+  # Manual (sem "triggering"): mede no Mac M2 o que o Windows/Android nao preveem.
+  # Nao publica nada e nao altera o fluxo de release acima.
+  churchdaw-macos-medicao:
+    name: ChurchDAW — medicao no Mac M2 (Pad original x otimizado + capturas do desktop)
+    instance_type: mac_mini_m2
+    max_build_duration: 60
+    environment:
+      xcode: latest
+    scripts:
+      - name: Configurar
+        script: |
+          set -euo pipefail
+          cmake -B build-mac \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCHURCHDAW_ENABLE_DESKTOP_LICENSING=OFF \
+            -DCHURCHDAW_ALLOW_UNLICENSED_DESKTOP_BUILD=ON \
+            -DCHURCHDAW_BUILD_LICENSE_TESTS=OFF \
+            -DCHURCHDAW_BUILD_AUDIO_TESTS=ON \
+            -DCHURCHDAW_UPDATE_REQUIRE_OS_SIGNATURE=OFF
+          mkdir -p dist-mac/medicao
+          { sysctl -n machdep.cpu.brand_string; sw_vers; sysctl hw.perflevel0.logicalcpu hw.perflevel1.logicalcpu; } > dist-mac/medicao/maquina.txt 2>&1 || true
+
+      - name: Compilar a sonda do Pad
+        ignore_failure: true
+        script: |
+          set -euo pipefail
+          cmake --build build-mac --config Release --parallel 4 --target ChurchDAWPadSynthRenderProbe
+
+      - name: Pad no Mac M2 - original (2bd4ebb) x otimizado, alternando
+        ignore_failure: true
+        script: |
+          set -euo pipefail
+          PROBE="$(find build-mac -type f -name ChurchDAWPadSynthRenderProbe -perm -u+x -print -quit)"
+          test -n "$PROBE"
+          BASE=Tests/Audio/Baselines/padsynth-v1-48k.cdpcap
+          cp "$PROBE" /tmp/probe-novo
+          git cat-file -e "2bd4ebb^{commit}" 2>/dev/null || git fetch --unshallow --quiet
+          cp Source/PadSynthProcessor.h /tmp/PadSynthProcessor.novo.h
+          git show 2bd4ebb:Source/PadSynthProcessor.h > Source/PadSynthProcessor.h
+          cmake --build build-mac --config Release --parallel 4 --target ChurchDAWPadSynthRenderProbe
+          cp "$PROBE" /tmp/probe-original
+          cp /tmp/PadSynthProcessor.novo.h Source/PadSynthProcessor.h
+          for i in 1 2 3 4; do
+            for v in original novo; do
+              echo "$v rodada $i: $(/tmp/probe-$v --self-test --repetitions 5 --baseline "$BASE" 2>&1 | grep -E 'PAD_SYNTH_TIMING|_OK|FAIL|mismatch' | tr '\n' ' ')"
+            done
+          done | tee dist-mac/medicao/pad-ab-mac.txt
+
+      - name: Compilar a previa de design do desktop
+        ignore_failure: true
+        script: |
+          set -euo pipefail
+          cmake --build build-mac --config Release --parallel 4 --target ChurchDAWDesktopDesignPreview
+
+      - name: Testes de tela e capturas do desktop no Mac (previa isolada)
+        ignore_failure: true
+        script: |
+          set -euo pipefail
+          APPBIN="$(find build-mac -type f -path '*ChurchDAW Design Preview.app/Contents/MacOS/*' -print -quit)"
+          test -n "$APPBIN"
+          FIX="$(mktemp -d)"
+          mkdir "$FIX/settings" "$FIX/data" "$FIX/caps" "$FIX/caps-cenas"
+          export CHURCHDAW_QA_SETTINGS_DIR="$FIX/settings" CHURCHDAW_QA_DATA_DIR="$FIX/data"
+          run() { perl -e 'alarm shift; exec @ARGV' 300 "$APPBIN" "$@"; }
+          run --test-shell 2>&1 | tail -8 | tee dist-mac/medicao/test-shell-mac.txt || true
+          run --size=1600x900 --showcase --capture-dir "$FIX/caps" || true
+          run --size=1600x900 --surface scenes --capture-dir "$FIX/caps-cenas" || true
+          cp -R "$FIX/caps" dist-mac/medicao/caps-desktop || true
+          cp -R "$FIX/caps-cenas" dist-mac/medicao/caps-cenas || true
+    artifacts:
+      - dist-mac/medicao/*
+      - dist-mac/medicao/**/*.png

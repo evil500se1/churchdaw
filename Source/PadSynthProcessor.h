@@ -1082,7 +1082,7 @@ private:
         const float pi2 = juce::MathConstants<float>::twoPi;
         switch (type)
         {
-            case 0: return std::sin (pi2 * phase);
+            case 0: return fastSin2Pi (phase);
             case 1: return 1.0f - 4.0f * std::abs (phase - 0.5f);
             case 2: return (2.0f * phase - 1.0f) - polyBlep (phase, increment);
             case 3:
@@ -1094,9 +1094,9 @@ private:
                 return y;
             }
             default:
-                return 0.72f * std::sin (pi2 * phase)
-                     + 0.20f * std::sin (pi2 * phase * 2.0f)
-                     + 0.08f * std::sin (pi2 * phase * 3.0f);
+                return 0.72f * fastSin2Pi (phase)
+                     + 0.20f * fastSin2Pi (phase * 2.0f)
+                     + 0.08f * fastSin2Pi (phase * 3.0f);
         }
     }
 
@@ -1112,7 +1112,7 @@ private:
     {
         switch (type)
         {
-            case 0: return std::sin (juce::MathConstants<float>::twoPi * phase);
+            case 0: return fastSin2Pi (phase);
             case 1: return 1.0f - 4.0f * std::abs (phase - 0.5f);
             case 2: return 2.0f * phase - 1.0f;
             default:
@@ -1125,7 +1125,23 @@ private:
         }
     }
 
+    // seno de 2*pi*x (x em voltas) por polinomio de Taylor de 11a ordem apos
+    // reducao para [0, 1/4]: erro absoluto < 6e-8, ~4x mais rapido que sinf.
+    static float fastSin2Pi (float x) noexcept
+    {
+        x -= std::floor (x + 0.5f);
+        const float ax = std::abs (x);
+        const float y = ax > 0.25f ? 0.5f - ax : ax;
+        const float t = juce::MathConstants<float>::twoPi * y;
+        const float z = t * t;
+        const float r = t * (1.0f + z * (-1.0f / 6.0f + z * (1.0f / 120.0f
+                      + z * (-1.0f / 5040.0f + z * (1.0f / 362880.0f
+                      + z * (-1.0f / 39916800.0f))))));
+        return x < 0.0f ? -r : r;
+    }
+
     struct FilterCoefficients
+
     {
         float g = 0.0f;
         float r = 0.0f;
@@ -1267,7 +1283,7 @@ private:
                 const float brightness = juce::jmap (settings.xyX, 0.62f, 1.55f);
                 const float envOctaves = s.filterEnv * (modEnv - 0.35f) * 4.0f;
                 const float cutoff = s.cutoff * brightness
-                    * std::pow (2.0f, envOctaves + motion * 1.5f);
+                    * std::exp2 (envOctaves + motion * 1.5f);
 
                 if (s.drive > 0.0001f)
                 {

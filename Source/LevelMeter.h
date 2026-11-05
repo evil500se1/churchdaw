@@ -85,7 +85,7 @@ public:
     }
 
     // mostra "L" / "R" embaixo de cada barra (so faz sentido em medidor estereo)
-    void setChannelLabels (bool shouldShow) { channelLabels = shouldShow; repaint(); }
+    void setChannelLabels (bool shouldShow) { channelLabels = shouldShow; invalidateSkinFrame(); repaint(); }
 
     // Escala dB compacta ao lado do bargraph. Os strips do mixer usam isto
     // para reproduzir a leitura de console da referencia; o master conserva
@@ -119,6 +119,7 @@ public:
     void setTopDb (float newTopDb)
     {
         maxDb = juce::jmax (minDb + 12.0f, newTopDb);
+        invalidateSkinFrame();
         repaint();
     }
 
@@ -132,8 +133,11 @@ public:
 
         skinOn = enabled;
         skinUnit = unit;
+        invalidateSkinFrame();
         repaint();
     }
+
+    void resized() override { invalidateSkinFrame(); }
 
     // avisa o nivel exibido (0..1) a cada quadro. Serve pra acender o card do
     // canal sem criar um segundo timer nem um segundo leitor do nivel (o
@@ -142,37 +146,27 @@ public:
 
     void paintSkin (juce::Graphics& g)
     {
-        auto bounds = getLocalBounds().toFloat();
+        const auto geom = skinGeom();
         const float u = skinUnit;
         const bool alerta = clipSticky && clipRole != ClipRole::limiterWorking;
-
-        juce::Rectangle<float> labelRow;
-        if (channelLabels && channels == 2)
-            labelRow = bounds.removeFromBottom (juce::jmax (12.0f, 20.0f * u));
-
-        const float gap = channels == 2 ? juce::jmax (2.0f, 6.0f * u) : 0.0f;
-        const float barW = (bounds.getWidth() - gap * (float) (channels - 1)) / (float) channels;
-        const float segH = juce::jmax (3.0f, 7.0f * u);
-        const float segGap = juce::jmax (1.5f, 3.0f * u);
-        const float step = segH + segGap;
+        const auto labelRow = geom.labelRow;
+        const float gap = geom.gap;
+        const float barW = geom.barW;
 
         for (int ch = 0; ch < channels; ++ch)
         {
-            const auto bar = juce::Rectangle<float> (bounds.getX() + (float) ch * (barW + gap),
-                                                     bounds.getY(), barW, bounds.getHeight());
-            const int numSeg = juce::jmax (1, (int) ((bar.getHeight() + segGap) / step));
-            const float ladderTop = bar.getBottom() - ((float) numSeg * step - segGap);
+            const auto bar = geom.bar (ch);
+            const int numSeg = geom.numSeg (bar);
+            const float ladderTop = geom.ladderTop (bar, numSeg);
             const float lvl = displayDb[ch];
             const float peak = peakDb[ch];
-            const float radius = juce::jmax (1.0f, segH * 0.18f);
+            const float radius = juce::jmax (1.0f, geom.segH * 0.18f);
 
             for (int i = 0; i < numSeg; ++i)
             {
-                const auto seg = juce::Rectangle<float> (bar.getX(), ladderTop + (float) i * step, barW, segH);
-                const float pEntry = 1.0f - (seg.getBottom() - bar.getY()) / bar.getHeight();
+                const auto seg = juce::Rectangle<float> (bar.getX(), ladderTop + (float) i * geom.step, barW, geom.segH);
                 const float pColour = 1.0f - (seg.getCentreY() - bar.getY()) / bar.getHeight();
-                const float dbEntry = proportionToDb (pEntry);
-                const bool active = lvl > minDb + 0.05f && dbEntry <= lvl + 0.01f;
+                const bool active = skinSegmentLit (bar, seg, lvl);
                 const float p = dbToProportion (proportionToDb (pColour));
                 const auto tone = p >= 0.82f ? juce::Colour (0xfff2495c)
                                 : p >= 0.60f ? juce::Colour (0xfff4b73b)
@@ -604,6 +598,106 @@ private:
         return minDb + juce::jlimit (0.0f, 1.0f, p) * (maxDb - minDb);
     }
 
+    // Geometria da escada da skin, num lugar so: paintSkin e skinFrame precisam
+    // concordar sobre onde cada segmento cai, senao o gate de repintura deixa de
+    // repintar uma imagem que mudou.
+    struct SkinGeom
+    {
+        juce::Rectangle<float> area, labelRow;   // area = tudo menos a linha dos rotulos L/R
+        float gap = 0.0f, barW = 0.0f, segH = 0.0f, segGap = 0.0f, step = 0.0f;
+
+        juce::Rectangle<float> bar (int ch) const noexcept
+        {
+            return { area.getX() + (float) ch * (barW + gap), area.getY(), barW, area.getHeight() };
+        }
+
+        int numSeg (const juce::Rectangle<float>& b) const noexcept
+        {
+            return juce::jmax (1, (int) ((b.getHeight() + segGap) / step));
+        }
+
+        float ladderTop (const juce::Rectangle<float>& b, int n) const noexcept
+        {
+            return b.getBottom() - ((float) n * step - segGap);
+        }
+    };
+
+    SkinGeom skinGeom() const noexcept
+    {
+        SkinGeom s;
+        s.area = getLocalBounds().toFloat();
+        const float u = skinUnit;
+
+        if (channelLabels && channels == 2)
+            s.labelRow = s.area.removeFromBottom (juce::jmax (12.0f, 20.0f * u));
+
+        s.gap = channels == 2 ? juce::jmax (2.0f, 6.0f * u) : 0.0f;
+        s.barW = (s.area.getWidth() - s.gap * (float) (channels - 1)) / (float) channels;
+        s.segH = juce::jmax (3.0f, 7.0f * u);
+        s.segGap = juce::jmax (1.5f, 3.0f * u);
+        s.step = s.segH + s.segGap;
+        return s;
+    }
+
+    bool skinSegmentLit (const juce::Rectangle<float>& bar, const juce::Rectangle<float>& seg,
+                         float lvl) const noexcept
+    {
+        const float pEntry = 1.0f - (seg.getBottom() - bar.getY()) / bar.getHeight();
+        return lvl > minDb + 0.05f && proportionToDb (pEntry) <= lvl + 0.01f;
+    }
+
+    // Tudo que paintSkin desenha de um canal e funcao de (segmentos acesos, linha
+    // do pico, cor do pico). Dois estados com o mesmo SkinFrame dao a MESMA imagem.
+    struct SkinFrame
+    {
+        int lit = -1;            // -1 = ainda nao pintado
+        float peakY = -1.0f;     // -1 = sem linha de pico
+        bool peakHot = false;
+
+        bool operator== (const SkinFrame& o) const noexcept
+        {
+            return lit == o.lit && peakY == o.peakY && peakHot == o.peakHot;
+        }
+    };
+
+    SkinFrame skinFrame (int ch) const noexcept
+    {
+        const auto geom = skinGeom();
+        const auto bar = geom.bar (ch);
+        const int numSeg = geom.numSeg (bar);
+        const float ladderTop = geom.ladderTop (bar, numSeg);
+
+        SkinFrame f;
+        f.lit = 0;
+
+        for (int i = 0; i < numSeg; ++i)
+        {
+            const juce::Rectangle<float> seg (bar.getX(), ladderTop + (float) i * geom.step, geom.barW, geom.segH);
+            if (skinSegmentLit (bar, seg, displayDb[ch]))
+                ++f.lit;
+        }
+
+        if (peakDb[ch] > minDb + 0.5f)
+        {
+            f.peakY = bar.getBottom() - bar.getHeight() * dbToProportion (peakDb[ch]);
+            f.peakHot = peakDb[ch] >= -0.05f;
+        }
+
+        return f;
+    }
+
+    // Geometria, escala ou estado de exibicao mudaram por fora do timer: o proximo
+    // quadro tem de repintar mesmo que o SkinFrame coincida com o antigo.
+    void invalidateSkinFrame() noexcept
+    {
+        paintedFrame[0] = SkinFrame();
+        paintedFrame[1] = SkinFrame();
+    }
+
+    SkinFrame paintedFrame[2];
+
+    friend struct LevelMeterTestAccess;
+
     // A paleta do medidor vive AQUI, e nao no NordLookAndFeel, porque ela e
     // escolhida por CONTRASTE, nao por harmonia com o resto da tela: todo
     // segmento aceso fica acima de 4.5:1 contra o apagado, que e o minimo pra
@@ -680,6 +774,8 @@ private:
                 lastShownPeak[ch] = minDb;
                 peakHoldFrames[ch] = 0;
             }
+
+            invalidateSkinFrame();
 
             // luz informativa do limiter tambem apaga: ela e "esta segurando
             // AGORA", e escondido nao existe agora nenhum pra mostrar
@@ -807,6 +903,26 @@ private:
             else
             {
                 peakDb[ch] = juce::jmax (peakDb[ch] - quedaPicoDb, minDb);
+            }
+
+            // Skin: so repinta quando a IMAGEM muda (segmentos acesos ou linha do
+            // pico). Um Pad parado oscila +-0,2 dB, bem menos que os ~1,7 dB de um
+            // segmento: o limiar de 0,16 dB abaixo repintava o medidor inteiro 24x
+            // por segundo para desenhar os mesmos segmentos. Medido no Xiaomi com o
+            // Pad tocando: 620 -> 255 Mciclos/s so por congelar os medidores.
+            if (skinOn)
+            {
+                lastShownDb[ch] = displayDb[ch];
+                lastShownPeak[ch] = peakDb[ch];
+
+                const auto frame = skinFrame (ch);
+                if (! (frame == paintedFrame[ch]))
+                {
+                    paintedFrame[ch] = frame;
+                    barsChanged = true;
+                }
+
+                continue;
             }
 
             const bool floorCrossed =

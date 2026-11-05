@@ -249,6 +249,7 @@ if(CHURCHDAW_BUILD_AUDIO_TESTS AND NOT ANDROID AND NOT IOS)
         Tests/UI/MixerStripCollapseTests.cpp
         Tests/UI/MidiLearnOverlayTests.cpp
         Tests/UI/TimbrePickerLayoutTests.cpp
+        Tests/UI/LevelMeterSkinTests.cpp
         Tests/Plugin/PluginPreviewLifecycleTests.cpp
         Tests/Plugin/PluginCandidateSearchTests.cpp
         Tests/UI/FullUpgradeTests.cpp)
@@ -655,6 +656,8 @@ if(CHURCHDAW_BUILD_AUDIO_TESTS AND NOT ANDROID AND NOT IOS)
         COMMAND ChurchDAWMixerStripCollapseTests --midi-learn)
     add_test(NAME ChurchDAWTimbrePickerLayout
         COMMAND ChurchDAWMixerStripCollapseTests --timbre-picker)
+    add_test(NAME ChurchDAWLevelMeterSkin
+        COMMAND ChurchDAWMixerStripCollapseTests --level-meter-skin)
     add_test(NAME ChurchDAWFullUpgrade
         COMMAND ChurchDAWMixerStripCollapseTests --full-upgrade)
     add_test(NAME ChurchDAWPluginPreviewLifecycle

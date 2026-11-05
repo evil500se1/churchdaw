@@ -2,7 +2,7 @@
 
 #include <juce_gui_basics/juce_gui_basics.h>
 #include "MobileShellConfig.h"
-#if CHURCHDAW_MOBILE_SHELL
+#if CHURCHDAW_CHURCHLIVE_LOOK
  #include "ChurchLiveFonts.h"
 #endif
 #include <cmath>
@@ -20,31 +20,31 @@ public:
     //==============================================================================
 
     // ---- superficies (grafite quente, OLED premium) ----
-    static juce::Colour bgApp()          { return juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xff0a0a0d : 0xff101216); }   // preto grafite neutro
-    static juce::Colour bgAppLift()      { return juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xff14141a : 0xff191c22); }   // luz ambiente da console
-    static juce::Colour bgCard()         { return juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xff14141a : 0xff191c22); }   // painel/card
-    static juce::Colour bgCardHi()       { return juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xff1c1c24 : 0xff22262d); }   // topo do glass
-    static juce::Colour bgCardSel()      { return juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xff1c1c24 : 0xff252a32); }   // card selecionado
-    static juce::Colour bgControl()      { return juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xff1c1c24 : 0xff22262e); }   // campos/controles
-    static juce::Colour bgControlHi()    { return juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xff23232c : 0xff2b3039); }
-    static juce::Colour borderDefault()  { return juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xff2b2b36 : 0xff383e48); }
-    static juce::Colour borderSoft()     { return juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xff22222b : 0xff292e36); }
+    static juce::Colour bgApp()          { return juce::Colour (CHURCHDAW_CHURCHLIVE_LOOK ? 0xff0a0a0d : 0xff101216); }   // preto grafite neutro
+    static juce::Colour bgAppLift()      { return juce::Colour (CHURCHDAW_CHURCHLIVE_LOOK ? 0xff14141a : 0xff191c22); }   // luz ambiente da console
+    static juce::Colour bgCard()         { return juce::Colour (CHURCHDAW_CHURCHLIVE_LOOK ? 0xff14141a : 0xff191c22); }   // painel/card
+    static juce::Colour bgCardHi()       { return juce::Colour (CHURCHDAW_CHURCHLIVE_LOOK ? 0xff1c1c24 : 0xff22262d); }   // topo do glass
+    static juce::Colour bgCardSel()      { return juce::Colour (CHURCHDAW_CHURCHLIVE_LOOK ? 0xff1c1c24 : 0xff252a32); }   // card selecionado
+    static juce::Colour bgControl()      { return juce::Colour (CHURCHDAW_CHURCHLIVE_LOOK ? 0xff1c1c24 : 0xff22262e); }   // campos/controles
+    static juce::Colour bgControlHi()    { return juce::Colour (CHURCHDAW_CHURCHLIVE_LOOK ? 0xff23232c : 0xff2b3039); }
+    static juce::Colour borderDefault()  { return juce::Colour (CHURCHDAW_CHURCHLIVE_LOOK ? 0xff2b2b36 : 0xff383e48); }
+    static juce::Colour borderSoft()     { return juce::Colour (CHURCHDAW_CHURCHLIVE_LOOK ? 0xff22222b : 0xff292e36); }
     static juce::Colour hairline()       { return juce::Colours::white.withAlpha (0.050f); }
-    static juce::Colour bgFloating()     { return juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xff1c1c24 : 0xff22262d); }
-    static juce::Colour bgFloatingHover() { return juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xff23232c : 0xff36303a); }
-    static juce::Colour focusOutline()   { return juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xffff6b7d : 0xffeb7184); }
+    static juce::Colour bgFloating()     { return juce::Colour (CHURCHDAW_CHURCHLIVE_LOOK ? 0xff1c1c24 : 0xff22262d); }
+    static juce::Colour bgFloatingHover() { return juce::Colour (CHURCHDAW_CHURCHLIVE_LOOK ? 0xff23232c : 0xff36303a); }
+    static juce::Colour focusOutline()   { return juce::Colour (CHURCHDAW_CHURCHLIVE_LOOK ? 0xffff6b7d : 0xffeb7184); }
 
     // ---- texto ----
-    static juce::Colour txtPrimary()     { return juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xfff5f3f4 : 0xfff2f2f3); }
-    static juce::Colour txtSecondary()   { return juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xffa3a1ad : 0xffb2bac7); }
-    static juce::Colour txtDisabled()    { return juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xff7d7b88 : 0xff7f8998); }
+    static juce::Colour txtPrimary()     { return juce::Colour (CHURCHDAW_CHURCHLIVE_LOOK ? 0xfff5f3f4 : 0xfff2f2f3); }
+    static juce::Colour txtSecondary()   { return juce::Colour (CHURCHDAW_CHURCHLIVE_LOOK ? 0xffa3a1ad : 0xffb2bac7); }
+    static juce::Colour txtDisabled()    { return juce::Colour (CHURCHDAW_CHURCHLIVE_LOOK ? 0xff7d7b88 : 0xff7f8998); }
 
     // ---- acento e status ----
-    static juce::Colour nordRed()        { return juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xffd92b40 : 0xffdc3f57); }   // acento global
-    static juce::Colour nordRedBright()  { return juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xffff5a6e : 0xfff15b70); }   // hover/destaque
-    static juce::Colour nordRedDark()    { return juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xff5a1420 : 0xff6d1220); }
-    static juce::Colour amberSolo()      { return juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xfff4b73b : 0xffffb020); }   // solo/atencao
-    static juce::Colour greenOk()        { return juce::Colour (CHURCHDAW_MOBILE_SHELL ? 0xff3ddc84 : 0xff46d37c); }   // status normal
+    static juce::Colour nordRed()        { return juce::Colour (CHURCHDAW_CHURCHLIVE_LOOK ? 0xffd92b40 : 0xffdc3f57); }   // acento global
+    static juce::Colour nordRedBright()  { return juce::Colour (CHURCHDAW_CHURCHLIVE_LOOK ? 0xffff5a6e : 0xfff15b70); }   // hover/destaque
+    static juce::Colour nordRedDark()    { return juce::Colour (CHURCHDAW_CHURCHLIVE_LOOK ? 0xff5a1420 : 0xff6d1220); }
+    static juce::Colour amberSolo()      { return juce::Colour (CHURCHDAW_CHURCHLIVE_LOOK ? 0xfff4b73b : 0xffffb020); }   // solo/atencao
+    static juce::Colour greenOk()        { return juce::Colour (CHURCHDAW_CHURCHLIVE_LOOK ? 0xff3ddc84 : 0xff46d37c); }   // status normal
     static juce::Colour redClip()        { return juce::Colour (0xffff1744); }   // erro/clip
 
     // Fundo do app com estetica matte dark minimalista:
@@ -72,6 +72,21 @@ public:
         // than stacking shiny frames around every section of the console.
         const float corner = integratedStrip ? 9.0f : radius;
         const auto cue = accent.isTransparent() ? nordRed() : accent;
+       #if CHURCHDAW_CHURCHLIVE_LOOK
+        // Church Live no desktop: superficie neutra (sem o azul do grafite
+        // antigo), borda de 1 px e selecao pela borda vermelha -- sem barra de
+        // topo nem brilho. O codigo anterior segue no #else.
+        const auto surface = empty ? juce::Colour (0xff0d0d11)
+                           : selected ? bgCardSel()
+                           : master ? juce::Colour (0xff1b1318) : bgCard();
+        g.setColour (surface);
+        g.fillRoundedRectangle (card, corner);
+        g.setColour (selected ? nordRedBright().withAlpha (0.85f)
+                              : (empty ? borderSoft() : borderDefault()));
+        g.drawRoundedRectangle (card.reduced (0.5f), corner, 1.0f);
+        juce::ignoreUnused (cue);
+        return;
+       #else
         const auto surface = empty ? juce::Colour (0xff171a20)
                            : selected ? juce::Colour (0xff242830)
                            : master ? juce::Colour (0xff1e2229) : juce::Colour (0xff20242b);
@@ -91,6 +106,7 @@ public:
             }
         }
         return;
+       #endif
        #else
         const float corner = integratedStrip ? 8.0f : radius;
         const auto cue = accent.isTransparent() ? nordRed() : accent;
@@ -287,7 +303,7 @@ public:
     // ---- raio de canto: TRES escalas, nao cinco ----
     // Premium: um pouco mais generoso no card/painel (vidro, nao tijolo).
     static constexpr float radiusControl = 6.0f;   // botoes, combos, chips
-    static constexpr float radiusCard    = CHURCHDAW_MOBILE_SHELL ? 18.0f : 10.0f;  // cards de canal
+    static constexpr float radiusCard    = CHURCHDAW_CHURCHLIVE_LOOK ? 18.0f : 10.0f;  // cards de canal
     static constexpr float radiusPanel   = 14.0f;  // paineis e visores
 
     // LEDs do painel. Nas fotos: VERDE nas escadas de nivel dos faders, VERMELHO
@@ -787,7 +803,7 @@ public:
         g.drawRoundedRectangle (pill.reduced (0.5f), radius, 1.0f);
     }
 
-   #if CHURCHDAW_MOBILE_SHELL
+   #if CHURCHDAW_CHURCHLIVE_LOOK
     // Fonte padrao do app mobile: Barlow empacotada (nao a do sistema). Troca
     // so as fontes "padrao" (sans e monoespacada); nomes explicitos seguem.
     juce::Typeface::Ptr getTypefaceForFont (const juce::Font& font) override

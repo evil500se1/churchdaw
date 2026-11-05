@@ -215,6 +215,7 @@ workflows:
           test -n "$APPBIN"
           FIX="$(mktemp -d)"
           mkdir "$FIX/settings" "$FIX/data" "$FIX/caps" "$FIX/caps-cenas"
+          printf 'churchdaw-design-preview-v1' > "$FIX/.churchdaw-design-preview"
           export CHURCHDAW_QA_SETTINGS_DIR="$FIX/settings" CHURCHDAW_QA_DATA_DIR="$FIX/data"
           run() { perl -e 'alarm shift; exec @ARGV' 300 "$APPBIN" "$@"; }
           run --test-shell 2>&1 | tail -8 | tee dist-mac/medicao/test-shell-mac.txt || true

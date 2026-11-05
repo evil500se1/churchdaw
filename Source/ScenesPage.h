@@ -5,8 +5,10 @@
 #include "ChurchLiveSkin.h"
 #include "LiveScenes.h"
 
+#include <array>
 #include <cmath>
 #include <functional>
+#include <vector>
 
 //==============================================================================
 // Pagina CENAS do desktop (Windows/Mac).
@@ -40,10 +42,16 @@ public:
     {
         setOpaque (true);
         setWantsKeyboardFocus (false);
+        // Sem isto o JUCE entrega o foco do teclado ao primeiro filho focavel (o campo
+        // "Musica") a cada clique em linha ou botao -- e as teclas do computador do
+        // palco passariam a digitar nele. So os campos de texto pegam foco, e so
+        // quando clicados.
+        setMouseClickGrabsKeyboardFocus (false);
 
         for (auto* b : { &carregarBtn, &salvarBtn, &limparBtn, &anteriorBtn, &proximaBtn })
         {
             b->setWantsKeyboardFocus (false);
+            b->setMouseClickGrabsKeyboardFocus (false);
             addAndMakeVisible (*b);
         }
 
@@ -129,6 +137,12 @@ public:
         g.fillRoundedRectangle (L.cabecalho.getX(), L.cabecalho.getY() + m.fpx (7), m.fpx (3), m.fpx (14), 1.0f);
         drawText (g, "CENAS", L.cabecalho.withTrimmedLeft (m.px (12)).withHeight (m.px (28)),
                   font (Face::barlowBold, m.fpx (14, 9.0f), 0.28f), text(), juce::Justification::centredLeft);
+        int gravadas = 0;
+        for (const auto& c : cenas)
+            gravadas += c.preenchida ? 1 : 0;
+        drawText (g, juce::String (gravadas) + " de " + juce::String (ChurchDAWLive::numeroDeCenas) + " gravadas",
+                  L.cabecalho.withTrimmedLeft (m.px (94)).withHeight (m.px (28)),
+                  font (Face::mono, m.fpx (13, 9.0f)), textMute(), juce::Justification::centredLeft);
         drawText (g, utf8 (u8"Cada cena guarda o som completo de uma música: instrumentos, volumes, Pad e Master."),
                   L.cabecalho.withTrimmedTop (m.px (30)),
                   font (Face::barlow, m.fpx (17, 11.0f)), textSec(), juce::Justification::topLeft);
@@ -407,6 +421,13 @@ private:
         {
             g.setColour (selecionada ? elevated() : (i == hover ? elevated().interpolatedWith (panel(), 0.5f) : panel()));
             g.fillRoundedRectangle (rf, radius);
+            if (noAr)
+            {
+                // brilho suave que nasce da barra vermelha: a musica no ar se acha de longe
+                g.setGradientFill (juce::ColourGradient (redFill().withAlpha (0.20f), rf.getX(), 0.0f,
+                                                         redFill().withAlpha (0.0f), rf.getX() + rf.getWidth() * 0.5f, 0.0f, false));
+                g.fillRoundedRectangle (rf, radius);
+            }
             g.setColour (selecionada ? accent().withAlpha (0.9f) : line());
             g.drawRoundedRectangle (rf.reduced (0.5f), radius, selecionada ? 1.6f : 1.0f);
         }
@@ -463,6 +484,24 @@ private:
 
             x = ficha (g, { x, cy }, juce::String (juce::roundToInt ((float) c.bpm)) + " BPM", fMono, textSec(), m).getX() - m.fpx (8);
             x = ficha (g, { x, cy }, c.tonalidade.isNotEmpty() ? c.tonalidade : "-", fMono, accentSoft(), m).getX() - m.fpx (14);
+
+            // assinatura do mix: uma barra por canal (altura = volume; apagada = canal sem timbre).
+            // Da pra ver, sem abrir a cena, quantos canais ela usa e como estao balanceados.
+            const float bw = m.fpx (4, 2.0f), gapB = m.fpx (2, 1.0f), bh = m.fpx (24, 12.0f);
+            const float total = (float) ChurchDAWLive::numeroDeCanais * bw + (float) (ChurchDAWLive::numeroDeCanais - 1) * gapB;
+            const float bx = x - total;
+            // canal sem timbre fica VAZIO (nada desenhado): a posicao da barra e o numero do canal
+            for (int ch = 0; ch < ChurchDAWLive::numeroDeCanais; ++ch)
+            {
+                const auto& canal = c.canais[ch];
+                if (! (canal.ligado && canal.rotuloDoTimbre.isNotEmpty()))
+                    continue;
+
+                const float altura = bh * juce::jlimit (0.18f, 1.0f, canal.volume);
+                g.setColour (noAr ? accentSoft() : accent().withAlpha (0.85f));
+                g.fillRoundedRectangle (bx + (float) ch * (bw + gapB), cy + bh * 0.5f - altura, bw, altura, bw * 0.4f);
+            }
+            x = bx - m.fpx (16);
         }
 
         // texto
@@ -808,5 +847,269 @@ private:
     juce::TextButton carregarBtn, salvarBtn, limparBtn, anteriorBtn, proximaBtn;
     juce::TextEditor musicaEd, secaoEd, tomEd, bpmEd, compassoEd;
 
+    friend struct ScenesPageTestAccess;
+
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (ScenesPage)
+};
+
+//==============================================================================
+// Faixa de cenas do modo LIVE (desktop): as musicas gravadas, lado a lado, na
+// subbarra da mesa. Um toque carrega -- a troca de musica no culto sem abrir
+// pagina nenhuma. A musica no ar fica vermelha e, quando nao cabem todos os
+// nomes, so ela mostra o titulo (as outras viram so o numero).
+//
+// Mesma regra do resto: aqui so se CARREGA. Gravar e na pagina CENAS.
+//==============================================================================
+class SceneStrip final : public juce::Component
+{
+public:
+    using Cena = ChurchDAWLive::Cena;
+
+    SceneStrip()
+    {
+        // Trocar de musica com um toque nao pode mexer no foco do teclado do palco.
+        setWantsKeyboardFocus (false);
+        setMouseClickGrabsKeyboardFocus (false);
+    }
+
+    std::function<ChurchDAWLive::Resultado (int)> onCarregar;
+    std::function<void()> onAbrirCenas;
+
+    void atualizar (const Cena* origem, int cenaAtiva)
+    {
+        for (int i = 0; i < ChurchDAWLive::numeroDeCenas; ++i)
+            cenas[(size_t) i] = origem[i];
+
+        ativa = cenaAtiva;
+        repaint();
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        using namespace ChurchLiveSkin;
+        const auto m = metricsOf (*this);
+        const auto L = calcular (m);
+
+        g.setColour (hover == kIcone ? text() : textMute());
+        NordLookAndFeel::drawDesktopNavigationIcon (g, "navScenes", L.icone.toFloat().reduced (m.fpx (4, 2.0f)), false);
+
+        if (L.chips.empty())
+        {
+            g.setColour (hover == kIcone ? text() : textMute());
+            g.setFont (font (Face::barlowSemi, m.fpx (14, 9.5f)));
+            g.drawText (juce::String::fromUTF8 (u8"Nenhuma cena gravada \u00b7 toque para criar"),
+                        L.vazio, juce::Justification::centredLeft, true);
+            return;
+        }
+
+        for (const auto& chip : L.chips)
+        {
+            const auto& c = cenas[(size_t) chip.indice];
+            const bool noAr = chip.indice == ativa;
+            const auto r = chip.area.toFloat();
+            const float radius = juce::jmin (m.fpx (9, 4.0f), r.getHeight() * 0.5f);
+
+            if (noAr)
+            {
+                g.setColour (redFill().withAlpha (0.22f));
+                g.fillRoundedRectangle (r.expanded (m.fpx (2, 1.0f)), radius + 1.0f);
+                g.setColour (redFill());
+                g.fillRoundedRectangle (r, radius);
+            }
+            else
+            {
+                g.setColour (chip.indice == hover ? elevated() : panel());
+                g.fillRoundedRectangle (r, radius);
+                g.setColour (chip.indice == hover ? textMute().withAlpha (0.6f) : line());
+                g.drawRoundedRectangle (r.reduced (0.5f), radius, 1.0f);
+            }
+
+            auto texto = chip.area.reduced (m.px (8, 3), 0);
+            const auto numero = juce::String (chip.indice + 1).paddedLeft ('0', 2);
+            const auto fMono = font (Face::mono, m.fpx (12, 8.5f));
+            g.setColour (noAr ? juce::Colours::white : textSec());
+            g.setFont (fMono);
+
+            if (chip.comTitulo)
+            {
+                const int wNum = juce::roundToInt (textWidth (fMono, numero)) + m.px (6, 3);
+                g.drawText (numero, texto.removeFromLeft (wNum), juce::Justification::centredLeft, false);
+                g.setColour (noAr ? juce::Colours::white : text());
+                g.setFont (font (Face::barlowBold, m.fpx (15, 10.0f)));
+                g.drawText (titulo (c, chip.indice), texto, juce::Justification::centredLeft, true);
+            }
+            else
+            {
+                g.drawText (numero, texto, juce::Justification::centred, false);
+            }
+        }
+    }
+
+    void mouseMove (const juce::MouseEvent& e) override
+    {
+        const int h = alvoEm (e.getPosition());
+        if (h != hover)
+        {
+            hover = h;
+            setMouseCursor (h != kNada ? juce::MouseCursor::PointingHandCursor : juce::MouseCursor::NormalCursor);
+            repaint();
+        }
+    }
+
+    void mouseExit (const juce::MouseEvent&) override
+    {
+        if (hover != kNada)
+        {
+            hover = kNada;
+            repaint();
+        }
+    }
+
+    void mouseDown (const juce::MouseEvent& e) override
+    {
+        const int alvo = alvoEm (e.getPosition());
+
+        if (alvo == kIcone)
+        {
+            if (onAbrirCenas != nullptr)
+                onAbrirCenas();
+        }
+        else if (juce::isPositiveAndBelow (alvo, ChurchDAWLive::numeroDeCenas) && onCarregar != nullptr)
+        {
+            // um toque na musica NO AR nao a recarrega: reaplicar zeraria o que o
+            // musico mexeu na mesa. Recarregar e decisao da pagina CENAS.
+            if (alvo != ativa)
+                (void) onCarregar (alvo);
+        }
+    }
+
+private:
+    static constexpr int kNada = -1;
+    static constexpr int kIcone = 100;
+
+    struct Chip { int indice; juce::Rectangle<int> area; bool comTitulo; };
+    struct Layout { juce::Rectangle<int> icone, vazio; std::vector<Chip> chips; };
+
+    static juce::String titulo (const Cena& c, int i)
+    {
+        if (c.musica.isNotEmpty()) return c.musica;
+        if (c.nome.isNotEmpty())   return c.nome;
+        return "Cena " + juce::String (i + 1);
+    }
+
+    Layout calcular (const ChurchLiveSkin::Metrics& m) const
+    {
+        using namespace ChurchLiveSkin;
+        Layout L;
+        auto area = getLocalBounds();
+        L.icone = area.removeFromLeft (area.getHeight());
+        area.removeFromLeft (m.px (6, 3));
+        L.vazio = area;
+
+        std::vector<int> gravadas;
+        for (int i = 0; i < ChurchDAWLive::numeroDeCenas; ++i)
+            if (cenas[(size_t) i].preenchida)
+                gravadas.push_back (i);
+
+        if (gravadas.empty() || area.getWidth() < m.px (40, 20))
+            return L;
+
+        const int gap = m.px (6, 3);
+        const int padX = m.px (8, 3) * 2;
+        const auto fMono = font (Face::mono, m.fpx (12, 8.5f));
+        const auto fTitulo = font (Face::barlowBold, m.fpx (15, 10.0f));
+        const int wNum = juce::roundToInt (textWidth (fMono, "00")) + m.px (6, 3);
+        const int wSoNumero = juce::roundToInt (textWidth (fMono, "00")) + padX + m.px (6, 3);   // folga: o JUCE mede o texto um pouco mais largo
+        const int maxTitulo = m.px (150, 60);
+
+        std::vector<int> natural;
+        int somaNatural = 0;
+        for (int i : gravadas)
+        {
+            const int w = padX + wNum + juce::jmin (maxTitulo, juce::roundToInt (textWidth (fTitulo, titulo (cenas[(size_t) i], i))) + m.px (4, 2));
+            natural.push_back (w);
+            somaNatural += w;
+        }
+
+        const int n = (int) gravadas.size();
+        const int gaps = gap * (n - 1);
+        const bool cabeTudo = somaNatural + gaps <= area.getWidth();
+
+        int x = area.getX();
+        for (int k = 0; k < n; ++k)
+        {
+            const int i = gravadas[(size_t) k];
+            int w = natural[(size_t) k];
+            bool comTitulo = true;
+
+            if (! cabeTudo)
+            {
+                // Nao cabem todos os nomes inteiros: a musica NO AR fica com o nome inteiro e as
+                // outras dividem o resto com o nome abreviado ("Grande e o..."). So quando nem
+                // isso da (menos de ~4 letras) viram apenas o numero.
+                const bool ehAtiva = i == ativa;
+                const bool temAtiva = juce::isPositiveAndBelow (ativa, ChurchDAWLive::numeroDeCenas)
+                                       && cenas[(size_t) ativa].preenchida;
+                int wAtiva = 0;
+                for (int j = 0; j < n; ++j)
+                    if (gravadas[(size_t) j] == ativa)
+                        wAtiva = natural[(size_t) j];
+
+                const int outros = juce::jmax (1, n - (temAtiva ? 1 : 0));
+                const int sobra = area.getWidth() - gaps - (temAtiva ? wAtiva : 0);
+                const int porChip = sobra / outros;
+                const int minComTitulo = padX + wNum + m.px (34, 16);
+
+                if (ehAtiva)
+                {
+                    w = juce::jmin (wAtiva, juce::jmax (wSoNumero, area.getWidth() - gaps - (n - 1) * wSoNumero));
+                }
+                else if (porChip >= minComTitulo)
+                {
+                    w = juce::jmin (natural[(size_t) k], porChip);
+                }
+                else
+                {
+                    w = wSoNumero;
+                    comTitulo = false;
+                }
+            }
+
+            if (x + w > area.getRight())
+                w = juce::jmax (0, area.getRight() - x);
+
+            if (w <= 0)
+                break;
+
+            L.chips.push_back ({ i, juce::Rectangle<int> (x, area.getY(), w, area.getHeight()), comTitulo });
+            x += w + gap;
+        }
+
+        return L;
+    }
+
+    int alvoEm (juce::Point<int> p) const
+    {
+        const auto L = calcular (ChurchLiveSkin::metricsOf (*this));
+
+        if (L.icone.contains (p))
+            return kIcone;
+
+        if (L.chips.empty())
+            return L.vazio.contains (p) ? kIcone : kNada;
+
+        for (const auto& chip : L.chips)
+            if (chip.area.contains (p))
+                return chip.indice;
+
+        return kNada;
+    }
+
+    std::array<Cena, ChurchDAWLive::numeroDeCenas> cenas;
+    int ativa = -1;
+    int hover = kNada;
+
+    friend struct ScenesPageTestAccess;
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (SceneStrip)
 };

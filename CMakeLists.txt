@@ -250,6 +250,7 @@ if(CHURCHDAW_BUILD_AUDIO_TESTS AND NOT ANDROID AND NOT IOS)
         Tests/UI/MidiLearnOverlayTests.cpp
         Tests/UI/TimbrePickerLayoutTests.cpp
         Tests/UI/LevelMeterSkinTests.cpp
+        Tests/UI/ScenesPageTests.cpp
         Tests/Plugin/PluginPreviewLifecycleTests.cpp
         Tests/Plugin/PluginCandidateSearchTests.cpp
         Tests/UI/FullUpgradeTests.cpp)
@@ -418,6 +419,7 @@ if(CHURCHDAW_BUILD_AUDIO_TESTS AND NOT ANDROID AND NOT IOS)
 
     target_link_libraries(ChurchDAWMidiMappingSafetyTests
         PRIVATE
+            ChurchAssets   # a sonda inclui NordLookAndFeel.h -> ChurchLiveFonts.h (BinaryData)
             juce::juce_audio_processors
             juce::juce_cryptography
         PUBLIC
@@ -658,6 +660,8 @@ if(CHURCHDAW_BUILD_AUDIO_TESTS AND NOT ANDROID AND NOT IOS)
         COMMAND ChurchDAWMixerStripCollapseTests --timbre-picker)
     add_test(NAME ChurchDAWLevelMeterSkin
         COMMAND ChurchDAWMixerStripCollapseTests --level-meter-skin)
+    add_test(NAME ChurchDAWScenesPage
+        COMMAND ChurchDAWMixerStripCollapseTests --scenes-page)
     add_test(NAME ChurchDAWFullUpgrade
         COMMAND ChurchDAWMixerStripCollapseTests --full-upgrade)
     add_test(NAME ChurchDAWPluginPreviewLifecycle

@@ -3631,10 +3631,24 @@ void testAsyncPluginCreationIsTwoPhaseAndRejectsStale (
 }
 }
 
+// Regressao do crash de startup: o app aberto SEM dispositivo de audio (interface USB
+// desligada) restaura a cena ativa e chama panic() antes do primeiro prepareToPlay.
+// O SampleStreamer ainda nao tem as entradas das vozes e streams[i] caia fora do
+// vetor. Se isto voltar, o processo morre aqui.
+static void testPanicBeforeFirstPrepare (TestContext& test)
+{
+    TimbresProcessor proc;
+    proc.panic();
+    proc.panic();   // idempotente
+    test.expect (true, "panic() antes do primeiro prepareToPlay nao pode derrubar o processo");
+}
+
 int main (int argc, char* argv[])
 {
     juce::ScopedJuceInitialiser_GUI juce;
     TestContext test;
+
+    testPanicBeforeFirstPrepare (test);
 
     const bool idleAppGraphOnly = argc > 1
         && juce::String (argv[1]) == "--idle-app-graph-only";

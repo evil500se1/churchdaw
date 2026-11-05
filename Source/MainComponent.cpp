@@ -1017,13 +1017,25 @@ MainComponent::MainComponent (
     };
     scenesPage->onDetalhes = [this] (int i, const ChurchDAWLive::Cena& nova) { atualizarMetadadosDaCena (i, nova); };
     scenesPage->onApagar = [this] (int i) { apagarCena (i); };
+    sceneStrip = std::make_unique<SceneStrip>();
+    sceneStrip->onCarregar = [this] (int i)
+    {
+        const auto r = aplicarCena (i);
+        liveScenePanel.atualizar (cenas, cenaAtiva);
+        return r;
+    };
+    sceneStrip->onAbrirCenas = [this] { showScenesPage(); };
     liveScenePanel.aoAtualizar = [this] (const ChurchDAWLive::Cena* origem, int ativa)
     {
         if (scenesPage != nullptr)
             scenesPage->atualizar (origem, ativa);
+        if (sceneStrip != nullptr)
+            sceneStrip->atualizar (origem, ativa);
     };
     scenesPage->atualizar (cenas, cenaAtiva);
+    sceneStrip->atualizar (cenas, cenaAtiva);
     addChildComponent (*scenesPage);
+    addChildComponent (*sceneStrip);
    #endif
 
     avisarSobreArquivosDeVersaoFutura();
@@ -5011,6 +5023,27 @@ void MainComponent::resized()
     redoMixButton.setBounds (editActions.removeFromLeft (74));
     undoMixButton.setVisible (desktopReferenceLayout && ! learning && ! padEditorVisible);
     redoMixButton.setVisible (undoMixButton.isVisible());
+
+   #if ! CHURCHDAW_MOBILE_SHELL
+    if (sceneStrip != nullptr)
+    {
+        // Entre "Refazer" e a coluna MASTER da subbarra da mesa Live. Mesma conta
+        // da largura do MASTER usada no paint da subbarra.
+        const int masterW = juce::jlimit (232, 292, juce::roundToInt (programBand.getWidth() * 0.239f));
+        const int x0 = programBand.getX() + 18 + 118 + 78 + 5 + 74 + 16;
+        const auto faixa = juce::Rectangle<int> (x0, programBand.getY() + 4,
+                                                 programBand.getRight() - masterW - 14 - x0,
+                                                 programBand.getHeight() - 8);
+        const bool mostrar = desktopReferenceLayout && compactProgramBand && ! learning
+                          && ! padEditorVisible && ! scenesPageVisible && ! quickMidiMappingMode
+                          && faixa.getWidth() > 120 && faixa.getHeight() > 12;
+        sceneStrip->getProperties().set (
+            "churchU", desktopRail ? (double) desktopRailBounds.getWidth() / 104.0
+                                   : (double) ChurchLiveSkin::metricsFor (getWidth(), getHeight()).u);
+        sceneStrip->setBounds (mostrar ? faixa : juce::Rectangle<int>());
+        sceneStrip->setVisible (mostrar);
+    }
+   #endif
 
     // A workspace must stay below the settings/catalogue cards on resize.
     for (auto* overlay : { audioPanel.get(), aboutPanel.get(), librariesPanel.get() })

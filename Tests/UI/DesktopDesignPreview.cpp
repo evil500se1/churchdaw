@@ -323,7 +323,9 @@ public:
             quit();
             return;
         }
-        if (surface == "scenes")
+        // --demo-scenes: cenas de exemplo em qualquer tela (ex.: a faixa do modo Live)
+        demoScenes = surface == "scenes" || tokens.contains ("--demo-scenes");
+        if (demoScenes)
             writeDemoScenes();
         if (tokens.contains ("--test-shell"))
         {
@@ -394,7 +396,7 @@ public:
     {
         stopTimer();
         window.reset();
-        if (surface == "scenes")
+        if (demoScenes)
         {
             // o fixture volta a nao ter cenas
             demoScenesFile().deleteFile();
@@ -738,6 +740,7 @@ private:
     } };
     juce::File captureDirectory;
     juce::String surface;
+    bool demoScenes = false;
     juce::Array<juce::Component::SafePointer<juce::Component>> desktopBeforePopup;
     size_t captureIndex = 0;
     int captureWaitTicks = 0;

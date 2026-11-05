@@ -408,6 +408,8 @@ private:
     std::unique_ptr<PerformanceSessionPanel> performanceSessionPanel;
     // Pagina CENAS do desktop (botao do trilho que substituiu "Instrumentos").
     std::unique_ptr<ScenesPage> scenesPage;
+    // Faixa de troca rapida na subbarra da mesa Live (desktop).
+    std::unique_ptr<SceneStrip> sceneStrip;
     bool scenesPageVisible = false;
     bool padEditorVisible = false;
     // ultima posicao do card do Pad setada por codigo: se a atual difere, o

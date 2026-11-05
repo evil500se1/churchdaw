@@ -13169,7 +13169,13 @@ private:
         }
 
        #if CHURCHDAW_STREAM_SAMPLES
-        streamer.stream ((int) (&v - voices)).stop();
+        // panic() / troca de timbre ANTES do primeiro prepareToPlay (app aberto sem
+        // dispositivo de audio: interface USB desligada, "Sem audio"): o
+        // SampleStreamer ainda nao tem as maxVoices entradas e streams[i] cairia fora
+        // do vetor. Foi o crash de startup ao restaurar uma cena ativa com pagina de
+        // motor. Mesmo cuidado que releaseResources ja tem (wasProcessorPrepared).
+        if (const int streamIndex = (int) (&v - voices); streamIndex < streamer.numStreams())
+            streamer.stream (streamIndex).stop();
        #endif
 
         v.active = false;

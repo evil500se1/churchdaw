@@ -20248,6 +20248,9 @@ public:
         // Six channels and master also fit beside the vertical scrollbar at
         // the shell's 900 px minimum width.
         const bool referenceDesktop = getWidth() >= 860 && getHeight() >= 380;
+       #if CHURCHDAW_CHURCHLIVE_LOOK
+        applyDesktopChurchLiveRoles (referenceDesktop);
+       #endif
         auto area = getLocalBounds().reduced (referenceDesktop ? 8 : 12);
 
         title.setVisible (! referenceDesktop);
@@ -21479,6 +21482,49 @@ public:
     }
 
 private:
+   #if CHURCHDAW_CHURCHLIVE_LOOK && ! CHURCHDAW_MOBILE_SHELL
+    // Desktop: so os papeis que dao a identidade Church Live aos controles que
+    // ja existem (ON em pilula, PANIC vermelho cheio, medidores segmentados).
+    // O layout e os demais controles seguem o NordLookAndFeel do desktop.
+    void applyDesktopChurchLiveRoles (bool on)
+    {
+        if (desktopRolesApplied == on)
+            return;
+
+        desktopRolesApplied = on;
+        const auto tag = [on] (juce::Component& c, const char* role, double unit)
+        {
+            if (on)
+            {
+                c.getProperties().set ("churchSkin", role);
+                c.getProperties().set ("churchU", unit);
+                c.setLookAndFeel (&ChurchLiveSkin::lookAndFeel());
+            }
+            else
+            {
+                c.getProperties().remove ("churchSkin");
+                c.getProperties().remove ("churchU");
+                c.setLookAndFeel (nullptr);
+            }
+            c.repaint();
+        };
+
+        for (auto& s : strips)
+        {
+            tag (s.onBtn, "switch", 0.6);
+            // pilula pequena demais p/ "ON" ao lado da bolinha: so a bolinha
+            s.onBtn.getProperties().set ("churchNoLabel", on);
+            if (s.meter != nullptr)
+                s.meter->setSkin (on, 0.55f);
+        }
+
+        tag (panicButton, "panic", 0.5);
+        if (masterMeter != nullptr)
+            masterMeter->setSkin (on, 0.55f);
+    }
+    bool desktopRolesApplied = false;
+   #endif
+
    #if CHURCHDAW_MOBILE_SHELL
     //==========================================================================
     // SKIN CHURCH LIVE (so visual; ver ChurchLiveSkin.h). Liga o LookAndFeel e

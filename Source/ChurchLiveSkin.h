@@ -392,7 +392,7 @@ public:
                                     : b.getToggleState();
         const auto label = b.getButtonText();
 
-        if (r == "switch")
+        if (r == "switch" && ! b.getProperties().getWithDefault ("churchNoLabel", false))
         {
             const float h = bounds.getHeight();
             g.setFont (font (Face::barlowBold, m.fpx (16, 10.0f), 0.02f));

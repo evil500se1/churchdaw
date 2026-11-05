@@ -133,13 +133,14 @@ inline TopBar layoutTopBar (juce::Rectangle<int> bar, const Metrics& m, bool arr
 
 //==============================================================================
 // Pecas desenhadas (mesmos tokens em qualquer tela).
-inline void drawWordmark (juce::Graphics& g, juce::Rectangle<int> area, const Metrics& m)
+inline void drawWordmark (juce::Graphics& g, juce::Rectangle<int> area, const Metrics& m,
+                         const char* accentWord = "LIVE", bool allowSubtitle = true, bool spaced = true)
 {
     if (area.getWidth() < 40)
         return;
 
     const float titlePx = m.fpx (46, 20.0f);
-    const bool showSubtitle = m.fpx (12) >= 8.0f && area.getHeight() >= titlePx * 1.7f;
+    const bool showSubtitle = allowSubtitle && m.fpx (12) >= 8.0f && area.getHeight() >= titlePx * 1.7f;
     auto r = area.toFloat();
 
     // icone de barras (equalizador) a esquerda do nome
@@ -158,7 +159,7 @@ inline void drawWordmark (juce::Graphics& g, juce::Rectangle<int> area, const Me
     x += barW * 1.4f;
 
     const auto titleFont = font (Face::condExtraItalic, titlePx, 0.01f);
-    const float churchW = juce::GlyphArrangement::getStringWidth (titleFont, "CHURCH ");
+    const float churchW = juce::GlyphArrangement::getStringWidth (titleFont, spaced ? "CHURCH " : "CHURCH");
     const float titleH = titlePx * 1.25f;
     const auto titleRect = juce::Rectangle<float> (x, cy - titleH * 0.5f,
                                                    juce::jmax (1.0f, r.getRight() - x), titleH);
@@ -166,7 +167,7 @@ inline void drawWordmark (juce::Graphics& g, juce::Rectangle<int> area, const Me
     g.setColour (text());
     g.drawText ("CHURCH", titleRect.toNearestInt(), juce::Justification::centredLeft, false);
     g.setColour (accent());
-    g.drawText ("LIVE", titleRect.withTrimmedLeft (churchW).toNearestInt(),
+    g.drawText (accentWord, titleRect.withTrimmedLeft (churchW).toNearestInt(),
                 juce::Justification::centredLeft, false);
 
     if (showSubtitle)
@@ -179,6 +180,15 @@ inline void drawWordmark (juce::Graphics& g, juce::Rectangle<int> area, const Me
                         .toNearestInt(),
                     juce::Justification::centredLeft, false);
     }
+}
+
+// Item de trilho ativo. O desktop opta por seguir o estado de toggle do botao
+// (churchActiveFromToggle); o mobile calcula "churchActive" no layout.
+inline bool railIsActive (const juce::Button& b)
+{
+    return (bool) b.getProperties().getWithDefault ("churchActiveFromToggle", false)
+               ? b.getToggleState()
+               : (bool) b.getProperties().getWithDefault ("churchActive", false);
 }
 
 inline void drawChevron (juce::Graphics& g, juce::Rectangle<float> r, int direction /* 0 baixo, -1 esq, 1 dir */,
@@ -299,7 +309,7 @@ public:
         const auto m = metrics (b);
         const float alpha = b.isEnabled() ? 1.0f : 0.40f;
         const auto bounds = b.getLocalBounds().toFloat();
-        const bool on = r == "rail" ? (bool) b.getProperties().getWithDefault ("churchActive", false)
+        const bool on = r == "rail" ? railIsActive (b)
                                     : b.getToggleState();
 
         if (r == "switch")
@@ -378,7 +388,7 @@ public:
         const auto m = metrics (b);
         const float alpha = b.isEnabled() ? 1.0f : 0.40f;
         const auto bounds = b.getLocalBounds().toFloat();
-        const bool on = r == "rail" ? (bool) b.getProperties().getWithDefault ("churchActive", false)
+        const bool on = r == "rail" ? railIsActive (b)
                                     : b.getToggleState();
         const auto label = b.getButtonText();
 

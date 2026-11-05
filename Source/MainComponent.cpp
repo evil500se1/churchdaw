@@ -2787,12 +2787,25 @@ void MainComponent::paint (juce::Graphics& g)
     const bool narrowHeader = narrowHeaderLayout;
     if (desktopReferenceLayout)
     {
+        if (desktopRail)
+        {
+            // Church Live: cabecalho no mesmo fundo do app, trilho a esquerda.
+            g.setColour (NordLookAndFeel::bgApp());
+            g.fillRect (headerArea);
+            g.setColour (ChurchLiveSkin::railBg());
+            g.fillRect (desktopRailBounds.withTop (0));
+            g.setColour (ChurchLiveSkin::railLine());
+            g.fillRect (desktopRailBounds.getRight() - 1, 0, 1, getHeight());
+        }
+        else
+        {
         g.setColour (juce::Colour (0xff16191e));
         g.fillRect (headerArea);
         g.setColour (juce::Colours::white.withAlpha (0.035f));
         g.drawHorizontalLine (headerContentY + 56,
                               (float) headerArea.getX() + 18.0f,
                               (float) headerArea.getRight() - 18.0f);
+        }
     }
     else
     {
@@ -2827,10 +2840,19 @@ void MainComponent::paint (juce::Graphics& g)
 
         const int brandX = brandArea().getX();
         const int brandY = brandArea().getCentreY() - 16;
+        if (desktopRail)
+        {
+            ChurchLiveSkin::Metrics wordmarkMetrics;
+            wordmarkMetrics.u = 0.565f;   // titulo de ~26 px na fileira de 56
+            ChurchLiveSkin::drawWordmark (g, brandArea(), wordmarkMetrics, "DAW", false, false);
+        }
+        else
+        {
         g.setColour (juce::Colours::white);
         g.drawText ("CHURCH", brandX, brandY, churchW + 2, 32, juce::Justification::centredLeft);
         g.setColour (NordLookAndFeel::nordRedBright());
         g.drawText ("DAW", brandX + churchW, brandY, dawW + 4, 32, juce::Justification::centredLeft);
+        }
 
         // Os tres modulos tecnicos desenham suas proprias chapas elevadas.
         // Aqui fica apenas a luz ambiente que os une, sem uma quarta caixa.
@@ -3783,6 +3805,24 @@ void MainComponent::resized()
     // contracts its technical regions instead of switching to a cramped legacy
     // layout when a native window border subtracts one or two pixels.
     desktopReferenceLayout = DesktopHeaderLayout::supports (layoutContentBounds);
+   #if ! CHURCHDAW_MOBILE_SHELL
+    desktopRail = CHURCHDAW_DESKTOP_RAIL && DesktopHeaderLayout::supportsRail (layoutContentBounds);
+    if (desktopRail)
+    {
+        const int railW = DesktopHeaderLayout::railWidth (layoutContentBounds.getWidth());
+        desktopRailBounds = layoutContentBounds.withWidth (railW);
+        layoutContentBounds = layoutContentBounds.withTrimmedLeft (railW);
+    }
+    else
+    {
+        desktopRailBounds = {};
+    }
+
+    if (desktopRailWasOn && ! desktopRail)
+        clearDesktopRail();
+
+    desktopRailWasOn = desktopRail;
+   #endif
     // FULL SCREEN LIVE MIXER: Sem menu lateral, tudo na cara e com máxima largura para os canais
     desktopSidebarWidth = 0;
     desktopBottomBarHeight = desktopReferenceLayout ? 62 : 0;
@@ -3945,7 +3985,8 @@ void MainComponent::resized()
    #else
     const bool learningBand = mapButton.getToggleState() || midiLearnActive.load();
     desktopHeaderTwoRows = desktopReferenceLayout || safeContentWidth < 1160;
-    layoutHeaderHeight = desktopReferenceLayout ? DesktopHeaderLayout::height
+    layoutHeaderHeight = desktopReferenceLayout ? (desktopRail ? DesktopHeaderLayout::railHeaderHeight
+                                                                  : DesktopHeaderLayout::height)
                        : compact ? (desktopHeaderTwoRows ? 82 : 46)
                                  : desktopHeaderTwoRows ? 96 : headerHeight;
     layoutProgramBandHeight = desktopReferenceLayout
@@ -4377,7 +4418,8 @@ void MainComponent::resized()
 
         if (desktopReferenceLayout)
         {
-            const auto header = DesktopHeaderLayout::calculate (headerRow);
+            const auto header = desktopRail ? DesktopHeaderLayout::calculateRail (headerRow)
+                                         : DesktopHeaderLayout::calculate (headerRow);
             deviceBar.setCompact (false);
             deviceBar.setBounds (header.devices);
             engineStatusBounds = header.engine;
@@ -4387,7 +4429,10 @@ void MainComponent::resized()
                                                    .withTrimmedTop (23)
                                                    .withTrimmedBottom (7));
             saveButton.setBounds (learning ? juce::Rectangle<int>() : header.save);
-            layoutNavigation (header.navigation);
+            if (desktopRail)
+                layoutDesktopRail (learning);
+            else
+                layoutNavigation (header.navigation);
         }
         else if (desktopHeaderTwoRows && ! learning)
         {
@@ -18394,6 +18439,77 @@ void MainComponent::clearShellSkin()
 }
 #endif
 
+#if ! CHURCHDAW_MOBILE_SHELL
+// Trilho do desktop: os mesmos destinos das abas, empilhados a esquerda e
+// desenhados pelo papel "rail" do skin Church Live (icone sobre o rotulo, faixa
+// vermelha no item ativo). O estado ativo segue o toggle de cada botao.
+void MainComponent::layoutDesktopRail (bool learning)
+{
+    using namespace ChurchLiveSkin;
+
+    Metrics m;
+    m.u = (float) desktopRailBounds.getWidth() / 104.0f;   // mesma escala do trilho do Android
+
+    juce::Array<juce::Button*> items;
+    if (learning)
+    {
+        items.add (&clearMapButton);
+        items.add (&mapButton);
+    }
+    else
+    {
+        items.add (&instrumentsButton);
+        items.add (&liveButton);
+        items.add (&mapButton);
+        items.add (&padButton);
+       #if CHURCHDAW_HOSTS_PLUGINS
+        items.add (&scanButton);
+       #endif
+        items.add (&liveCamButton);
+        items.add (&librariesButton);
+        items.add (&audioSettingsButton);
+    }
+
+    // Destino fora da lista (ex.: Plugins sem host, limpar fora do Mapear) some.
+    for (juce::Button* button : std::initializer_list<juce::Button*> {
+             &instrumentsButton, &liveButton, &mapButton, &clearMapButton, &padButton,
+             &scanButton, &liveCamButton, &librariesButton, &audioSettingsButton })
+        if (! items.contains (button))
+            button->setBounds ({});
+
+    const int gap = m.px (6, 3);
+    auto area = desktopRailBounds.reduced (0, m.px (10, 4));
+    const int count = juce::jmax (1, items.size());
+    const int itemH = juce::jlimit (44, m.px (84, 56), (area.getHeight() - gap * (count - 1)) / count);
+    // Em janelas altas a pilha de destinos fica centralizada, como no Android.
+    area.removeFromTop (juce::jmax (0, (area.getHeight() - (itemH * count + gap * (count - 1))) / 2));
+
+    for (juce::Button* button : items)
+    {
+        button->getProperties().set ("churchSkin", "rail");
+        button->getProperties().set ("churchU", (double) m.u);
+        button->getProperties().set ("churchActiveFromToggle", true);
+        button->setLookAndFeel (&ChurchLiveSkin::lookAndFeel());
+        button->setBounds (area.removeFromTop (itemH));
+        area.removeFromTop (gap);
+    }
+}
+
+// Ao sair do layout de referencia (janela pequena) os botoes voltam a ser
+// desenhados pelo look and feel padrao do desktop.
+void MainComponent::clearDesktopRail()
+{
+    for (juce::Button* button : std::initializer_list<juce::Button*> {
+             &instrumentsButton, &liveButton, &mapButton, &clearMapButton, &padButton,
+             &scanButton, &liveCamButton, &librariesButton, &audioSettingsButton })
+    {
+        button->getProperties().remove ("churchSkin");
+        button->getProperties().remove ("churchU");
+        button->getProperties().remove ("churchActiveFromToggle");
+        button->setLookAndFeel (nullptr);
+    }
+}
+#endif
 // Audio e Bibliotecas abrem POR CIMA do palco: sem isto o trilho seguia marcando
 // "Timbres" debaixo deles. O estado base (palco/live/mapear/pad) vem do layout.
 void MainComponent::refreshRailActive()

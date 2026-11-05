@@ -2,12 +2,28 @@
 
 #include <juce_gui_basics/juce_gui_basics.h>
 
+// Trilho de navegacao a esquerda (como no Android) em vez das abas no topo, na
+// janela de referencia (>= 900x580). Defina CHURCHDAW_DESKTOP_RAIL=0 para voltar
+// as abas.
+#ifndef CHURCHDAW_DESKTOP_RAIL
+ #define CHURCHDAW_DESKTOP_RAIL 1
+#endif
+
 // The desktop header allocates every region before placing components. This
 // keeps device names readable without borrowing space from navigation.
 struct DesktopHeaderLayout
 {
     juce::Rectangle<int> brand, devices, engine, save, navigation;
     static constexpr int height = 100;
+    static constexpr int railHeaderHeight = 56;   // uma fileira so: a navegacao sai para o trilho
+    static int railWidth (int) noexcept { return 84; }
+    // O mixer so mantem o layout de referencia com >= 860 px de largura propria;
+    // por isso o trilho so entra quando a janela comporta os 900 px de antes MAIS o
+    // trilho. Abaixo disso as abas do topo continuam como eram.
+    static bool supportsRail (juce::Rectangle<int> bounds) noexcept
+    {
+        return supports (bounds) && bounds.getWidth() >= 900 + railWidth (bounds.getWidth());
+    }
 
     static bool supports (juce::Rectangle<int> bounds) noexcept
     {
@@ -28,6 +44,13 @@ struct DesktopHeaderLayout
         result.devices = top;
         result.navigation = { bounds.getX() + 18, bounds.getY() + 58,
                               juce::jmax (0, bounds.getWidth() - 36), 38 };
+        return result;
+    }
+    // Mesma fileira de marca/dispositivos/engine/salvar, sem a fileira de abas.
+    static DesktopHeaderLayout calculateRail (juce::Rectangle<int> bounds)
+    {
+        auto result = calculate (bounds);
+        result.navigation = {};
         return result;
     }
 };

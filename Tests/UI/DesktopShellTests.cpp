@@ -49,6 +49,39 @@ void testHeaderRegions()
     }
 }
 
+void testRailRegions()
+{
+    // O trilho so entra quando a janela comporta os 900 px de antes MAIS o trilho:
+    // o mixer exige >= 860 px de largura propria para manter o layout de referencia.
+    const int railW = DesktopHeaderLayout::railWidth (1280);
+    expect (! DesktopHeaderLayout::supportsRail ({ 0, 0, 900 + railW - 1, 580 }),
+            "the rail must not shrink the mixer below its reference width");
+    expect (DesktopHeaderLayout::supportsRail ({ 0, 0, 900 + railW, 580 }),
+            "the rail must be available as soon as the window can hold it");
+    expect (! DesktopHeaderLayout::supportsRail ({ 0, 0, 1600, 579 }),
+            "the rail must respect the desktop shell minimum height");
+
+    // A largura do cabecalho ao lado do trilho e a da janela menos o trilho.
+    for (const int width : { 900, 1000, 1099, 1100, 1178, 1280, 1500 })
+    {
+        const juce::Rectangle<int> bounds (37, 23, width, DesktopHeaderLayout::railHeaderHeight);
+        const auto layout = DesktopHeaderLayout::calculateRail (bounds);
+        expect (layout.navigation.isEmpty(), "the rail layout must not reserve a tab row");
+        const std::array<juce::Rectangle<int>, 4> regions {
+            layout.brand, layout.devices, layout.engine, layout.save
+        };
+        for (size_t index = 0; index < regions.size(); ++index)
+        {
+            expect (! regions[index].isEmpty(), "a rail header region disappeared");
+            expect (bounds.contains (regions[index]), "a rail header region escapes its parent");
+            for (size_t other = index + 1; other < regions.size(); ++other)
+                expect (! regions[index].intersects (regions[other]),
+                        "rail header controls overlap at a supported width");
+        }
+        expect (layout.devices.getWidth() >= (width < 1100 ? 376 : 440),
+                "device names lost the minimum readable allocation beside the rail");
+    }
+}
 void testSustainOwnership()
 {
     PianoVisualState state;
@@ -172,6 +205,7 @@ int runDesktopShellTests()
 {
     failures = 0;
     testHeaderRegions();
+    testRailRegions();
     testSustainOwnership();
     testDockRendering();
     std::cout << "Desktop shell regressions: " << (failures == 0 ? "PASS" : "FAIL")

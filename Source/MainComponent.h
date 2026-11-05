@@ -1039,6 +1039,12 @@ private:
     bool desktopHeaderTwoRows = false;
     bool compactProgramBand = false;
     bool desktopReferenceLayout = false;
+    // Trilho de navegacao a esquerda no desktop (DesktopHeaderLayout::railWidth).
+    bool desktopRail = false;
+    bool desktopRailWasOn = false;
+    juce::Rectangle<int> desktopRailBounds;
+    void layoutDesktopRail (bool learning);
+    void clearDesktopRail();
     enum class DesktopWorkspace { mixer, performance, session };
     DesktopWorkspace desktopWorkspace = DesktopWorkspace::mixer;
     juce::TextButton undoMixButton, redoMixButton;

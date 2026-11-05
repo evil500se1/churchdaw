@@ -745,6 +745,9 @@ private:
         float pinkNoise = 0.0f;
         float osc1Increment = 0.0f, osc2Increment = 0.0f;
         float subIncrement = 0.0f, lfoIncrement = 0.0f;
+        // Ultimo ponto EXATO do cutoff (ver modulatedCoefficients).
+        float cutInvBase0 = 0.0f, cutE0 = 0.0f, cutG0 = 0.0f, cutDg = 0.0f, cutDg2 = 0.0f;
+        bool cutValid = false;
     };
 
     struct Voice
@@ -1191,6 +1194,37 @@ private:
                  : once;
     }
 
+    // g = tan(pi*cutoff/sr) por voz/camada/amostra era o maior custo do DSP em ARM.
+    // A modulacao do cutoff e suave, entao g e expandido em 2a ordem em torno do
+    // ultimo ponto exato: dg/dln(cutoff) = theta*(1+g^2), d2g = dg*(1+2*g*theta).
+    // Dentro de maxStep o erro (3a ordem) e < ~1e-6 relativo, valido so p/ cutoff
+    // < 0.30*sr (a curva do tan fica ingreme perto do Nyquist); saltos (automacao,
+    // inicio de voz) e cutoff fora dessa faixa refazem o calculo exato.
+    FilterCoefficients modulatedCoefficients (VoiceLayer& v, float baseCutoff,
+                                              float exponent, float filterR) const noexcept
+    {
+        constexpr float maxStep = 4.0e-3f;   // em unidades de ln(cutoff)
+        const float step = 0.69314718f * (exponent - v.cutE0)
+                         + (baseCutoff * v.cutInvBase0 - 1.0f);
+        if (v.cutValid && std::abs (step) < maxStep)
+        {
+            const float g = v.cutG0 + step * (v.cutDg + 0.5f * v.cutDg2 * step);
+            return { g, filterR, 1.0f + filterR * g + g * g };
+        }
+
+        const float cutoff = baseCutoff * std::exp2 (exponent);
+        const auto c = filterCoefficients (cutoff, filterR, sampleRate);
+        v.cutValid = baseCutoff > 0.0f && cutoff > 31.0f
+                  && cutoff < (float) sampleRate * 0.30f;
+        v.cutInvBase0 = baseCutoff > 0.0f ? 1.0f / baseCutoff : 0.0f;
+        v.cutE0 = exponent;
+        v.cutG0 = c.g;
+        const float theta = juce::MathConstants<float>::pi * cutoff / (float) sampleRate;
+        v.cutDg = theta * (1.0f + c.g * c.g);
+        v.cutDg2 = v.cutDg * (1.0f + 2.0f * c.g * theta);
+        return c;
+    }
+
     void prepareActiveVoiceIncrements (const BlockSettings& settings,
                                        int onlyChannel = 0) noexcept
     {
@@ -1282,8 +1316,8 @@ private:
                     * juce::jmap (settings.xyX, 0.45f, 1.55f);
                 const float brightness = juce::jmap (settings.xyX, 0.62f, 1.55f);
                 const float envOctaves = s.filterEnv * (modEnv - 0.35f) * 4.0f;
-                const float cutoff = s.cutoff * brightness
-                    * std::exp2 (envOctaves + motion * 1.5f);
+                const float baseCutoff = s.cutoff * brightness;
+                const float cutoffExponent = envOctaves + motion * 1.5f;
 
                 if (s.drive > 0.0001f)
                 {
@@ -1299,8 +1333,8 @@ private:
                 // vezes por voz/camada/amostra consumia a maior parte do DSP
                 // em ARM. Reusar os mesmos coeficientes preserva exatamente a
                 // topologia e a resposta sonora do filtro.
-                const auto coefficients = filterCoefficients (
-                    cutoff, s.filterR, sampleRate);
+                const auto coefficients = modulatedCoefficients (
+                    v, baseCutoff, cutoffExponent, s.filterR);
                 voiceL += processFilter (
                     value * gainL, coefficients,
                     v.filterL, v.filter2L, s.filterType);

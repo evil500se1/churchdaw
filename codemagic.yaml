@@ -223,6 +223,28 @@ workflows:
           run --size=1600x900 --surface scenes --capture-dir "$FIX/caps-cenas" || true
           cp -R "$FIX/caps" dist-mac/medicao/caps-desktop || true
           cp -R "$FIX/caps-cenas" dist-mac/medicao/caps-cenas || true
+
+      - name: Compilar a previa mobile (layout do iPad e do iPhone)
+        ignore_failure: true
+        script: |
+          set -euo pipefail
+          cmake --build build-mac --config Release --parallel 4 --target ChurchDAWMobileDesignPreview
+
+      - name: Capturas do layout iPad/iPhone no Mac (9 telas por tamanho)
+        ignore_failure: true
+        script: |
+          set -euo pipefail
+          APPBIN="$(find build-mac -type f -path '*ChurchDAW Mobile Preview.app/Contents/MacOS/*' -print -quit)"
+          test -n "$APPBIN"
+          FIX="$(mktemp -d)"
+          mkdir "$FIX/settings" "$FIX/data"
+          printf 'churchdaw-design-preview-v1' > "$FIX/.churchdaw-design-preview"
+          export CHURCHDAW_QA_SETTINGS_DIR="$FIX/settings" CHURCHDAW_QA_DATA_DIR="$FIX/data"
+          for SZ in 1366x1024 1180x820 926x428; do
+            mkdir "$FIX/mobile-$SZ"
+            perl -e 'alarm shift; exec @ARGV' 300 "$APPBIN" --size="$SZ" --capture-all --capture-dir "$FIX/mobile-$SZ" || true
+            cp -R "$FIX/mobile-$SZ" "dist-mac/medicao/mobile-$SZ" || true
+          done
     artifacts:
       - dist-mac/medicao/*
       - dist-mac/medicao/**/*.png

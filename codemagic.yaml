@@ -71,6 +71,9 @@ workflows:
             CODE_SIGN_IDENTITY=""
 
           SIM_APP="$(find build-ios -path '*Release-iphonesimulator*' -type d -name ChurchDAW.app -print -quit)"
+          if [[ -z "$SIM_APP" ]]; then
+            SIM_APP="$(find build-ios -type d -name ChurchDAW.app -print -quit)"
+          fi
           test -n "$SIM_APP"
           plutil -lint "$SIM_APP/Info.plist"
           python3 Tests/Studio/ValidateIOSBundle.py "$SIM_APP"

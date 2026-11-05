@@ -21514,6 +21514,9 @@ private:
             tag (s.onBtn, "switch", 0.6);
             // pilula pequena demais p/ "ON" ao lado da bolinha: so a bolinha
             s.onBtn.getProperties().set ("churchNoLabel", on);
+            tag (s.muteBtn, "mute", 0.55);
+            tag (s.soloBtn, "solo", 0.55);
+            tag (s.flushBtn, "pill", 0.55);
             if (s.meter != nullptr)
                 s.meter->setSkin (on, 0.55f);
         }

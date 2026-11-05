@@ -5,11 +5,71 @@
  #define CHURCHDAW_UI_BISECT 0
 #endif
 
+#include <juce_audio_basics/juce_audio_basics.h>   // juce::Decibels
 #include <juce_gui_basics/juce_gui_basics.h>
 
 #include "NordLookAndFeel.h"
 
+#include <algorithm>
 #include <functional>
+#include <vector>
+
+//==============================================================================
+// Um relogio so para todos os medidores. Cada medidor com timer proprio acordava
+// a thread da interface na sua propria fase: medido no Xiaomi parado e em
+// silencio, ~158 despertares/s na thread principal (+97/s na thread de timers do
+// JUCE) para ~7 medidores a 24 Hz. Com um relogio, todos rodam no mesmo tick.
+// Apenas thread de mensagens (como o proprio juce::Timer).
+//==============================================================================
+class MeterClock : private juce::Timer
+{
+public:
+    struct Client
+    {
+        virtual void meterTick() = 0;
+
+    protected:
+        ~Client() = default;
+    };
+
+    static MeterClock& get() { static MeterClock clock; return clock; }
+
+    void add (Client& client, int hz)
+    {
+        jassert (clients.empty() || hz == currentHz);   // um relogio: todos os medidores da plataforma usam o mesmo Hz
+
+        clients.push_back (&client);
+
+        if (! isTimerRunning())
+        {
+            currentHz = hz;
+            startTimerHz (hz);
+        }
+    }
+
+    void remove (Client& client)
+    {
+        clients.erase (std::remove (clients.begin(), clients.end(), &client), clients.end());
+
+        if (clients.empty())
+            stopTimer();
+    }
+
+    size_t size() const { return clients.size(); }
+
+private:
+    void timerCallback() override
+    {
+        const auto snapshot = clients;   // um tick pode destruir outro medidor
+
+        for (auto* client : snapshot)
+            if (std::find (clients.begin(), clients.end(), client) != clients.end())
+                client->meterTick();
+    }
+
+    std::vector<Client*> clients;
+    int currentHz = 0;
+};
 
 //==============================================================================
 // Medidor de nivel generico (1 ou 2 barras): gradiente verde -> amarelo ->
@@ -17,7 +77,7 @@
 // para apagar). As fontes de nivel/clip sao funcoes "le e zera".
 //==============================================================================
 class LevelMeter : public juce::Component,
-                   private juce::Timer
+                   private MeterClock::Client
 {
 public:
     using LevelFn = std::function<float (int channel)>;
@@ -51,15 +111,15 @@ public:
         // porque canais em silencio saem em fast-path (zero dB math/repaint) e
         // mudancas apenas de nivel repintam somente a regiao interna das barras.
         timerHzUsado = 24;
-        startTimerHz (timerHzUsado);
+        MeterClock::get().add (*this, timerHzUsado);
        #elif JUCE_IOS
         timerHzUsado = 24;
-        startTimerHz (timerHzUsado);
+        MeterClock::get().add (*this, timerHzUsado);
        #else
         // 45 Hz no desktop: ataque e queda deixam de revelar degraus de frame
         // sem transformar o meter em um repaint permanente de 60 Hz.
         timerHzUsado = 45;
-        startTimerHz (timerHzUsado);
+        MeterClock::get().add (*this, timerHzUsado);
        #endif
 
         // Balistica em TEMPO (nao em quadros): mesma queda/hold em qualquer
@@ -69,6 +129,8 @@ public:
         quedaPicoDb  = 24.0f / (float) timerHzUsado;
         ticksHold    = juce::jmax (1, juce::roundToInt (1.5f * (float) timerHzUsado));
     }
+
+    ~LevelMeter() override { MeterClock::get().remove (*this); }
 
     void mouseDown (const juce::MouseEvent&) override
     {
@@ -653,7 +715,7 @@ private:
                       (db - minDb) / 30.0f);
     }
 
-    void timerCallback() override
+    void meterTick() override
     {
         // escondido (ex.: tela da cadeia sob o Church Live fullscreen): nao
         // consome a fonte le-e-zera -- roubava quadros e clips do medidor

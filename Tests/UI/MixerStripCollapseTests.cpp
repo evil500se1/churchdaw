@@ -89,6 +89,7 @@ bool contem (const std::vector<juce::Component*>& lista, juce::Component* alvo)
 
 int runMidiLearnOverlayTests();
 int runTimbrePickerLayoutTests();
+int runMeterClockTests();
 int runPluginGalleryLayoutTests();
 int runFullUpgradeTests();
 int runPluginPreviewLifecycleTests (bool legacy);
@@ -108,6 +109,8 @@ int main (int argc, char** argv)
         return runPluginGalleryLayoutTests();
     if (argc > 1 && std::string (argv[1]) == "--timbre-picker")
         return runTimbrePickerLayoutTests();
+    if (argc > 1 && std::string (argv[1]) == "--meter-clock")
+        return runMeterClockTests();
 
     StripMock strip;
     const auto collapse = churchDAWStripCollapseList (strip);

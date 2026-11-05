@@ -249,6 +249,7 @@ if(CHURCHDAW_BUILD_AUDIO_TESTS AND NOT ANDROID AND NOT IOS)
         Tests/UI/MixerStripCollapseTests.cpp
         Tests/UI/MidiLearnOverlayTests.cpp
         Tests/UI/TimbrePickerLayoutTests.cpp
+        Tests/UI/MeterClockTests.cpp
         Tests/Plugin/PluginPreviewLifecycleTests.cpp
         Tests/Plugin/PluginCandidateSearchTests.cpp
         Tests/UI/FullUpgradeTests.cpp)
@@ -321,7 +322,8 @@ if(CHURCHDAW_BUILD_AUDIO_TESTS AND NOT ANDROID AND NOT IOS)
     target_compile_definitions(ChurchDAWMixerStripCollapseTests PRIVATE
         JUCE_WEB_BROWSER=0
         JUCE_PUSH_NOTIFICATIONS=0
-        JUCE_USE_CURL=0)
+        JUCE_USE_CURL=0
+        JUCE_MODAL_LOOPS_PERMITTED=1)
     target_compile_definitions(ChurchDAWChannelToneTests PRIVATE
         JUCE_WEB_BROWSER=0
         JUCE_PUSH_NOTIFICATIONS=0
@@ -394,6 +396,7 @@ if(CHURCHDAW_BUILD_AUDIO_TESTS AND NOT ANDROID AND NOT IOS)
 
     target_link_libraries(ChurchDAWMixerStripCollapseTests
         PRIVATE
+            ChurchAssets
             juce::juce_dsp
             juce::juce_audio_basics
             juce::juce_audio_processors
@@ -654,6 +657,8 @@ if(CHURCHDAW_BUILD_AUDIO_TESTS AND NOT ANDROID AND NOT IOS)
         COMMAND ChurchDAWMixerStripCollapseTests --midi-learn)
     add_test(NAME ChurchDAWTimbrePickerLayout
         COMMAND ChurchDAWMixerStripCollapseTests --timbre-picker)
+    add_test(NAME ChurchDAWMeterClock
+        COMMAND ChurchDAWMixerStripCollapseTests --meter-clock)
     add_test(NAME ChurchDAWFullUpgrade
         COMMAND ChurchDAWMixerStripCollapseTests --full-upgrade)
     add_test(NAME ChurchDAWPluginPreviewLifecycle
